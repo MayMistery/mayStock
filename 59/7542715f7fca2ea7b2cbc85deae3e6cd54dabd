@@ -1,0 +1,97 @@
+Sources/MayStock/Services/SystemMonitor/MemoryMonitor.swift
+  s_7654b07158c363::t_6c7cf91da33bc2 1-6 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4dfcbfd84368a83fc3ec7d","tool_type":"agent","tool_id":"Write","line_ranges":[{"Range":[1,6]}]}]}
+  s_7654b07158c363::t_c5913a47503ea0 17 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4dfcf7d84368a83fc3ec9f","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Single":17}]}]}
+  s_7654b07158c363::t_e5385fb71af802 7-9,14-16
+  s_7654b07158c363::t_6ee76567d4bba9 18-20
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "597542715f7fca2ea7b2cbc85deae3e6cd54dabd",
+  "prompts": {},
+  "sessions": {
+    "s_7654b07158c363": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a4dee0b8420981c2217833f",
+        "model": "c_o_new__max"
+      },
+      "human_author": "MayStock Dev <dev@maystock.local>"
+    }
+  },
+  "attestation_metadata": {
+    "Sources/MayStock/Services/SystemMonitor/MemoryMonitor.swift": [
+      {
+        "hash": "s_7654b07158c363::t_6c7cf91da33bc2",
+        "line_ranges": [
+          {
+            "Range": [
+              1,
+              6
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4dfcbfd84368a83fc3ec7d",
+            "tool_type": "agent",
+            "tool_id": "Write",
+            "line_ranges": [
+              {
+                "Range": [
+                  1,
+                  6
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "hash": "s_7654b07158c363::t_c5913a47503ea0",
+        "line_ranges": [
+          {
+            "Single": 17
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4dfcf7d84368a83fc3ec9f",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Single": 17
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_7654b07158c363": {
+      "tool": "trae",
+      "conversation_id": "6a4dee0b8420981c2217833f",
+      "session_id": "6a4dee0b8420981c2217833f",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_7654b07158c363::t_6c7cf91da33bc2": {
+      "tool": "trae",
+      "conversation_id": "6a4dee0b8420981c2217833f",
+      "session_id": "6a4dee0b8420981c2217833f",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_7654b07158c363::t_c5913a47503ea0": {
+      "tool": "trae",
+      "conversation_id": "6a4dee0b8420981c2217833f",
+      "session_id": "6a4dee0b8420981c2217833f",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
