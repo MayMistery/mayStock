@@ -30,8 +30,8 @@ enum OKXMessageParserTests {
         {"arg":{"channel":"candle1m","instId":"BTC-USDT"},"data":[["1720000000000","62000","62500","61800","62300","100.5","6230000","6230000","1"]]}
         """
         let result = try OKXMessageParser.parse(json)
-        guard case .candle(let ohlc) = result else {
-            assertionFailure("Expected candle, got \(result)")
+        guard case .candles(let ohlcList) = result, let ohlc = ohlcList.first else {
+            assertionFailure("Expected candles, got \(result)")
             return
         }
         assert(ohlc.open == 62000.0, "Expected open 62000.0, got \(ohlc.open)")

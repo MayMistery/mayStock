@@ -47,14 +47,19 @@ final class MarketDataProvider {
             currentPrice = tick.price
             ticks.append(tick)
             if ticks.count > maxTicks { ticks.removeFirst() }
-        case .candle(let ohlc):
-            if let lastIndex = candles.indices.last,
-               !candles[lastIndex].confirmed,
-               candles[lastIndex].timestamp == ohlc.timestamp {
-                candles[lastIndex] = ohlc
-            } else {
-                candles.append(ohlc)
-                if candles.count > maxCandles { candles.removeFirst() }
+        case .candles(let ohlcList):
+            for ohlc in ohlcList {
+                if let lastIndex = candles.indices.last,
+                   !candles[lastIndex].confirmed,
+                   candles[lastIndex].timestamp == ohlc.timestamp {
+                    candles[lastIndex] = ohlc
+                } else {
+                    candles.append(ohlc)
+                }
+            }
+            candles.sort { $0.timestamp < $1.timestamp }
+            if candles.count > maxCandles {
+                candles.removeFirst(candles.count - maxCandles)
             }
         case .orderBook(let book):
             orderBook = book

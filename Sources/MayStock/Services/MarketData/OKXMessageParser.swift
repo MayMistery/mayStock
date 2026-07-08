@@ -8,7 +8,7 @@ enum OKXParseError: Error {
 
 enum OKXMessage: Sendable {
     case ticker(MarketTick)
-    case candle(OHLC)
+    case candles([OHLC])
     case orderBook(OrderBook)
     case ping
     case subscribed
@@ -67,24 +67,26 @@ struct OKXMessageParser {
     }
 
     private static func parseCandle(_ dataArray: [Any]) throws -> OKXMessage {
-        guard let first = dataArray.first as? [Any],
-              first.count >= 9,
-              let tsStr = first[0] as? String, let tsMs = Double(tsStr),
-              let openStr = first[1] as? String, let open = Double(openStr),
-              let highStr = first[2] as? String, let high = Double(highStr),
-              let lowStr = first[3] as? String, let low = Double(lowStr),
-              let closeStr = first[4] as? String, let close = Double(closeStr),
-              let volStr = first[5] as? String, let vol = Double(volStr),
-              let confirmStr = first[8] as? String else {
-            throw OKXParseError.missingField("candle fields")
+        var ohlcList: [OHLC] = []
+        for item in dataArray {
+            guard let arr = item as? [Any],
+                  arr.count >= 9,
+                  let tsStr = arr[0] as? String, let tsMs = Double(tsStr),
+                  let openStr = arr[1] as? String, let open = Double(openStr),
+                  let highStr = arr[2] as? String, let high = Double(highStr),
+                  let lowStr = arr[3] as? String, let low = Double(lowStr),
+                  let closeStr = arr[4] as? String, let close = Double(closeStr),
+                  let volStr = arr[5] as? String, let vol = Double(volStr),
+                  let confirmStr = arr[8] as? String else { continue }
+            ohlcList.append(OHLC(
+                timestamp: Date(timeIntervalSince1970: tsMs / 1000.0),
+                open: open, high: high, low: low, close: close,
+                volume: vol,
+                confirmed: confirmStr == "1"
+            ))
         }
-        let ohlc = OHLC(
-            timestamp: Date(timeIntervalSince1970: tsMs / 1000.0),
-            open: open, high: high, low: low, close: close,
-            volume: vol,
-            confirmed: confirmStr == "1"
-        )
-        return .candle(ohlc)
+        guard !ohlcList.isEmpty else { throw OKXParseError.missingField("candle fields") }
+        return .candles(ohlcList)
     }
 
     private static func parseOrderBook(_ dataArray: [Any]) throws -> OKXMessage {

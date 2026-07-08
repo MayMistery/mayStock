@@ -65,15 +65,19 @@ struct PopoverView: View {
     @ViewBuilder
     private var chartView: some View {
         Group {
-            switch viewModel.selectedChartType {
-            case .line:
+            if let item = viewModel.selectedItem, item.type != .crypto {
                 LineChartView(data: lineData, title: "")
-            case .candlestick:
-                CandlestickChartView(candles: viewModel.marketData.candles)
-            case .volume:
-                VolumeChartView(candles: viewModel.marketData.candles)
-            case .depth:
-                DepthChartView(orderBook: viewModel.marketData.orderBook)
+            } else {
+                switch viewModel.selectedChartType {
+                case .line:
+                    LineChartView(data: lineData, title: "")
+                case .candlestick:
+                    CandlestickChartView(candles: viewModel.marketData.candles)
+                case .volume:
+                    VolumeChartView(candles: viewModel.marketData.candles)
+                case .depth:
+                    DepthChartView(orderBook: viewModel.marketData.orderBook)
+                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

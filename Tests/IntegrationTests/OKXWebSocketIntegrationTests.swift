@@ -39,7 +39,7 @@ enum OKXWebSocketIntegrationTests {
         var receivedCandle = false
 
         service.onMessage = { message in
-            if case .candle = message {
+            if case .candles = message {
                 receivedCandle = true
             }
         }
