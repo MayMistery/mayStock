@@ -1,0 +1,330 @@
+Sources/MayStock/Features/Charts/VolumeChartView.swift
+  s_7654b07158c363::t_51d7e524d551c3 7-8,13-14,21-30,33-34,51-55 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4e0fb7d84368a83fc3f1b8","tool_type":"agent","tool_id":"Write","line_ranges":[{"Range":[7,8]},{"Range":[13,14]},{"Range":[21,30]},{"Range":[33,34]},{"Range":[51,55]}]}]}
+  s_7654b07158c363::t_ed284795704ce6 56
+Sources/MayStock/Features/Charts/LineChartView.swift
+  s_7654b07158c363::t_98b88280943a9e 8-9,20-21,30-40,43-44,61-62,67,76-80 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4e0fa1d84368a83fc3f1b5","tool_type":"agent","tool_id":"Write","line_ranges":[{"Range":[8,9]},{"Range":[20,21]},{"Range":[30,40]},{"Range":[43,44]},{"Range":[61,62]},{"Single":67},{"Range":[76,80]}]}]}
+  s_7654b07158c363::t_ad8415cf974148 81
+Sources/MayStock/Features/Charts/CandlestickChartView.swift
+  s_7654b07158c363::t_2a1eaf157de456 6-9,15-42,45-50,53-57,59-75,77-79,83-147 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4e0f73d84368a83fc3f1b2","tool_type":"agent","tool_id":"Write","line_ranges":[{"Range":[6,9]},{"Range":[15,42]},{"Range":[45,50]},{"Range":[53,57]},{"Range":[59,75]},{"Range":[77,79]},{"Range":[83,147]}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4c78db4f45cf8e0689482686d72558b7aa2879c9",
+  "prompts": {},
+  "sessions": {
+    "s_7654b07158c363": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a4dee0b8420981c2217833f",
+        "model": "c_o_new__max"
+      },
+      "human_author": "MayStock Dev <dev@maystock.local>"
+    }
+  },
+  "attestation_metadata": {
+    "Sources/MayStock/Features/Charts/CandlestickChartView.swift": [
+      {
+        "hash": "s_7654b07158c363::t_2a1eaf157de456",
+        "line_ranges": [
+          {
+            "Range": [
+              6,
+              9
+            ]
+          },
+          {
+            "Range": [
+              15,
+              42
+            ]
+          },
+          {
+            "Range": [
+              45,
+              50
+            ]
+          },
+          {
+            "Range": [
+              53,
+              57
+            ]
+          },
+          {
+            "Range": [
+              59,
+              75
+            ]
+          },
+          {
+            "Range": [
+              77,
+              79
+            ]
+          },
+          {
+            "Range": [
+              83,
+              147
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4e0f73d84368a83fc3f1b2",
+            "tool_type": "agent",
+            "tool_id": "Write",
+            "line_ranges": [
+              {
+                "Range": [
+                  6,
+                  9
+                ]
+              },
+              {
+                "Range": [
+                  15,
+                  42
+                ]
+              },
+              {
+                "Range": [
+                  45,
+                  50
+                ]
+              },
+              {
+                "Range": [
+                  53,
+                  57
+                ]
+              },
+              {
+                "Range": [
+                  59,
+                  75
+                ]
+              },
+              {
+                "Range": [
+                  77,
+                  79
+                ]
+              },
+              {
+                "Range": [
+                  83,
+                  147
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "Sources/MayStock/Features/Charts/LineChartView.swift": [
+      {
+        "hash": "s_7654b07158c363::t_98b88280943a9e",
+        "line_ranges": [
+          {
+            "Range": [
+              8,
+              9
+            ]
+          },
+          {
+            "Range": [
+              20,
+              21
+            ]
+          },
+          {
+            "Range": [
+              30,
+              40
+            ]
+          },
+          {
+            "Range": [
+              43,
+              44
+            ]
+          },
+          {
+            "Range": [
+              61,
+              62
+            ]
+          },
+          {
+            "Single": 67
+          },
+          {
+            "Range": [
+              76,
+              80
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4e0fa1d84368a83fc3f1b5",
+            "tool_type": "agent",
+            "tool_id": "Write",
+            "line_ranges": [
+              {
+                "Range": [
+                  8,
+                  9
+                ]
+              },
+              {
+                "Range": [
+                  20,
+                  21
+                ]
+              },
+              {
+                "Range": [
+                  30,
+                  40
+                ]
+              },
+              {
+                "Range": [
+                  43,
+                  44
+                ]
+              },
+              {
+                "Range": [
+                  61,
+                  62
+                ]
+              },
+              {
+                "Single": 67
+              },
+              {
+                "Range": [
+                  76,
+                  80
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "Sources/MayStock/Features/Charts/VolumeChartView.swift": [
+      {
+        "hash": "s_7654b07158c363::t_51d7e524d551c3",
+        "line_ranges": [
+          {
+            "Range": [
+              7,
+              8
+            ]
+          },
+          {
+            "Range": [
+              13,
+              14
+            ]
+          },
+          {
+            "Range": [
+              21,
+              30
+            ]
+          },
+          {
+            "Range": [
+              33,
+              34
+            ]
+          },
+          {
+            "Range": [
+              51,
+              55
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4e0fb7d84368a83fc3f1b8",
+            "tool_type": "agent",
+            "tool_id": "Write",
+            "line_ranges": [
+              {
+                "Range": [
+                  7,
+                  8
+                ]
+              },
+              {
+                "Range": [
+                  13,
+                  14
+                ]
+              },
+              {
+                "Range": [
+                  21,
+                  30
+                ]
+              },
+              {
+                "Range": [
+                  33,
+                  34
+                ]
+              },
+              {
+                "Range": [
+                  51,
+                  55
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_7654b07158c363": {
+      "tool": "trae",
+      "conversation_id": "6a4dee0b8420981c2217833f",
+      "session_id": "6a4dee0b8420981c2217833f",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_7654b07158c363::t_2a1eaf157de456": {
+      "tool": "trae",
+      "conversation_id": "6a4dee0b8420981c2217833f",
+      "session_id": "6a4dee0b8420981c2217833f",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_7654b07158c363::t_51d7e524d551c3": {
+      "tool": "trae",
+      "conversation_id": "6a4dee0b8420981c2217833f",
+      "session_id": "6a4dee0b8420981c2217833f",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_7654b07158c363::t_98b88280943a9e": {
+      "tool": "trae",
+      "conversation_id": "6a4dee0b8420981c2217833f",
+      "session_id": "6a4dee0b8420981c2217833f",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
