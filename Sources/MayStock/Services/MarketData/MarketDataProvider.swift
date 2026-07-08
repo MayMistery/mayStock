@@ -15,6 +15,7 @@ final class MarketDataProvider {
 
     private let maxCandles = 500
     private let maxTicks = 300
+    private var pendingTimeSpanSwitch = false
 
     init() {
         webSocket.onMessage = { [weak self] message in
@@ -38,7 +39,7 @@ final class MarketDataProvider {
     func switchTimeSpan(instId: String, newChannel: String, oldChannel: String) {
         webSocket.unsubscribe(channel: oldChannel, instId: instId)
         webSocket.subscribe(channel: newChannel, instId: instId)
-        candles = []
+        pendingTimeSpanSwitch = true
     }
 
     private func handleMessage(_ message: OKXMessage) {
@@ -48,18 +49,23 @@ final class MarketDataProvider {
             ticks.append(tick)
             if ticks.count > maxTicks { ticks.removeFirst() }
         case .candles(let ohlcList):
-            for ohlc in ohlcList {
-                if let lastIndex = candles.indices.last,
-                   !candles[lastIndex].confirmed,
-                   candles[lastIndex].timestamp == ohlc.timestamp {
-                    candles[lastIndex] = ohlc
-                } else {
-                    candles.append(ohlc)
+            if pendingTimeSpanSwitch {
+                candles = ohlcList.sorted { $0.timestamp < $1.timestamp }
+                pendingTimeSpanSwitch = false
+            } else {
+                for ohlc in ohlcList {
+                    if let lastIndex = candles.indices.last,
+                       !candles[lastIndex].confirmed,
+                       candles[lastIndex].timestamp == ohlc.timestamp {
+                        candles[lastIndex] = ohlc
+                    } else {
+                        candles.append(ohlc)
+                    }
                 }
-            }
-            candles.sort { $0.timestamp < $1.timestamp }
-            if candles.count > maxCandles {
-                candles.removeFirst(candles.count - maxCandles)
+                candles.sort { $0.timestamp < $1.timestamp }
+                if candles.count > maxCandles {
+                    candles.removeFirst(candles.count - maxCandles)
+                }
             }
         case .orderBook(let book):
             orderBook = book

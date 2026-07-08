@@ -26,6 +26,10 @@ final class NetworkMonitor {
             }
         }
         previousReading = (current.bytesIn, current.bytesOut, now)
+        if history.isEmpty {
+            let tick = MarketTick(timestamp: now, price: 0, volume: 0)
+            history.append(tick)
+        }
     }
 
     func formatBytes(_ bytes: Int64) -> String {

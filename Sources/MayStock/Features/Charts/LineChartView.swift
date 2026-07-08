@@ -19,13 +19,22 @@ struct LineChartView: View {
             } else {
                 let visible = Array(data.suffix(visibleCount))
                 Chart(visible) { tick in
-                    LineMark(
-                        x: .value("Time", tick.timestamp),
-                        y: .value("Value", tick.price)
-                    )
-                    .interpolationMethod(.catmullRom)
-                    .foregroundStyle(lineGradient)
-                    .lineStyle(StrokeStyle(lineWidth: 2))
+                    if visible.count == 1 {
+                        PointMark(
+                            x: .value("Time", tick.timestamp),
+                            y: .value("Value", tick.price)
+                        )
+                        .foregroundStyle(.green)
+                        .symbolSize(30)
+                    } else {
+                        LineMark(
+                            x: .value("Time", tick.timestamp),
+                            y: .value("Value", tick.price)
+                        )
+                        .interpolationMethod(.catmullRom)
+                        .foregroundStyle(lineGradient)
+                        .lineStyle(StrokeStyle(lineWidth: 2))
+                    }
                 }
                 .chartXAxis {
                     AxisMarks(values: .automatic(desiredCount: 5)) { value in

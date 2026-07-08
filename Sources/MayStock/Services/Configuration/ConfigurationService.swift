@@ -12,7 +12,20 @@ final class ConfigurationService {
     init(directory: URL? = nil) {
         let dir = directory ?? ConfigurationService.defaultDirectory()
         self.directory = dir
-        self.monitorItems = Self.load(from: dir) ?? Self.defaultItems()
+        let loaded = Self.load(from: dir)
+        let defaults = Self.defaultItems()
+        if let items = loaded, !items.isEmpty {
+            var finalItems = items
+            let enabledCount = items.filter(\.isEnabled).count
+            if enabledCount < 2 {
+                for i in finalItems.indices {
+                    finalItems[i].isEnabled = true
+                }
+            }
+            self.monitorItems = finalItems
+        } else {
+            self.monitorItems = defaults
+        }
     }
 
     func save() throws {
@@ -25,7 +38,12 @@ final class ConfigurationService {
     private static func load(from directory: URL) -> [MonitorItem]? {
         let fileURL = directory.appendingPathComponent("config.json")
         guard let data = try? Data(contentsOf: fileURL) else { return nil }
-        return try? JSONDecoder().decode([MonitorItem].self, from: data)
+        if let items = try? JSONDecoder().decode([MonitorItem].self, from: data) {
+            return items
+        }
+        // Corrupted config — delete it
+        try? FileManager.default.removeItem(at: fileURL)
+        return nil
     }
 
     private static func defaultItems() -> [MonitorItem] {

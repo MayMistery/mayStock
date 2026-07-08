@@ -75,9 +75,23 @@ final class StatusBarController: NSObject {
     }
 
     private func startSampling() {
+        // Initial rapid burst: 3 samples over 400ms to ensure history has data
         cpuMonitor.sample()
         memoryMonitor.sample()
         networkMonitor.sample()
+        
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(200))
+            self.cpuMonitor.sample()
+            self.memoryMonitor.sample()
+            self.networkMonitor.sample()
+            
+            try? await Task.sleep(for: .milliseconds(200))
+            self.cpuMonitor.sample()
+            self.memoryMonitor.sample()
+            self.networkMonitor.sample()
+            self.updateMenuBarText()
+        }
 
         samplingTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
