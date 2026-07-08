@@ -72,7 +72,7 @@ struct PopoverView: View {
                 case .line:
                     LineChartView(data: lineData, title: "")
                 case .candlestick:
-                    CandlestickChartView(candles: viewModel.marketData.candles)
+                    CandlestickChartView(candles: viewModel.marketData.candles, timeSpan: viewModel.selectedTimeSpan)
                 case .volume:
                     VolumeChartView(candles: viewModel.marketData.candles)
                 case .depth:
