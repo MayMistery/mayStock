@@ -1,0 +1,93 @@
+Sources/MayStock/App/StatusBarController.swift
+  s_7654b07158c363::t_4c8094b438d9e6 170 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4dfeb9d84368a83fc3ed5c","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Single":170}]}]}
+  s_7654b07158c363::t_0fc18ce3ae9415 176 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4dfeb9d84368a83fc3ed5c","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Single":176}]}]}
+  s_7654b07158c363::t_188a602d3c43ca 167-169
+  s_7654b07158c363::t_aeeb37231a90b8 171-175
+  s_7654b07158c363::t_78a98dee6bd3be 177-179
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b9b727eb5a33c31cd182571eb4526e79ddbd16e7",
+  "prompts": {},
+  "sessions": {
+    "s_7654b07158c363": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a4dee0b8420981c2217833f",
+        "model": "c_o_new__max",
+        "display_model_name": "Test-O-New"
+      },
+      "human_author": "MayStock Dev <dev@maystock.local>"
+    }
+  },
+  "attestation_metadata": {
+    "Sources/MayStock/App/StatusBarController.swift": [
+      {
+        "hash": "s_7654b07158c363::t_4c8094b438d9e6",
+        "line_ranges": [
+          {
+            "Single": 170
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4dfeb9d84368a83fc3ed5c",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Single": 170
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "hash": "s_7654b07158c363::t_0fc18ce3ae9415",
+        "line_ranges": [
+          {
+            "Single": 176
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4dfeb9d84368a83fc3ed5c",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Single": 176
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_7654b07158c363": {
+      "tool": "trae",
+      "conversation_id": "6a4dee0b8420981c2217833f",
+      "session_id": "6a4dee0b8420981c2217833f",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_7654b07158c363::t_0fc18ce3ae9415": {
+      "tool": "trae",
+      "conversation_id": "6a4dee0b8420981c2217833f",
+      "session_id": "6a4dee0b8420981c2217833f",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_7654b07158c363::t_4c8094b438d9e6": {
+      "tool": "trae",
+      "conversation_id": "6a4dee0b8420981c2217833f",
+      "session_id": "6a4dee0b8420981c2217833f",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
