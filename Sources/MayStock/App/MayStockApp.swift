@@ -6,8 +6,7 @@ struct MayStockApp: App {
 
     var body: some Scene {
         Settings {
-            Text("MayStock Settings")
-                .frame(width: 500, height: 400)
+            SettingsView(configService: appDelegate.configService)
         }
     }
 }
