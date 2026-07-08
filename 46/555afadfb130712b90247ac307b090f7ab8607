@@ -1,0 +1,104 @@
+Sources/MayStock/App/StatusBarController.swift
+  s_7654b07158c363::t_18b969dccf5e1b 162,164-177 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4e0b10d84368a83fc3efea","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Single":162},{"Range":[164,177]}]}]}
+Sources/MayStock/Features/Charts/LineChartView.swift
+  s_7654b07158c363::t_00f0e7c890e286 34 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4e0b1ed84368a83fc3efed","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Single":34}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "46555afadfb130712b90247ac307b090f7ab8607",
+  "prompts": {},
+  "sessions": {
+    "s_7654b07158c363": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a4dee0b8420981c2217833f",
+        "model": "c_o_new__max"
+      },
+      "human_author": "MayStock Dev <dev@maystock.local>"
+    }
+  },
+  "attestation_metadata": {
+    "Sources/MayStock/App/StatusBarController.swift": [
+      {
+        "hash": "s_7654b07158c363::t_18b969dccf5e1b",
+        "line_ranges": [
+          {
+            "Single": 162
+          },
+          {
+            "Range": [
+              164,
+              177
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4e0b10d84368a83fc3efea",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Single": 162
+              },
+              {
+                "Range": [
+                  164,
+                  177
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "Sources/MayStock/Features/Charts/LineChartView.swift": [
+      {
+        "hash": "s_7654b07158c363::t_00f0e7c890e286",
+        "line_ranges": [
+          {
+            "Single": 34
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4e0b1ed84368a83fc3efed",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Single": 34
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_7654b07158c363": {
+      "tool": "trae",
+      "conversation_id": "6a4dee0b8420981c2217833f",
+      "session_id": "6a4dee0b8420981c2217833f",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_7654b07158c363::t_00f0e7c890e286": {
+      "tool": "trae",
+      "conversation_id": "6a4dee0b8420981c2217833f",
+      "session_id": "6a4dee0b8420981c2217833f",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_7654b07158c363::t_18b969dccf5e1b": {
+      "tool": "trae",
+      "conversation_id": "6a4dee0b8420981c2217833f",
+      "session_id": "6a4dee0b8420981c2217833f",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
