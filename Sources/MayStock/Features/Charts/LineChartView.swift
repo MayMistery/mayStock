@@ -31,6 +31,7 @@ struct LineChartView: View {
                     .foregroundStyle(areaGradient)
                 }
                 .chartXAxis(.hidden)
+                .chartYScale(domain: .automatic(includesZero: false))
                 .chartYAxis {
                     AxisMarks(position: .trailing, values: .automatic(desiredCount: 4)) { value in
                         AxisValueLabel {

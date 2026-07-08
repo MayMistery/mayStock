@@ -159,8 +159,22 @@ final class StatusBarController: NSObject {
     }
 
     @objc private func openSettings() {
+        NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
-        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+        DispatchQueue.main.async {
+            NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+            NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification,
+                object: nil, queue: .main
+            ) { [weak self] _ in
+                guard let self else { return }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    if NSApp.windows.filter({ $0.isVisible && !($0 is NSPanel) }).isEmpty {
+                        NSApp.setActivationPolicy(.accessory)
+                    }
+                }
+            }
+        }
     }
 
     @objc private func quit() {
