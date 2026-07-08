@@ -22,16 +22,10 @@ struct LineChartView: View {
                     )
                     .interpolationMethod(.catmullRom)
                     .foregroundStyle(lineGradient)
-
-                    AreaMark(
-                        x: .value("Time", tick.timestamp),
-                        y: .value("Value", tick.price)
-                    )
-                    .interpolationMethod(.catmullRom)
-                    .foregroundStyle(areaGradient)
+                    .lineStyle(StrokeStyle(lineWidth: 2))
                 }
                 .chartXAxis(.hidden)
-                .chartYScale(domain: .automatic(includesZero: false))
+                .chartYScale(domain: yDomain)
                 .chartYAxis {
                     AxisMarks(position: .trailing, values: .automatic(desiredCount: 4)) { value in
                         AxisValueLabel {
@@ -50,8 +44,14 @@ struct LineChartView: View {
         LinearGradient(colors: [.green, .cyan], startPoint: .leading, endPoint: .trailing)
     }
 
-    private var areaGradient: LinearGradient {
-        LinearGradient(colors: [.green.opacity(0.3), .clear], startPoint: .top, endPoint: .bottom)
+    private var yDomain: ClosedRange<Double> {
+        let prices = data.map(\.price)
+        guard let min = prices.min(), let max = prices.max(), max > min else {
+            let val = prices.first ?? 0
+            return (val - 1)...(val + 1)
+        }
+        let padding = (max - min) * 0.05
+        return (min - padding)...(max + padding)
     }
 
     private func formatValue(_ v: Double) -> String {
