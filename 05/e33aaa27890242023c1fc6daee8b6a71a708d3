@@ -1,0 +1,75 @@
+Sources/MayStock/Services/MarketData/OKXWebSocketService.swift
+  s_7654b07158c363::t_27c7c58314a368 79-81 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4dfdecd84368a83fc3ecf1","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[79,81]}]}]}
+  s_7654b07158c363::t_5ba09d46d5c098 76-78
+  s_7654b07158c363::t_a8586ec447e9af 82-84
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "05e33aaa27890242023c1fc6daee8b6a71a708d3",
+  "prompts": {},
+  "sessions": {
+    "s_7654b07158c363": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a4dee0b8420981c2217833f",
+        "model": "c_o_new__max"
+      },
+      "human_author": "MayStock Dev <dev@maystock.local>"
+    }
+  },
+  "attestation_metadata": {
+    "Sources/MayStock/Services/MarketData/OKXWebSocketService.swift": [
+      {
+        "hash": "s_7654b07158c363::t_27c7c58314a368",
+        "line_ranges": [
+          {
+            "Range": [
+              79,
+              81
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4dfdecd84368a83fc3ecf1",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  79,
+                  81
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_7654b07158c363": {
+      "tool": "trae",
+      "conversation_id": "6a4dee0b8420981c2217833f",
+      "session_id": "6a4dee0b8420981c2217833f",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_7654b07158c363::t_27c7c58314a368": {
+      "tool": "trae",
+      "conversation_id": "6a4dee0b8420981c2217833f",
+      "session_id": "6a4dee0b8420981c2217833f",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_7654b07158c363::t_d47f4bb142c341": {
+      "tool": "trae",
+      "conversation_id": "6a4dee0b8420981c2217833f",
+      "session_id": "6a4dee0b8420981c2217833f",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
