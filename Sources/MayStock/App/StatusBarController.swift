@@ -188,19 +188,11 @@ final class StatusBarController: NSObject {
     }
 
     @objc func mouseExited(with event: NSEvent) {
-        Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(400))
-            if let popoverWindow = self.popover.contentViewController?.view.window {
-                let mouseLocation = NSEvent.mouseLocation
-                if !popoverWindow.frame.contains(mouseLocation) {
-                    self.popover.performClose(nil)
-                }
-            }
-        }
+        // Do nothing — popover stays until user clicks elsewhere
     }
 
     private func startPopoverMouseMonitoring() {
-        eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown]) { [weak self] _ in
+        eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             Task { @MainActor in
                 guard let self = self, self.popover.isShown else { return }
                 let mouseLocation = NSEvent.mouseLocation
