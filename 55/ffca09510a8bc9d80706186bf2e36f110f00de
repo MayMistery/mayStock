@@ -1,0 +1,259 @@
+Sources/MayStock/Services/MarketData/MarketDataProvider.swift
+  s_7654b07158c363::t_26b882b1dafaee 50-62 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4e0d6ad84368a83fc3f10f","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[50,62]}]}]}
+Sources/MayStock/Features/Popover/PopoverView.swift
+  s_7654b07158c363::t_ed9de7857d4e4b 68,70-80 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4e0d77d84368a83fc3f112","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Single":68},{"Range":[70,80]}]}]}
+Tests/MayStockTests/OKXMessageParserTests.swift
+  s_7654b07158c363::t_4bf642409b6697 33-34 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4e0d95d84368a83fc3f11b","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[33,34]}]}]}
+Sources/MayStock/Services/MarketData/OKXMessageParser.swift
+  s_7654b07158c363::t_d3c22a18d32a44 70-86,88-89 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4e0d5ad84368a83fc3f10c","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[70,86]},{"Range":[88,89]}]}]}
+  s_7654b07158c363::t_62adee2616e4c8 11 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4e0d4ed84368a83fc3f109","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Single":11}]}]}
+Tests/IntegrationTests/OKXWebSocketIntegrationTests.swift
+  s_7654b07158c363::t_434e43794fdc99 42 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4e0db0d84368a83fc3f121","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Single":42}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "55ffca09510a8bc9d80706186bf2e36f110f00de",
+  "prompts": {},
+  "sessions": {
+    "s_7654b07158c363": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a4dee0b8420981c2217833f",
+        "model": "c_o_new__max"
+      },
+      "human_author": "MayStock Dev <dev@maystock.local>"
+    }
+  },
+  "attestation_metadata": {
+    "Sources/MayStock/Features/Popover/PopoverView.swift": [
+      {
+        "hash": "s_7654b07158c363::t_ed9de7857d4e4b",
+        "line_ranges": [
+          {
+            "Single": 68
+          },
+          {
+            "Range": [
+              70,
+              80
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4e0d77d84368a83fc3f112",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Single": 68
+              },
+              {
+                "Range": [
+                  70,
+                  80
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "Sources/MayStock/Services/MarketData/MarketDataProvider.swift": [
+      {
+        "hash": "s_7654b07158c363::t_26b882b1dafaee",
+        "line_ranges": [
+          {
+            "Range": [
+              50,
+              62
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4e0d6ad84368a83fc3f10f",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  50,
+                  62
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "Sources/MayStock/Services/MarketData/OKXMessageParser.swift": [
+      {
+        "hash": "s_7654b07158c363::t_d3c22a18d32a44",
+        "line_ranges": [
+          {
+            "Range": [
+              70,
+              86
+            ]
+          },
+          {
+            "Range": [
+              88,
+              89
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4e0d5ad84368a83fc3f10c",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  70,
+                  86
+                ]
+              },
+              {
+                "Range": [
+                  88,
+                  89
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "hash": "s_7654b07158c363::t_62adee2616e4c8",
+        "line_ranges": [
+          {
+            "Single": 11
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4e0d4ed84368a83fc3f109",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Single": 11
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "Tests/IntegrationTests/OKXWebSocketIntegrationTests.swift": [
+      {
+        "hash": "s_7654b07158c363::t_434e43794fdc99",
+        "line_ranges": [
+          {
+            "Single": 42
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4e0db0d84368a83fc3f121",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Single": 42
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "Tests/MayStockTests/OKXMessageParserTests.swift": [
+      {
+        "hash": "s_7654b07158c363::t_4bf642409b6697",
+        "line_ranges": [
+          {
+            "Range": [
+              33,
+              34
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4e0d95d84368a83fc3f11b",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  33,
+                  34
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_7654b07158c363": {
+      "tool": "trae",
+      "conversation_id": "6a4dee0b8420981c2217833f",
+      "session_id": "6a4dee0b8420981c2217833f",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_7654b07158c363::t_26b882b1dafaee": {
+      "tool": "trae",
+      "conversation_id": "6a4dee0b8420981c2217833f",
+      "session_id": "6a4dee0b8420981c2217833f",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_7654b07158c363::t_434e43794fdc99": {
+      "tool": "trae",
+      "conversation_id": "6a4dee0b8420981c2217833f",
+      "session_id": "6a4dee0b8420981c2217833f",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_7654b07158c363::t_4bf642409b6697": {
+      "tool": "trae",
+      "conversation_id": "6a4dee0b8420981c2217833f",
+      "session_id": "6a4dee0b8420981c2217833f",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_7654b07158c363::t_62adee2616e4c8": {
+      "tool": "trae",
+      "conversation_id": "6a4dee0b8420981c2217833f",
+      "session_id": "6a4dee0b8420981c2217833f",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_7654b07158c363::t_d3c22a18d32a44": {
+      "tool": "trae",
+      "conversation_id": "6a4dee0b8420981c2217833f",
+      "session_id": "6a4dee0b8420981c2217833f",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_7654b07158c363::t_ed9de7857d4e4b": {
+      "tool": "trae",
+      "conversation_id": "6a4dee0b8420981c2217833f",
+      "session_id": "6a4dee0b8420981c2217833f",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
