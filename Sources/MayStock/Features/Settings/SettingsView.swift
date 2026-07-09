@@ -1,17 +1,3 @@
-import SwiftUI
-
-struct SettingsView: View {
-    let configService: ConfigurationService
-
-    var body: some View {
-        TabView {
-            GeneralSettingsView()
-                .tabItem { Label("General", systemImage: "gear") }
-            MonitorsSettingsView(configService: configService)
-                .tabItem { Label("Monitors", systemImage: "gauge") }
-            AppearanceSettingsView()
-                .tabItem { Label("Appearance", systemImage: "paintbrush") }
-        }
-        .frame(width: 500, height: 400)
-    }
-}
+// MayStock 2.0: 本文件已废弃并被置空（旧 1.x 代码）。
+// 新实现见 Sources/MayStockKit 与 Sources/MayStock 下的对应模块。
+// 可安全删除此文件及其所在的空目录（Features/ Services/ Models/）。
