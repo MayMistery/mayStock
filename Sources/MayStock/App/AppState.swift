@@ -44,6 +44,8 @@ final class AppState {
     let hub: MarketHub
     let alerts: AlertEngine
     let notifications: NotificationService
+    /// Chart mode / window selections, shared by every panel presentation.
+    let charts = ChartPreferences()
 
     private(set) var cliInfo: CLIInfo?
 

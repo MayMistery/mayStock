@@ -33,7 +33,9 @@ cmd_test() {
       -Xlinker -rpath -Xlinker "$TESTING_LIBS"
     )
   fi
-  swift test "${swift_testing_flags[@]}"
+  # bash 3.2 (the macOS default) treats an empty array as unset under `set -u`,
+  # so expand it through the `+` form.
+  swift test ${swift_testing_flags[@]+"${swift_testing_flags[@]}"}
 }
 
 cmd_e2e() {

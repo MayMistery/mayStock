@@ -151,6 +151,17 @@ public struct OrderBook: Sendable, Equatable {
         return (bestBid + bestAsk) / 2
     }
 
+    public var spread: Double? {
+        guard let bestBid, let bestAsk else { return nil }
+        return bestAsk - bestBid
+    }
+
+    /// Spread in basis points of mid — the scale-free way to compare books.
+    public var spreadBps: Double? {
+        guard let spread, let mid, mid > 0 else { return nil }
+        return spread / mid * 10_000
+    }
+
     /// Cumulative depth suitable for a depth chart.
     /// Bid side is returned in descending-price order (walking away from mid).
     public var cumulativeBids: [BookLevel] {
@@ -167,6 +178,101 @@ public struct OrderBook: Sendable, Equatable {
             running += level.size
             return BookLevel(price: level.price, size: running)
         }
+    }
+
+    /// Cumulative depth clipped to a symmetric price window around mid, plus
+    /// the aggregates a depth chart needs to label itself.
+    ///
+    /// `pct` is the half-window as a percentage of mid (0.25 → ±0.25%); `nil`
+    /// means "as deep as the book goes". The window is symmetric and never
+    /// wider than the *shallower* side, so both curves always reach the edge
+    /// instead of one of them stopping in mid-air.
+    public func profile(withinPct pct: Double?) -> DepthProfile? {
+        guard let mid, mid > 0 else { return nil }
+        let bids = cumulativeBids, asks = cumulativeAsks
+        guard let deepestBid = bids.last?.price, let deepestAsk = asks.last?.price else { return nil }
+
+        let reach = Swift.min(mid - deepestBid, deepestAsk - mid)
+        guard reach > 0 else { return nil }
+        let requested = pct.map { mid * $0 / 100 }
+        let span = Swift.max(Swift.min(requested ?? reach, reach), mid * 1e-6)
+
+        let lo = mid - span, hi = mid + span
+        // Keep one level past the edge so the step function reaches it, then
+        // pin that level's price to the edge itself.
+        func clip(_ levels: [BookLevel], inside: (Double) -> Bool, edge: Double) -> [BookLevel] {
+            var kept: [BookLevel] = []
+            for level in levels {
+                if inside(level.price) {
+                    kept.append(level)
+                } else {
+                    kept.append(BookLevel(price: edge, size: level.size))
+                    break
+                }
+            }
+            if kept.isEmpty, let first = levels.first {
+                kept = [BookLevel(price: edge, size: first.size)]
+            }
+            return kept
+        }
+        let clippedBids = clip(bids, inside: { $0 >= lo }, edge: lo)
+        let clippedAsks = clip(asks, inside: { $0 <= hi }, edge: hi)
+
+        let bidTotal = clippedBids.last?.size ?? 0
+        let askTotal = clippedAsks.last?.size ?? 0
+        return DepthProfile(
+            mid: mid, lo: lo, hi: hi,
+            bids: clippedBids, asks: clippedAsks,
+            maxCumulative: Swift.max(bidTotal, askTotal, .leastNonzeroMagnitude),
+            bidTotal: bidTotal, askTotal: askTotal,
+            spanPct: span / mid * 100,
+            clampedToBook: requested.map { $0 > reach } ?? false,
+            ts: ts)
+    }
+}
+
+/// Cumulative depth around mid, windowed for display.
+public struct DepthProfile: Sendable, Equatable {
+    public let mid: Double
+    /// Window edges in price terms.
+    public let lo: Double
+    public let hi: Double
+    /// Cumulative levels walking away from mid (bids descending, asks ascending).
+    public let bids: [BookLevel]
+    public let asks: [BookLevel]
+    public let maxCumulative: Double
+    public let bidTotal: Double
+    public let askTotal: Double
+    /// Half-window actually drawn, in percent of mid.
+    public let spanPct: Double
+    /// The book ran out before the requested window — the view narrowed it.
+    public let clampedToBook: Bool
+    public let ts: Date
+
+    public init(
+        mid: Double, lo: Double, hi: Double,
+        bids: [BookLevel], asks: [BookLevel],
+        maxCumulative: Double, bidTotal: Double, askTotal: Double,
+        spanPct: Double, clampedToBook: Bool, ts: Date
+    ) {
+        self.mid = mid
+        self.lo = lo
+        self.hi = hi
+        self.bids = bids
+        self.asks = asks
+        self.maxCumulative = maxCumulative
+        self.bidTotal = bidTotal
+        self.askTotal = askTotal
+        self.spanPct = spanPct
+        self.clampedToBook = clampedToBook
+        self.ts = ts
+    }
+
+    /// −1 (all asks) … 0 (balanced) … +1 (all bids), inside the window.
+    public var imbalance: Double {
+        let total = bidTotal + askTotal
+        guard total > 0 else { return 0 }
+        return (bidTotal - askTotal) / total
     }
 }
 

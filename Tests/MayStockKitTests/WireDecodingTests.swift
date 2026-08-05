@@ -124,39 +124,5 @@ struct CandleMergeTests {
     }
 }
 
-@Suite("Sparkline buffer")
-struct SparklineTests {
-    @Test func throttlesSampling() {
-        var buffer = SparklineBuffer(capacity: 10, minInterval: 1.0)
-        let t0 = Date(timeIntervalSince1970: 0)
-        buffer.sample(price: 1, at: t0)
-        buffer.sample(price: 2, at: t0.addingTimeInterval(0.2)) // dropped
-        buffer.sample(price: 3, at: t0.addingTimeInterval(1.2))
-        #expect(buffer.points.map(\.price) == [1, 3])
-    }
-
-    @Test func windowAndMovePct() {
-        var buffer = SparklineBuffer(capacity: 1000, minInterval: 1)
-        let now = Date(timeIntervalSince1970: 10_000)
-        for i in 0..<600 {
-            buffer.sample(price: 100 + Double(i) * 0.01,
-                          at: now.addingTimeInterval(Double(i - 600) * 1))
-        }
-        let w = buffer.window(minutes: 5, now: now)
-        #expect(w.count <= 301 && w.count >= 299)
-        let move = buffer.movePct(minutes: 5, now: now)
-        #expect(move != nil && move! > 0)
-    }
-
-    @Test func seedOnlyWhenEmpty() {
-        var buffer = SparklineBuffer()
-        let candles = (0..<10).map {
-            Candle(ts: Date(timeIntervalSince1970: Double($0) * 60),
-                   open: 1, high: 1, low: 1, close: Double($0), volume: 0, confirmed: true)
-        }
-        buffer.seed(candles: candles)
-        #expect(buffer.points.count == 10)
-        buffer.seed(candles: candles)
-        #expect(buffer.points.count == 10) // idempotent
-    }
-}
+// Sparkline buffer coverage lives in ChartDataTests.swift alongside the rest
+// of the charting data path.

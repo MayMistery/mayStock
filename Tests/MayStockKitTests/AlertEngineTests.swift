@@ -80,7 +80,7 @@ struct AlertEngineTests {
             condition: .movePctWithin(windowMinutes: 5, pct: 1.0),
             rearmAfterSeconds: 600)])
 
-        var spark = SparklineBuffer(capacity: 1000, minInterval: 1)
+        var spark = SparklineBuffer()
         let t0 = Date(timeIntervalSince1970: 100_000)
         // Flat for 4 minutes…
         for i in 0..<240 {

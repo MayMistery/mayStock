@@ -11,6 +11,12 @@ public final class InstrumentSession {
     public private(set) var ticker: Ticker?
     public private(set) var bar: BarInterval
     public private(set) var candles: [Candle] = []
+    /// The previous interval's series, kept on screen (dimmed) while the new
+    /// one backfills so switching never flashes an empty chart.
+    public private(set) var staleCandles: [Candle] = []
+    public private(set) var staleBar: BarInterval?
+    /// A REST backfill for `bar` is in flight.
+    public private(set) var isBackfilling = true
     /// books5 live snapshot (best 5 levels, ~100ms cadence).
     public private(set) var liveBook: OrderBook?
     /// 50-level REST snapshot for the depth chart (refreshed while panel open).
@@ -80,9 +86,47 @@ public final class InstrumentSession {
         spark.seed(candles: seedCandles)
     }
 
-    public func switchBar(_ new: BarInterval) {
+    // MARK: Interval switching
+
+    /// Enough bars to be worth drawing — below this the view keeps showing the
+    /// previous interval rather than a two-candle stub.
+    public static let minimumDrawableCandles = 3
+
+    /// The series a chart should render right now, and the interval it belongs
+    /// to. Falls back to the previous interval while a switch is in flight.
+    public var displayCandles: (candles: [Candle], bar: BarInterval) {
+        if candles.count >= Self.minimumDrawableCandles || staleCandles.isEmpty {
+            return (candles, bar)
+        }
+        return (staleCandles, staleBar ?? bar)
+    }
+
+    /// Begin switching interval: the incoming series starts empty, but the
+    /// outgoing one is retained for display until the backfill lands.
+    public func beginBarSwitch(to new: BarInterval) {
         guard new != bar else { return }
+        if candles.count >= Self.minimumDrawableCandles {
+            staleCandles = candles
+            staleBar = bar
+        }
         bar = new
         candles = []
+        isBackfilling = true
+    }
+
+    /// Backfill landed. Ignored if the user switched again in the meantime.
+    public func finishBackfill(_ incoming: [Candle], for target: BarInterval) {
+        guard bar == target else { return }
+        candles.mergeCandles(incoming)
+        isBackfilling = false
+        staleCandles = []
+        staleBar = nil
+        lastUpdate = Date()
+    }
+
+    /// Backfill failed — stop the spinner and let live WS candles fill in.
+    public func failBackfill(for target: BarInterval) {
+        guard bar == target else { return }
+        isBackfilling = false
     }
 }

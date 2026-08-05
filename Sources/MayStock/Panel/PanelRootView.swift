@@ -1,22 +1,18 @@
 import SwiftUI
 import MayStockKit
 
-enum ChartMode: String, CaseIterable, Identifiable {
-    case line = "折线"
-    case candles = "K线"
-    case depth = "深度"
-    var id: String { rawValue }
-}
-
 /// Content of the hover panel: header, chart, stats, alerts, trade strip.
 struct PanelRootView: View {
     let appState: AppState
     let instId: String
     var onHoverChange: (Bool) -> Void = { _ in }
 
-    @State private var mode: ChartMode = .candles
-    @State private var lineWindowMinutes = 60
+    /// Published upward by whichever chart is on screen, so the readout has a
+    /// dedicated row instead of floating over the bars being read.
+    @State private var legend: [ChartLegendItem] = []
     @State private var showTradeTicket = false
+
+    static let panelSize = CGSize(width: 384, height: 452)
 
     private var session: InstrumentSession? { appState.hub.session(for: instId) }
     private var watchItem: WatchItem? {
@@ -24,29 +20,46 @@ struct PanelRootView: View {
     }
 
     var body: some View {
-        VStack(spacing: 10) {
+        @Bindable var charts = appState.charts
+        VStack(spacing: 9) {
             if let session {
                 header(session)
-                chartArea(session)
-                controls(session)
+                VStack(spacing: 5) {
+                    ChartLegendRow(items: legend)
+                    chartArea(session)
+                    controls(session,
+                             mode: $charts.mode,
+                             lineWindow: $charts.lineWindow,
+                             depthZoom: $charts.depthZoom)
+                }
                 statsRow(session)
                 Divider().opacity(0.5)
                 alertsRow(session)
                 if appState.store.config.trading.enabled {
                     tradeStrip(session)
                 }
+                Spacer(minLength: 0)
                 footer(session)
             } else {
                 ChartPlaceholder(text: "未找到该标的会话")
             }
         }
         .padding(14)
-        .frame(width: 384, height: 442)
+        .frame(width: Self.panelSize.width, height: Self.panelSize.height)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1))
         .onHover(perform: onHoverChange)
+        .onChange(of: appState.charts.mode, initial: true) { _, mode in
+            // The 400-level book snapshot is only worth fetching while it is
+            // actually on screen.
+            if mode == .depth {
+                appState.hub.startDepthPolling(instId: instId)
+            } else {
+                appState.hub.stopDepthPolling(instId: instId)
+            }
+        }
     }
 
     // MARK: Header
@@ -58,7 +71,7 @@ struct PanelRootView: View {
                     Text(instId).font(.system(size: 13, weight: .semibold))
                     connectionDot(session.connection)
                 }
-                Text("OKX · \(session.bar.rawValue)")
+                Text("OKX · \(subtitle(session))")
                     .font(.system(size: 9)).foregroundStyle(.tertiary)
             }
             Spacer()
@@ -78,6 +91,14 @@ struct PanelRootView: View {
         }
     }
 
+    private func subtitle(_ session: InstrumentSession) -> String {
+        switch appState.charts.mode {
+        case .line: return "折线 \(appState.charts.lineWindow.title)"
+        case .candles: return "K线 \(session.bar.rawValue)"
+        case .depth: return "深度 \(appState.charts.depthZoom.title)"
+        }
+    }
+
     private func connectionDot(_ state: OKXConnectionState) -> some View {
         Circle()
             .fill(state == .connected ? ChartStyle.up
@@ -92,57 +113,54 @@ struct PanelRootView: View {
     @ViewBuilder
     private func chartArea(_ session: InstrumentSession) -> some View {
         let decimals = watchItem?.decimals ?? session.priceDecimals
-        Group {
-            switch mode {
+        ZStack {
+            switch appState.charts.mode {
             case .line:
-                LineChartView(points: session.spark.window(minutes: lineWindowMinutes),
-                              decimals: decimals)
+                LineChartView(
+                    points: session.spark.window(minutes: appState.charts.lineWindow.minutes),
+                    window: appState.charts.lineWindow,
+                    decimals: decimals)
             case .candles:
-                CandleChartView(candles: session.candles, bar: session.bar, decimals: decimals)
+                let display = session.displayCandles
+                let isStale = session.isBackfilling && !display.candles.isEmpty
+                CandleChartView(candles: display.candles, bar: display.bar, decimals: decimals)
+                    .opacity(isStale ? 0.45 : 1)
+                if isStale {
+                    // Keep the outgoing interval on screen while the new one
+                    // backfills, rather than flashing an empty chart.
+                    ChartLoadingBadge(text: "加载 \(session.bar.rawValue)…")
+                }
             case .depth:
-                DepthChartView(book: session.deepBook ?? session.liveBook, decimals: decimals)
+                DepthChartView(book: session.deepBook ?? session.liveBook,
+                               zoom: appState.charts.depthZoom,
+                               decimals: decimals)
             }
         }
         .frame(maxWidth: .infinity)
-        .frame(height: 196)
+        .frame(height: 190)
+        .onPreferenceChange(ChartLegendKey.self) { payload in
+            legend = payload.items ?? []
+        }
     }
 
-    private func controls(_ session: InstrumentSession) -> some View {
-        HStack(spacing: 8) {
-            Picker("", selection: $mode) {
-                ForEach(ChartMode.allCases) { m in Text(m.rawValue).tag(m) }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(width: 168)
-
-            Spacer()
-
-            switch mode {
-            case .candles:
-                Picker("", selection: Binding(
-                    get: { session.bar },
-                    set: { appState.hub.switchBar(instId: instId, to: $0) }
-                )) {
-                    ForEach(BarInterval.allCases) { bar in Text(bar.rawValue).tag(bar) }
-                }
-                .pickerStyle(.menu)
-                .labelsHidden()
-                .fixedSize()
+    private func controls(
+        _ session: InstrumentSession,
+        mode: Binding<ChartMode>,
+        lineWindow: Binding<LineWindow>,
+        depthZoom: Binding<DepthZoom>
+    ) -> some View {
+        HStack(spacing: 6) {
+            SegmentedFilter(segments: ChartMode.segments, selection: mode)
+            Spacer(minLength: 2)
+            switch mode.wrappedValue {
             case .line:
-                Picker("", selection: $lineWindowMinutes) {
-                    Text("5m").tag(5)
-                    Text("15m").tag(15)
-                    Text("1H").tag(60)
-                    Text("4H").tag(240)
-                    Text("24H").tag(1440)
-                }
-                .pickerStyle(.menu)
-                .labelsHidden()
-                .fixedSize()
+                SegmentedFilter(segments: LineWindow.segments, selection: lineWindow)
+            case .candles:
+                SegmentedFilter(segments: BarInterval.segments, selection: Binding(
+                    get: { session.bar },
+                    set: { appState.hub.switchBar(instId: instId, to: $0) }))
             case .depth:
-                Text("50 档 · 3s 刷新")
-                    .font(.system(size: 9)).foregroundStyle(.tertiary)
+                SegmentedFilter(segments: DepthZoom.segments, selection: depthZoom)
             }
         }
     }

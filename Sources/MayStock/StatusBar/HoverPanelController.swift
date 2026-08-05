@@ -10,14 +10,15 @@ final class HoverPanelController {
     private unowned let appState: AppState
 
     private var panel: NSPanel?
-    private var hosting: NSHostingView<PanelRootView>?
+    private var hosting: FirstMouseHostingView<PanelRootView>?
     private var currentInstId: String?
     private(set) var isPinned = false
     private var mouseInsidePanel = false
     private var hideWorkItem: DispatchWorkItem?
     private var clickOutsideMonitor: Any?
 
-    private let panelSize = NSSize(width: 384, height: 442)
+    private let panelSize = NSSize(width: PanelRootView.panelSize.width,
+                                   height: PanelRootView.panelSize.height)
 
     init(appState: AppState) {
         self.appState = appState
@@ -40,8 +41,11 @@ final class HoverPanelController {
             currentInstId = instId
             hosting?.rootView = makeRootView(instId: instId)
         }
-        // Idempotent; also restarts polling after a hide/re-show of the same instrument.
-        appState.hub.startDepthPolling(instId: instId)
+        // Idempotent; also restarts polling after a hide/re-show of the same
+        // instrument. Only the depth chart consumes the deep snapshot.
+        if appState.charts.mode == .depth {
+            appState.hub.startDepthPolling(instId: instId)
+        }
 
         position(panel, under: statusItem)
         if !panel.isVisible {
@@ -131,7 +135,7 @@ final class HoverPanelController {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
         let root = makeRootView(instId: currentInstId ?? "BTC-USDT")
-        let hosting = NSHostingView(rootView: root)
+        let hosting = FirstMouseHostingView(rootView: root)
         hosting.frame = NSRect(origin: .zero, size: panelSize)
         panel.contentView = hosting
 
@@ -179,4 +183,16 @@ final class HoverPanelController {
 private final class KeyablePanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+}
+
+/// The panel deliberately never activates the app, so without this the first
+/// click on a chart filter would be spent merely focusing the window — every
+/// interval switch would need two clicks.
+private final class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    required init(rootView: Content) { super.init(rootView: rootView) }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 }

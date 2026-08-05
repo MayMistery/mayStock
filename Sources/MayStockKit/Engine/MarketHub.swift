@@ -20,7 +20,6 @@ public final class MarketHub {
     private let rest: OKXRESTClient
     private let wsPublic: OKXWSClient
     private let wsBusiness: OKXWSClient
-    private var sparklineSeedMinutes: Int = 1_440
     private var depthPollTasks: [String: Task<Void, Never>] = [:]
 
     public init(
@@ -77,19 +76,31 @@ public final class MarketHub {
         }
 
         // REST warm-up: metadata, candle backfill, sparkline seed, first tick.
+        //
+        // The sparkline is seeded at *two* resolutions: 5m bars cover the full
+        // 25h retention (so the 4H/24H line windows have real data the instant
+        // the app launches) and 1m bars refine the most recent 5h.
+        let bar = item.defaultBar
         Task { [rest] in
             async let metaTask = try? rest.instrumentMeta(instId: item.instId)
-            async let candlesTask = try? rest.candles(instId: item.instId, bar: item.defaultBar, target: 300)
-            async let sparkTask = try? rest.candles(instId: item.instId, bar: .m1, target: 300)
+            async let candlesTask = try? rest.candles(instId: item.instId, bar: bar, target: 300)
+            async let coarseSeedTask = try? rest.candles(instId: item.instId, bar: .m5, target: 300)
+            async let fineSeedTask = try? rest.candles(instId: item.instId, bar: .m1, target: 300)
             async let tickerTask = try? rest.ticker(instId: item.instId)
 
-            let (meta, candles, sparkSeed, ticker) = await (metaTask, candlesTask, sparkTask, tickerTask)
+            let (meta, candles, coarseSeed, fineSeed, ticker) =
+                await (metaTask, candlesTask, coarseSeedTask, fineSeedTask, tickerTask)
             await MainActor.run {
                 guard let session = self.sessions[item.instId] else { return }
                 if let meta { session.apply(meta: meta) }
-                if let candles { session.apply(candles: candles, reset: false) }
-                if let sparkSeed { session.seedSparkline(from: sparkSeed) }
+                if let coarseSeed { session.seedSparkline(from: coarseSeed) }
+                if let fineSeed { session.seedSparkline(from: fineSeed) }
                 if let ticker, session.ticker == nil { session.apply(ticker: ticker) }
+                if let candles {
+                    session.finishBackfill(candles, for: bar)
+                } else {
+                    session.failBackfill(for: bar)
+                }
             }
         }
     }
@@ -114,7 +125,7 @@ public final class MarketHub {
     public func switchBar(instId: String, to bar: BarInterval) {
         guard let session = sessions[instId], session.bar != bar else { return }
         let old = session.bar
-        session.switchBar(bar)
+        session.beginBarSwitch(to: bar)
 
         Task { [wsBusiness] in
             await wsBusiness.unsubscribe([OKXChannelArg(channel: old.wsChannel, instId: instId)])
@@ -123,24 +134,30 @@ public final class MarketHub {
         Task { [rest] in
             let candles = try? await rest.candles(instId: instId, bar: bar, target: 300)
             await MainActor.run {
-                guard let candles, let session = self.sessions[instId], session.bar == bar else { return }
-                session.apply(candles: candles, reset: false)
+                guard let session = self.sessions[instId] else { return }
+                if let candles, !candles.isEmpty {
+                    session.finishBackfill(candles, for: bar)
+                } else {
+                    session.failBackfill(for: bar)
+                }
             }
         }
     }
 
     // MARK: Depth polling (only while a panel shows the depth chart)
 
-    public func startDepthPolling(instId: String) {
+    /// 400 levels is the deepest a single `books` call returns, and it is what
+    /// makes a ±0.5% depth window show real structure instead of a spike.
+    public func startDepthPolling(instId: String, depth: Int = 400, interval: TimeInterval = 2) {
         guard depthPollTasks[instId] == nil else { return }
         depthPollTasks[instId] = Task { [rest] in
             while !Task.isCancelled {
-                if let book = try? await rest.books(instId: instId, depth: 50) {
+                if let book = try? await rest.books(instId: instId, depth: depth) {
                     await MainActor.run {
                         self.sessions[instId]?.apply(deepBook: book)
                     }
                 }
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
             }
         }
     }
