@@ -67,6 +67,13 @@ public struct OKXRESTClient: Sendable {
         return envelope.data
     }
 
+    /// Envelope-aware GET for callers outside this file (alternative data).
+    public func getRaw<Row: Decodable>(
+        _ type: Row.Type, path: String, query: [String: String]
+    ) async throws -> [Row] {
+        try await get(type, path: path, query: query)
+    }
+
     // MARK: Market data
 
     private struct TickerRESTRow: Decodable {
@@ -121,6 +128,91 @@ public struct OKXRESTClient: Sendable {
         return collected.sorted { $0.ts < $1.ts }
     }
 
+    /// Deep history for backtesting: walks `/market/candles` and then
+    /// `/market/history-candles` backwards until `target` rows are collected or
+    /// the exchange runs out of data.
+    ///
+    /// `progress` reports rows gathered so far — a 365-day 1H window is ~88
+    /// requests, which the caller should not present as a frozen UI.
+    public func historyCandles(
+        instId: String,
+        bar: BarInterval,
+        target: Int,
+        progress: (@Sendable (Int) -> Void)? = nil
+    ) async throws -> [Candle] {
+        guard target > 0 else { return [] }
+        var byTimestamp: [Date: Candle] = [:]
+        var after: String? = nil
+        var usingHistory = false
+        // Generous ceiling: stops a bad cursor from looping forever while still
+        // covering a year of 1H bars (~88 pages).
+        let maxRequests = target / 50 + 40
+
+        for _ in 0..<maxRequests {
+            let path = usingHistory ? "api/v5/market/history-candles" : "api/v5/market/candles"
+            var query = ["instId": instId, "bar": bar.restBar, "limit": usingHistory ? "100" : "300"]
+            if let after { query["after"] = after }
+
+            let rows = try await get([String].self, path: path, query: query)
+            let page = rows.compactMap(OKXWireDecoder.candle(fromRow:))
+            guard !page.isEmpty else {
+                if usingHistory { break }
+                usingHistory = true   // recent endpoint exhausted; go deeper
+                continue
+            }
+            for candle in page { byTimestamp[candle.ts] = candle }
+            progress?(byTimestamp.count)
+
+            guard let oldest = page.map(\.ts).min() else { break }
+            let cursor = String(Int(oldest.timeIntervalSince1970 * 1000))
+            if cursor == after { break }   // no forward progress — stop
+            after = cursor
+
+            if byTimestamp.count >= target { break }
+            if !usingHistory, page.count < 300 { usingHistory = true }
+            try? await Task.sleep(nanoseconds: 120_000_000)
+        }
+
+        let sorted = byTimestamp.values.sorted { $0.ts < $1.ts }
+        return sorted.count > target ? Array(sorted.suffix(target)) : sorted
+    }
+
+    private struct FundingRateRow: Decodable {
+        let fundingRate: String
+        let fundingTime: String
+    }
+
+    /// Historical funding settlements for a perpetual swap, oldest first.
+    /// Backtests of swap strategies charge these against open positions rather
+    /// than assuming funding is free.
+    public func fundingRateHistory(
+        instId: String, since: Date, limit: Int = 1_000
+    ) async throws -> [FundingRate] {
+        var collected: [FundingRate] = []
+        var after: String? = nil
+        let maxRequests = limit / 100 + 2
+
+        for _ in 0..<maxRequests {
+            var query = ["instId": instId, "limit": "100"]
+            if let after { query["after"] = after }
+            let rows = try await get(FundingRateRow.self,
+                                     path: "api/v5/public/funding-rate-history", query: query)
+            guard !rows.isEmpty else { break }
+            let page = rows.compactMap { row -> FundingRate? in
+                guard let rate = Double(row.fundingRate), let ms = Double(row.fundingTime) else { return nil }
+                return FundingRate(ts: Date(timeIntervalSince1970: ms / 1000), rate: rate)
+            }
+            collected.append(contentsOf: page)
+            guard let oldest = page.map(\.ts).min() else { break }
+            if oldest <= since || collected.count >= limit { break }
+            let cursor = String(Int(oldest.timeIntervalSince1970 * 1000))
+            if cursor == after { break }
+            after = cursor
+            try? await Task.sleep(nanoseconds: 120_000_000)
+        }
+        return collected.filter { $0.ts >= since }.sorted { $0.ts < $1.ts }
+    }
+
     private struct BookRESTRow: Decodable {
         let asks: [[String]]
         let bids: [[String]]
@@ -149,6 +241,7 @@ public struct OKXRESTClient: Sendable {
         let tickSz: String
         let lotSz: String
         let minSz: String
+        let ctVal: String?
     }
 
     /// Instrument metadata (tick size → price decimals). Also serves as
@@ -162,7 +255,8 @@ public struct OKXRESTClient: Sendable {
             instId: row.instId,
             tickSize: Double(row.tickSz) ?? 0.01,
             lotSize: Double(row.lotSz) ?? 0,
-            minSize: Double(row.minSz) ?? 0)
+            minSize: Double(row.minSz) ?? 0,
+            contractValue: row.ctVal.flatMap(Double.init))
     }
 }
 

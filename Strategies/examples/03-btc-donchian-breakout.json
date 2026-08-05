@@ -1,0 +1,22 @@
+{
+  "schema" : 1,
+  "id" : "03-btc-donchian-breakout",
+  "name" : "BTC 通道突破（海龟式）",
+  "version" : "1.0.0",
+  "author" : "MayStock examples",
+  "notes" : "突破前 N 根高点做多、跌破 M 根低点离场，ATR 止损，按单笔风险定仓位。通道取上一根，避免拿当根自己比自己。",
+  "market" : { "instId" : "BTC-USDT", "instType" : "SPOT", "bar" : "4H" },
+  "params" : [
+    { "name" : "entryLen", "default" : 20, "min" : 8, "max" : 120, "label" : "入场通道" },
+    { "name" : "exitLen",  "default" : 10, "min" : 4, "max" : 60,  "label" : "离场通道" }
+  ],
+  "signals" : {
+    "longEntry" : "close > ref(highest(high, entryLen), 1)",
+    "longExit"  : "close < ref(lowest(low, exitLen), 1)"
+  },
+  "sizing" : { "mode" : "riskPerTrade", "value" : 1 },
+  "risk" : {
+    "atrStop" : { "period" : 14, "mult" : 2.5 },
+    "maxDailyLossPct" : 5, "leverage" : 1, "cooldownBars" : 0, "minHoldBars" : 0
+  }
+}

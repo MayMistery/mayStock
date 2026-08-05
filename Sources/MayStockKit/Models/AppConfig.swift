@@ -77,7 +77,7 @@ public struct WatchItem: Codable, Identifiable, Sendable, Equatable {
 // MARK: - Trading / General
 
 public struct TradingPrefs: Codable, Sendable, Equatable {
-    /// Show trade actions in the panel at all.
+    /// Show the position & return strip in the hover panel.
     public var enabled: Bool
     /// Explicit path to the official `okx` CLI; `nil` = search PATH & common dirs.
     public var cliPath: String?
@@ -85,21 +85,29 @@ public struct TradingPrefs: Codable, Sendable, Equatable {
     public var liveTradingUnlocked: Bool
     /// `okx --profile <name>`; `nil` = CLI default profile.
     public var profile: String?
-    /// Prefill for the trade ticket, in quote currency (e.g. USDT).
-    public var defaultQuoteSize: Double
 
     public init(
         enabled: Bool = true,
         cliPath: String? = nil,
         liveTradingUnlocked: Bool = false,
-        profile: String? = nil,
-        defaultQuoteSize: Double = 100
+        profile: String? = nil
     ) {
         self.enabled = enabled
         self.cliPath = cliPath
         self.liveTradingUnlocked = liveTradingUnlocked
         self.profile = profile
-        self.defaultQuoteSize = defaultQuoteSize
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case enabled, cliPath, liveTradingUnlocked, profile
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        cliPath = try c.decodeIfPresent(String.self, forKey: .cliPath)
+        liveTradingUnlocked = try c.decodeIfPresent(Bool.self, forKey: .liveTradingUnlocked) ?? false
+        profile = try c.decodeIfPresent(String.self, forKey: .profile)
     }
 }
 
@@ -125,21 +133,43 @@ public struct AppConfig: Codable, Sendable, Equatable {
     public var alerts: [AlertRule]
     public var trading: TradingPrefs
     public var general: GeneralPrefs
+    /// Strategy portfolio: mode, capital and per-strategy allocations.
+    public var strategy: StrategyPortfolioPrefs
 
-    public static let currentSchemaVersion = 2
+    /// v3 adds `strategy` and drops the manual order ticket's default size.
+    /// v2 files still load — every field decodes with a default.
+    public static let currentSchemaVersion = 3
+    public static let minimumSupportedSchemaVersion = 2
 
     public init(
         schemaVersion: Int = AppConfig.currentSchemaVersion,
         watchlist: [WatchItem] = [WatchItem(instId: "BTC-USDT")],
         alerts: [AlertRule] = [],
         trading: TradingPrefs = TradingPrefs(),
-        general: GeneralPrefs = GeneralPrefs()
+        general: GeneralPrefs = GeneralPrefs(),
+        strategy: StrategyPortfolioPrefs = StrategyPortfolioPrefs()
     ) {
         self.schemaVersion = schemaVersion
         self.watchlist = watchlist
         self.alerts = alerts
         self.trading = trading
         self.general = general
+        self.strategy = strategy
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion, watchlist, alerts, trading, general, strategy
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try c.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 0
+        watchlist = try c.decodeIfPresent([WatchItem].self, forKey: .watchlist) ?? []
+        alerts = try c.decodeIfPresent([AlertRule].self, forKey: .alerts) ?? []
+        trading = try c.decodeIfPresent(TradingPrefs.self, forKey: .trading) ?? TradingPrefs()
+        general = try c.decodeIfPresent(GeneralPrefs.self, forKey: .general) ?? GeneralPrefs()
+        strategy = try c.decodeIfPresent(StrategyPortfolioPrefs.self, forKey: .strategy)
+            ?? StrategyPortfolioPrefs()
     }
 
     public static let `default` = AppConfig()
@@ -167,8 +197,10 @@ public struct ConfigIO: Sendable {
         guard let data = try? Data(contentsOf: fileURL) else { return .default }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        if let config = try? decoder.decode(AppConfig.self, from: data),
-           config.schemaVersion >= 2 {
+        if var config = try? decoder.decode(AppConfig.self, from: data),
+           config.schemaVersion >= AppConfig.minimumSupportedSchemaVersion,
+           !config.watchlist.isEmpty {
+            config.schemaVersion = AppConfig.currentSchemaVersion
             return config
         }
         if let migrated = Self.migrateV1(data: data) { return migrated }

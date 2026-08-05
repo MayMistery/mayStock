@@ -8,6 +8,7 @@ struct TradingSettingsView: View {
     @State private var detecting = false
 
     private var trading: TradingPrefs { appState.store.config.trading }
+    private var strategyPrefs: StrategyPortfolioPrefs { appState.store.config.strategy }
 
     var body: some View {
         Form {
@@ -59,38 +60,82 @@ struct TradingSettingsView: View {
                     set: { v in appState.store.update { $0.trading.profile = v.isEmpty ? nil : v } }))
             }
 
-            Section("下单") {
-                Toggle("在悬浮面板显示交易操作", isOn: Binding(
+            Section("策略交易") {
+                Toggle("在悬浮面板显示仓位与收益", isOn: Binding(
                     get: { trading.enabled },
                     set: { v in appState.store.update { $0.trading.enabled = v } }))
-                TextField("默认下单金额（USDT）", text: Binding(
-                    get: { PriceFormatter.plain(trading.defaultQuoteSize) },
-                    set: { v in
-                        if let d = Double(v) { appState.store.update { $0.trading.defaultQuoteSize = d } }
-                    }))
-                    .font(.body.monospacedDigit())
+                LabeledContent("下单方式") {
+                    Text("由策略工作台按信号自动下单")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+                HStack {
+                    Text("回测起始资金")
+                    Spacer()
+                    TextField("", text: Binding(
+                        get: { PriceFormatter.plain(strategyPrefs.backtestCapital) },
+                        set: { v in
+                            if let d = Double(v), d > 0 {
+                                appState.store.update { $0.strategy.backtestCapital = d }
+                            }
+                        }))
+                        .font(.body.monospacedDigit())
+                        .multilineTextAlignment(.trailing)
+                        .frame(width: 110)
+                    Text(strategyPrefs.quoteCurrency)
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+                Button("打开策略工作台…") { appState.openStrategyStudio() }
             }
 
             Section("安全") {
                 Toggle(isOn: Binding(
                     get: { trading.liveTradingUnlocked },
-                    set: { v in appState.store.update { $0.trading.liveTradingUnlocked = v } })) {
+                    set: { v in
+                        appState.store.update { config in
+                            config.trading.liveTradingUnlocked = v
+                            // Locking live must not leave strategies armed
+                            // against a real account.
+                            if !v {
+                                config.strategy.mode = .demo
+                                for index in config.strategy.allocations.indices {
+                                    config.strategy.allocations[index].running = false
+                                }
+                            }
+                        }
+                    })) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("解锁实盘交易")
-                        Text("关闭时所有订单都走 OKX 模拟盘（--demo）。实盘下单前仍需逐单确认。")
+                        Text("关闭时所有订单都走 OKX 模拟盘（--demo）。解锁后仍需在工作台里逐个策略切换到实盘。")
                             .font(.system(size: 10)).foregroundStyle(.secondary)
                     }
                 }
                 if trading.liveTradingUnlocked {
-                    Label("实盘已解锁 — 每一笔订单都会真实成交，请谨慎。",
+                    Label("实盘已解锁 — 策略下的每一笔订单都会真实成交，请谨慎。",
                           systemImage: "exclamationmark.octagon.fill")
                         .font(.system(size: 11))
                         .foregroundStyle(.red)
                 }
+                Toggle(isOn: Binding(
+                    get: { strategyPrefs.allowScriptEngines },
+                    set: { v in appState.store.update { $0.strategy.allowScriptEngines = v } })) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("允许外部脚本策略")
+                        Text("声明式清单只做数组运算，永远安全；外部脚本等于在本机执行导入文件带来的任意代码。")
+                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                    }
+                }
             }
 
             Section {
-                Text("API Key 由官方 okx CLI 管理（`okx config`），MayStock 不接触、不存储任何密钥。")
+                LabeledContent("账户凭证") {
+                    Text(appState.tradeBridge.hasCredentials()
+                         ? "已检测到 ~/.okx/config.toml"
+                         : "未配置 —— 运行 `okx config` 添加模拟盘 API Key")
+                        .font(.system(size: 11))
+                        .foregroundStyle(appState.tradeBridge.hasCredentials() ? ChartStyle.up : .orange)
+                }
+                Text("API Key 由官方 okx CLI 管理（`okx config`），MayStock 不接触、不存储任何密钥。"
+                     + "回测只用公开行情，无需任何凭证。")
                     .font(.system(size: 10)).foregroundStyle(.tertiary)
             }
         }

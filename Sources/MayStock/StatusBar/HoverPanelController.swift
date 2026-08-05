@@ -16,9 +16,16 @@ final class HoverPanelController {
     private var mouseInsidePanel = false
     private var hideWorkItem: DispatchWorkItem?
     private var clickOutsideMonitor: Any?
+    /// The status item the panel is currently anchored under, so a content-driven
+    /// resize can re-anchor rather than drift up over the menu bar.
+    private weak var anchorItem: NSStatusItem?
 
-    private let panelSize = NSSize(width: PanelRootView.panelSize.width,
-                                   height: PanelRootView.panelSize.height)
+    /// Only the width is fixed. The height follows the content, reported by the
+    /// hosted view: the strip below the chart grows and shrinks with account
+    /// rows and open positions, and a hard-coded height was already short of
+    /// what the strip needs.
+    private var panelSize = NSSize(width: PanelRootView.width, height: 512)
+    private static let heightBounds: ClosedRange<CGFloat> = 360...760
 
     init(appState: AppState) {
         self.appState = appState
@@ -47,6 +54,7 @@ final class HoverPanelController {
             appState.hub.startDepthPolling(instId: instId)
         }
 
+        anchorItem = statusItem
         position(panel, under: statusItem)
         if !panel.isVisible {
             panel.alphaValue = 0
@@ -114,7 +122,23 @@ final class HoverPanelController {
                 } else {
                     self.scheduleHide()
                 }
-            })
+            },
+            onHeightChange: { [weak self] height in self?.applyHeight(height) })
+    }
+
+    /// Adopt the height SwiftUI just laid out, and re-anchor: a window grows
+    /// from its bottom-left origin, so a taller panel would otherwise creep up
+    /// into the menu bar instead of down the screen.
+    private func applyHeight(_ height: CGFloat) {
+        guard height > 1 else { return }
+        let clamped = min(max(height.rounded(.up), Self.heightBounds.lowerBound),
+                          Self.heightBounds.upperBound)
+        guard abs(clamped - panelSize.height) > 0.5 else { return }
+        panelSize = NSSize(width: PanelRootView.width, height: clamped)
+        hosting?.frame = NSRect(origin: .zero, size: panelSize)
+        guard let panel else { return }
+        panel.setContentSize(panelSize)
+        if let anchorItem { position(panel, under: anchorItem) }
     }
 
     private func ensurePanel() -> NSPanel {
@@ -134,6 +158,10 @@ final class HoverPanelController {
         panel.becomesKeyOnlyIfNeeded = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
+        // A hosting *view*, not a hosting controller: assigning an
+        // NSHostingController to a borderless panel collapses its frame to
+        // zero, and an invisible panel is a far worse failure than a slightly
+        // wrong height.
         let root = makeRootView(instId: currentInstId ?? "BTC-USDT")
         let hosting = FirstMouseHostingView(rootView: root)
         hosting.frame = NSRect(origin: .zero, size: panelSize)

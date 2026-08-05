@@ -21,9 +21,13 @@ DEVELOPER_DIR_PATH="$(xcode-select -p 2>/dev/null || true)"
 TESTING_FRAMEWORKS="$DEVELOPER_DIR_PATH/Library/Developer/Frameworks"
 TESTING_LIBS="$DEVELOPER_DIR_PATH/Library/Developer/usr/lib"
 
-cmd_build() { swift build -c release; }
+# The Rust kernel must exist before Swift links against it.
+cmd_kernel() { ./Scripts/build-kernel.sh "${1:-release}"; }
+
+cmd_build() { cmd_kernel release; swift build -c release; }
 
 cmd_test() {
+  cmd_kernel release
   local swift_testing_flags=()
   if [[ -d "$TESTING_FRAMEWORKS" && -d "$TESTING_LIBS" ]]; then
     swift_testing_flags=(
@@ -43,6 +47,7 @@ cmd_e2e() {
   "$BUILD_DIR/maystock-e2e" doctor BTC-USDT
   "$BUILD_DIR/maystock-e2e" alert-sim
   "$BUILD_DIR/maystock-e2e" trade-doctor
+  "$BUILD_DIR/maystock-e2e" strategy-doctor
 }
 
 cmd_verify() {

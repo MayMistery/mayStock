@@ -95,6 +95,9 @@ final class StatusItemController: NSObject {
 
     private func showContextMenu() {
         let menu = NSMenu()
+        let studio = NSMenuItem(title: "策略工作台…", action: #selector(openStudio), keyEquivalent: "s")
+        studio.target = self
+        menu.addItem(studio)
         let settings = NSMenuItem(title: "设置…", action: #selector(openSettings), keyEquivalent: ",")
         settings.target = self
         menu.addItem(settings)
@@ -112,6 +115,7 @@ final class StatusItemController: NSObject {
         statusItem.menu = nil // restore normal click handling
     }
 
+    @objc private func openStudio() { appState.openStrategyStudio() }
     @objc private func openSettings() { appState.openSettings() }
     @objc private func openAbout() { appState.openAbout() }
     @objc private func quit() { NSApp.terminate(nil) }

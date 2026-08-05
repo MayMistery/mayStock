@@ -1,0 +1,19 @@
+{
+  "schema" : 1,
+  "id" : "04-eth-bollinger-range",
+  "name" : "ETH 区间低吸（布林回归）",
+  "version" : "1.0.0",
+  "author" : "MayStock examples",
+  "notes" : "跌破布林下轨后回升买入、摸到中轨止盈。震荡市有效，单边下跌靠止损兜底。",
+  "market" : { "instId" : "ETH-USDT", "instType" : "SPOT", "bar" : "4H" },
+  "params" : [
+    { "name" : "period", "default" : 20, "min" : 10, "max" : 80,  "label" : "均线周期" },
+    { "name" : "mult",   "default" : 2,  "min" : 1,  "max" : 3.5, "step" : 0.25, "label" : "带宽倍数" }
+  ],
+  "signals" : {
+    "longEntry" : "close crosses_above bb_lower(close, period, mult)",
+    "longExit"  : "close crosses_above sma(close, period)"
+  },
+  "sizing" : { "mode" : "equityPct", "value" : 100 },
+  "risk" : { "stopLossPct" : 5, "cooldownBars" : 1, "leverage" : 1, "minHoldBars" : 0 }
+}

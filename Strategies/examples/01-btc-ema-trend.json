@@ -1,0 +1,20 @@
+{
+  "schema" : 1,
+  "id" : "01-btc-ema-trend",
+  "name" : "BTC 趋势跟随（EMA 交叉）",
+  "version" : "1.0.0",
+  "author" : "MayStock examples",
+  "notes" : "快慢 EMA 金叉入场、死叉离场，200 根均线之上才做多。趋势策略的标准形态。",
+  "market" : { "instId" : "BTC-USDT", "instType" : "SPOT", "bar" : "1H" },
+  "params" : [
+    { "name" : "fast",  "default" : 12,  "min" : 4,  "max" : 60,  "label" : "快线周期" },
+    { "name" : "slow",  "default" : 26,  "min" : 10, "max" : 200, "label" : "慢线周期" },
+    { "name" : "trend", "default" : 200, "min" : 50, "max" : 300, "label" : "趋势过滤" }
+  ],
+  "signals" : {
+    "longEntry" : "ema(close, fast) crosses_above ema(close, slow) and close > sma(close, trend)",
+    "longExit"  : "ema(close, fast) crosses_below ema(close, slow)"
+  },
+  "sizing" : { "mode" : "equityPct", "value" : 100 },
+  "risk" : { "stopLossPct" : 4, "cooldownBars" : 1, "leverage" : 1, "minHoldBars" : 0 }
+}

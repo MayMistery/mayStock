@@ -1,0 +1,22 @@
+{
+  "schema" : 1,
+  "id" : "09-btc-tsmom-volscaled",
+  "name" : "BTC 时序动量（AQR 1/3/12 月合成 + 波动率目标）",
+  "version" : "1.0.0",
+  "author" : "MayStock examples",
+  "notes" : "复现 Hurst/Ooi/Pedersen《百年趋势跟随证据》：1/3/12 月时序动量等权合成，敞口 = 三个 sign 的均值（−1..+1 连续），再按 Moskowitz/Ooi/Pedersen 的做法缩放到目标年化波动。与 10 号（同信号、无缩放）配对使用，可直接检验 Kim/Tse/Wald 2016 的结论：收益究竟来自趋势信号还是波动率缩放。",
+  "market" : { "instId" : "BTC-USDT", "instType" : "SPOT", "bar" : "1D" },
+  "params" : [
+    { "name" : "fast",   "default" : 30,  "min" : 10, "max" : 60,  "label" : "短周期(日)" },
+    { "name" : "medium", "default" : 90,  "min" : 40, "max" : 150, "label" : "中周期(日)" },
+    { "name" : "slow",   "default" : 365, "min" : 180, "max" : 400, "label" : "长周期(日)" }
+  ],
+  "signals" : {
+    "exposure" : "(sign(roc(close, fast)) + sign(roc(close, medium)) + sign(roc(close, slow))) / 3"
+  },
+  "sizing" : { "mode" : "volatilityTarget", "value" : 40 },
+  "risk" : {
+    "volLookbackBars" : 60, "maxExposure" : 1, "rebalanceThreshold" : 0.1,
+    "leverage" : 1, "cooldownBars" : 0, "minHoldBars" : 0
+  }
+}

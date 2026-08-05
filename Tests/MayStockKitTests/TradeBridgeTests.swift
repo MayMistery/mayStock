@@ -36,8 +36,9 @@ struct TradeBridgeTests {
         let stub = try makeStubCLI(stdout: #"{"code":"0","data":[{"ordId":"123456","sCode":"0"}]}"#)
         defer { try? FileManager.default.removeItem(at: stub.dir) }
 
-        let order = SpotOrderRequest(instId: "BTC-USDT", side: .buy, kind: .market, size: 100, sizeUnit: .quote)
-        let result = try await stub.bridge.placeSpotOrder(order, demo: true)
+        let order = OrderRequest(instId: "BTC-USDT", side: .buy, kind: .market,
+                                 size: 100, sizeUnit: .quote, clOrdId: "ms0123abcd0000000001")
+        let result = try await stub.bridge.place(order, mode: .demo)
 
         #expect(result.ordId == "123456")
         let args = recordedArgs(stub.argsFile)
@@ -47,17 +48,32 @@ struct TradeBridgeTests {
         #expect(args.contains("--ordType") && args.contains("market"))
         #expect(args.contains("--sz") && args.contains("100"))
         #expect(args.contains("--tgtCcy") && args.contains("quote_ccy"))
+        #expect(args.contains("--clOrdId") && args.contains("ms0123abcd0000000001"),
+                "every order must carry its strategy tag")
         #expect(args.contains("--demo"), "demo orders must carry --demo")
         #expect(args.contains("--json"))
+    }
+
+    @Test func swapOrderUsesSwapModule() async throws {
+        let stub = try makeStubCLI(stdout: #"{"code":"0","data":[{"ordId":"55","sCode":"0"}]}"#)
+        defer { try? FileManager.default.removeItem(at: stub.dir) }
+
+        let order = OrderRequest(instId: "BTC-USDT-SWAP", instType: .swap, side: .sell,
+                                 kind: .market, size: 3, sizeUnit: .base)
+        _ = try await stub.bridge.place(order, mode: .demo)
+
+        let args = recordedArgs(stub.argsFile)
+        #expect(args.contains("swap") && args.contains("place"))
+        #expect(!args.contains("--tgtCcy"), "tgtCcy is spot-only")
     }
 
     @Test func limitSellIncludesPrice() async throws {
         let stub = try makeStubCLI(stdout: #"{"code":"0","data":[{"ordId":"789","sCode":"0"}]}"#)
         defer { try? FileManager.default.removeItem(at: stub.dir) }
 
-        let order = SpotOrderRequest(instId: "ETH-USDT", side: .sell, kind: .limit,
-                                     size: 0.5, sizeUnit: .base, limitPrice: 4000)
-        _ = try await stub.bridge.placeSpotOrder(order, demo: true)
+        let order = OrderRequest(instId: "ETH-USDT", side: .sell, kind: .limit,
+                                 size: 0.5, sizeUnit: .base, limitPrice: 4000)
+        _ = try await stub.bridge.place(order, mode: .demo)
 
         let args = recordedArgs(stub.argsFile)
         #expect(args.contains("--px") && args.contains("4000"))
@@ -68,31 +84,42 @@ struct TradeBridgeTests {
         let stub = try makeStubCLI(stdout: "{}")
         defer { try? FileManager.default.removeItem(at: stub.dir) }
 
-        let order = SpotOrderRequest(instId: "BTC-USDT", side: .buy, kind: .market, size: 10)
+        let order = OrderRequest(instId: "BTC-USDT", side: .buy, kind: .market, size: 10)
         await #expect(throws: TradeError.self) {
-            _ = try await stub.bridge.placeSpotOrder(order, demo: false, liveUnlocked: false)
+            _ = try await stub.bridge.place(order, mode: .live, liveUnlocked: false)
         }
         // The stub must never have been invoked.
         #expect(!FileManager.default.fileExists(atPath: stub.argsFile.path))
     }
 
-    @Test func liveOrderOmitsDemoFlagWhenUnlocked() async throws {
+    @Test func liveOrderSendsLiveFlagWhenUnlocked() async throws {
         let stub = try makeStubCLI(stdout: #"{"code":"0","data":[{"ordId":"1","sCode":"0"}]}"#)
         defer { try? FileManager.default.removeItem(at: stub.dir) }
 
-        let order = SpotOrderRequest(instId: "BTC-USDT", side: .buy, kind: .market, size: 10)
-        _ = try await stub.bridge.placeSpotOrder(order, demo: false, liveUnlocked: true)
+        let order = OrderRequest(instId: "BTC-USDT", side: .buy, kind: .market, size: 10)
+        _ = try await stub.bridge.place(order, mode: .live, liveUnlocked: true)
         let args = recordedArgs(stub.argsFile)
         #expect(!args.contains("--demo"))
+        #expect(args.contains("--live"))
     }
 
     @Test func cliFailureSurfacesStderr() async throws {
         let stub = try makeStubCLI(stdout: #"{"code":"51000","msg":"Parameter sz error"}"#, exitCode: 2)
         defer { try? FileManager.default.removeItem(at: stub.dir) }
 
-        let order = SpotOrderRequest(instId: "BTC-USDT", side: .buy, kind: .market, size: 0)
+        let order = OrderRequest(instId: "BTC-USDT", side: .buy, kind: .market, size: 0)
         await #expect(throws: TradeError.self) {
-            _ = try await stub.bridge.placeSpotOrder(order, demo: true)
+            _ = try await stub.bridge.place(order, mode: .demo)
+        }
+    }
+
+    @Test func missingOrdIdIsNotSilentlyAccepted() async throws {
+        let stub = try makeStubCLI(stdout: #"{"code":"0","data":[{"sCode":"51008","sMsg":"insufficient"}]}"#)
+        defer { try? FileManager.default.removeItem(at: stub.dir) }
+
+        let order = OrderRequest(instId: "BTC-USDT", side: .buy, kind: .market, size: 10)
+        await #expect(throws: TradeError.self) {
+            _ = try await stub.bridge.place(order, mode: .demo)
         }
     }
 
@@ -109,14 +136,43 @@ struct TradeBridgeTests {
         #expect(balances.last?.available == 1500.5)
     }
 
+    @Test func parsesPositionsSigningShortLegs() {
+        let json = """
+        {"code":"0","data":[
+          {"instId":"BTC-USDT-SWAP","posSide":"short","pos":"3","avgPx":"60000",
+           "markPx":"59000","upl":"30","lever":"2","liqPx":"88000"},
+          {"instId":"ETH-USDT-SWAP","posSide":"net","pos":"-2","avgPx":"3000","upl":"-5"}]}
+        """
+        let positions = TradeBridge.parsePositions(json: json)
+        #expect(positions.count == 2)
+        #expect(positions.first?.quantity == -3, "a short leg is negative exposure")
+        #expect(positions.first?.leverage == 2)
+        #expect(positions.last?.quantity == -2)
+    }
+
+    @Test func parsesFillsWithClientOrderIds() {
+        let json = """
+        {"code":"0","data":[
+          {"instId":"BTC-USDT","tradeId":"t1","ordId":"o1","clOrdId":"ms0123abcd0000000001",
+           "side":"buy","fillPx":"100","fillSz":"0.5","fee":"-0.05","feeCcy":"USDT","ts":"1700000000000"},
+          {"instId":"BTC-USDT","tradeId":"t2","ordId":"o2","clOrdId":"",
+           "side":"sell","fillPx":"110","fillSz":"0.5","fee":"-0.06","feeCcy":"USDT","ts":"1700000600000"}]}
+        """
+        let fills = TradeBridge.parseFills(json: json)
+        #expect(fills.count == 2)
+        #expect(fills.first?.clOrdId == "ms0123abcd0000000001")
+        #expect(fills.last?.clOrdId == nil, "empty clOrdId must not become an empty-string tag")
+        #expect(fills.first!.ts < fills.last!.ts, "fills are returned oldest first")
+    }
+
     @Test func missingCLIThrowsCliNotFound() async {
         let bridge = TradeBridge(explicitCLIPath: "/nonexistent/okx-\(UUID().uuidString)")
         // explicit path invalid + nothing in search paths ⇒ depends on machine;
         // so only assert when truly absent:
         if bridge.resolveCLIPath() == nil {
-            let order = SpotOrderRequest(instId: "BTC-USDT", side: .buy, kind: .market, size: 1)
+            let order = OrderRequest(instId: "BTC-USDT", side: .buy, kind: .market, size: 1)
             await #expect(throws: TradeError.self) {
-                _ = try await bridge.placeSpotOrder(order, demo: true)
+                _ = try await bridge.place(order, mode: .demo)
             }
         }
     }
@@ -201,5 +257,72 @@ struct FormatterTests {
     @Test func compactVolume() {
         #expect(PriceFormatter.compact(12_400) == "12.4K")
         #expect(PriceFormatter.compact(3_400_000) == "3.40M")
+    }
+}
+
+@Suite("CLI robustness")
+struct TradeBridgeRobustnessTests {
+    private func makeStub(_ body: String) throws -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("maystock-robust-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("okx")
+        try "#!/bin/sh\n\(body)\n".write(to: url, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        return url
+    }
+
+    @Test func aHangingCliDoesNotHangTheCaller() async throws {
+        // Without a watchdog this wedges the strategy runner permanently: the
+        // tick never returns, `isTicking` stays true, and trading stops silently.
+        let stub = try makeStub("sleep 120")
+        defer { try? FileManager.default.removeItem(at: stub.deletingLastPathComponent()) }
+        let bridge = TradeBridge(explicitCLIPath: stub.path)
+
+        let started = Date()
+        await #expect(throws: TradeError.self) {
+            _ = try await bridge.balances(mode: .demo)
+        }
+        // `balances` falls back to a second command when the first fails, so
+        // the worst case is two timeouts — still far short of the child's 120s.
+        #expect(Date().timeIntervalSince(started) < TradeBridge.commandTimeout * 2 + 10,
+                "the watchdog must fire well before the child would finish")
+    }
+
+    @Test func heavyStderrDoesNotDeadlockTheReader() async throws {
+        // Draining stdout to completion before touching stderr deadlocks once
+        // the child fills the stderr buffer — and the real okx CLI writes an
+        // update banner there. Both pipes must be read concurrently.
+        let stub = try makeStub("""
+        i=0
+        while [ $i -lt 4000 ]; do
+          echo "warning line $i padding padding padding padding padding" >&2
+          i=$((i+1))
+        done
+        echo '{"code":"0","data":[{"details":[{"ccy":"USDT","availBal":"5"}]}]}'
+        """)
+        defer { try? FileManager.default.removeItem(at: stub.deletingLastPathComponent()) }
+        let bridge = TradeBridge(explicitCLIPath: stub.path)
+
+        let balances = try await bridge.balances(mode: .demo)
+        #expect(balances.first?.ccy == "USDT")
+        #expect(balances.first?.available == 5)
+    }
+
+    @Test func heavyStdoutAlsoSurvives() async throws {
+        let stub = try makeStub("""
+        printf '{"code":"0","data":[{"details":['
+        i=0
+        while [ $i -lt 800 ]; do
+          printf '{"ccy":"C%s","availBal":"1"},' "$i"
+          i=$((i+1))
+        done
+        printf '{"ccy":"USDT","availBal":"9"}]}]}'
+        """)
+        defer { try? FileManager.default.removeItem(at: stub.deletingLastPathComponent()) }
+        let bridge = TradeBridge(explicitCLIPath: stub.path)
+        let balances = try await bridge.balances(mode: .demo)
+        #expect(balances.count > 100)
+        #expect(balances.first { $0.ccy == "USDT" }?.available == 9)
     }
 }

@@ -7,6 +7,7 @@ import MayStockKit
 ///   maystock-e2e watch <instId> [sec]  stream live ticks to stdout
 ///   maystock-e2e alert-sim             alert engine simulation (offline)
 ///   maystock-e2e trade-doctor          okx CLI detection + public call
+///   maystock-e2e strategy-doctor       compile presets + real multi-window backtest
 ///
 /// Exit code 0 = pass. Non-zero = failure (CI-friendly).
 @main
@@ -25,6 +26,8 @@ struct E2EMain {
             ok = await alertSim()
         case "trade-doctor":
             ok = await tradeDoctor()
+        case "strategy-doctor":
+            ok = await strategyDoctor(instId: args.count > 1 ? args[1] : nil)
         default:
             print("unknown command: \(command)")
             ok = false
@@ -217,6 +220,98 @@ struct E2EMain {
             fail("okx market ticker", String(describing: error))
             return false
         }
+    }
+
+    // MARK: strategy-doctor
+
+    /// The strategy E2E: every preset compiles, deep history paginates without
+    /// gaps or duplicates, swap contract sizing resolves, and a full five-window
+    /// report comes back internally consistent. Needs no API key — backtesting
+    /// only ever reads public market data.
+    static func strategyDoctor(instId: String?) async -> Bool {
+        print("MayStock strategy doctor · \(Date())")
+        var allOK = true
+        let rest = OKXRESTClient()
+
+        // 1. Every shipped preset must compile.
+        var compiled: [CompiledStrategy] = []
+        for preset in StrategyLibrary.presets {
+            do {
+                compiled.append(try preset.compile())
+            } catch {
+                fail("compile \(preset.id)", String(describing: error)); allOK = false
+            }
+        }
+        if compiled.count == StrategyLibrary.presets.count {
+            pass("presets compile", "\(compiled.count) 个内置策略")
+        }
+        if !OrderTag.collisions(among: StrategyLibrary.presets.map(\.id)).isEmpty {
+            fail("clOrdId 归因", "策略短 ID 冲突"); allOK = false
+        } else {
+            pass("clOrdId 归因", "无短 ID 冲突")
+        }
+
+        // 2. Deep history pagination — the part that only breaks against the
+        //    real API, where page caps and cursors actually apply.
+        let probe = instId ?? "BTC-USDT"
+        do {
+            let candles = try await rest.historyCandles(instId: probe, bar: .h1, target: 900)
+            let ascending = zip(candles, candles.dropFirst()).allSatisfy { $0.ts < $1.ts }
+            let unique = Set(candles.map(\.ts)).count == candles.count
+            if candles.count >= 700, ascending, unique {
+                pass("history 分页", "\(candles.count) 根 1H，时间严格递增且无重复")
+            } else {
+                fail("history 分页",
+                     "count=\(candles.count) ascending=\(ascending) unique=\(unique)")
+                allOK = false
+            }
+        } catch {
+            fail("history 分页", String(describing: error)); allOK = false
+        }
+
+        // 3. Swap sizing needs ctVal — without it every perp order is 100× wrong.
+        do {
+            if let meta = try await rest.instrumentMeta(instId: "BTC-USDT-SWAP"),
+               let contractValue = meta.contractValue, contractValue > 0 {
+                pass("永续合约面值", "ctVal=\(contractValue) → 0.5 BTC = "
+                     + "\(PriceFormatter.plain(meta.exchangeSize(forBaseQuantity: 0.5))) 张")
+            } else {
+                fail("永续合约面值", "缺少 ctVal"); allOK = false
+            }
+        } catch {
+            fail("永续合约面值", String(describing: error)); allOK = false
+        }
+
+        // 4. A real five-window report.
+        guard let strategy = compiled.first else { return false }
+        do {
+            let report = try await BacktestRunner().run(strategy: strategy, capital: 10_000)
+            var previousBars = 0
+            var monotonic = true
+            for window in BacktestWindow.allCases {
+                guard let result = report.result(for: window) else { continue }
+                if result.barCount < previousBars { monotonic = false }
+                previousBars = result.barCount
+                let metrics = result.metrics
+                pass("回测 \(window.displayName)",
+                     "收益 \(PriceFormatter.signedPercent(metrics.totalReturnPct))"
+                     + " · 回撤 \(PriceFormatter.percent(metrics.maxDrawdownPct, decimals: 1))"
+                     + " · \(metrics.tradeCount) 笔"
+                     + " · 对标持有 \(PriceFormatter.signedPercent(metrics.buyHoldReturnPct))")
+            }
+            if monotonic {
+                pass("窗口嵌套", "长窗口覆盖的 K 线不少于短窗口")
+            } else {
+                fail("窗口嵌套", "长窗口 K 线数少于短窗口"); allOK = false
+            }
+            pass("稳健性徽章", report.robustness.grade.displayName
+                 + "（\(report.robustness.observedTrades)/\(report.robustness.requiredTrades) 笔）")
+        } catch {
+            fail("多窗口回测", String(describing: error)); allOK = false
+        }
+
+        print(allOK ? "\nstrategy doctor: PASS" : "\nstrategy doctor: FAIL")
+        return allOK
     }
 }
 

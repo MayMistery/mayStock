@@ -284,12 +284,35 @@ public struct InstrumentMeta: Sendable, Equatable {
     public let tickSize: Double // e.g. 0.1 for BTC-USDT
     public let lotSize: Double
     public let minSize: Double
+    /// Base units per contract (`ctVal`). Swap order sizes are counted in
+    /// contracts, not coins — 1 BTC-USDT-SWAP contract is 0.01 BTC. Nil for spot.
+    public let contractValue: Double?
 
-    public init(instId: String, tickSize: Double, lotSize: Double, minSize: Double) {
+    public init(
+        instId: String, tickSize: Double, lotSize: Double,
+        minSize: Double, contractValue: Double? = nil
+    ) {
         self.instId = instId
         self.tickSize = tickSize
         self.lotSize = lotSize
         self.minSize = minSize
+        self.contractValue = contractValue
+    }
+
+    /// Convert a base-currency quantity into the units the exchange expects,
+    /// rounded down to a whole lot. Returns 0 when the result is below `minSize`.
+    public func exchangeSize(forBaseQuantity quantity: Double) -> Double {
+        let raw = quantity / (contractValue ?? 1)
+        let step = lotSize > 0 ? lotSize : 0
+        let rounded = step > 0 ? (raw / step).rounded(.down) * step : raw
+        guard rounded >= minSize, rounded > 0 else { return 0 }
+        // Trim binary noise so "0.30000000000000004" never reaches the CLI.
+        return (rounded * 1e10).rounded() / 1e10
+    }
+
+    /// Inverse of `exchangeSize` — what an order of `size` represents in coins.
+    public func baseQuantity(forExchangeSize size: Double) -> Double {
+        size * (contractValue ?? 1)
     }
 
     /// Number of fraction digits implied by the tick size (0.1 → 1).

@@ -1,0 +1,23 @@
+{
+  "schema" : 1,
+  "id" : "05-btc-funding-contrarian",
+  "name" : "BTC 资金费率反向",
+  "version" : "1.0.0",
+  "author" : "MayStock examples",
+  "notes" : "资金费率是仓位拥挤度的直接读数。费率深度为负 = 空头拥挤且在付钱给多头，历史上常见于阶段性底部。此处只在费率转负且价格站上短均线时做多，避免在下跌中途接刀。注意 OKX 只提供约 90 天资金费率历史，长窗口无法验证。",
+  "market" : { "instId" : "BTC-USDT", "instType" : "SPOT", "bar" : "4H" },
+  "data" : {
+    "funding" : { "source" : "fundingRate", "instId" : "BTC-USDT-SWAP" }
+  },
+  "params" : [
+    { "name" : "enterBelow", "default" : -0.00005, "min" : -0.0004, "max" : 0, "step" : 0.00005, "label" : "入场费率阈值" },
+    { "name" : "exitAbove",  "default" : 0.0002,  "min" : 0.00005, "max" : 0.0008, "step" : 0.00005, "label" : "离场费率阈值" },
+    { "name" : "trend",      "default" : 20, "min" : 5, "max" : 60, "label" : "短均线" }
+  ],
+  "signals" : {
+    "longEntry" : "funding < enterBelow and close > sma(close, trend)",
+    "longExit"  : "funding > exitAbove or close < sma(close, trend)"
+  },
+  "sizing" : { "mode" : "equityPct", "value" : 100 },
+  "risk" : { "stopLossPct" : 5, "leverage" : 1, "cooldownBars" : 1, "minHoldBars" : 0 }
+}

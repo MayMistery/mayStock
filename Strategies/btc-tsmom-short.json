@@ -1,0 +1,51 @@
+{
+  "schema": 1,
+  "id": "btc-tsmom-short",
+  "name": "BTC 时序动量 · 永续做空腿",
+  "version": "1.0.0",
+  "author": "MayStock examples",
+  "notes": "混合组合的做空腿。信号与现货做多腿完全相同（AQR 1/3/12 月时序动量合成），但敞口被 min(…, 0) 钳到非正，所以它只在下跌趋势里做空，上涨趋势里空仓 —— 上涨由现货腿承担。这样避免为了做空而长期持有永续多头、白付资金费。两条腿在时间上互斥：同一标的不会同时有多头和空头。",
+  "market": {
+    "instId": "BTC-USDT-SWAP",
+    "instType": "SWAP",
+    "bar": "1D"
+  },
+  "params": [
+    {
+      "name": "fast",
+      "default": 30,
+      "min": 10,
+      "max": 60,
+      "label": "短周期(日)"
+    },
+    {
+      "name": "medium",
+      "default": 90,
+      "min": 40,
+      "max": 150,
+      "label": "中周期(日)"
+    },
+    {
+      "name": "slow",
+      "default": 365,
+      "min": 180,
+      "max": 400,
+      "label": "长周期(日)"
+    }
+  ],
+  "signals": {
+    "exposure": "min((sign(roc(close, fast)) + sign(roc(close, medium)) + sign(roc(close, slow))) / 3, 0)"
+  },
+  "sizing": {
+    "mode": "volatilityTarget",
+    "value": 40
+  },
+  "risk": {
+    "volLookbackBars": 60,
+    "maxExposure": 1,
+    "rebalanceThreshold": 0.1,
+    "leverage": 1,
+    "cooldownBars": 0,
+    "minHoldBars": 0
+  }
+}

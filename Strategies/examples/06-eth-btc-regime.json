@@ -1,0 +1,23 @@
+{
+  "schema" : 1,
+  "id" : "06-eth-btc-regime",
+  "name" : "ETH 跟随 BTC 大盘状态",
+  "version" : "1.0.0",
+  "author" : "MayStock examples",
+  "notes" : "跨标的示例：只在 BTC 处于自身上升趋势时才交易 ETH。ETH 的 beta 高于 BTC，大盘转弱时单独看 ETH 的信号极易假突破。btc 变量来自 data 块声明的另一标的收盘价，按 K 线时间轴对齐。",
+  "market" : { "instId" : "ETH-USDT", "instType" : "SPOT", "bar" : "4H" },
+  "data" : {
+    "btc" : { "source" : "instrumentClose", "instId" : "BTC-USDT" }
+  },
+  "params" : [
+    { "name" : "fast",    "default" : 10, "min" : 4,  "max" : 40,  "label" : "ETH 快线" },
+    { "name" : "slow",    "default" : 30, "min" : 10, "max" : 120, "label" : "ETH 慢线" },
+    { "name" : "btcTrend","default" : 50, "min" : 10, "max" : 150, "label" : "BTC 趋势周期" }
+  ],
+  "signals" : {
+    "longEntry" : "ema(close, fast) crosses_above ema(close, slow) and btc > sma(btc, btcTrend)",
+    "longExit"  : "ema(close, fast) crosses_below ema(close, slow) or btc < sma(btc, btcTrend)"
+  },
+  "sizing" : { "mode" : "equityPct", "value" : 100 },
+  "risk" : { "stopLossPct" : 5, "leverage" : 1, "cooldownBars" : 1, "minHoldBars" : 0 }
+}

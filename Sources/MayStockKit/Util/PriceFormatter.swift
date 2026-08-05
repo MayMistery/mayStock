@@ -45,6 +45,38 @@ public enum PriceFormatter {
         String(format: "%@%.2f%%", value >= 0 ? "+" : "", value)
     }
 
+    /// Unsigned percent: 62.4 → "62%".
+    public static func percent(_ value: Double, decimals: Int = 0) -> String {
+        guard value.isFinite else { return "—" }
+        return String(format: "%.\(decimals)f%%", value)
+    }
+
+    /// Fixed decimals, no grouping: (1.2345, 2) → "1.23".
+    public static func decimals(_ value: Double, _ places: Int) -> String {
+        guard value.isFinite else { return value > 0 ? "∞" : "—" }
+        return String(format: "%.\(places)f", value)
+    }
+
+    /// Ratio-style metric that may legitimately be infinite (a run with no
+    /// losing trades) or undefined (no trades at all).
+    public static func ratio(_ value: Double, places: Int = 2) -> String {
+        if value.isNaN { return "—" }
+        if value.isInfinite { return value > 0 ? "∞" : "—" }
+        return String(format: "%.\(places)f", value)
+    }
+
+    /// Money in the quote currency: 12345.6 → "12,345.60".
+    public static func money(_ value: Double, decimals places: Int = 2) -> String {
+        guard value.isFinite else { return "—" }
+        return price(value, decimals: places)
+    }
+
+    /// Signed money with an explicit plus for gains: 12.3 → "+12.30".
+    public static func signedMoney(_ value: Double, decimals places: Int = 2) -> String {
+        guard value.isFinite else { return "—" }
+        return (value >= 0 ? "+" : "-") + price(abs(value), decimals: places)
+    }
+
     /// Compact volume: 12_400 → "12.4K".
     public static func compact(_ value: Double) -> String {
         let v = abs(value)

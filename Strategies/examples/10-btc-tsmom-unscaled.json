@@ -1,0 +1,22 @@
+{
+  "schema" : 1,
+  "id" : "10-btc-tsmom-unscaled",
+  "name" : "BTC 时序动量（同信号，无波动率缩放）",
+  "version" : "1.0.0",
+  "author" : "MayStock examples",
+  "notes" : "对照组：与 09 号信号完全相同，仅把仓位从「波动率目标」换成「满仓」。两者之差就是波动率缩放的净贡献 —— Kim/Tse/Wald (2016) 认为 TSMOM 的收益主要来自缩放而非信号本身。",
+  "market" : { "instId" : "BTC-USDT", "instType" : "SPOT", "bar" : "1D" },
+  "params" : [
+    { "name" : "fast",   "default" : 30,  "min" : 10, "max" : 60,  "label" : "短周期(日)" },
+    { "name" : "medium", "default" : 90,  "min" : 40, "max" : 150, "label" : "中周期(日)" },
+    { "name" : "slow",   "default" : 365, "min" : 180, "max" : 400, "label" : "长周期(日)" }
+  ],
+  "signals" : {
+    "exposure" : "(sign(roc(close, fast)) + sign(roc(close, medium)) + sign(roc(close, slow))) / 3"
+  },
+  "sizing" : { "mode" : "equityPct", "value" : 100 },
+  "risk" : {
+    "volLookbackBars" : 60, "maxExposure" : 1, "rebalanceThreshold" : 0.1,
+    "leverage" : 1, "cooldownBars" : 0, "minHoldBars" : 0
+  }
+}

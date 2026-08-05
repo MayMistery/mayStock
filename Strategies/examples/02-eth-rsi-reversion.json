@@ -1,0 +1,21 @@
+{
+  "schema" : 1,
+  "id" : "02-eth-rsi-reversion",
+  "name" : "ETH 均值回归（RSI 超卖回升）",
+  "version" : "1.0.0",
+  "author" : "MayStock examples",
+  "notes" : "RSI 自超卖区回升买入、回到中性离场。换手高，对手续费极敏感。",
+  "market" : { "instId" : "ETH-USDT", "instType" : "SPOT", "bar" : "1H" },
+  "params" : [
+    { "name" : "period",    "default" : 14,  "min" : 4,  "max" : 40,  "label" : "RSI 周期" },
+    { "name" : "oversold",  "default" : 30,  "min" : 10, "max" : 45,  "label" : "超卖线" },
+    { "name" : "exitLevel", "default" : 60,  "min" : 50, "max" : 85,  "label" : "离场线" },
+    { "name" : "trend",     "default" : 200, "min" : 50, "max" : 300, "label" : "趋势过滤" }
+  ],
+  "signals" : {
+    "longEntry" : "rsi(close, period) crosses_above oversold and close > sma(close, trend)",
+    "longExit"  : "rsi(close, period) > exitLevel or close < sma(close, trend)"
+  },
+  "sizing" : { "mode" : "equityPct", "value" : 100 },
+  "risk" : { "stopLossPct" : 3, "takeProfitPct" : 6, "minHoldBars" : 1, "leverage" : 1, "cooldownBars" : 0 }
+}

@@ -6,13 +6,17 @@ struct PanelRootView: View {
     let appState: AppState
     let instId: String
     var onHoverChange: (Bool) -> Void = { _ in }
+    /// Reports the laid-out height so the window can follow it.
+    var onHeightChange: (CGFloat) -> Void = { _ in }
+
+    /// The panel's fixed width. Its *height* is deliberately not fixed —
+    /// `HoverPanelController` sizes the window to whatever this lays out to, so
+    /// adding a row here can never silently clip the bottom of the panel.
+    static let width: CGFloat = 384
 
     /// Published upward by whichever chart is on screen, so the readout has a
     /// dedicated row instead of floating over the bars being read.
     @State private var legend: [ChartLegendItem] = []
-    @State private var showTradeTicket = false
-
-    static let panelSize = CGSize(width: 384, height: 452)
 
     private var session: InstrumentSession? { appState.hub.session(for: instId) }
     private var watchItem: WatchItem? {
@@ -36,7 +40,7 @@ struct PanelRootView: View {
                 Divider().opacity(0.5)
                 alertsRow(session)
                 if appState.store.config.trading.enabled {
-                    tradeStrip(session)
+                    PositionStripView(appState: appState, instId: instId)
                 }
                 Spacer(minLength: 0)
                 footer(session)
@@ -45,11 +49,13 @@ struct PanelRootView: View {
             }
         }
         .padding(14)
-        .frame(width: Self.panelSize.width, height: Self.panelSize.height)
+        .frame(width: Self.width)
+        .fixedSize(horizontal: false, vertical: true)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1))
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { onHeightChange($0) }
         .onHover(perform: onHoverChange)
         .onChange(of: appState.charts.mode, initial: true) { _, mode in
             // The 400-level book snapshot is only worth fetching while it is
@@ -239,37 +245,6 @@ struct PanelRootView: View {
 
     private func quickAlert(_ condition: AlertRule.Condition) {
         appState.alerts.add(AlertRule(instId: instId, condition: condition))
-    }
-
-    // MARK: Trade
-
-    @ViewBuilder
-    private func tradeStrip(_ session: InstrumentSession) -> some View {
-        if showTradeTicket {
-            TradeTicketView(appState: appState, instId: instId,
-                            referencePrice: session.ticker?.last,
-                            onClose: { showTradeTicket = false })
-        } else {
-            HStack(spacing: 8) {
-                Button {
-                    showTradeTicket = true
-                } label: {
-                    Text("买入 / 卖出")
-                        .font(.system(size: 11, weight: .semibold))
-                        .frame(maxWidth: .infinity)
-                }
-                .controlSize(.small)
-
-                if !appState.store.config.trading.liveTradingUnlocked {
-                    Text("DEMO")
-                        .font(.system(size: 8, weight: .bold))
-                        .padding(.horizontal, 5).padding(.vertical, 2)
-                        .background(Color.orange.opacity(0.18), in: Capsule())
-                        .foregroundStyle(.orange)
-                        .help("当前为模拟盘。实盘需在设置 → 交易 中解锁。")
-                }
-            }
-        }
     }
 
     private func footer(_ session: InstrumentSession) -> some View {

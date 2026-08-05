@@ -1,0 +1,46 @@
+{
+  "schema": 1,
+  "id": "btc-4h-breakout",
+  "name": "BTC 4H 通道突破",
+  "version": "1.0.0",
+  "author": "MayStock lab",
+  "notes": "研究候选，未通过验证：走向前样本外虽为正，但效率比 -0.80（样本内亏、样本外碰巧赚），属于运气而非边际。固定参数跑满一年时 72 组参数全部亏损。保留作对照，不建议投入资金。",
+  "market": {
+    "instId": "BTC-USDT",
+    "instType": "SPOT",
+    "bar": "4H"
+  },
+  "params": [
+    {
+      "name": "entryLen",
+      "default": 20,
+      "min": 6,
+      "max": 100,
+      "label": "入场通道"
+    },
+    {
+      "name": "exitLen",
+      "default": 10,
+      "min": 3,
+      "max": 50,
+      "label": "离场通道"
+    }
+  ],
+  "signals": {
+    "longEntry": "close > ref(highest(high, entryLen), 1)",
+    "longExit": "close < ref(lowest(low, exitLen), 1)"
+  },
+  "sizing": {
+    "mode": "equityPct",
+    "value": 100
+  },
+  "risk": {
+    "atrStop": {
+      "period": 14,
+      "mult": 2.5
+    },
+    "leverage": 1,
+    "cooldownBars": 0,
+    "minHoldBars": 0
+  }
+}

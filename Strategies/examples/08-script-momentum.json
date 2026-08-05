@@ -1,0 +1,22 @@
+{
+  "schema" : 1,
+  "id" : "08-script-momentum",
+  "name" : "外部脚本示例（Python 动量）",
+  "version" : "1.0.0",
+  "author" : "MayStock examples",
+  "notes" : "演示脚本策略适配器。脚本只决定方向，止损/冷却/仓位上限仍由本清单与工作台控制。运行前需显式解锁：CLI 加 --allow-scripts，App 在 设置 → 交易 中开启。",
+  "market" : { "instId" : "BTC-USDT", "instType" : "SPOT", "bar" : "4H" },
+  "engine" : {
+    "kind" : "script",
+    "command" : "Strategies/scripts/momentum.py",
+    "args" : [],
+    "timeoutSeconds" : 30
+  },
+  "params" : [
+    { "name" : "fast", "default" : 10, "min" : 4,  "max" : 40,  "label" : "快线" },
+    { "name" : "slow", "default" : 40, "min" : 15, "max" : 120, "label" : "慢线" }
+  ],
+  "signals" : {},
+  "sizing" : { "mode" : "equityPct", "value" : 100 },
+  "risk" : { "stopLossPct" : 5, "leverage" : 1, "cooldownBars" : 1, "minHoldBars" : 0 }
+}

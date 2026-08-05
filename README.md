@@ -33,11 +33,40 @@
 - **Alerts** — price cross (with hysteresis), 24h change thresholds,
   volatility within a window; system notifications, optional sound, optional
   shell hook (env vars let you chain the `okx` CLI: alert → order).
+- **Strategy studio** — import a declarative strategy manifest (JSON) and get
+  **1/7/30/90/365-day** backtests in one pass: return, drawdown, Sharpe,
+  profit factor, and the buy-and-hold benchmark, plus a **robustness badge**
+  built from sample size, out-of-sample decay and cross-window agreement.
+  Numbers that cannot support a decision are labelled "insufficient sample"
+  rather than presented as insight. Then allocate capital and start or stop
+  trading. Manifests do arithmetic over candles — **no code is executed**.
+- **Per-strategy attribution** — the exchange holds one balance, so every
+  order carries a `clOrdId` strategy tag and is reconciled against
+  `okx spot fills`. Each strategy's position, realised/unrealised P&L and
+  return are therefore exact; anything that doesn't reconcile is shown as
+  unattributed rather than quietly absorbed. The hover panel shows positions
+  and returns only — there is no manual order entry.
 - **Trading** — via OKX's official CLI (Agent Trade Kit). Demo mode by
-  default; live trading requires an explicit unlock *and* per-order
-  confirmation. MayStock never touches your API keys.
+  default; live trading requires an explicit unlock *and* per-strategy
+  confirmation. MayStock never touches your API keys. **Backtests need no
+  credentials at all — they read public market data.**
+- **Research bench** (`maystock-lab`) — grid optimisation, **walk-forward
+  validation**, portfolio backtests with leg correlation, and OKX fee-tier
+  modelling (defaults to regular Lv1; `--sync` pulls your account's real
+  rates). Optimisation always reports the Sharpe the luckiest of N trials
+  would reach with *no edge at all*, so a curve-fit cannot pose as a
+  discovery. Ships 20 declarable signal sources (Fear & Greed, on-chain,
+  DXY/VIX/treasuries, Coinbase premium — all free, no key, up to 65 years of
+  history) plus an `ic` command that scores them with overlap and
+  multiple-testing corrections. See [docs/STRATEGY-DEV.md](docs/STRATEGY-DEV.md).
 - **Watchlist** — any OKX spot/perp instrument, validated against the
   exchange when added. BTC-USDT out of the box.
+
+```bash
+./Scripts/new-strategy.sh "My ETH trend" trend ETH-USDT 4H   # scaffold, backtest, walk-forward
+make lab ARGS="walkforward 01-btc-ema-trend --folds 4"
+make lab ARGS="portfolio 01-btc-ema-trend eth-4h-breakout --weights 0.5,0.5 --capital 30000"
+```
 
 ## Install From Release
 

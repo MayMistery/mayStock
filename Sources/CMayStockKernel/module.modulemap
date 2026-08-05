@@ -1,0 +1,5 @@
+module CMayStockKernel {
+    header "include/maystock_kernel.h"
+    link "maystock_kernel"
+    export *
+}
