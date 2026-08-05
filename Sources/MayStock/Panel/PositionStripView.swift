@@ -11,26 +11,50 @@ struct PositionStripView: View {
     let appState: AppState
     let instId: String
 
-    /// Strategies holding this instrument, with their live P&L.
+    /// Strategies holding this *underlying*, with their live P&L.
+    ///
+    /// Matching is by underlying rather than by exact `instId`: a short on
+    /// `BTC-USDT-SWAP` is a BTC position and belongs on the BTC panel, even
+    /// though the watchlist tracks spot `BTC-USDT`. Requiring an exact match is
+    /// what made the hybrid portfolio's perpetual legs invisible here.
     private var holdings: [(state: StrategyPositionState, name: String)] {
         appState.ledger.positions.values
-            .filter { $0.instId == instId && !$0.isFlat }
+            .filter { Self.underlying($0.instId) == Self.underlying(instId) && !$0.isFlat }
             .sorted { abs($0.quantity) > abs($1.quantity) }
             .map { ($0, appState.strategy(id: $0.strategyId)?.name ?? $0.strategyId) }
     }
 
+    /// "BTC-USDT-SWAP" and "BTC-USDT" are both BTC against USDT.
+    private static func underlying(_ instId: String) -> String {
+        let (base, quote) = StrategyLedger.currencies(of: instId)
+        return "\(base)-\(quote)"
+    }
+
+    /// Positions the portfolio holds on some *other* underlying, so nothing is
+    /// ever silently invisible just because the panel is scoped to one symbol.
+    private var elsewhere: [StrategyPositionState] {
+        appState.ledger.positions.values
+            .filter { Self.underlying($0.instId) != Self.underlying(instId) && !$0.isFlat }
+            .sorted { $0.instId < $1.instId }
+    }
+
     private var runningHere: Int {
         appState.strategies
-            .filter { $0.market.instId == instId }
+            .filter { Self.underlying($0.market.instId) == Self.underlying(instId) }
             .filter { appState.store.config.strategy.allocation(for: $0.id)?.running == true }
             .count
     }
 
+    /// Mark each holding against *its own* instrument — a perpetual and its
+    /// spot pair do not trade at the same price.
+    private func mark(for holding: StrategyPositionState) -> Double? {
+        appState.mark(for: holding.instId) ?? appState.mark(for: instId)
+    }
     private var mark: Double? { appState.mark(for: instId) }
 
     private var totalQuantity: Double { holdings.reduce(0) { $0 + $1.state.quantity } }
     private var totalNetPnL: Double {
-        holdings.reduce(0) { $0 + $1.state.netPnL(mark: mark) }
+        holdings.reduce(0) { $0 + $1.state.netPnL(mark: mark(for: $1.state)) }
     }
     private var totalCapital: Double {
         holdings.reduce(0) {
@@ -63,10 +87,13 @@ struct PositionStripView: View {
     @ViewBuilder
     private var positionsBlock: some View {
         if holdings.isEmpty {
-            HStack(spacing: 4) {
-                Text(runningHere > 0 ? "策略运行中 · 当前空仓" : "本标的无策略持仓")
-                    .font(.system(size: 9)).foregroundStyle(.tertiary)
-                Spacer()
+            VStack(spacing: 2) {
+                HStack(spacing: 4) {
+                    Text(runningHere > 0 ? "策略运行中 · 当前空仓" : "本标的无策略持仓")
+                        .font(.system(size: 9)).foregroundStyle(.tertiary)
+                    Spacer()
+                }
+                elsewhereRow
             }
         } else {
             VStack(spacing: 3) {
@@ -94,13 +121,35 @@ struct PositionStripView: View {
                         .font(.system(size: 8)).foregroundStyle(.tertiary)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
+                elsewhereRow
+            }
+        }
+    }
+
+    /// One line naming every other underlying the book is exposed to.
+    @ViewBuilder
+    private var elsewhereRow: some View {
+        let others = elsewhere
+        if !others.isEmpty {
+            HStack(spacing: 4) {
+                Image(systemName: "arrow.triangle.branch")
+                    .font(.system(size: 7)).foregroundStyle(.tertiary)
+                Text(others.map { state in
+                    let (base, _) = StrategyLedger.currencies(of: state.instId)
+                    return "\(base) \(state.quantity > 0 ? "多" : "空")"
+                }.joined(separator: " · "))
+                    .font(.system(size: 8)).foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
             }
         }
     }
 
     private func row(_ state: StrategyPositionState, name: String) -> some View {
         let capital = appState.store.config.strategy.allocation(for: state.strategyId)?.capital ?? 0
-        let pct = state.returnPct(mark: mark, capital: capital)
+        let markHere = mark(for: state)
+        let pct = state.returnPct(mark: markHere, capital: capital)
+        let isSwap = state.instId.hasSuffix("-SWAP")
         return HStack(spacing: 6) {
             Circle()
                 .fill(ChartStyle.trend(state.quantity > 0))
@@ -108,6 +157,13 @@ struct PositionStripView: View {
             Text(name)
                 .font(.system(size: 9)).foregroundStyle(.secondary)
                 .lineLimit(1)
+            // The panel is scoped to an underlying, so the leg has to say
+            // which market it is actually on.
+            Text(isSwap ? "永续" : "现货")
+                .font(.system(size: 7, weight: .medium))
+                .padding(.horizontal, 3).padding(.vertical, 1)
+                .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 3))
+                .foregroundStyle(.tertiary)
             Spacer(minLength: 2)
             Text(PriceFormatter.plain(abs(state.quantity)))
                 .font(.system(size: 9)).monospacedDigit().foregroundStyle(.tertiary)

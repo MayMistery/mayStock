@@ -258,3 +258,33 @@ struct PortfolioAllocationTests {
         #expect(portfolio.runningCount == 1)
     }
 }
+
+@Suite("Instrument underlying")
+struct InstrumentUnderlyingTests {
+    /// The panel groups positions by underlying so a perpetual leg shows up on
+    /// its spot symbol's panel. That grouping is built on `currencies(of:)`, so
+    /// a swap and its spot pair must report the same base and quote.
+    ///
+    /// This was a real defect: the hybrid portfolio's `BTC-USDT-SWAP` shorts
+    /// were invisible on the `BTC-USDT` panel, which read "当前空仓" while the
+    /// account was short 11.65 contracts.
+    @Test func aSwapAndItsSpotPairShareAnUnderlying() {
+        let spot = StrategyLedger.currencies(of: "BTC-USDT")
+        let swap = StrategyLedger.currencies(of: "BTC-USDT-SWAP")
+        #expect(spot.base == swap.base)
+        #expect(spot.quote == swap.quote)
+        #expect(spot.base == "BTC" && spot.quote == "USDT")
+    }
+
+    @Test func differentAssetsDoNotCollide() {
+        let btc = StrategyLedger.currencies(of: "BTC-USDT-SWAP")
+        let eth = StrategyLedger.currencies(of: "ETH-USDT-SWAP")
+        #expect(btc.base != eth.base)
+    }
+
+    @Test func degenerateInstrumentIdsAreSafe() {
+        #expect(StrategyLedger.currencies(of: "BTC").base == "BTC")
+        #expect(StrategyLedger.currencies(of: "BTC").quote == "USDT")
+        #expect(StrategyLedger.currencies(of: "").base == "")
+    }
+}
