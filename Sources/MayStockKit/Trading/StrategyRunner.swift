@@ -543,6 +543,18 @@ public final class StrategyRunner {
             return
         }
 
+        // In OKX's long/short (hedge) account mode every swap order must name
+        // the position leg it acts on, and `side` alone does not identify it:
+        // "sell" opens a short but also closes a long. The leg is whichever
+        // position we currently hold, or — from flat — whichever the delta is
+        // opening. Spot has no such concept and must not send the field.
+        var posSide: PositionSide?
+        if market.instType == .swap {
+            let held = host.ledger.position(for: strategy.id)?.quantity ?? 0
+            let leg = abs(held) > 1e-12 ? held : baseDelta
+            posSide = leg > 0 ? .long : .short
+        }
+
         let order = OrderRequest(
             instId: market.instId,
             instType: market.instType,
@@ -550,6 +562,7 @@ public final class StrategyRunner {
             kind: .market,
             size: size,
             sizeUnit: .base,
+            posSide: posSide,
             clOrdId: OrderTag.make(strategyId: strategy.id))
 
         do {
