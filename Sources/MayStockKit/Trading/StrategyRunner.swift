@@ -349,6 +349,7 @@ public final class StrategyRunner {
         await sampleEquity(for: host)
         sampleStrategyEquity(for: host)
         evaluateProtection(for: host)
+        evaluateCommitment(for: host)
 
         let active = portfolio.allocations.filter { $0.running && !portfolio.emergencyStop }
         guard !active.isEmpty else { return }
@@ -1054,8 +1055,62 @@ public final class StrategyRunner {
         // `reducing`, never `halted`: a halted engine cannot close the position
         // that tripped the breaker, which is the one order it most needs to
         // send. Closing stays available; opening does not.
-        if protectionTripped != nil { limits.state = .reducing }
+        if protectionTripped != nil || overCommitted != nil { limits.state = .reducing }
         return limits
+    }
+
+    /// Set when the book already holds more than the account can back.
+    ///
+    /// Each strategy sizes against *its own* budget and never looks at the
+    /// others, which is the right separation — one strategy's drawdown must not
+    /// shrink another's position. But nothing was checking the sum. Four
+    /// strategies each allocated half the account is a book that opens at twice
+    /// the account, and every individual order looks perfectly reasonable on
+    /// the way there.
+    ///
+    /// The studio window warns when the *budgets* over-commit, deliberately
+    /// without resizing anyone's book. This is the other half: whatever the
+    /// budgets say, the engine stops adding exposure once the account is fully
+    /// committed. Reducing stays available — refusing to close an
+    /// over-committed book is how a protective limit becomes the problem.
+    public private(set) var overCommitted: String?
+
+    /// Absolute notional the ledger currently holds, marked to market.
+    public private(set) var committedNotional: Double = 0
+
+    /// Compare what the book holds against what the account can back.
+    private func evaluateCommitment(for host: StrategyRunnerHost) {
+        committedNotional = host.ledger.positions.values
+            .filter { !$0.isFlat }
+            .reduce(0) { $0 + $1.exposure(mark: marks[$1.instId]) }
+
+        guard let equity = accountEquity, equity > 0 else {
+            overCommitted = nil
+            return
+        }
+        // The most permissive leverage any armed strategy is allowed. A book
+        // running one 3x strategy may legitimately hold three times the
+        // account; judging it against 1x would refuse trades it was configured
+        // for.
+        let allowed = host.portfolio.allocations
+            .filter(\.running)
+            .compactMap { allocation in
+                host.runnableStrategies.first { $0.id == allocation.strategyId }
+                    .map { strategy in
+                        Swift.min(allocation.leverageCap ?? .greatestFiniteMagnitude,
+                                  Swift.max(strategy.manifest.risk.leverage, 1))
+                    }
+            }
+            .max() ?? 1
+        let ceiling = equity * allowed
+
+        if committedNotional > ceiling * 1.02 {
+            overCommitted = "已持仓名义 \(PriceFormatter.money(committedNotional, decimals: 0))"
+                + " 超过账户可支撑的 \(PriceFormatter.money(ceiling, decimals: 0))"
+                + "（权益 × \(PriceFormatter.decimals(allowed, 1)) 倍），只允许减仓"
+        } else {
+            overCommitted = nil
+        }
     }
 
     /// Why the portfolio is currently refusing new exposure, if it is.

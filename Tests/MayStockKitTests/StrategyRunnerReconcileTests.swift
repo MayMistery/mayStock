@@ -278,6 +278,36 @@ struct StrategyRunnerReconcileTests {
         #expect(host.halts.isEmpty)
     }
 
+    @Test("持仓超过账户可支撑时只允许减仓")
+    func anOverCommittedBookStopsOpening() async {
+        // Each strategy sizes against its own budget and never looks at the
+        // others — the right separation, but nothing was checking the sum.
+        // Four strategies each allocated half the account opens a book at twice
+        // the account, and every single order looks reasonable on the way there.
+        let host = FakeHost()
+        seedLongPosition(host, strategyId: "alpha", contracts: 10_000)
+        host.fake.price = 100
+        host.fake.positionsResult = .success([exchangePosition(contracts: 10_000)])
+
+        let runner = runner(for: host)
+        await runner.tick()
+
+        // 10 000 contracts x 0.01 BTC x 100 = 10 000 000 notional against an
+        // account of 1 000.
+        #expect(runner.overCommitted != nil)
+        #expect(runner.committedNotional > 0)
+    }
+
+    @Test("持仓在账户能力之内时不干预")
+    func aNormalBookIsLeftAlone() async {
+        let host = FakeHost()
+        seedLongPosition(host, strategyId: "alpha", contracts: 1)
+        host.fake.positionsResult = .success([exchangePosition(contracts: 1)])
+        let runner = runner(for: host)
+        await runner.tick()
+        #expect(runner.overCommitted == nil)
+    }
+
     @Test("交易所仓位多于台账时不并入")
     func anIncreaseIsNotAbsorbed() async {
         let host = FakeHost()

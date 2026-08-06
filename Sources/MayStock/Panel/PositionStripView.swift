@@ -77,7 +77,11 @@ struct PositionStripView: View {
                 openPnLPct: appState.openPnLPct,
                 placeholder: appState.accountError ?? "读取账户余额…",
                 change: { appState.equityChange($0) },
-                protection: appState.runner.protectionTripped,
+                // Over-commitment outranks the drawdown breaker: one is a
+                // policy the user chose, the other is a book bigger than the
+                // account backing it.
+                protection: appState.runner.overCommitted
+                    ?? appState.runner.protectionTripped,
                 heartbeat: appState.heartbeatWarning,
                 onOpenStudio: {
                     appState.openStrategyStudio(selecting: holdings.first?.state.strategyId)
