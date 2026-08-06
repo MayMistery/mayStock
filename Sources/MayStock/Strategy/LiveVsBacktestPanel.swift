@@ -9,8 +9,14 @@ import SwiftUI
 /// is a figure on screen rather than a feeling, the better. Both are computed
 /// by the kernel, from the same data the backtester uses.
 struct LiveVsBacktestPanel: View {
+    /// Handed in rather than read from the environment, like every other view
+    /// here. Nothing in this app ever calls `.environment(_:)` — it is an
+    /// AppKit shell that constructs its hosting views by hand — so an
+    /// `@Environment(AppState.self)` here found no value and trapped on sight,
+    /// taking the whole app down the moment the 持仓与成交 tab was opened. A
+    /// stored property cannot be forgotten: leaving it out is a build error.
+    let appState: AppState
     let strategy: CompiledStrategy
-    @Environment(AppState.self) private var appState
 
     var body: some View {
         if slippage != nil || comparison != nil {

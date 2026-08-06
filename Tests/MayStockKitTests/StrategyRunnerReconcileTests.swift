@@ -1095,3 +1095,67 @@ struct HeartbeatTests {
         #expect(host.completedTicks.isEmpty)
     }
 }
+
+// MARK: - App wiring
+
+/// MayStock is an AppKit shell: it builds its hosting views by hand and never
+/// calls `.environment(_:)` on any of them. A SwiftUI view that reads AppState
+/// out of the environment therefore finds nothing there and traps the instant
+/// it renders — which is exactly what took the whole app down on 2026-08-06 the
+/// first time anyone opened the 持仓与成交 tab. Every other view in the app
+/// takes `let appState: AppState`, which the compiler will not let you forget.
+///
+/// Checked against the source rather than at runtime because the defect is a
+/// *missing* call: there is no object to interrogate, only a convention to hold.
+@Suite("App wiring")
+struct AppWiringTests {
+    private func appSources() -> [URL] {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()      // MayStockKitTests
+            .deletingLastPathComponent()      // Tests
+            .deletingLastPathComponent()      // package root
+            .appendingPathComponent("Sources/MayStock")
+        let files = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil)?
+            .compactMap { $0 as? URL }
+            .filter { $0.pathExtension == "swift" }
+        return files ?? []
+    }
+
+    /// Source with `//` comments stripped, so prose mentioning the API does not
+    /// read as a call to it.
+    private func code(of url: URL) throws -> String {
+        try String(contentsOf: url, encoding: .utf8)
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { line -> Substring in
+                guard let comment = line.range(of: "//") else { return line }
+                return line[line.startIndex..<comment.lowerBound]
+            }
+            .joined(separator: "\n")
+    }
+
+    @Test("没有人注入，就没有视图可以从 environment 里读 AppState")
+    func noViewReadsAppStateFromAnEnvironmentNothingPopulates() throws {
+        let sources = appSources()
+        try #require(!sources.isEmpty, "the app sources must be reachable from the test")
+
+        var injectors: [String] = []
+        var readers: [String] = []
+        for url in sources {
+            let text = try code(of: url)
+            if text.contains(".environment(") || text.contains(".environmentObject(") {
+                injectors.append(url.lastPathComponent)
+            }
+            if text.contains("@Environment(AppState.self)") {
+                readers.append(url.lastPathComponent)
+            }
+        }
+
+        #expect(readers.isEmpty,
+                "these read AppState from an environment nothing fills: \(readers)")
+        // The other half of the invariant. If a future change starts injecting
+        // AppState for real, reading it becomes legitimate and this whole check
+        // should be deleted rather than worked around.
+        #expect(injectors.isEmpty,
+                "AppState is being injected now (\(injectors)) — revisit this check")
+    }
+}
