@@ -44,6 +44,10 @@ public protocol StrategyRunnerHost: AnyObject {
     var venue: any ExchangeVenue { get }
 
     func runnerDidChange()
+    /// A tick completed. Persisted as a heartbeat, so an app that was killed,
+    /// slept, or whose loop died can be told apart from one that simply had
+    /// nothing to do.
+    func runnerDidCompleteTick(at ts: Date)
     func runnerDidHalt(strategyId: String, reason: String)
     /// A fresh reading of total account equity, for the equity curve.
     func runnerDidSampleEquity(_ equity: Double, at ts: Date)
@@ -170,6 +174,11 @@ public final class StrategyRunner {
     /// How often the loop wakes. Bar-close detection does the real pacing.
     public static let tickInterval: TimeInterval = 20
 
+    /// Past this without a completed tick, the engine is presumed not to be
+    /// trading. Generous against the 20-second interval, because a laptop
+    /// waking from sleep legitimately misses a few.
+    public static let heartbeatTimeout: TimeInterval = 300
+
     public init(host: StrategyRunnerHost) {
         self.host = host
     }
@@ -247,7 +256,13 @@ public final class StrategyRunner {
         isTicking = true
         tickStartedAt = Date()
         fillsThisTick.removeAll()
-        defer { isTicking = false; tickStartedAt = nil; lastTickAt = Date() }
+        defer {
+            isTicking = false
+            tickStartedAt = nil
+            let finished = Date()
+            lastTickAt = finished
+            host.runnerDidCompleteTick(at: finished)
+        }
 
         let portfolio = host.portfolio
         let strategies = host.runnableStrategies

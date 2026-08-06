@@ -62,6 +62,9 @@ final class AppState {
 
     let demoLedger = StrategyLedger(mode: .demo)
     let liveLedger = StrategyLedger(mode: .live)
+    let heartbeatStore = HeartbeatStore(directory: ConfigIO.defaultDirectory())
+    /// When the engine last finished a full tick. Nil until the first one.
+    private(set) var lastCompletedTickAt: Date?
     let demoEquity = AccountEquityCurve(mode: .demo)
     let liveEquity = AccountEquityCurve(mode: .live)
     /// One curve per strategy, so a single-strategy backtest has something
@@ -495,6 +498,37 @@ extension AppState: StrategyRunnerHost {
         // The runner mutates observable state directly; this hook exists for
         // side effects that must not run inside the tick loop.
         saveLedger(tradingMode)
+    }
+
+    func runnerDidCompleteTick(at ts: Date) {
+        lastCompletedTickAt = ts
+        // Written to disk, not just held in memory: the question this answers
+        // is "was this app trading while I was not watching", and an in-memory
+        // value cannot answer it after a crash or a restart.
+        heartbeatStore.record(ts)
+    }
+
+    /// How long the trading loop has been silent, or nil when it has never run.
+    ///
+    /// Read from disk at launch, so a restart reports the gap it was away for
+    /// rather than starting the clock fresh — the gap is the whole point.
+    var heartbeatSilence: TimeInterval? {
+        guard let last = lastCompletedTickAt ?? heartbeatStore.load() else { return nil }
+        return Date().timeIntervalSince(last)
+    }
+
+    /// Set when the engine should be trading and demonstrably is not.
+    ///
+    /// A process that is alive but has stopped doing its job is the failure
+    /// mode that goes unnoticed: nothing errors, the panel keeps showing the
+    /// last numbers it had, and the account simply stops being managed.
+    var heartbeatWarning: String? {
+        guard store.config.strategy.allocations.contains(where: \.running),
+              !store.config.strategy.emergencyStop,
+              let silence = heartbeatSilence,
+              silence > StrategyRunner.heartbeatTimeout else { return nil }
+        let minutes = Int(silence / 60)
+        return "交易循环已 \(minutes) 分钟没有完成一次轮询，仓位当前无人管理"
     }
 
     func runnerDidSampleEquity(_ equity: Double, at ts: Date) {

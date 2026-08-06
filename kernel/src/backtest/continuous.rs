@@ -8,8 +8,8 @@
 //! which is what makes a turnover comparison meaningful.
 
 use super::{
-    bucket_funding, empty_result, BacktestConfig, BacktestResult, EquityPoint, ExitReason, Metrics,
-    Trade,
+    bucket_funding, empty_result, liquidation_buffer, utc_day, BacktestConfig, BacktestResult,
+    EquityPoint, ExitReason, Metrics, Trade,
 };
 use crate::candle::Candle;
 use crate::decide::{realised_volatility, volatility_scale, Direction};
@@ -78,8 +78,27 @@ pub fn run(
     let first_tradable = strategy.warmup_bars.min(candles.len() - 1);
     let threshold = manifest.risk.rebalance_threshold.max(0.0);
 
+    // The daily-loss breaker and the liquidation check apply here exactly as
+    // they do on the binary path. `decide_live` tests the breaker *before* it
+    // branches on exposure, so live already halts a continuous strategy that
+    // has bled through its limit; a simulation that did not would report
+    // returns from days the runner would have sat out.
+    let mut halted_day: Option<i64> = None;
+    let mut day = utc_day(candles[0].ts_ms);
+    let mut day_start_equity = config.initial_capital;
+    let mut liquidations = 0usize;
+
     for index in 0..candles.len() {
         let candle = candles[index];
+
+        if utc_day(candle.ts_ms) != day {
+            day = utc_day(candle.ts_ms);
+            day_start_equity =
+                equity + unrealised_for(quantity, average_price, candle.close, accrued_funding);
+            // Latched for the day only. Leaving it set would make the backtest
+            // decline trades the runner takes tomorrow.
+            halted_day = None;
+        }
 
         // --- 1. Execute the adjustment decided at the previous close.
         if let Some(target) = pending_target_quantity.take() {
@@ -171,8 +190,75 @@ pub fn run(
             }
         }
 
+        // --- 2b. Liquidation. A scaled position changes size every rebalance,
+        //         so the level is recomputed from what is currently held rather
+        //         than fixed at entry.
+        if quantity != 0.0 && leverage > 1.0 {
+            let buffer = liquidation_buffer(config.maintenance_margin_rate, leverage);
+            let level = if quantity > 0.0 {
+                average_price * (1.0 - buffer)
+            } else {
+                average_price * (1.0 + buffer)
+            };
+            let breached = if quantity > 0.0 {
+                candle.low <= level
+            } else {
+                candle.high >= level
+            };
+            if breached {
+                // Everything is lost at the liquidation price, and the
+                // exchange does not ask whether the bar closed better.
+                let realised = (level - average_price)
+                    * quantity.abs()
+                    * if quantity > 0.0 { 1.0 } else { -1.0 };
+                equity += realised;
+                let net = realised - accrued_fees - accrued_funding;
+                trades.push(Trade {
+                    id: trades.len() + 1,
+                    direction: if quantity > 0.0 { Direction::Long } else { Direction::Short },
+                    entry_ts,
+                    exit_ts: candle.ts_ms,
+                    entry_price: average_price,
+                    exit_price: level,
+                    quantity: quantity.abs(),
+                    notional: quantity.abs() * average_price,
+                    gross_pnl: realised,
+                    fees: accrued_fees,
+                    funding: accrued_funding,
+                    net_pnl: net,
+                    return_pct: if entry_equity > 0.0 { net / entry_equity * 100.0 } else { 0.0 },
+                    bars: index - entry_index,
+                    exit_reason: ExitReason::Liquidation,
+                });
+                liquidations += 1;
+                quantity = 0.0;
+                average_price = 0.0;
+                accrued_fees = 0.0;
+                accrued_funding = 0.0;
+                entry_equity = equity;
+                pending_target_quantity = None;
+            }
+        }
+
+        // --- 2c. Daily-loss breaker.
+        let marked = equity
+            + unrealised_for(quantity, average_price, candle.close, accrued_funding);
+        if let Some(limit) = manifest.risk.max_daily_loss_pct {
+            if halted_day.is_none()
+                && day_start_equity > 0.0
+                && (day_start_equity - marked) / day_start_equity * 100.0 >= limit
+            {
+                halted_day = Some(day);
+                // Stand the position down at this close, and take nothing else
+                // today. The runner does the same thing.
+                if quantity != 0.0 {
+                    pending_target_quantity = Some(0.0);
+                }
+            }
+        }
+
         // --- 3. Decide next bar's target exposure.
-        if index >= first_tradable && index + 1 < candles.len() {
+        if index >= first_tradable && index + 1 < candles.len() && halted_day.is_none() {
             let raw = raw_exposure[index];
             // Unknown means flat, never a guess.
             let target = if raw.is_nan() { 0.0 } else { raw };
@@ -278,7 +364,7 @@ pub fn run(
         final_equity: equity,
         trades,
         equity_curve,
-        liquidations: 0,
+        liquidations,
         warmup_bars: strategy.warmup_bars,
         data_quality: crate::quality::inspect(
             &candles, crate::strategy::bar_seconds(&manifest.market.bar), None),
@@ -286,4 +372,95 @@ pub fn run(
             && config.funding_rates.is_empty(),
         metrics,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::strategy::Manifest;
+
+    fn strategy(risk: &str, leverage: f64) -> CompiledStrategy {
+        let json = format!(
+            r#"{{"id":"c","name":"c","market":{{"instId":"BTC-USDT-SWAP","instType":"SWAP","bar":"1H"}},
+                 "signals":{{"exposure":"1"}},
+                 "sizing":{{"mode":"equityPct","value":100}},
+                 "risk":{{"leverage":{leverage},"rebalanceThreshold":0.001{risk}}}}}"#
+        );
+        let manifest: Manifest = serde_json::from_str(&json).unwrap();
+        CompiledStrategy::compile(manifest, &[]).unwrap()
+    }
+
+    /// A steady slide: enough to trip a daily-loss limit and, with leverage,
+    /// enough to liquidate.
+    fn falling(count: i64, per_bar: f64) -> Vec<Candle> {
+        (0..count)
+            .map(|i| {
+                let close = 100.0 * (1.0 - per_bar).powi(i as i32);
+                Candle {
+                    ts_ms: i * 3_600_000,
+                    open: close / (1.0 - per_bar),
+                    high: close / (1.0 - per_bar),
+                    low: close,
+                    close,
+                    volume: 1.0,
+                    confirmed: 1,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_daily_breaker_applies_to_a_scaled_position_too() {
+        // `decide_live` checks the limit before it branches on exposure, so
+        // live halts a continuous strategy that bleeds through it. A backtest
+        // that kept trading would report returns from days the runner sat out.
+        let bars = falling(60, 0.01);
+        let config = BacktestConfig::default();
+
+        let unguarded = run(&strategy("", 1.0), &bars, &config).unwrap();
+        let guarded = run(&strategy(r#","maxDailyLossPct":3"#, 1.0), &bars, &config).unwrap();
+
+        assert!(
+            guarded.final_equity > unguarded.final_equity,
+            "guarded {} vs unguarded {}",
+            guarded.final_equity,
+            unguarded.final_equity
+        );
+    }
+
+    #[test]
+    fn the_breaker_clears_at_the_utc_day_boundary() {
+        // Latched for the day only. A permanently halted backtest would refuse
+        // trades the runner takes tomorrow.
+        let bars = falling(200, 0.004);
+        let guarded = run(
+            &strategy(r#","maxDailyLossPct":2"#, 1.0),
+            &bars,
+            &BacktestConfig::default(),
+        )
+        .unwrap();
+        // More than one trade means it resumed after halting.
+        assert!(guarded.trades.len() > 1, "trades {}", guarded.trades.len());
+    }
+
+    #[test]
+    fn a_levered_scaled_position_can_be_liquidated() {
+        // Previously hard-coded to zero: a 5x continuous position could ride a
+        // 40% fall to the end of the backtest, which the exchange would never
+        // have permitted.
+        let bars = falling(80, 0.02);
+        let result = run(&strategy("", 5.0), &bars, &BacktestConfig::default()).unwrap();
+        assert!(result.liquidations > 0, "expected a liquidation");
+        assert!(result
+            .trades
+            .iter()
+            .any(|t| t.exit_reason == ExitReason::Liquidation));
+    }
+
+    #[test]
+    fn an_unlevered_position_is_never_liquidated() {
+        let bars = falling(80, 0.02);
+        let result = run(&strategy("", 1.0), &bars, &BacktestConfig::default()).unwrap();
+        assert_eq!(result.liquidations, 0);
+    }
 }

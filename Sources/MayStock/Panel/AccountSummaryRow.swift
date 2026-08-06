@@ -23,24 +23,33 @@ struct AccountSummaryRow: View {
     let change: (EquityWindow) -> EquityChange?
     /// Why the portfolio is refusing new exposure, when it is.
     var protection: String? = nil
+    /// Set when the trading loop has gone quiet while strategies are armed.
+    var heartbeat: String? = nil
     var onOpenStudio: () -> Void = {}
 
     /// A protective breaker the user cannot see is worth nothing — it would
     /// look like the strategies had simply stopped finding trades.
+    ///
+    /// A silent trading loop outranks it: a paused engine is a decision, while
+    /// a dead one is a position nobody is managing.
     @ViewBuilder
     private var protectionBanner: some View {
-        if let reason = protection {
+        if let reason = heartbeat ?? protection {
             HStack(spacing: 5) {
-                Image(systemName: "hand.raised.fill")
-                    .font(.system(size: 9)).foregroundStyle(.orange)
+                Image(systemName: heartbeat != nil
+                      ? "exclamationmark.triangle.fill" : "hand.raised.fill")
+                    .font(.system(size: 9))
+                    .foregroundStyle(heartbeat != nil ? ChartStyle.down : .orange)
                 Text(reason)
                     .font(.system(size: 9, weight: .medium))
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(heartbeat != nil ? ChartStyle.down : .orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
             .padding(.horizontal, 7).padding(.vertical, 4)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+            .background(
+                (heartbeat != nil ? ChartStyle.down : Color.orange).opacity(0.12),
+                in: RoundedRectangle(cornerRadius: 6))
         }
     }
 
