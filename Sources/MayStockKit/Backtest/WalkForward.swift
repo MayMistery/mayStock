@@ -210,10 +210,20 @@ public struct WalkForwardAnalysis: Sendable {
             return WalkForwardResult(
                 folds: [], stitchedEquity: [], stitchedMetrics: .empty,
                 objective: objective, totalTrials: 0,
-                warnings: ["历史长度不足以切成 \(folds) 折（每折至少需要 \(warmup + 40) 根 K 线）"])
+                warnings: ["历史长度不足以切成 \(folds) 折：策略预热需 \(warmup) 根，"
+                    + "每折至少要 \(warmup + 40) 根，而现有 \(candles.count) 根只够每折 \(perFold) 根。"
+                    + "用更长的历史、更少的折数，或缩短最长回看周期 —— "
+                    + "在此之前这个策略无法被走向前验证，这不是通过。"])
         }
 
         var completed: [WalkForwardFold] = []
+        // Counted so "zero folds" can say *why*. A strategy with a long
+        // lookback simply cannot be walk-forward validated on the history
+        // available, and reporting that as "insufficient data" makes it look
+        // like a data problem rather than a structural one — which is how two
+        // live strategies came to be deployed having never been validated at
+        // all.
+        var skippedForWarmup = 0
         var stitched: [EquityPoint] = []
         var runningEquity = config.initialCapital
         var trials = 0
@@ -223,7 +233,10 @@ public struct WalkForwardAnalysis: Sendable {
             let foldStart = index * perFold
             let foldEnd = Swift.min(foldStart + perFold, candles.count)
             let split = foldStart + Int(Double(foldEnd - foldStart) * inSampleFraction)
-            guard split - foldStart > warmup + 10, foldEnd - split > warmup + 10 else { continue }
+            guard split - foldStart > warmup + 10, foldEnd - split > warmup + 10 else {
+                skippedForWarmup += 1
+                continue
+            }
 
 
             // Purge, then embargo, then test.
@@ -240,7 +253,10 @@ public struct WalkForwardAnalysis: Sendable {
             // either side of a boundary still describe the same market.
             let embargo = Int(Double(perFold) * embargoFraction)
             let fitEnd = split - warmup - embargo
-            guard fitEnd - foldStart > warmup + 10 else { continue }
+            guard fitEnd - foldStart > warmup + 10 else {
+                skippedForWarmup += 1
+                continue
+            }
 
             let inSampleCandles = Array(candles[foldStart..<fitEnd])
             let outStart = Swift.max(split - warmup, 0)
@@ -283,10 +299,16 @@ public struct WalkForwardAnalysis: Sendable {
         }
 
         guard !completed.isEmpty else {
+            let diagnosis = skippedForWarmup > 0
+                ? "\(folds) 折全部无法评估：策略预热需 \(warmup) 根，而每折的样本外段只有约 "
+                    + "\(Int(Double(perFold) * (1 - inSampleFraction))) 根，装不下 "
+                    + "\(warmup + 10) 根的下限。用更长的历史、更少的折数，或缩短最长回看周期 —— "
+                    + "在此之前这个策略无法被走向前验证，这不是通过。"
+                : "没有任何一折能同时给出样本内最优与样本外结果"
             return WalkForwardResult(
                 folds: [], stitchedEquity: [], stitchedMetrics: .empty,
                 objective: objective, totalTrials: trials,
-                warnings: warnings + ["没有任何一折能同时给出样本内最优与样本外结果"])
+                warnings: warnings + [diagnosis])
         }
 
         let allTrades = completed.flatMap(\.outOfSampleTrades)

@@ -1268,3 +1268,74 @@ struct BacktestWindowLadderTests {
         #expect(BacktestWindow.headline == [.d1, .d7, .d30])
     }
 }
+
+// MARK: - Silence must never read as a pass
+
+struct ValidationHonestyTests {
+    private func strategy(slow: Int) throws -> CompiledStrategy {
+        let json = """
+        {"schema":1,"id":"slow","name":"Slow",
+         "market":{"instId":"BTC-USDT","instType":"SPOT","bar":"1D"},
+         "params":[{"name":"slow","default":\(slow),"min":\(slow - 10),"max":\(slow + 10)}],
+         "signals":{"longEntry":"close > sma(close, slow)",
+                    "longExit":"close < sma(close, slow)"},
+         "sizing":{"mode":"equityPct","value":100}}
+        """
+        return try JSONDecoder().decode(
+            StrategyManifest.self, from: Data(json.utf8)).compile()
+    }
+
+    private func candles(_ count: Int) -> [Candle] {
+        (0..<count).map { i in
+            let base = 100 + sin(Double(i) * 0.05) * 20 + Double(i) * 0.02
+            return Candle(ts: Date(timeIntervalSince1970: Double(i) * 86_400),
+                          open: base, high: base + 1, low: base - 1, close: base + 0.2,
+                          volume: 10, confirmed: true)
+        }
+    }
+
+    @Test("装不下的走向前会说清为什么，而不是含糊地「数据不足」")
+    func zeroFoldsExplainsItself() throws {
+        // A long lookback simply cannot be walk-forward validated on short
+        // history. Reporting that as "insufficient data" makes it look like a
+        // data problem rather than a structural one — which is how a strategy
+        // gets deployed having never been validated at all.
+        let result = WalkForwardAnalysis(
+            strategy: try strategy(slow: 365),
+            config: BacktestConfig(initialCapital: 10_000), folds: 4
+        ).run(candles: candles(600))
+
+        #expect(result.folds.isEmpty)
+        let explanation = result.warnings.joined()
+        #expect(explanation.contains("预热"), "it must name the warm-up as the cause")
+        #expect(explanation.contains("这不是通过"), "and refuse to be read as a pass")
+    }
+
+    @Test("历史够长时同一个策略是能验证的")
+    func enoughHistoryLetsItRun() throws {
+        // The counterpart: the message must be about this history, not a
+        // permanent verdict on the strategy.
+        let result = WalkForwardAnalysis(
+            strategy: try strategy(slow: 30),
+            config: BacktestConfig(initialCapital: 10_000), folds: 4
+        ).run(candles: candles(1_200))
+        #expect(!result.folds.isEmpty)
+    }
+
+    @Test("交易太少导致无法重采样时，报告要明说")
+    func anAbsentResampleIsStated() throws {
+        // Below ten trades the resample declines to run. It used to print
+        // nothing, and a validation run seeing no warning concludes it passed.
+        let sparse = BacktestMetrics.empty
+        let result = BacktestResult(
+            strategyId: "x", instId: "BTC-USDT", bar: .d1,
+            start: Date(timeIntervalSince1970: 0),
+            end: Date(timeIntervalSince1970: 86_400 * 100),
+            barCount: 100, initialCapital: 10_000, finalEquity: 10_500,
+            trades: [], equityCurve: [], liquidations: 0, warmupBars: 10,
+            fundingUnmodelled: false, metrics: sparse)
+        let assessment = RobustnessAssessment.evaluate(
+            results: [.full: result], bar: .d1, freeParameterCount: 1)
+        #expect(assessment.notes.contains { $0.contains("这不是通过") })
+    }
+}

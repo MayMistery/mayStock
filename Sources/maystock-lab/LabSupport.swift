@@ -181,6 +181,37 @@ enum Lab {
         return fetched
     }
 
+    /// Funding history for a perpetual, or an empty list for anything else.
+    ///
+    /// Extracted because `optimize` and `walkforward` did not fetch it at all,
+    /// so gates 1 and 2 scored perpetuals with no carry cost while gate 3 did —
+    /// three commands judging the same strategy under different economics. For
+    /// a short held across days, funding is not a rounding error.
+    static func fundingRates(
+        strategy: CompiledStrategy, candles: [Candle], days: Int,
+        rest: OKXRESTClient = OKXRESTClient()
+    ) async -> [FundingRate] {
+        guard strategy.market.instType == .swap, let first = candles.first else { return [] }
+        return (try? await rest.fundingRateHistory(
+            instId: strategy.market.instId, since: first.ts,
+            limit: days * 3 + 10)) ?? []
+    }
+
+    /// A backtest config with everything the manifest and the account imply —
+    /// external series, funding, fees. The one place these are assembled, so a
+    /// command cannot quietly omit one.
+    static func config(
+        strategy: CompiledStrategy, capital: Double, schedule: OKXFeeSchedule,
+        data: (candles: [Candle], series: [String: [Double]], coverage: [SeriesCoverage]),
+        days: Int
+    ) async -> BacktestConfig {
+        var config = BacktestConfig(
+            initialCapital: capital, feeSchedule: schedule, externalSeries: data.series)
+        config.fundingRates = await fundingRates(
+            strategy: strategy, candles: data.candles, days: days)
+        return config
+    }
+
     /// Candles plus every series the manifest declares, aligned and reported.
     static func fetchMarketData(
         strategy: CompiledStrategy, days: Int, rest: OKXRESTClient = OKXRESTClient()

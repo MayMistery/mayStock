@@ -124,14 +124,10 @@ struct LabMain {
         let data = try await Lab.fetchMarketData(strategy: strategy, days: days)
         let candles = data.candles
         Lab.reportCoverage(data.coverage, bar: strategy.market.bar, days: days)
-        var config = BacktestConfig(initialCapital: capital, feeSchedule: schedule,
-                                    externalSeries: data.series)
+        var config = await Lab.config(
+            strategy: strategy, capital: capital, schedule: schedule, data: data, days: days)
         config.scriptTargets = try await Lab.scriptTargets(
             strategy: strategy, candles: candles, series: data.series, arguments: arguments)
-        if strategy.market.instType == .swap, let first = candles.first {
-            config.fundingRates = (try? await OKXRESTClient().fundingRateHistory(
-                instId: strategy.market.instId, since: first.ts, limit: days * 3 + 10)) ?? []
-        }
 
         let result = try BacktestEngine(strategy: strategy, config: config).run(candles: candles)
         Out.kv("区间", "\(result.start.formatted(date: .numeric, time: .shortened))"
@@ -202,8 +198,11 @@ struct LabMain {
         let data = try await Lab.fetchMarketData(strategy: strategy, days: days)
         let candles = data.candles
         Lab.reportCoverage(data.coverage, bar: strategy.market.bar, days: days)
-        let config = BacktestConfig(initialCapital: capital, feeSchedule: schedule,
-                                    externalSeries: data.series)
+        let config = await Lab.config(
+            strategy: strategy, capital: capital, schedule: schedule, data: data, days: days)
+        if strategy.market.instType == .swap, config.fundingRates.isEmpty {
+            Out.warn("未取到资金费率历史，永续成本被低估 —— 寻优结果会偏乐观")
+        }
         let optimiser = StrategyOptimizer(strategy: strategy, config: config, objective: objective)
 
         let progress = ProgressTicker()
@@ -274,8 +273,11 @@ struct LabMain {
         let data = try await Lab.fetchMarketData(strategy: strategy, days: days)
         let candles = data.candles
         Lab.reportCoverage(data.coverage, bar: strategy.market.bar, days: days)
-        let config = BacktestConfig(initialCapital: capital, feeSchedule: schedule,
-                                    externalSeries: data.series)
+        let config = await Lab.config(
+            strategy: strategy, capital: capital, schedule: schedule, data: data, days: days)
+        if strategy.market.instType == .swap, config.fundingRates.isEmpty {
+            Out.warn("未取到资金费率历史，永续成本被低估 —— 验证结果会偏乐观")
+        }
         let analysis = WalkForwardAnalysis(
             strategy: strategy, config: config, objective: objective,
             folds: folds, inSampleFraction: inSample)
@@ -347,13 +349,9 @@ struct LabMain {
         for (index, strategy) in strategies.enumerated() {
             let data = try await Lab.fetchMarketData(strategy: strategy, days: days)
             let candles = data.candles
-            var config = BacktestConfig(
-                initialCapital: capital * weights[index], feeSchedule: schedule,
-                externalSeries: data.series)
-            if strategy.market.instType == .swap, let first = candles.first {
-                config.fundingRates = (try? await OKXRESTClient().fundingRateHistory(
-                    instId: strategy.market.instId, since: first.ts, limit: days * 3 + 10)) ?? []
-            }
+            let config = await Lab.config(
+                strategy: strategy, capital: capital * weights[index],
+                schedule: schedule, data: data, days: days)
             let result = try BacktestEngine(strategy: strategy, config: config).run(candles: candles)
             legs.append(PortfolioLeg(
                 strategyId: strategy.id, strategyName: strategy.name,

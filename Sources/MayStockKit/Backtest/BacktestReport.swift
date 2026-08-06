@@ -196,6 +196,15 @@ public struct RobustnessAssessment: Sendable, Equatable {
         // account against it means sizing against whichever ordering happened
         // to occur, so the distribution is always reported, not just when it
         // is alarming.
+        // Absence must be stated. A missing resample used to print nothing at
+        // all, which reads as "nothing to report" when it means "not enough
+        // trades to judge" — and a validation run that sees no warning
+        // concludes the strategy passed.
+        if primary.drawdownDistribution == nil {
+            notes.append(
+                "成交笔数不足（\(observed) 笔，重采样至少需要 10 笔），"
+                + "无法给出回撤分布 —— 这不是通过，是没测出来。")
+        }
         if let resampled = primary.drawdownDistribution {
             notes.append(
                 "换个成交顺序（\(resampled.iterations) 次重采样）：回撤中位 "
