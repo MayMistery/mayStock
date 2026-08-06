@@ -377,3 +377,55 @@ struct PerpetualContractSizingTests {
         #expect(ledger.position(for: "s")?.multiplier == 1, "never scale by zero")
     }
 }
+
+@Suite("Position sizing units")
+@MainActor
+struct PositionSizingUnitTests {
+    /// `submit(baseDelta:)` is denominated in coins and converts to contracts
+    /// itself, so every caller must hand it coins.
+    ///
+    /// The flatten and daily-loss paths passed `position.quantity`, which is
+    /// contracts. On the live book of 11.65 BTC-USDT-SWAP contracts that would
+    /// have submitted a sell for 11.65 *BTC* — a hundred times the position —
+    /// and an emergency stop is exactly when that must not happen.
+    @Test func flatteningUsesCoinsNotContracts() {
+        var state = StrategyPositionState(strategyId: "s", instId: "BTC-USDT-SWAP")
+        state.contractSize = 0.01
+        state.apply(StrategyFill(
+            id: "1", strategyId: "s", instId: "BTC-USDT-SWAP", side: .sell,
+            price: 64_769, quantity: 11.65, feeQuote: 0,
+            ts: Date(), clOrdId: nil, mode: .demo))
+
+        #expect(state.quantity == -11.65, "the ledger counts contracts")
+        #expect(abs(state.baseQuantity + 0.1165) < 1e-12, "orders are placed in coins")
+        // The distinction is a factor of 100 — the difference between closing
+        // a position and opening a much larger opposite one.
+        #expect(abs(state.quantity / state.baseQuantity) == 100)
+    }
+
+    /// A round trip through the instrument's own conversion must return the
+    /// contract count the exchange reported.
+    @Test func coinsRoundTripBackToContracts() {
+        let meta = InstrumentMeta(
+            instId: "BTC-USDT-SWAP", tickSize: 0.1, lotSize: 0.01,
+            minSize: 0.01, contractValue: 0.01)
+        var state = StrategyPositionState(strategyId: "s", instId: "BTC-USDT-SWAP")
+        state.contractSize = 0.01
+        state.apply(StrategyFill(
+            id: "1", strategyId: "s", instId: "BTC-USDT-SWAP", side: .sell,
+            price: 64_769, quantity: 11.65, feeQuote: 0,
+            ts: Date(), clOrdId: nil, mode: .demo))
+
+        let contracts = meta.exchangeSize(forBaseQuantity: abs(state.baseQuantity))
+        #expect(abs(contracts - 11.65) < 1e-9)
+    }
+
+    @Test func spotNeedsNoConversion() {
+        var state = StrategyPositionState(strategyId: "s", instId: "BTC-USDT")
+        state.apply(StrategyFill(
+            id: "1", strategyId: "s", instId: "BTC-USDT", side: .buy,
+            price: 64_769, quantity: 0.25, feeQuote: 0,
+            ts: Date(), clOrdId: nil, mode: .demo))
+        #expect(state.quantity == state.baseQuantity)
+    }
+}

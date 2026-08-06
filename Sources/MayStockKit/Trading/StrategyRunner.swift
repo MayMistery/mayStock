@@ -167,7 +167,11 @@ public final class StrategyRunner {
         guard let host,
               let strategy = host.runnableStrategies.first(where: { $0.id == strategyId }),
               let position = host.ledger.position(for: strategyId), !position.isFlat else { return }
-        await submit(baseDelta: -position.quantity, strategy: strategy, host: host, reason: "手动平仓")
+        // baseQuantity, not quantity: a swap position is counted in contracts, and
+        // submit() converts base units back into contracts itself. Passing
+        // contracts here would have tried to sell 11.65 BTC instead of 0.1165.
+        await submit(baseDelta: -position.baseQuantity, strategy: strategy, host: host,
+                     reason: "手动平仓")
     }
 
     /// Stop everything and flatten every open strategy position.
@@ -428,7 +432,8 @@ public final class StrategyRunner {
         if let limit = strategy.manifest.risk.maxDailyLossPct, anchor.equity > 0,
            (anchor.equity - equity) / anchor.equity * 100 >= limit {
             if let position, !position.isFlat {
-                await submit(baseDelta: -position.quantity, strategy: strategy, host: host, reason: "日内熔断")
+                await submit(baseDelta: -position.baseQuantity, strategy: strategy, host: host,
+                             reason: "日内熔断")
             }
             update(strategy.id) {
                 $0.status = .halted
@@ -478,11 +483,41 @@ public final class StrategyRunner {
             $0.targetDirection = target
         }
 
-        guard target != current else { return }
-
-        // --- Diff the target against what we actually hold.
         let price = latestBar.close
-        let held = position?.quantity ?? 0
+        // Held size in coins. The ledger counts swaps in contracts and
+        // `submit` converts coins back into contracts, so everything between
+        // here and there is denominated in coins.
+        let held = position?.baseQuantity ?? 0
+
+        // --- Continuous strategies hold a *scaled* position, so the target is
+        //     a fraction, not a direction. Sizing off the direction alone —
+        //     which this runner used to do — committed the whole budget
+        //     whatever the signal's conviction, so live ran an exposure the
+        //     backtest never modelled.
+        if let exposure = decision.targetExposure, price > 0, equity > 0 {
+            let manifestLeverage = strategy.manifest.market.instType.allowsLeverage
+                ? Swift.max(strategy.manifest.risk.leverage, 1) : 1
+            let leverage = Swift.min(manifestLeverage, allocation.leverageCap ?? manifestLeverage)
+            let desired = equity * exposure * leverage / price
+            let currentExposure = held * price / (equity * leverage)
+            let drift = abs(exposure - currentExposure)
+            // Rebalancing on every bar would churn fees away; the manifest's
+            // threshold is the same one the backtester honours.
+            let threshold = Swift.max(strategy.manifest.risk.rebalanceThreshold, 0)
+            guard drift >= threshold else {
+                update(strategy.id) {
+                    $0.message = "敞口 \(PriceFormatter.decimals(currentExposure, 3))"
+                        + " → 目标 \(PriceFormatter.decimals(exposure, 3))，未达再平衡阈值"
+                }
+                return
+            }
+            await submit(baseDelta: desired - held, strategy: strategy, host: host,
+                         reason: "敞口调整至 \(PriceFormatter.decimals(exposure, 3))")
+            return
+        }
+
+        // --- Binary strategies switch in and out.
+        guard target != current else { return }
         var desired = 0.0
         if let target {
             let notional = targetNotional(strategy: strategy, allocation: allocation,
@@ -570,8 +605,10 @@ public final class StrategyRunner {
             }
             notional = equity * (manifest.sizing.value / 100) / (stopPct / 100)
         case .volatilityTarget:
-            // The live runner is binary; continuous exposure is research-only
-            // until the runner can hold fractional targets.
+            // Only reachable from the binary path, which means the manifest
+            // asked for volatility targeting without declaring an exposure
+            // expression to scale. There is nothing to scale, so commit the
+            // budget — the continuous path above handles the real case.
             notional = equity * leverage
         }
         // Two hard ceilings: the strategy's own budget × leverage, and the
