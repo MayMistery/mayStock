@@ -47,11 +47,21 @@ public struct BacktestRunner: Sendable {
         strategy: CompiledStrategy,
         capital: Double = 10_000,
         windows: [BacktestWindow] = BacktestWindow.allCases,
+        /// Upper bound on the `.full` window, in days. Nil means "as much as
+        /// the exchange will serve". Callers that offer the user a `--days`
+        /// flag should pass it here, or the report silently covers a different
+        /// period from the backtest printed beside it.
+        maxDays: Int? = nil,
         onPhase: (@Sendable (BacktestPhase) -> Void)? = nil
     ) async throws -> StrategyBacktestReport {
         let market = strategy.market
         let barSeconds = market.bar.seconds
-        let longestDays = windows.map(\.days).max() ?? 30
+        // `.full` means "everything the caller asked for", which is the bar
+        // cap when they asked for no limit.
+        let capDays = Int(Double(Self.maxBars) * barSeconds / 86_400) + 1
+        let longestDays = windows.contains(where: \.coversEverything)
+            ? Swift.min(maxDays ?? capDays, capDays)
+            : (windows.map(\.days).max() ?? 30)
         let warmup = strategy.warmupBars
 
         let wantedBars = Int((Double(longestDays) * 86_400 / barSeconds).rounded(.up)) + warmup
@@ -97,8 +107,10 @@ public struct BacktestRunner: Sendable {
         var results: [BacktestWindow: BacktestResult] = [:]
         for window in windows.sorted(by: { $0.days < $1.days }) {
             onPhase?(.simulating(window))
-            let range = Self.sliceRange(candles, days: window.days,
-                                        warmup: warmup, end: lastCandle.ts)
+            let range = window.coversEverything
+                ? 0..<candles.count
+                : Self.sliceRange(candles, days: window.days,
+                                  warmup: warmup, end: lastCandle.ts)
             let slice = Array(candles[range])
             // A window needs at least the warm-up plus a couple of tradeable
             // bars before the simulation can say anything at all.

@@ -151,7 +151,7 @@ struct LabMain {
         // The multi-window view the app shows, for the same strategy.
         Out.heading("分窗口")
         let report = try await BacktestRunner(feeSchedule: schedule).run(
-            strategy: strategy, capital: capital)
+            strategy: strategy, capital: capital, maxDays: days)
         Out.row([("窗口", 8), ("日均", -10), ("总收益", -10), ("回撤", -9),
                  ("交易", -6), ("夏普", -7), ("买入持有", -10)])
         for window in BacktestWindow.allCases {

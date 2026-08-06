@@ -4,6 +4,19 @@ import Foundation
 
 public enum BacktestWindow: String, CaseIterable, Sendable, Identifiable, Codable, Hashable {
     case d1, d7, d30, d90, d365
+    /// Everything the caller asked for.
+    ///
+    /// Without this the ladder stopped at one year, and since the robustness
+    /// grade — including the Monte-Carlo resample and its loss probability —
+    /// is computed from the *longest* window present, every such verdict was a
+    /// judgement on the trailing 365 days no matter how much history was
+    /// requested. A 4H trend strategy makes eight to twelve trades a year, so
+    /// that was a resample of about ten trades from a single regime, and below
+    /// ten it silently declined to print at all.
+    ///
+    /// `--days 2000` and `--days 365` produced byte-identical robustness
+    /// blocks, which is how it went unnoticed.
+    case full
 
     public var id: String { rawValue }
 
@@ -14,8 +27,16 @@ public enum BacktestWindow: String, CaseIterable, Sendable, Identifiable, Codabl
         case .d30: return 30
         case .d90: return 90
         case .d365: return 365
+        // Deliberately not Int.max: the caller multiplies this by seconds per
+        // day to decide how many bars to fetch, and Int.max overflows that.
+        // `coversEverything` is the flag that actually means "no cutoff".
+        case .full: return 100_000
         }
     }
+
+    /// True for the window that means "all the history we were given" rather
+    /// than a fixed number of days.
+    public var coversEverything: Bool { self == .full }
 
     public var displayName: String {
         switch self {
@@ -24,6 +45,7 @@ public enum BacktestWindow: String, CaseIterable, Sendable, Identifiable, Codabl
         case .d30: return "30 日"
         case .d90: return "90 日"
         case .d365: return "1 年"
+        case .full: return "全样本"
         }
     }
 

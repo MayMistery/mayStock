@@ -1233,3 +1233,38 @@ struct WalkForwardEfficiencyTests {
         #expect(abs(efficiency - 0.5) < 1e-9)
     }
 }
+
+// MARK: - The robustness grade must judge everything it was given
+
+struct BacktestWindowLadderTests {
+    @Test("窗口阶梯里有「全样本」这一档")
+    func theLadderReachesTheWholeSample() {
+        // Without it the ladder stopped at one year, and the robustness grade —
+        // which takes the LONGEST window present — silently judged the trailing
+        // 365 days no matter how much history was requested. A 4H trend
+        // strategy makes 8-12 trades a year, so that was a resample of about
+        // ten trades from a single regime.
+        let longest = BacktestWindow.allCases.max { $0.days < $1.days }
+        #expect(longest == .full)
+        #expect(BacktestWindow.full.coversEverything)
+        #expect(BacktestWindow.d365.coversEverything == false)
+    }
+
+    @Test("全样本档的天数不会把取数算术撑爆")
+    func theFullWindowDoesNotOverflowTheBarArithmetic() {
+        // The caller multiplies days by seconds-per-day to size its fetch, so
+        // this cannot be Int.max — `coversEverything` is what carries the
+        // meaning, and the number just has to be large and finite.
+        let bars = Double(BacktestWindow.full.days) * 86_400 / BarInterval.h4.seconds
+        #expect(bars.isFinite)
+        #expect(BacktestWindow.full.days > BacktestWindow.d365.days)
+    }
+
+    @Test("全样本档不是头条窗口")
+    func theFullWindowIsNotAHeadline() {
+        // The panel shows 1/7/30 day returns; "since inception" is a different
+        // question and belongs in the robustness section, not the headline row.
+        #expect(BacktestWindow.full.isHeadline == false)
+        #expect(BacktestWindow.headline == [.d1, .d7, .d30])
+    }
+}
