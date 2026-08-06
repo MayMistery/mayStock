@@ -145,6 +145,16 @@ public struct OKXFeeSchedule: Codable, Sendable, Equatable {
     public var tier: OKXFeeTier
     public var executionStyle: FeeExecutionStyle
     /// Assumed adverse fill offset, in basis points, on top of the fee.
+    ///
+    /// Defaults to 1 bps, which is already generous: the measured bid-ask
+    /// spread on BTC-USDT-SWAP is 0.0155 bps (one tick, essentially always) and
+    /// this account's own book impact on real fills was 0.06–0.08 bps. See the
+    /// kernel's `default_slippage` for the full derivation.
+    ///
+    /// It was 5 for a long time, which charged eight basis points of imaginary
+    /// hurdle on every round trip and quietly failed strategies that were fine.
+    /// Replace it with `ms_calibrate_slippage` output once there are enough
+    /// fills to measure.
     public var slippageBps: Double
     /// Overrides fetched from the live account, in basis points.
     public var spotMakerOverrideBps: Double?
@@ -156,7 +166,7 @@ public struct OKXFeeSchedule: Codable, Sendable, Equatable {
     public init(
         tier: OKXFeeTier = .lv1,
         executionStyle: FeeExecutionStyle = .taker,
-        slippageBps: Double = 5,
+        slippageBps: Double = 1,
         spotMakerOverrideBps: Double? = nil,
         spotTakerOverrideBps: Double? = nil,
         swapMakerOverrideBps: Double? = nil,

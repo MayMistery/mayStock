@@ -367,6 +367,20 @@ public struct KernelSlippageReport: Decodable, Sendable, Equatable {
         return medianBps > assumedBps * 1.5
     }
 
+    /// True when the assumption is materially *worse* than reality.
+    ///
+    /// The mirror of the above, and worth reporting for the same reason. An
+    /// over-conservative slippage number does not produce a visible failure —
+    /// it produces strategies that are quietly discarded for missing a hurdle
+    /// that was never there. Slippage is charged twice per round trip, so an
+    /// assumption five times too high is eight basis points of imaginary cost
+    /// on every trade, which is more than the entire gross edge of most
+    /// short-horizon strategies.
+    public var overstatesCost: Bool {
+        guard let medianBps, samples >= 10 else { return false }
+        return assumedBps > Swift.max(medianBps, 0) * 2 + 0.5
+    }
+
     /// The figure to feed back into a backtest, or nil while the sample is too
     /// small to mean anything. Ten fills is not a lot, but it is enough to
     /// beat a number that was typed in.

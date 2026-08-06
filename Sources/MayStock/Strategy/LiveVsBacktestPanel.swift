@@ -71,6 +71,12 @@ struct LiveVsBacktestPanel: View {
             if report.understatesCost, let recommended = report.recommendedBps {
                 note("实际成本高于清单假设，回测收益被高估了。"
                      + "建议把 costs.slippageBps 改成 \(String(format: "%.0f", recommended))。")
+            } else if report.overstatesCost {
+                // The silent direction: nothing looks broken, strategies just
+                // fail to clear a hurdle that was never really there.
+                note("清单假设的滑点远高于实测。滑点每次往返收两遍，"
+                     + "假设偏高会让回测凭空多出一道门槛，把本来可行的策略默默毙掉。"
+                     + "建议按实测下调。")
             } else if report.samples < 10 {
                 note("成交样本还太少，这个数字先看看就好，不要拿去改回测。")
             }

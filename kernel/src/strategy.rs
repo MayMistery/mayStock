@@ -215,8 +215,33 @@ pub struct Costs {
     #[serde(rename = "slippageBps", default = "default_slippage")]
     pub slippage_bps: f64,
 }
+/// Adverse price move assumed on a market fill, per side, in basis points.
+///
+/// One, not five. Five was a number somebody typed, and it was wrong by more
+/// than an order of magnitude for the instruments this trades:
+///
+/// | component            | measured on BTC-USDT-SWAP |
+/// |----------------------|---------------------------|
+/// | bid-ask spread       | 0.0155 bps (one tick, and one tick essentially always) |
+/// | our own book impact  | 0.06–0.08 bps, from real fills on ~7,500 USDT orders |
+///
+/// The top of book holds 500+ contracts — several hundred thousand USDT — so an
+/// order this size does not move it. What remains is the drift between the bar
+/// close that produced the signal and the moment the order actually lands,
+/// which is roughly 1 bps unsigned over twenty seconds and has an expected
+/// value near zero because its direction is not ours to choose.
+///
+/// One basis point is therefore already generous: an order of magnitude above
+/// the measured spread and impact, with room for a thinner instrument or a
+/// disorderly minute. It is still an assumption, and `ms_calibrate_slippage`
+/// exists to replace it with this account's own fills.
+///
+/// Why this matters more than it looks: slippage is charged twice per round
+/// trip, so five versus one is eight basis points of hurdle on every trade a
+/// strategy makes. A sweep judged against the wrong hurdle discards good
+/// strategies silently, and that is the expensive direction of this error.
 fn default_slippage() -> f64 {
-    5.0
+    1.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
