@@ -406,7 +406,9 @@ final class AppState {
     private func loadLedgers() {
         for (mode, ledger) in [(TradingMode.demo, demoLedger), (.live, liveLedger)] {
             let payload = ledgerStore(mode).load()
-            ledger.replace(fills: payload.fills, positions: payload.positions)
+            ledger.replace(
+                fills: payload.fills, positions: payload.positions,
+                fundingIds: payload.fundingIds)
         }
         for (mode, curve) in [(TradingMode.demo, demoEquity), (.live, liveEquity)] {
             curve.replace(points: equityStore(mode).load())
@@ -425,7 +427,9 @@ final class AppState {
 
     private func saveLedger(_ mode: TradingMode) {
         let ledger = mode == .demo ? demoLedger : liveLedger
-        try? ledgerStore(mode).save(fills: ledger.fills, positions: ledger.positions)
+        try? ledgerStore(mode).save(
+            fills: ledger.fills, positions: ledger.positions,
+            fundingIds: ledger.recordedFundingIds)
     }
 
     private func equityStore(_ mode: TradingMode) -> AccountEquityStore {

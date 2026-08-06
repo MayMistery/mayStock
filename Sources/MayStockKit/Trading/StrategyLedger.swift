@@ -253,6 +253,17 @@ public final class StrategyLedger {
     public var recordedFillIds: Set<String> { Set(fills.map(\.id)) }
 
     /// Funding settlements already booked, by the exchange's bill id.
+    ///
+    /// Persisted with the rest of the book, and that is not a detail. Fills are
+    /// deduplicated against `recordedFillIds`, which is *derived* from the fills
+    /// on disk and so survives a restart for free. This set had no such backing
+    /// — it lived only in memory — while the exchange keeps serving the same
+    /// bills for days. Every relaunch therefore re-booked every settlement still
+    /// in the listing, and `fundingPaid` grew by a full history each time. The
+    /// account showed BTC +36.37 and ETH -77.90 against real bills of +2.73 and
+    /// -31.19: a carry cost inflated 13× and 2.5×, silently, with nothing
+    /// erroring. Idempotency that does not outlive the process is not
+    /// idempotency, it is a comment.
     public private(set) var recordedFundingIds: Set<String> = []
 
     /// Book a funding settlement against a strategy.
@@ -329,9 +340,14 @@ public final class StrategyLedger {
         onChanged?()
     }
 
-    public func replace(fills newFills: [StrategyFill], positions newPositions: [String: StrategyPositionState]) {
+    public func replace(
+        fills newFills: [StrategyFill],
+        positions newPositions: [String: StrategyPositionState],
+        fundingIds: Set<String> = []
+    ) {
         fills = newFills
         positions = newPositions
+        recordedFundingIds = fundingIds
     }
 
     /// Rebuild every position by replaying the stored fills — the recovery path
@@ -401,23 +417,36 @@ public struct StrategyLedgerStore: Sendable {
     private struct Payload: Codable {
         var fills: [StrategyFill]
         var positions: [String: StrategyPositionState]
+        /// Bill ids of funding already booked. Sorted on the way out so the
+        /// file does not churn between saves for no reason.
+        var fundingIds: [String]?
     }
 
-    public func load() -> (fills: [StrategyFill], positions: [String: StrategyPositionState]) {
-        guard let data = try? Data(contentsOf: fileURL) else { return ([], [:]) }
+    public typealias Snapshot = (
+        fills: [StrategyFill],
+        positions: [String: StrategyPositionState],
+        fundingIds: Set<String>)
+
+    public func load() -> Snapshot {
+        guard let data = try? Data(contentsOf: fileURL) else { return ([], [:], []) }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        guard let payload = try? decoder.decode(Payload.self, from: data) else { return ([], [:]) }
-        return (payload.fills, payload.positions)
+        guard let payload = try? decoder.decode(Payload.self, from: data) else { return ([], [:], []) }
+        return (payload.fills, payload.positions, Set(payload.fundingIds ?? []))
     }
 
-    public func save(fills: [StrategyFill], positions: [String: StrategyPositionState]) throws {
+    public func save(
+        fills: [StrategyFill],
+        positions: [String: StrategyPositionState],
+        fundingIds: Set<String> = []
+    ) throws {
         try FileManager.default.createDirectory(
             at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
-        let data = try encoder.encode(Payload(fills: fills, positions: positions))
+        let data = try encoder.encode(Payload(
+            fills: fills, positions: positions, fundingIds: fundingIds.sorted()))
         try data.write(to: fileURL, options: .atomic)
     }
 }

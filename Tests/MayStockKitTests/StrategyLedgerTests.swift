@@ -429,3 +429,76 @@ struct PositionSizingUnitTests {
         #expect(state.quantity == state.baseQuantity)
     }
 }
+
+// MARK: - Funding
+
+@Suite("资金费入账")
+@MainActor
+struct LedgerFundingTests {
+    private func payment(_ id: String, _ amount: Double) -> FundingPayment {
+        FundingPayment(
+            id: id, instId: "ETH-USDT-SWAP", amount: amount, ccy: "USDT",
+            ts: Date(timeIntervalSince1970: 1_770_000_000))
+    }
+
+    private func ledgerHoldingAPosition() -> StrategyLedger {
+        let ledger = StrategyLedger(mode: .demo)
+        ledger.record(StrategyFill(
+            id: "f1", strategyId: "eth-short", instId: "ETH-USDT-SWAP", side: .sell,
+            price: 1_919.58, quantity: 40, feeQuote: 0,
+            ts: Date(timeIntervalSince1970: 1_770_000_000), clOrdId: nil, mode: .demo))
+        return ledger
+    }
+
+    @Test func theSameBillIsOnlyBookedOnce() {
+        let ledger = ledgerHoldingAPosition()
+        #expect(ledger.recordFunding(payment("b1", -32.24), strategyId: "eth-short"))
+        #expect(!ledger.recordFunding(payment("b1", -32.24), strategyId: "eth-short"))
+        #expect(ledger.position(for: "eth-short")?.fundingPaid == -32.24)
+    }
+
+    /// The bug this exists to prevent, and it cost real accuracy: the dedup set
+    /// lived only in memory while the exchange kept serving the same bills for
+    /// days, so every relaunch re-booked the whole visible history. The demo
+    /// book read BTC +36.37 / ETH -77.90 against real bills of +2.73 / -31.19 —
+    /// a carry cost inflated 13× and 2.5×, with nothing erroring. Idempotency
+    /// that does not survive a restart is not idempotency.
+    @Test func bookedBillsSurviveARestart() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = StrategyLedgerStore(directory: directory, mode: .demo)
+
+        let before = ledgerHoldingAPosition()
+        before.recordFunding(payment("b1", -0.76), strategyId: "eth-short")
+        before.recordFunding(payment("b2", -0.28), strategyId: "eth-short")
+        before.recordFunding(payment("b3", -32.24), strategyId: "eth-short")
+        try store.save(
+            fills: before.fills, positions: before.positions,
+            fundingIds: before.recordedFundingIds)
+
+        // Relaunch, then poll again: the exchange still lists all three bills.
+        let payload = store.load()
+        let after = StrategyLedger(mode: .demo)
+        after.replace(
+            fills: payload.fills, positions: payload.positions, fundingIds: payload.fundingIds)
+        for bill in [("b1", -0.76), ("b2", -0.28), ("b3", -32.24)] {
+            #expect(!after.recordFunding(payment(bill.0, bill.1), strategyId: "eth-short"))
+        }
+        #expect(abs((after.position(for: "eth-short")?.fundingPaid ?? 0) - -33.28) < 1e-9)
+    }
+
+    /// A ledger written before the field existed decodes to an empty set. That
+    /// is honest — we genuinely do not know what it booked — so the first poll
+    /// after upgrading may still double-count once. It cannot recur.
+    @Test func aLedgerWithoutTheFieldStillLoads() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = StrategyLedgerStore(directory: directory, mode: .demo)
+        try Data(#"{"fills":[],"positions":{}}"#.utf8).write(to: store.fileURL)
+        #expect(store.load().fundingIds.isEmpty)
+    }
+}
