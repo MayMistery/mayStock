@@ -165,7 +165,8 @@ struct TimeWeightedDrawdownTests {
             (3, 20_000, 20_000),
         ])
         #expect(PortfolioReview.drawdownPct(points)! > 49)   // the naive reading
-        guard case .value(let drawdown) = PortfolioReview.timeWeightedDrawdownPct(points) else {
+        guard case .value(let drawdown, _, _) = PortfolioReview.timeWeightedDrawdownPct(points)
+        else {
             Issue.record("应当能算出来")
             return
         }
@@ -182,7 +183,8 @@ struct TimeWeightedDrawdownTests {
             (2, 38_000, 40_000),   // -6,000 off a 44,000 peak
             (3, 40_000, 40_000),
         ])
-        guard case .value(let drawdown) = PortfolioReview.timeWeightedDrawdownPct(points) else {
+        guard case .value(let drawdown, _, _) = PortfolioReview.timeWeightedDrawdownPct(points)
+        else {
             Issue.record("应当能算出来")
             return
         }
@@ -201,7 +203,8 @@ struct TimeWeightedDrawdownTests {
             (2, 18_000, 20_000),   // budget halved; P&L still -4,000... but now -2,000
             (3, 18_000, 20_000),
         ])
-        guard case .value(let drawdown) = PortfolioReview.timeWeightedDrawdownPct(points) else {
+        guard case .value(let drawdown, _, _) = PortfolioReview.timeWeightedDrawdownPct(points)
+        else {
             Issue.record("应当能算出来")
             return
         }
@@ -212,17 +215,54 @@ struct TimeWeightedDrawdownTests {
     /// Unknown must stay unknown. A missing basis is not zero, and not the
     /// previous value carried forward — a risk limit compared against a guess
     /// is worse than no limit at all, because it looks like one.
-    @Test func missingBasisReportsUnknownRatherThanANumber() {
+    @Test func tooLittleBasisReportsUnknownRatherThanANumber() {
         let points = curve([
             (0, 40_000, 40_000),
             (1, 20_000, nil),
-            (2, 20_000, 20_000),
+            (2, 20_000, 20_000),      // only one usable point at the tail
         ])
         guard case .unknown(let why) = PortfolioReview.timeWeightedDrawdownPct(points) else {
             Issue.record("缺基准时不该给出一个数")
             return
         }
         #expect(why.contains("基准"))
+    }
+
+    /// Legacy points are skipped, not fatal: a curve holds thirty days, and
+    /// refusing to look at anything until the last basis-less point ages out
+    /// would leave the halt rule blind for a month.
+    @Test func legacyPointsAreSkippedRatherThanPoisoningTheReading() {
+        let points = curve([
+            (0, 99_999, nil),         // written before `basis` existed
+            (1, 99_999, nil),
+            (2, 40_000, 40_000),
+            (3, 44_000, 40_000),
+            (4, 38_000, 40_000),
+        ])
+        guard case .value(let drawdown, let from, let samples) =
+            PortfolioReview.timeWeightedDrawdownPct(points)
+        else {
+            Issue.record("尾部有三个带基准的点，应当能算")
+            return
+        }
+        #expect(samples == 3)
+        #expect(from == at(2))
+        #expect(abs(drawdown - 13.636) < 0.01)
+    }
+
+    /// The span travels with the number. Two hours of drawdown and two months
+    /// of it are different claims, and a caller that cannot tell them apart
+    /// will eventually enforce a limit on the first as if it were the second.
+    @Test func theReadingCarriesHowMuchHistoryItSaw() {
+        let points = curve([(0, 40_000, 40_000), (1, 40_000, 40_000)])
+        guard case .value(_, let from, let samples) =
+            PortfolioReview.timeWeightedDrawdownPct(points)
+        else {
+            Issue.record("应当能算出来")
+            return
+        }
+        #expect(from == at(0))
+        #expect(samples == 2)
     }
 }
 
