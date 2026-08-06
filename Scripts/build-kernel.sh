@@ -8,6 +8,13 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PROFILE="${1:-release}"
+# Anything else lands as a directory name inside the staging path below and
+# fails several steps later with a confusing `cp: No such file` — including on
+# the obvious `--release`, which is cargo's spelling but not this script's.
+if [[ "$PROFILE" != "release" && "$PROFILE" != "debug" ]]; then
+  echo "usage: $0 [release|debug]  (got '$PROFILE')" >&2
+  exit 2
+fi
 export MACOSX_DEPLOYMENT_TARGET="15.0"
 export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.cargo/bin:$PATH"
 

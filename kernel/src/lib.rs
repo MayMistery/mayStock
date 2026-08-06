@@ -16,6 +16,7 @@ pub mod candle;
 pub mod decide;
 pub mod expr;
 pub mod ffi;
+pub mod reconcile;
 pub mod series;
 pub mod sizing;
 pub mod strategy;

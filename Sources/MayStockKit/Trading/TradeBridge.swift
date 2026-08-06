@@ -437,6 +437,71 @@ public struct TradeBridge: Sendable {
         return Self.parseFills(json: output)
     }
 
+    // MARK: Protective orders
+
+    /// Stops and take-profits the exchange is currently holding.
+    ///
+    /// `--ordType conditional,oco` covers both the single stop attached to an
+    /// entry and the paired stop/target; anything else in the algo book (grid
+    /// bots, TWAP) is somebody else's and is not reported here.
+    public func protectiveOrders(
+        instId: String, instType: InstrumentType, mode: TradingMode
+    ) async throws -> [VenueProtectiveOrder] {
+        let module = instType == .swap ? "swap" : "spot"
+        let output = try await runCLI(
+            [module, "algo", "orders", "--instId", instId], mode: mode)
+        return Self.parseProtectiveOrders(json: output, instId: instId)
+    }
+
+    static func parseProtectiveOrders(json: String, instId: String) -> [VenueProtectiveOrder] {
+        var found: [VenueProtectiveOrder] = []
+        walkObjects(in: json) { dict in
+            guard let algoId = dict["algoId"] as? String, !algoId.isEmpty,
+                  (dict["instId"] as? String) == instId else { return }
+            let stop = number(dict, "slTriggerPx")
+            let target = number(dict, "tpTriggerPx")
+            // An algo order with neither leg is not protecting anything.
+            guard stop != nil || target != nil else { return }
+            found.append(VenueProtectiveOrder(
+                algoId: algoId, instId: instId,
+                stopTriggerPrice: stop, takeProfitTriggerPrice: target,
+                size: number(dict, "sz") ?? 0,
+                posSide: (dict["posSide"] as? String).flatMap(PositionSide.init(rawValue:))))
+        }
+        return found
+    }
+
+    /// Move an existing stop's trigger price, leaving everything else alone.
+    public func amendProtectiveOrder(
+        instId: String, instType: InstrumentType, algoId: String,
+        stopPrice: Double, mode: TradingMode, liveUnlocked: Bool = false
+    ) async throws {
+        if mode == .live && !liveUnlocked { throw TradeError.liveTradingLocked }
+        let module = instType == .swap ? "swap" : "spot"
+        _ = try await runCLI(
+            [module, "algo", "amend", "--instId", instId, "--algoId", algoId,
+             "--newSlTriggerPx", PriceFormatter.plain(stopPrice), "--newSlOrdPx", "-1"],
+            mode: mode)
+    }
+
+    /// Attach a standalone reduce-only stop to a position that has none.
+    public func placeProtectiveOrder(
+        instId: String, instType: InstrumentType, posSide: PositionSide?,
+        size: Double, stopPrice: Double, mode: TradingMode, liveUnlocked: Bool = false
+    ) async throws {
+        if mode == .live && !liveUnlocked { throw TradeError.liveTradingLocked }
+        let module = instType == .swap ? "swap" : "spot"
+        // The order that closes a long is a sell, and vice versa.
+        let side: OrderSide = posSide == .short ? .buy : .sell
+        var args = [module, "algo", "place", "--instId", instId,
+                    "--side", side.rawValue, "--sz", PriceFormatter.plain(size),
+                    "--ordType", "conditional",
+                    "--slTriggerPx", PriceFormatter.plain(stopPrice),
+                    "--slOrdPx", "-1", "--reduceOnly"]
+        if let posSide, instType == .swap { args += ["--posSide", posSide.rawValue] }
+        _ = try await runCLI(args, mode: mode)
+    }
+
     /// This account's actual fee rates. The published tier table is a good
     /// default, but promotions, OKB discounts and sub-account terms all move
     /// the real number — so when credentials exist, ask.

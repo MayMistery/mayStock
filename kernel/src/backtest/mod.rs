@@ -376,28 +376,23 @@ pub fn run(
         //        look-ahead: the level updated here only governs *later* bars.
         if let Some(existing) = position.as_mut() {
             if let Some(trail_pct) = manifest.risk.trailing_stop_pct {
-                let anchor = existing.trail_anchor.unwrap_or(existing.entry_price);
-                let updated = if existing.direction == Direction::Long {
-                    anchor.max(candle.high)
-                } else {
-                    anchor.min(candle.low)
-                };
+                // The same three functions the live runner calls, so a stop
+                // that trails in simulation trails to the same price in
+                // production.
+                let updated = crate::sizing::trail_anchor(
+                    existing.direction,
+                    existing.trail_anchor.unwrap_or(existing.entry_price),
+                    &[candle.high],
+                    &[candle.low],
+                );
                 existing.trail_anchor = Some(updated);
-                let trail_stop = if existing.direction == Direction::Long {
-                    updated * (1.0 - trail_pct / 100.0)
-                } else {
-                    updated * (1.0 + trail_pct / 100.0)
-                };
-                existing.stop_price = Some(match existing.stop_price {
-                    Some(current) => {
-                        if existing.direction == Direction::Long {
-                            current.max(trail_stop)
-                        } else {
-                            current.min(trail_stop)
-                        }
-                    }
-                    None => trail_stop,
-                });
+                let level =
+                    crate::sizing::trailing_stop_level(existing.direction, updated, trail_pct);
+                existing.stop_price = Some(crate::sizing::ratchet_stop(
+                    existing.direction,
+                    existing.stop_price,
+                    level,
+                ));
             }
         }
 

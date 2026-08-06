@@ -65,6 +65,57 @@ public protocol ExchangeVenue: Sendable {
     func positions(mode: TradingMode, instType: InstrumentType) async throws -> [ExchangePosition]
 
     func accountSnapshot(mode: TradingMode) async throws -> AccountSnapshot
+
+    // MARK: Protective orders
+
+    /// The stop and take-profit orders the exchange is currently holding.
+    ///
+    /// Read rather than remembered: an app that has just restarted, or that was
+    /// closed while a stop moved, has no business guessing what the exchange is
+    /// enforcing on its behalf.
+    func protectiveOrders(
+        instId: String, instType: InstrumentType, mode: TradingMode
+    ) async throws -> [VenueProtectiveOrder]
+
+    /// Move an existing protective order's trigger price.
+    ///
+    /// Amending beats cancel-and-replace: a cancelled stop leaves the position
+    /// unprotected for as long as the replacement takes to land, which is
+    /// precisely the window a fast move exploits.
+    func amendProtectiveOrder(
+        instId: String, instType: InstrumentType, algoId: String,
+        stopPrice: Double, mode: TradingMode, liveUnlocked: Bool
+    ) async throws
+
+    /// Attach a standalone reduce-only stop to a position that has none.
+    func placeProtectiveOrder(
+        instId: String, instType: InstrumentType, posSide: PositionSide?,
+        size: Double, stopPrice: Double, mode: TradingMode, liveUnlocked: Bool
+    ) async throws
+}
+
+/// A stop or take-profit the exchange is holding for us.
+public struct VenueProtectiveOrder: Sendable, Equatable, Identifiable {
+    public let algoId: String
+    public let instId: String
+    public let stopTriggerPrice: Double?
+    public let takeProfitTriggerPrice: Double?
+    public let size: Double
+    public let posSide: PositionSide?
+
+    public var id: String { algoId }
+
+    public init(
+        algoId: String, instId: String, stopTriggerPrice: Double?,
+        takeProfitTriggerPrice: Double?, size: Double, posSide: PositionSide?
+    ) {
+        self.algoId = algoId
+        self.instId = instId
+        self.stopTriggerPrice = stopTriggerPrice
+        self.takeProfitTriggerPrice = takeProfitTriggerPrice
+        self.size = size
+        self.posSide = posSide
+    }
 }
 
 extension ExchangeVenue {

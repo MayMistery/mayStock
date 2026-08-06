@@ -64,6 +64,11 @@ final class AppState {
     let liveLedger = StrategyLedger(mode: .live)
     let demoEquity = AccountEquityCurve(mode: .demo)
     let liveEquity = AccountEquityCurve(mode: .live)
+    /// One curve per strategy, so a single-strategy backtest has something
+    /// like-for-like to be compared against. The account curve mixes every
+    /// strategy together and cannot answer "did *this* one track its test".
+    var demoStrategyEquity: [String: AccountEquityCurve] = [:]
+    var liveStrategyEquity: [String: AccountEquityCurve] = [:]
 
     @ObservationIgnored private(set) var runner: StrategyRunner!
     @ObservationIgnored private(set) var panel: HoverPanelController!
@@ -155,6 +160,12 @@ final class AppState {
     var liveTradingUnlocked: Bool { store.config.trading.liveTradingUnlocked }
     var ledger: StrategyLedger { tradingMode == .demo ? demoLedger : liveLedger }
     var equityCurve: AccountEquityCurve { tradingMode == .demo ? demoEquity : liveEquity }
+    var strategyEquityCurves: [String: AccountEquityCurve] {
+        tradingMode == .demo ? demoStrategyEquity : liveStrategyEquity
+    }
+    func strategyEquity(_ strategyId: String) -> AccountEquityCurve? {
+        strategyEquityCurves[strategyId]
+    }
 
     /// Live account equity in USDT, sampled by the runner.
     var accountEquity: Double? { runner.accountEquity }
@@ -365,6 +376,16 @@ final class AppState {
         for (mode, curve) in [(TradingMode.demo, demoEquity), (.live, liveEquity)] {
             curve.replace(points: equityStore(mode).load())
         }
+        for mode in [TradingMode.demo, TradingMode.live] {
+            var curves: [String: AccountEquityCurve] = [:]
+            for (strategyId, points) in strategyEquityStore(mode).loadByStrategy() {
+                let curve = AccountEquityCurve(mode: mode)
+                curve.replace(points: points)
+                curve.onChanged = { [weak self] in self?.saveStrategyEquity(mode) }
+                curves[strategyId] = curve
+            }
+            if mode == .demo { demoStrategyEquity = curves } else { liveStrategyEquity = curves }
+        }
     }
 
     private func saveLedger(_ mode: TradingMode) {
@@ -379,6 +400,16 @@ final class AppState {
     private func saveEquity(_ mode: TradingMode) {
         let curve = mode == .demo ? demoEquity : liveEquity
         try? equityStore(mode).save(curve.points)
+    }
+
+    private func strategyEquityStore(_ mode: TradingMode) -> AccountEquityStore {
+        AccountEquityStore(
+            directory: ConfigIO.defaultDirectory(), mode: mode, perStrategy: true)
+    }
+
+    private func saveStrategyEquity(_ mode: TradingMode) {
+        let curves = mode == .demo ? demoStrategyEquity : liveStrategyEquity
+        try? strategyEquityStore(mode).save(byStrategy: curves.mapValues(\.points))
     }
 
     // MARK: Shell hooks
@@ -440,6 +471,20 @@ extension AppState: StrategyRunnerHost {
         // The curve is per mode; the runner only ever samples the active one.
         equityCurve.record(equity: equity, at: ts)
         accountBalances = runner.accountBalances
+    }
+
+    func runnerDidSampleStrategyEquity(_ strategyId: String, equity: Double, at ts: Date) {
+        let mode = tradingMode
+        let curve: AccountEquityCurve
+        if let existing = strategyEquityCurves[strategyId] {
+            curve = existing
+        } else {
+            curve = AccountEquityCurve(mode: mode)
+            curve.onChanged = { [weak self] in self?.saveStrategyEquity(mode) }
+            if mode == .demo { demoStrategyEquity[strategyId] = curve }
+            else { liveStrategyEquity[strategyId] = curve }
+        }
+        curve.record(equity: equity, at: ts)
     }
 
     func runnerDidHalt(strategyId: String, reason: String) {

@@ -84,6 +84,7 @@ char *ms_strategy_decide(const MSStrategy *handle,
                          double leverage_cap,   /* negative = no portfolio cap */
                          int64_t bars_since_exit, /* negative = never held one */
                          bool halted_today,
+                         double entry_price,    /* 0 = flat; seeds the trail */
                          char **error_out);
 
 /* --- backtest -------------------------------------------------------- */
@@ -100,6 +101,15 @@ char *ms_backtest_run(const MSStrategy *handle,
  * need the same statistics). Request JSON carries equityCurve, trades,
  * initialCapital, bar and freeParameterCount. Caller frees. */
 char *ms_metrics_compute(const char *request_json, char **error_out);
+
+/* What slippage the account actually pays, measured from real fills against the
+ * open of the bar each one landed in. Request JSON carries fills, candles and
+ * assumedBps. Caller frees. */
+char *ms_calibrate_slippage(const char *request_json, char **error_out);
+
+/* How far the live equity curve has drifted from the backtest that justified
+ * it. Request JSON carries live and backtest sample arrays. Caller frees. */
+char *ms_compare_equity(const char *request_json, char **error_out);
 
 /* Evaluate one DSL expression over the candles; returns a JSON array where
  * warm-up NaNs are null. Caller frees. */

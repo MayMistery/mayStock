@@ -53,6 +53,30 @@ final class FakeVenue: ExchangeVenue, @unchecked Sendable {
     func accountSnapshot(mode: TradingMode) async throws -> AccountSnapshot {
         AccountSnapshot(balances: [], totalEquity: 1_000)
     }
+
+    // MARK: Protective orders
+
+    var protectiveResult: [VenueProtectiveOrder] = []
+    var amended: [(algoId: String, stopPrice: Double)] = []
+    var placedProtective: [(size: Double, stopPrice: Double)] = []
+
+    func protectiveOrders(
+        instId: String, instType: InstrumentType, mode: TradingMode
+    ) async throws -> [VenueProtectiveOrder] { protectiveResult }
+
+    func amendProtectiveOrder(
+        instId: String, instType: InstrumentType, algoId: String,
+        stopPrice: Double, mode: TradingMode, liveUnlocked: Bool
+    ) async throws {
+        amended.append((algoId, stopPrice))
+    }
+
+    func placeProtectiveOrder(
+        instId: String, instType: InstrumentType, posSide: PositionSide?,
+        size: Double, stopPrice: Double, mode: TradingMode, liveUnlocked: Bool
+    ) async throws {
+        placedProtective.append((size, stopPrice))
+    }
 }
 
 @MainActor
@@ -71,6 +95,10 @@ final class FakeHost: StrategyRunnerHost {
         halts.append((strategyId, reason))
     }
     func runnerDidSampleEquity(_ equity: Double, at ts: Date) {}
+    var strategyEquitySamples: [(strategyId: String, equity: Double)] = []
+    func runnerDidSampleStrategyEquity(_ strategyId: String, equity: Double, at ts: Date) {
+        strategyEquitySamples.append((strategyId, equity))
+    }
 }
 
 // MARK: - Fixtures
@@ -346,5 +374,120 @@ struct PositionOpenedAtTests {
         StrategyFill(
             id: UUID().uuidString, strategyId: "alpha", instId: instId, side: side,
             price: 100, quantity: quantity, feeQuote: 0, ts: ts, clOrdId: nil, mode: .demo)
+    }
+}
+
+// MARK: - Protective order parsing
+
+struct ProtectiveOrderParsingTests {
+    @Test("从 algo orders 输出里读出止损单")
+    func aStopIsFound() {
+        let json = """
+        {"data":[{"algoId":"9001","instId":"BTC-USDT-SWAP","slTriggerPx":"58000",
+                  "slOrdPx":"-1","sz":"10","posSide":"long","state":"live"}]}
+        """
+        let orders = TradeBridge.parseProtectiveOrders(json: json, instId: "BTC-USDT-SWAP")
+        #expect(orders.count == 1)
+        #expect(orders.first?.algoId == "9001")
+        #expect(orders.first?.stopTriggerPrice == 58_000)
+        #expect(orders.first?.posSide == .long)
+    }
+
+    @Test("别的合约的算法单不算数")
+    func anotherInstrumentIsIgnored() {
+        let json = """
+        {"data":[{"algoId":"9002","instId":"ETH-USDT-SWAP","slTriggerPx":"3000","sz":"1"}]}
+        """
+        #expect(TradeBridge.parseProtectiveOrders(
+            json: json, instId: "BTC-USDT-SWAP").isEmpty)
+    }
+
+    @Test("两条腿都没有的算法单不保护任何东西")
+    func anOrderWithNeitherLegIsNotProtective() {
+        // Grid bots and TWAP legs live in the same algo book; they are not stops.
+        let json = """
+        {"data":[{"algoId":"9003","instId":"BTC-USDT-SWAP","sz":"10","ordType":"twap"}]}
+        """
+        #expect(TradeBridge.parseProtectiveOrders(
+            json: json, instId: "BTC-USDT-SWAP").isEmpty)
+    }
+
+    @Test("止盈腿也读得出来")
+    func aTakeProfitLegIsRead() {
+        let json = """
+        {"data":[{"algoId":"9004","instId":"BTC-USDT-SWAP","tpTriggerPx":"72000","sz":"10"}]}
+        """
+        let orders = TradeBridge.parseProtectiveOrders(json: json, instId: "BTC-USDT-SWAP")
+        #expect(orders.first?.takeProfitTriggerPrice == 72_000)
+        #expect(orders.first?.stopTriggerPrice == nil)
+    }
+}
+
+// MARK: - Kernel bridge for the live/backtest comparison
+
+struct LiveVsBacktestBridgeTests {
+    private let instId = "BTC-USDT-SWAP"
+
+    private func candle(_ ts: TimeInterval, open: Double) -> Candle {
+        Candle(ts: Date(timeIntervalSince1970: ts), open: open, high: open + 5,
+               low: open - 5, close: open, volume: 1, confirmed: true)
+    }
+
+    private func fill(_ ts: TimeInterval, price: Double, side: OrderSide) -> StrategyFill {
+        StrategyFill(
+            id: UUID().uuidString, strategyId: "alpha", instId: instId, side: side,
+            price: price, quantity: 1, feeQuote: 0,
+            ts: Date(timeIntervalSince1970: ts), clOrdId: nil, mode: .demo)
+    }
+
+    @Test("滑点经过 FFI 往返后仍是同一个数")
+    func slippageRoundTrips() throws {
+        let report = try TradingKernel.calibrateSlippage(
+            fills: [fill(30, price: 100.10, side: .buy)],
+            candles: [candle(0, open: 100)],
+            assumedBps: 5)
+        #expect(report.samples == 1)
+        #expect(abs((report.medianBps ?? 0) - 10) < 1e-6)
+        #expect(report.assumedBps == 5)
+    }
+
+    @Test("样本太少时不给建议值")
+    func aThinSampleRecommendsNothing() throws {
+        // Three fills is not evidence. Feeding that back into a cost model
+        // would be replacing one guess with another, more confident one.
+        let fills = (0..<3).map { fill(Double($0) + 10, price: 100.5, side: .buy) }
+        let report = try TradingKernel.calibrateSlippage(
+            fills: fills, candles: [candle(0, open: 100)], assumedBps: 5)
+        #expect(report.recommendedBps == nil)
+        #expect(report.understatesCost == false)
+    }
+
+    @Test("实测成本高于假设时点名")
+    func aWorseThanAssumedCostIsFlagged() throws {
+        let fills = (0..<12).map { fill(Double($0) + 10, price: 100.5, side: .buy) }
+        let report = try TradingKernel.calibrateSlippage(
+            fills: fills, candles: [candle(0, open: 100)], assumedBps: 5)
+        // 50 bps measured against a 5 bps assumption.
+        #expect(report.understatesCost)
+        #expect((report.recommendedBps ?? 0) > 40)
+    }
+
+    @Test("净值对照经过 FFI 往返后仍是同一个数")
+    func equityComparisonRoundTrips() throws {
+        let live = (0..<8).map {
+            (ts: Date(timeIntervalSince1970: Double($0) * 60), equity: 1_000.0 + Double($0))
+        }
+        let result = try TradingKernel.compareEquity(live: live, backtest: live)
+        #expect(result.samples == 8)
+        #expect(abs(result.differencePct ?? 1) < 1e-9)
+        #expect(result.tracksShape == true)
+    }
+
+    @Test("重合期不足时报空而不是报零")
+    func tooLittleOverlapReportsNothing() throws {
+        let point = [(ts: Date(timeIntervalSince1970: 0), equity: 1_000.0)]
+        let result = try TradingKernel.compareEquity(live: point, backtest: point)
+        #expect(result.liveReturnPct == nil)
+        #expect(result.tracksShape == nil)
     }
 }
