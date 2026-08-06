@@ -126,7 +126,8 @@ pub fn run(
                     quantity += delta;
                 } else {
                     // Reducing or flipping: realise on the overlap.
-                    let closing = quantity.abs().min(delta.abs());
+                    let held_before = quantity.abs();
+                    let closing = held_before.min(delta.abs());
                     let realised = (fill - average_price)
                         * closing
                         * if quantity > 0.0 { 1.0 } else { -1.0 };
@@ -135,37 +136,57 @@ pub fn run(
                     let was_long = quantity > 0.0;
                     quantity += delta;
 
+                    // **Every** reduction is booked, not only the ones that
+                    // close the position outright.
+                    //
+                    // Volatility targeting realises its gains precisely by
+                    // trimming — it sells into strength and buys back into
+                    // weakness — so booking a trade only on a full close kept
+                    // every loser and discarded every winner. One search
+                    // candidate reported an 11% win rate, a 0.24 payoff ratio
+                    // and −0.4% expectancy per trade while its equity curve
+                    // was up 614%. Both numbers came from the same run; only
+                    // the ledger was wrong.
+                    //
+                    // It is not a cosmetic error: win rate, payoff, expectancy
+                    // and the Monte-Carlo resample are all computed from this
+                    // ledger, and the resample compounds it — so every
+                    // trimming strategy was pinned near a 100% probability of
+                    // loss regardless of what it actually did.
+                    let share = if held_before > 0.0 { closing / held_before } else { 0.0 };
+                    let fees_share = accrued_fees * share;
+                    let funding_share = accrued_funding * share;
+                    let net = realised - fees_share - funding_share;
+                    trades.push(Trade {
+                        id: trades.len() + 1,
+                        direction: if was_long { Direction::Long } else { Direction::Short },
+                        entry_ts,
+                        exit_ts: candle.ts_ms,
+                        entry_price: average_price,
+                        exit_price: fill,
+                        quantity: closing,
+                        notional: closing * average_price,
+                        gross_pnl: realised,
+                        fees: fees_share,
+                        funding: funding_share,
+                        net_pnl: net,
+                        return_pct: if entry_equity > 0.0 {
+                            net / entry_equity * 100.0
+                        } else {
+                            0.0
+                        },
+                        bars: index - entry_index,
+                        exit_reason: ExitReason::Signal,
+                    });
+                    // Only the closed share's costs are consumed; the rest
+                    // stays with the position that is still open.
+                    accrued_fees -= fees_share;
+                    accrued_funding -= funding_share;
+
                     if quantity.abs() < 1e-12 || remainder > 1e-12 {
-                        // The position closed (possibly reopening the other
-                        // way) — book it as a completed trade.
-                        let net = realised - accrued_fees - accrued_funding;
-                        trades.push(Trade {
-                            id: trades.len() + 1,
-                            direction: if was_long {
-                                Direction::Long
-                            } else {
-                                Direction::Short
-                            },
-                            entry_ts,
-                            exit_ts: candle.ts_ms,
-                            entry_price: average_price,
-                            exit_price: fill,
-                            quantity: closing,
-                            notional: closing * average_price,
-                            gross_pnl: realised,
-                            fees: accrued_fees,
-                            funding: accrued_funding,
-                            net_pnl: net,
-                            return_pct: if entry_equity > 0.0 {
-                                net / entry_equity * 100.0
-                            } else {
-                                0.0
-                            },
-                            bars: index - entry_index,
-                            exit_reason: ExitReason::Signal,
-                        });
-                        accrued_fees = 0.0;
-                        accrued_funding = 0.0;
+                        // Fully closed, or overshot into the opposite side.
+                        // Either way a new position starts here, so the clock
+                        // and the cost basis restart.
                         entry_ts = candle.ts_ms;
                         entry_index = index;
                         entry_equity = equity;
@@ -174,6 +195,9 @@ pub fn run(
                             quantity = 0.0;
                         }
                     }
+                    // A partial trim leaves entry_ts, entry_index and
+                    // average_price alone: what remains is the same position,
+                    // opened when it was opened, at the basis it was opened at.
                 }
             }
         }
@@ -455,6 +479,79 @@ mod tests {
             .trades
             .iter()
             .any(|t| t.exit_reason == ExitReason::Liquidation));
+    }
+
+    #[test]
+    fn trimming_a_position_books_a_trade() {
+        // A scaled position that is reduced without being closed used to
+        // realise its P&L into equity and book nothing. Volatility targeting
+        // takes profit exactly that way — selling into strength — so the
+        // ledger kept every loser and dropped every winner, and every metric
+        // derived from it (win rate, payoff, expectancy, and the Monte-Carlo
+        // resample that compounds them) was wrong in the same direction.
+        let json = r#"{"id":"trim","name":"trim",
+             "market":{"instId":"BTC-USDT-SWAP","instType":"SWAP","bar":"1H"},
+             "signals":{"exposure":"clamp(1 - bar_index / 60, 0, 1)"},
+             "sizing":{"mode":"equityPct","value":100},
+             "risk":{"leverage":1,"rebalanceThreshold":0.01}}"#;
+        let manifest: Manifest = serde_json::from_str(json).unwrap();
+        let strategy = CompiledStrategy::compile(manifest, &[]).unwrap();
+
+        // A steadily rising market, so every trim realises a gain.
+        let bars: Vec<Candle> = (0..80)
+            .map(|i| {
+                let close = 100.0 * (1.0 + 0.004 * i as f64);
+                Candle {
+                    ts_ms: i * 3_600_000,
+                    open: close,
+                    high: close * 1.001,
+                    low: close * 0.999,
+                    close,
+                    volume: 1.0,
+                    confirmed: 1,
+                }
+            })
+            .collect();
+
+        let result = run(&strategy, &bars, &BacktestConfig::default()).unwrap();
+        assert!(result.trades.len() > 5, "trims must appear in the ledger, got {}", result.trades.len());
+        // And they must be the winners they actually were.
+        let winners = result.trades.iter().filter(|t| t.net_pnl > 0.0).count();
+        assert!(
+            winners * 2 > result.trades.len(),
+            "{winners} winners out of {} on a monotonically rising market",
+            result.trades.len()
+        );
+    }
+
+    #[test]
+    fn a_trimmed_position_keeps_its_cost_basis_and_clock() {
+        // A partial reduction leaves the same position open. Restarting its
+        // entry price would re-mark the remainder at the trim price and erase
+        // the unrealised gain that has not been taken yet.
+        let json = r#"{"id":"trim2","name":"trim2",
+             "market":{"instId":"BTC-USDT-SWAP","instType":"SWAP","bar":"1H"},
+             "signals":{"exposure":"clamp(1 - bar_index / 200, 0, 1)"},
+             "sizing":{"mode":"equityPct","value":100},
+             "risk":{"leverage":1,"rebalanceThreshold":0.01}}"#;
+        let manifest: Manifest = serde_json::from_str(json).unwrap();
+        let strategy = CompiledStrategy::compile(manifest, &[]).unwrap();
+        let bars: Vec<Candle> = (0..60)
+            .map(|i| {
+                let close = 100.0 * (1.0 + 0.004 * i as f64);
+                Candle { ts_ms: i * 3_600_000, open: close, high: close * 1.001,
+                         low: close * 0.999, close, volume: 1.0, confirmed: 1 }
+            })
+            .collect();
+        let result = run(&strategy, &bars, &BacktestConfig::default()).unwrap();
+        // Every trim is of the same original position, so they all share one
+        // entry price — and each is held longer than the last.
+        let entries: Vec<f64> = result.trades.iter().map(|t| t.entry_price).collect();
+        assert!(entries.windows(2).all(|w| (w[0] - w[1]).abs() < 1e-9),
+                "a trim must not re-mark the remainder: {entries:?}");
+        let bars_held: Vec<usize> = result.trades.iter().map(|t| t.bars).collect();
+        assert!(bars_held.windows(2).all(|w| w[1] >= w[0]),
+                "the surviving position keeps ageing: {bars_held:?}");
     }
 
     #[test]

@@ -1159,3 +1159,77 @@ struct AppWiringTests {
                 "AppState is being injected now (\(injectors)) — revisit this check")
     }
 }
+
+// MARK: - Walk-forward efficiency
+
+struct WalkForwardEfficiencyTests {
+    private func fold(
+        id: Int, inDays: Double, outDays: Double, inPct: Double, outPct: Double
+    ) -> WalkForwardFold {
+        let start = Date(timeIntervalSince1970: 0)
+        // Metrics are derived, not settable, so the return is expressed the
+        // way the engine would produce it: as an equity curve.
+        func metrics(_ pct: Double, days: Double, from: Date) -> BacktestMetrics {
+            BacktestMetrics(
+                trades: [],
+                equityCurve: [
+                    EquityPoint(ts: from, equity: 10_000, price: 1),
+                    EquityPoint(ts: from.addingTimeInterval(days * 86_400),
+                                equity: 10_000 * (1 + pct / 100), price: 1),
+                ],
+                initialCapital: 10_000, bar: .h1, freeParameterCount: 1)
+        }
+        let inMetrics = metrics(inPct, days: inDays, from: start)
+        let outMetrics = metrics(
+            outPct, days: outDays, from: start.addingTimeInterval(inDays * 86_400))
+        return WalkForwardFold(
+            id: id,
+            inSampleStart: start,
+            inSampleEnd: start.addingTimeInterval(inDays * 86_400),
+            outOfSampleStart: start.addingTimeInterval(inDays * 86_400),
+            outOfSampleEnd: start.addingTimeInterval((inDays + outDays) * 86_400),
+            parameters: [:], inSample: inMetrics, outOfSample: outMetrics,
+            outOfSampleTrades: [], outOfSampleEquity: [])
+    }
+
+    private func result(_ folds: [WalkForwardFold]) -> WalkForwardResult {
+        WalkForwardResult(
+            folds: folds, stitchedEquity: [], stitchedMetrics: .empty,
+            objective: OptimizationObjective(), totalTrials: 0, warnings: [])
+    }
+
+    @Test("效率比按窗口长度归一：不衰减就是 1.0")
+    func noDecayScoresOne() {
+        // In-sample is 70% of the fold and out-of-sample is what survives the
+        // purge. Comparing raw totals compared a long window with a short one,
+        // so a strategy that decayed not at all scored about 0.4 — and the 0.5
+        // threshold then demanded that out-of-sample beat in-sample.
+        let sameRate = fold(id: 0, inDays: 70, outDays: 30, inPct: 7, outPct: 3)
+        #expect(abs((result([sameRate]).efficiency ?? 0) - 1.0) < 1e-9)
+    }
+
+    @Test("样本内没赚到钱时报空，而不是报满分")
+    func aFlatFitHasNoRatioToReport() {
+        // Returning 1.0 here let "the fit made no money" pass as "the fit held
+        // up perfectly"; one search candidate scored 2.37 on exactly that.
+        let flat = fold(id: 0, inDays: 70, outDays: 30, inPct: 0, outPct: 3)
+        #expect(result([flat]).efficiency == nil)
+        #expect(flat.efficiency == nil, "and the same holds per fold")
+    }
+
+    @Test("样本内亏损时也报空 —— 两个负数相除会得出漂亮的正数")
+    func aLosingFitHasNoMeaningfulRatio() {
+        // "in-sample -22%, out-of-sample -19%" once reported 1.21, which reads
+        // as a pass and is the opposite of one.
+        let losing = fold(id: 0, inDays: 70, outDays: 30, inPct: -22, outPct: -19)
+        #expect(result([losing]).efficiency == nil)
+    }
+
+    @Test("真正的衰减会被如实报出来")
+    func realDecayIsReported() {
+        // Half the daily rate survives.
+        let decayed = fold(id: 0, inDays: 70, outDays: 30, inPct: 14, outPct: 3)
+        let efficiency = result([decayed]).efficiency ?? 0
+        #expect(abs(efficiency - 0.5) < 1e-9)
+    }
+}

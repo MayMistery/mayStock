@@ -296,7 +296,7 @@ struct LabMain {
                 (fold.parameterSummary, 26),
                 (Out.tinted(fold.inSample.totalReturnPct, Out.signed(fold.inSample.totalReturnPct)), -10),
                 (Out.tinted(fold.outOfSample.totalReturnPct, Out.signed(fold.outOfSample.totalReturnPct)), -10),
-                (PriceFormatter.ratio(fold.efficiency), -8),
+                (fold.efficiency.map { PriceFormatter.ratio($0) } ?? "—", -8),
                 ("-" + PriceFormatter.percent(fold.outOfSample.maxDrawdownPct, decimals: 1), -11),
                 ("\(fold.outOfSample.tradeCount)", -6),
             ])
@@ -306,7 +306,9 @@ struct LabMain {
         Out.heading("样本外拼接（这才是你能实际拿到的结果）")
         Lab.printMetrics(result.stitchedMetrics, capital: capital)
         Out.rule()
-        Out.kv("效率比", PriceFormatter.ratio(result.efficiency) + "   （< 0.5 判为过拟合）")
+        Out.kv("效率比", (result.efficiency.map { PriceFormatter.ratio($0) }
+                          ?? "—（样本内无收益，无从计算）")
+               + "   （< 0.5 判为过拟合；已按窗口长度归一）")
         Out.kv("盈利折数", "\(result.profitableFolds)/\(result.folds.count)")
         Out.kv("累计尝试", "\(result.totalTrials) 组参数")
         for warning in result.warnings { Out.warn(warning) }

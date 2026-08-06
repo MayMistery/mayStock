@@ -39,11 +39,16 @@ public struct WalkForwardFold: Sendable, Identifiable {
         self.embargoedBars = embargoedBars
     }
 
-    /// How much of the fitted edge survived contact with unseen data.
-    public var efficiency: Double {
-        let fitted = inSample.totalReturnPct
-        guard abs(fitted) > 1e-9 else { return outOfSample.totalReturnPct > 0 ? 1 : 0 }
-        return outOfSample.totalReturnPct / fitted
+    /// How much of the fitted edge survived contact with unseen data, as a
+    /// rate — each side divided by its own span, since the windows differ in
+    /// length by construction. Nil when the fit made nothing to decay from.
+    public var efficiency: Double? {
+        let inDays = inSampleEnd.timeIntervalSince(inSampleStart) / 86_400
+        let outDays = outOfSampleEnd.timeIntervalSince(outOfSampleStart) / 86_400
+        guard inDays > 0, outDays > 0 else { return nil }
+        let fitted = inSample.totalReturnPct / inDays
+        guard fitted > 1e-12 else { return nil }
+        return (outOfSample.totalReturnPct / outDays) / fitted
     }
 
     public var parameterSummary: String {
@@ -76,13 +81,39 @@ public struct WalkForwardResult: Sendable {
         self.warnings = warnings
     }
 
-    /// Mean out-of-sample return divided by mean in-sample return. Below 0.5
-    /// is the accepted line for "the parameters were fitted to history".
-    public var efficiency: Double {
-        guard !folds.isEmpty else { return 0 }
-        let fitted = folds.map(\.inSample.totalReturnPct).reduce(0, +) / Double(folds.count)
-        let live = folds.map(\.outOfSample.totalReturnPct).reduce(0, +) / Double(folds.count)
-        guard abs(fitted) > 1e-9 else { return live > 0 ? 1 : 0 }
+    /// How much of the fitted edge survived, per unit of time.
+    ///
+    /// **Rate, not total.** The in-sample stretch is 70% of each fold and the
+    /// out-of-sample stretch is what is left after the purge and embargo, so
+    /// comparing raw totals compares a long window with a short one: a
+    /// strategy that decayed not at all would score about 0.4, and the 0.5
+    /// threshold would then be demanding that out-of-sample *beat* in-sample.
+    /// Dividing each side by its own span removes the asymmetry, and 1.0 means
+    /// exactly what it should — no decay.
+    ///
+    /// `nil` when it cannot be computed, which is not the same as zero. In
+    /// particular a fold whose in-sample return is ~0 has no ratio to report;
+    /// returning 1.0 there — as this used to — let "the fit made no money"
+    /// masquerade as "the fit held up perfectly", and one search candidate
+    /// scored 2.37 on exactly that.
+    public var efficiency: Double? {
+        let rates = folds.compactMap { fold -> (fitted: Double, live: Double)? in
+            let inDays = fold.inSampleEnd.timeIntervalSince(fold.inSampleStart) / 86_400
+            let outDays = fold.outOfSampleEnd.timeIntervalSince(fold.outOfSampleStart) / 86_400
+            guard inDays > 0, outDays > 0 else { return nil }
+            return (fold.inSample.totalReturnPct / inDays,
+                    fold.outOfSample.totalReturnPct / outDays)
+        }
+        guard !rates.isEmpty else { return nil }
+        let fitted = rates.map(\.fitted).reduce(0, +) / Double(rates.count)
+        let live = rates.map(\.live).reduce(0, +) / Double(rates.count)
+        // A fit that made nothing is not a baseline anything can be measured
+        // against.
+        guard abs(fitted) > 1e-9 else { return nil }
+        // And a *losing* fit makes the ratio meaningless in the other
+        // direction: two negatives divide to a flattering positive, which is
+        // how "in-sample −22%, out-of-sample −19%" once reported 1.21.
+        guard fitted > 0 else { return nil }
         return live / fitted
     }
 
@@ -99,8 +130,14 @@ public struct WalkForwardResult: Sendable {
         if stitchedMetrics.totalReturnPct <= 0 {
             return "样本外整体亏损 —— 参数是拟合出来的，不要投入真金"
         }
+        // No ratio means the in-sample fit made nothing to decay from. That is
+        // not a pass, and it is not a fail either — it is an untestable fold,
+        // and saying so is the only honest option.
+        guard let efficiency else {
+            return "样本内本身没有可衡量的收益，效率比无从计算 —— 这不是通过，是没测出来"
+        }
         if efficiency < 0.5 {
-            return "样本外仅保留 \(PriceFormatter.percent(efficiency * 100)) 的样本内收益，"
+            return "样本外仅保留 \(PriceFormatter.percent(efficiency * 100)) 的样本内收益率，"
                 + "衰减过大，属于过拟合"
         }
         if consistency < 0.6 {
