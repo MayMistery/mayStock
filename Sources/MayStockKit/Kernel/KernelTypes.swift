@@ -39,15 +39,23 @@ public struct KernelAccountState: Encodable, Sendable {
     public var dayStartEquity: Double
     /// Portfolio-level cap, when tighter than the manifest's leverage.
     public var leverageCap: Double?
+    /// Bars since the last exit, for the cooldown rule. Nil when the strategy
+    /// has never held a position.
+    public var barsSinceExit: Int?
+    /// The daily-loss breaker already tripped today.
+    public var haltedToday: Bool
 
     public init(
         equity: Double = 0, heldBase: Double = 0,
-        dayStartEquity: Double = 0, leverageCap: Double? = nil
+        dayStartEquity: Double = 0, leverageCap: Double? = nil,
+        barsSinceExit: Int? = nil, haltedToday: Bool = false
     ) {
         self.equity = equity
         self.heldBase = heldBase
         self.dayStartEquity = dayStartEquity
         self.leverageCap = leverageCap
+        self.barsSinceExit = barsSinceExit
+        self.haltedToday = haltedToday
     }
 }
 
@@ -64,6 +72,10 @@ public struct KernelDecision: Decodable, Sendable, Equatable {
     public let haltDailyLoss: Bool
     /// Why, for the runtime status line.
     public let reason: String
+    /// Protective levels to attach to the entry order so the exchange enforces
+    /// them, rather than this app polling for a price it will miss.
+    public let stopPrice: Double?
+    public let takeProfitPrice: Double?
     /// Continuous exposure in −1…+1, or nil for a binary strategy.
     public let targetExposure: Double?
     public let confirmedBars: Int
@@ -78,6 +90,7 @@ public struct KernelDecision: Decodable, Sendable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case target, targetExposure, confirmedBars, barTs, warmingUp
         case targetBaseQuantity, baseDelta, shouldTrade, haltDailyLoss, reason
+        case stopPrice, takeProfitPrice
     }
 
     public init(from decoder: Decoder) throws {
@@ -88,6 +101,8 @@ public struct KernelDecision: Decodable, Sendable, Equatable {
         shouldTrade = try c.decode(Bool.self, forKey: .shouldTrade)
         haltDailyLoss = try c.decode(Bool.self, forKey: .haltDailyLoss)
         reason = try c.decode(String.self, forKey: .reason)
+        stopPrice = try c.decodeIfPresent(Double.self, forKey: .stopPrice)
+        takeProfitPrice = try c.decodeIfPresent(Double.self, forKey: .takeProfitPrice)
         // Rust writes NaN for "not an exposure strategy"; JSON has no NaN, so
         // it arrives as null.
         targetExposure = try c.decodeIfPresent(Double.self, forKey: .targetExposure)

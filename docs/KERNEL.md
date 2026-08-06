@@ -80,6 +80,15 @@ void        ms_string_free(char *);
 [LiveSizingParityTests](../Tests/MayStockKitTests/KernelGoldenTests.swift)
 把这条性质钉死：同一根 K 线、同样的资金，实盘计划开出的名义额必须等于回测开出的。
 
+**保护性离场随单挂到交易所**：计划里的 `stopPrice` / `takeProfitPrice` 作为
+`--slTriggerPx` / `--tpTriggerPx` 附在入场单上，由交易所 24 小时执行。
+不用 20 秒轮询 —— 轮询会睡过止损存在的那根插针，应用关掉时更是完全不设防。
+触发后按市价成交（`--slOrdPx -1`）：限价离场可能在它本要躲开的行情里一直挂着不成交。
+
+**冷却与日内熔断也在内核**：`can_enter` 回测和实盘共用；熔断只锁当天，
+UTC 日切换时由运行器清空 —— 回测正是这么做的，实盘若永久锁死，
+回测收益里就含有实盘永远拿不到的次日交易。
+
 一个刻意的设计：**取不到仓位大小时，`target` 仍然报出信号方向**，只是
 `shouldTrade` 为 false。把它报成「空仓」会让调用方以为策略没有观点，
 而事实是它有观点但执行不了 —— 状态栏要显示的正是后者。

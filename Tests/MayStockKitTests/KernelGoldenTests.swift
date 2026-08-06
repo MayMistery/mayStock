@@ -463,3 +463,91 @@ struct LiveSizingParityTests {
         #expect(abs(flat.targetBaseQuantity - full) / full < 1e-9)
     }
 }
+
+/// Risk controls the live path used to skip entirely.
+@Suite("Live risk controls")
+struct LiveRiskControlTests {
+
+    private func plan(
+        _ manifestJSON: String, current: TradeDirection? = nil,
+        account: KernelAccountState = KernelAccountState(equity: 30_000, dayStartEquity: 30_000)
+    ) throws -> KernelDecision {
+        let kernel = try KernelStrategy(manifestJSON: manifestJSON)
+        return try kernel.decide(
+            candles: KernelGoldenTests.candles(600), current: current, account: account)
+    }
+
+    /// Stops rode along with the order rather than being polled for. A
+    /// 20-second poll sleeps straight through the intrabar spike a stop exists
+    /// for, and protects nothing at all while the app is closed.
+    @Test func anEntryCarriesItsStopAndTarget() throws {
+        let decision = try plan(KernelGoldenTests.manifest(
+            signals: #"{"longEntry": "close > 0"}"#,
+            risk: #"{"stopLossPct":4,"takeProfitPct":8,"leverage":1}"#))
+        #expect(decision.shouldTrade)
+        let stop = try #require(decision.stopPrice, "a 4% stop must reach the exchange")
+        let target = try #require(decision.takeProfitPrice)
+        let entry = stop / 0.96
+        #expect(stop < entry, "a long's stop sits below it")
+        #expect(target > entry, "and its target above")
+        #expect(abs(target / entry - 1.08) < 1e-6)
+    }
+
+    @Test func anAtrStopAlsoReachesTheExchange() throws {
+        let decision = try plan(KernelGoldenTests.manifest(
+            signals: #"{"longEntry": "close > 0"}"#,
+            sizing: #"{"mode":"riskPerTrade","value":1}"#,
+            risk: #"{"atrStop":{"period":14,"mult":2.5},"leverage":1}"#))
+        #expect(decision.shouldTrade)
+        #expect(decision.stopPrice != nil, "sizing by ATR without exiting by it is half a rule")
+    }
+
+    @Test func aStoplessStrategyAttachesNothing() throws {
+        let decision = try plan(KernelGoldenTests.manifest(
+            signals: #"{"longEntry": "close > 0"}"#))
+        #expect(decision.stopPrice == nil)
+        #expect(decision.takeProfitPrice == nil)
+    }
+
+    /// Cooldown: the backtester waits N bars after an exit before re-entering.
+    /// Live used to re-enter on the very next bar.
+    @Test func cooldownBlocksAnImmediateReentry() throws {
+        let json = KernelGoldenTests.manifest(
+            signals: #"{"longEntry": "close > 0"}"#,
+            risk: #"{"cooldownBars":5,"leverage":1}"#)
+        let blocked = try plan(json, account: KernelAccountState(
+            equity: 30_000, dayStartEquity: 30_000, barsSinceExit: 2))
+        #expect(!blocked.shouldTrade)
+        #expect(blocked.reason.contains("冷却"))
+
+        let allowed = try plan(json, account: KernelAccountState(
+            equity: 30_000, dayStartEquity: 30_000, barsSinceExit: 6))
+        #expect(allowed.shouldTrade)
+    }
+
+    @Test func cooldownNeverBlocksTheFirstEntry() throws {
+        let decision = try plan(KernelGoldenTests.manifest(
+            signals: #"{"longEntry": "close > 0"}"#,
+            risk: #"{"cooldownBars":5,"leverage":1}"#))
+        #expect(decision.shouldTrade, "nothing has been exited yet")
+    }
+
+    /// The breaker latches for the rest of the day and no longer than that —
+    /// the backtester resumes at the UTC boundary, so live must too, or the
+    /// backtest counts trades live can never take.
+    @Test func theBreakerLatchesForTheDayAndNoLonger() throws {
+        let json = KernelGoldenTests.manifest(
+            signals: #"{"longEntry": "close > 0"}"#,
+            risk: #"{"maxDailyLossPct":2,"leverage":1}"#)
+        // Already halted today, but equity has recovered.
+        let stillHalted = try plan(json, account: KernelAccountState(
+            equity: 30_000, dayStartEquity: 30_000, haltedToday: true))
+        #expect(stillHalted.haltDailyLoss)
+        #expect(stillHalted.target == 0)
+
+        // A fresh day resets the flag; the runner clears it at the boundary.
+        let newDay = try plan(json, account: KernelAccountState(
+            equity: 30_000, dayStartEquity: 30_000, haltedToday: false))
+        #expect(!newDay.haltDailyLoss)
+    }
+}

@@ -151,6 +151,14 @@ pub struct LiveDecision {
     pub halt_daily_loss: bool,
     /// Human-readable justification, for the runtime status line.
     pub reason: String,
+    /// Protective levels to attach to the entry order, so the *exchange*
+    /// enforces them. Polling for a stop on a 20-second tick would miss
+    /// exactly the intrabar spike a stop exists for, and would not protect the
+    /// position at all while the app is closed.
+    #[serde(rename = "stopPrice")]
+    pub stop_price: Option<f64>,
+    #[serde(rename = "takeProfitPrice")]
+    pub take_profit_price: Option<f64>,
     /// Continuous exposure in −1…+1 for exposure strategies; NaN otherwise.
     #[serde(rename = "targetExposure")]
     pub target_exposure: f64,
@@ -178,6 +186,11 @@ pub struct AccountState {
     pub day_start_equity: f64,
     /// Cap from the portfolio, if tighter than the manifest's.
     pub leverage_cap: Option<f64>,
+    /// Bars since this strategy last closed a position, for the cooldown rule.
+    /// `None` means it has never held one.
+    pub bars_since_exit: Option<usize>,
+    /// The daily-loss breaker already tripped today.
+    pub halted_today: bool,
 }
 
 impl Default for AccountState {
@@ -187,7 +200,18 @@ impl Default for AccountState {
             held_base: 0.0,
             day_start_equity: 0.0,
             leverage_cap: None,
+            bars_since_exit: None,
+            halted_today: false,
         }
+    }
+}
+
+/// May a new position be opened, given the cooldown rule? Shared with the
+/// backtester so "wait N bars after an exit" means the same in both.
+pub fn can_enter(bars_since_exit: Option<usize>, cooldown: usize) -> bool {
+    match (cooldown, bars_since_exit) {
+        (0, _) | (_, None) => true,
+        (c, Some(since)) => since > c,
     }
 }
 
@@ -204,6 +228,8 @@ fn idle(reason: &str, current: Option<Direction>, held: f64, bars: usize, ts: i6
         confirmed_bars: bars,
         bar_ts: ts,
         warming_up: warming,
+        stop_price: None,
+        take_profit_price: None,
     }
 }
 
@@ -253,10 +279,10 @@ pub fn decide_live(
     // legitimate action is to close out. Checked before sizing so a halted
     // strategy cannot be handed a position to open.
     if let Some(limit) = strategy.manifest.risk.max_daily_loss_pct {
-        if account.day_start_equity > 0.0
+        let tripped = account.day_start_equity > 0.0
             && (account.day_start_equity - account.equity) / account.day_start_equity * 100.0
-                >= limit
-        {
+                >= limit;
+        if tripped || account.halted_today {
             return Ok(LiveDecision {
                 target: 0,
                 target_exposure: f64::NAN,
@@ -264,10 +290,12 @@ pub fn decide_live(
                 base_delta: -account.held_base,
                 should_trade: account.held_base.abs() > 1e-12,
                 halt_daily_loss: true,
-                reason: format!("日内亏损达到 {limit:.1}%，已停止交易"),
+                reason: format!("日内亏损达到 {limit:.1}%，本日停止交易"),
                 confirmed_bars: candles.len(),
                 bar_ts,
                 warming_up: false,
+                stop_price: None,
+                take_profit_price: None,
             });
         }
     }
@@ -334,6 +362,10 @@ pub fn decide_live(
             confirmed_bars: candles.len(),
             bar_ts,
             warming_up: false,
+            // Continuous strategies express risk through exposure size, not
+            // through a stop level; attaching one would fight the rebalancer.
+            stop_price: None,
+            take_profit_price: None,
         });
     }
 
@@ -376,7 +408,19 @@ pub fn decide_live(
         return Ok(idle("信号未变", target, account.held_base, candles.len(), bar_ts, false));
     }
 
+    // Cooldown: reversing straight out of a losing side is the signal working,
+    // but re-entering the same side immediately after an exit is churn. The
+    // backtester enforces this; without it live re-enters a bar early.
+    if target.is_some() && current.is_none()
+        && !can_enter(account.bars_since_exit, strategy.manifest.risk.cooldown_bars)
+    {
+        return Ok(idle(
+            "冷却中", None, account.held_base, candles.len(), bar_ts, false));
+    }
+
     let mut target_base = 0.0;
+    let mut stop_price = None;
+    let mut take_profit_price = None;
     if let Some(direction) = target {
         let highs: Vec<f64> = candles.iter().map(|c| c.high).collect();
         let lows: Vec<f64> = candles.iter().map(|c| c.low).collect();
@@ -388,6 +432,18 @@ pub fn decide_live(
             series.get(index).copied().unwrap_or(f64::NAN)
         });
         let distance = crate::sizing::stop_distance(strategy, price, atr);
+        // Levels ride along with the order so the exchange, not this loop,
+        // enforces them.
+        stop_price = distance.map(|d| {
+            if direction == Direction::Long { price - d } else { price + d }
+        });
+        take_profit_price = strategy.manifest.risk.take_profit_pct.map(|pct| {
+            if direction == Direction::Long {
+                price * (1.0 + pct / 100.0)
+            } else {
+                price * (1.0 - pct / 100.0)
+            }
+        });
         match crate::sizing::target_notional(strategy, account.equity, price, leverage, distance) {
             Some(notional) => target_base = notional / price * direction.sign(),
             None => {
@@ -406,6 +462,8 @@ pub fn decide_live(
                     confirmed_bars: candles.len(),
                     bar_ts,
                     warming_up: false,
+                    stop_price: None,
+                    take_profit_price: None,
                 });
             }
         }
@@ -426,6 +484,8 @@ pub fn decide_live(
         confirmed_bars: candles.len(),
         bar_ts,
         warming_up: false,
+        stop_price,
+        take_profit_price,
     })
 }
 

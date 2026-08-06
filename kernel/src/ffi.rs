@@ -213,6 +213,9 @@ pub unsafe extern "C" fn ms_strategy_decide(
     day_start_equity: f64,
     // Negative means no portfolio cap tighter than the manifest's.
     leverage_cap: f64,
+    // Negative means the strategy has never held a position.
+    bars_since_exit: i64,
+    halted_today: bool,
     error_out: *mut *mut c_char,
 ) -> *mut c_char {
     guarded(error_out, ptr::null_mut(), || {
@@ -235,6 +238,8 @@ pub unsafe extern "C" fn ms_strategy_decide(
                 held_base,
                 day_start_equity,
                 leverage_cap: (leverage_cap > 0.0).then_some(leverage_cap),
+                bars_since_exit: (bars_since_exit >= 0).then_some(bars_since_exit as usize),
+                halted_today,
             },
         )
         .map_err(|e| e.to_string())?;
@@ -423,7 +428,7 @@ mod tests {
         let mut error: *mut c_char = ptr::null_mut();
         let json = unsafe {
             ms_strategy_decide(handle, bars.as_ptr(), bars.len(), 0, 0, ptr::null(),
-                               10_000.0, 0.0, 10_000.0, -1.0, &mut error)
+                               10_000.0, 0.0, 10_000.0, -1.0, -1, false, &mut error)
         };
         assert!(error.is_null());
         let value: serde_json::Value = serde_json::from_str(&take_string(json)).unwrap();
@@ -439,7 +444,7 @@ mod tests {
         let mut error: *mut c_char = ptr::null_mut();
         let json =
             unsafe { ms_strategy_decide(handle, ptr::null(), 0, 0, 0, ptr::null(),
-                               10_000.0, 0.0, 10_000.0, -1.0, &mut error) };
+                               10_000.0, 0.0, 10_000.0, -1.0, -1, false, &mut error) };
         assert!(error.is_null());
         let value: serde_json::Value = serde_json::from_str(&take_string(json)).unwrap();
         assert_eq!(value["target"], 0);

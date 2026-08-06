@@ -34,6 +34,11 @@ public struct OrderRequest: Sendable, Equatable {
     public var limitPrice: Double?
     public var posSide: PositionSide?
     public var reduceOnly: Bool
+    /// Protective levels attached to the order. The exchange holds these, so
+    /// they survive the app being closed and they trigger on an intrabar spike
+    /// that a 20-second poll would sleep straight through.
+    public var stopTriggerPrice: Double?
+    public var takeProfitTriggerPrice: Double?
     /// Strategy attribution tag; see `OrderTag`.
     public var clOrdId: String?
 
@@ -47,8 +52,12 @@ public struct OrderRequest: Sendable, Equatable {
         limitPrice: Double? = nil,
         posSide: PositionSide? = nil,
         reduceOnly: Bool = false,
+        stopTriggerPrice: Double? = nil,
+        takeProfitTriggerPrice: Double? = nil,
         clOrdId: String? = nil
     ) {
+        self.stopTriggerPrice = stopTriggerPrice
+        self.takeProfitTriggerPrice = takeProfitTriggerPrice
         self.instId = instId
         self.instType = instType
         self.side = side
@@ -295,6 +304,14 @@ public struct TradeBridge: Sendable {
         }
         if order.reduceOnly, order.instType == .swap {
             args += ["--reduceOnly", "true"]
+        }
+        // `-1` is OKX's "fill at market once triggered". A limit exit could sit
+        // unfilled through the move it was meant to escape.
+        if let stop = order.stopTriggerPrice, stop > 0 {
+            args += ["--slTriggerPx", PriceFormatter.plain(stop), "--slOrdPx", "-1"]
+        }
+        if let target = order.takeProfitTriggerPrice, target > 0 {
+            args += ["--tpTriggerPx", PriceFormatter.plain(target), "--tpOrdPx", "-1"]
         }
         if let clOrdId = order.clOrdId {
             args += ["--clOrdId", clOrdId]

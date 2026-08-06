@@ -133,7 +133,8 @@ public final class KernelStrategy: @unchecked Sendable {
                     self.handle, buffer, count,
                     Int32(current.kernelCode), Int64(max(barsHeld, 0)), externalJSON,
                     account.equity, account.heldBase, account.dayStartEquity,
-                    account.leverageCap ?? -1, error)
+                    account.leverageCap ?? -1,
+                    Int64(account.barsSinceExit ?? -1), account.haltedToday, error)
             }
             return try JSONDecoder().decode(KernelDecision.self, from: Data(json.utf8))
         }

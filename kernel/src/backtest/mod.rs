@@ -313,7 +313,8 @@ pub fn run(
             }
             if position.is_none() && halted_day.is_none() {
                 if let Some(direction) = target {
-                    if can_enter(index, cooldown_reference, manifest.risk.cooldown_bars) {
+                    let since_exit = cooldown_reference.map(|exit| index - exit);
+                    if crate::decide::can_enter(since_exit, manifest.risk.cooldown_bars) {
                         let fill = fill_price(candle.open, direction, false, slippage);
                         // ATR as known at the decision bar — never this bar's.
                         let atr = atr_series.as_ref().map(|s| {
@@ -508,12 +509,6 @@ pub fn run(
     })
 }
 
-fn can_enter(index: usize, last_exit: Option<usize>, cooldown: usize) -> bool {
-    match (cooldown, last_exit) {
-        (0, _) | (_, None) => true,
-        (c, Some(exit)) => index - exit > c,
-    }
-}
 
 #[allow(clippy::too_many_arguments)]
 fn open_position(

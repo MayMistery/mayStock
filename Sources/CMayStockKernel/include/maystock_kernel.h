@@ -22,6 +22,7 @@
 #define MAYSTOCK_KERNEL_H
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -81,6 +82,8 @@ char *ms_strategy_decide(const MSStrategy *handle,
                          double held_base,
                          double day_start_equity,
                          double leverage_cap,   /* negative = no portfolio cap */
+                         int64_t bars_since_exit, /* negative = never held one */
+                         bool halted_today,
                          char **error_out);
 
 /* --- backtest -------------------------------------------------------- */

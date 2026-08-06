@@ -27,8 +27,6 @@ public struct StrategyRuntimeState: Sendable, Equatable {
     public var lastEvaluatedAt: Date?
     public var lastOrderAt: Date?
     public var targetDirection: TradeDirection?
-    /// Bar index of the most recent exit, for the cooldown rule.
-    public var barsSinceExit: Int?
 
     public init() {}
 }
@@ -124,7 +122,9 @@ public final class StrategyRunner {
     private var lastActedBar: [String: Date] = [:]
 
     private struct CacheKey: Hashable { let instId: String; let bar: BarInterval }
-    private struct DayAnchor { var day: Date; var equity: Double }
+    private struct DayAnchor { var day: Date; var equity: Double; var halted: Bool }
+    /// Confirmed bar on which each strategy last went flat, for the cooldown.
+    private var lastExitBar: [String: Date] = [:]
 
     /// How often the loop wakes. Bar-close detection does the real pacing.
     public static let tickInterval: TimeInterval = 20
@@ -433,8 +433,14 @@ public final class StrategyRunner {
         // simulation and committed the whole budget live.
         let equity = workingCapital(strategy: strategy, allocation: allocation, host: host)
         let today = Self.utcDay(of: Date())
-        var anchor = dayAnchors[strategy.id] ?? DayAnchor(day: today, equity: equity)
-        if anchor.day != today { anchor = DayAnchor(day: today, equity: equity) }
+        var anchor = dayAnchors[strategy.id]
+            ?? DayAnchor(day: today, equity: equity, halted: false)
+        // A new UTC day clears the breaker, exactly as the backtester does.
+        // Leaving it latched would mean the backtest counted tomorrow's trades
+        // and live never took them.
+        if anchor.day != today {
+            anchor = DayAnchor(day: today, equity: equity, halted: false)
+        }
         dayAnchors[strategy.id] = anchor
 
         let decision: KernelDecision
@@ -447,7 +453,10 @@ public final class StrategyRunner {
                     equity: equity,
                     heldBase: position?.baseQuantity ?? 0,
                     dayStartEquity: anchor.equity,
-                    leverageCap: allocation.leverageCap))
+                    leverageCap: allocation.leverageCap,
+                    barsSinceExit: barsSince(lastExitBar[strategy.id],
+                                             latestBar: latestBar, market: market),
+                    haltedToday: anchor.halted))
         } catch {
             update(strategy.id) {
                 $0.status = .failed
@@ -477,11 +486,24 @@ public final class StrategyRunner {
 
         if decision.shouldTrade {
             await submit(baseDelta: decision.baseDelta, strategy: strategy, host: host,
-                         reason: decision.reason)
+                         reason: decision.reason,
+                         stopPrice: decision.stopPrice,
+                         takeProfitPrice: decision.takeProfitPrice)
+            if decision.target == 0 { lastExitBar[strategy.id] = latestBar.ts }
         }
         if decision.haltDailyLoss {
-            host.runnerDidHalt(strategyId: strategy.id, reason: "日内亏损熔断")
+            // Latched for the rest of the UTC day only — the anchor above
+            // clears it at the day boundary.
+            dayAnchors[strategy.id]?.halted = true
         }
+    }
+
+    /// Bars between `since` and the latest bar, or nil when there is no `since`.
+    private func barsSince(
+        _ since: Date?, latestBar: Candle, market: StrategyMarket
+    ) -> Int? {
+        guard let since, market.bar.seconds > 0 else { return nil }
+        return Swift.max(Int(latestBar.ts.timeIntervalSince(since) / market.bar.seconds), 0)
     }
 
     /// Bars the current position has been held for, from its first fill.
@@ -548,7 +570,8 @@ public final class StrategyRunner {
     // MARK: Order submission
 
     private func submit(
-        baseDelta: Double, strategy: CompiledStrategy, host: StrategyRunnerHost, reason: String
+        baseDelta: Double, strategy: CompiledStrategy, host: StrategyRunnerHost, reason: String,
+        stopPrice: Double? = nil, takeProfitPrice: Double? = nil
     ) async {
         guard abs(baseDelta) > 0 else { return }
         let market = strategy.market
@@ -597,6 +620,8 @@ public final class StrategyRunner {
             size: size,
             sizeUnit: .base,
             posSide: posSide,
+            stopTriggerPrice: stopPrice,
+            takeProfitTriggerPrice: takeProfitPrice,
             clOrdId: OrderTag.make(strategyId: strategy.id))
 
         do {
