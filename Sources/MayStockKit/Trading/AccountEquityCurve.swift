@@ -7,10 +7,26 @@ import Observation
 public struct AccountEquityPoint: Codable, Sendable, Equatable {
     public let ts: Date
     public let equity: Double
+    /// Capital backing this curve at this instant, when the curve has one.
+    ///
+    /// A per-strategy curve is *budget plus P&L*, so re-sizing a strategy from
+    /// 39,829 to 19,914 puts a 50% cliff in the series that has nothing to do
+    /// with the market. Reading a drawdown straight off that curve reports a
+    /// catastrophe every time somebody rebalances — which, wired to anything
+    /// that acts on its own, would halt the whole book for doing paperwork.
+    ///
+    /// Recording the basis makes the cliff removable: P&L is `equity - basis`
+    /// and stays continuous across the change, so the return over each interval
+    /// can be taken against the capital that was actually at risk for it.
+    /// `nil` means genuinely unknown — points written before this field
+    /// existed. Unknown must stay unknown rather than defaulting to a number
+    /// that would make the arithmetic silently wrong.
+    public let basis: Double?
 
-    public init(ts: Date, equity: Double) {
+    public init(ts: Date, equity: Double, basis: Double? = nil) {
         self.ts = ts
         self.equity = equity
+        self.basis = basis
     }
 }
 
@@ -333,8 +349,11 @@ public final class AccountEquityCurve {
 
     /// Append a sample. Returns false when the sample was rejected — too soon
     /// after the previous one, non-finite, or timestamped in the past.
+    ///
+    /// `basis` is the capital backing the curve, for the curves that have one;
+    /// see `AccountEquityPoint.basis`.
     @discardableResult
-    public func record(equity: Double, at ts: Date = Date()) -> Bool {
+    public func record(equity: Double, at ts: Date = Date(), basis: Double? = nil) -> Bool {
         guard equity.isFinite, equity > 0 else { return false }
         if let last = points.last {
             // A clock that jumps backwards (NTP correction, sleep/wake) must
@@ -342,7 +361,8 @@ public final class AccountEquityCurve {
             guard ts > last.ts,
                   ts.timeIntervalSince(last.ts) >= Self.minimumSampleInterval else { return false }
         }
-        points.append(AccountEquityPoint(ts: ts, equity: equity))
+        let cleanBasis = (basis?.isFinite == true && (basis ?? 0) > 0) ? basis : nil
+        points.append(AccountEquityPoint(ts: ts, equity: equity, basis: cleanBasis))
         compact(now: ts)
         onChanged?()
         return true

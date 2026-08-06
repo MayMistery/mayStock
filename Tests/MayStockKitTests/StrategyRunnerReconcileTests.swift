@@ -112,9 +112,11 @@ final class FakeHost: StrategyRunnerHost {
         halts.append((strategyId, reason))
     }
     func runnerDidSampleEquity(_ equity: Double, at ts: Date) {}
-    var strategyEquitySamples: [(strategyId: String, equity: Double)] = []
-    func runnerDidSampleStrategyEquity(_ strategyId: String, equity: Double, at ts: Date) {
-        strategyEquitySamples.append((strategyId, equity))
+    var strategyEquitySamples: [(strategyId: String, equity: Double, basis: Double)] = []
+    func runnerDidSampleStrategyEquity(
+        _ strategyId: String, equity: Double, basis: Double, at ts: Date
+    ) {
+        strategyEquitySamples.append((strategyId, equity, basis))
     }
 }
 

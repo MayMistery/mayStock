@@ -539,7 +539,9 @@ extension AppState: StrategyRunnerHost {
         accountBalances = runner.accountBalances
     }
 
-    func runnerDidSampleStrategyEquity(_ strategyId: String, equity: Double, at ts: Date) {
+    func runnerDidSampleStrategyEquity(
+        _ strategyId: String, equity: Double, basis: Double, at ts: Date
+    ) {
         let mode = tradingMode
         let curve: AccountEquityCurve
         if let existing = strategyEquityCurves[strategyId] {
@@ -550,7 +552,7 @@ extension AppState: StrategyRunnerHost {
             if mode == .demo { demoStrategyEquity[strategyId] = curve }
             else { liveStrategyEquity[strategyId] = curve }
         }
-        curve.record(equity: equity, at: ts)
+        curve.record(equity: equity, at: ts, basis: basis)
     }
 
     func runnerDidHalt(strategyId: String, reason: String) {

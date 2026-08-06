@@ -25,6 +25,7 @@ struct LabMain {
             case "ic": try await informationCoefficient(arguments)
             case "factors": try await factors(arguments)
             case "oracle": try await oracle(arguments)
+            case "review": try await review(arguments)
             case "list": list()
             case "help", "--help", "-h": usage()
             default:
@@ -85,6 +86,14 @@ struct LabMain {
               **上帝视角上限**：假设你能预知未来、完美抓住每一个波段，能赚多少？
               同时统计「前高前低」在真实数据里到底有多少次挡住了价格。
               这是唯一刻意使用未来函数的地方，用来给一切策略划出天花板。
+
+          review [--apply] [--json] [--log <路径>] [--dir <目录>]
+                 [--seed-policy [--force]]
+              无人值守复盘：心跳、净值缺口、预算超额、回撤是否越过预注册额度、
+              资金费出血、策略静默、以及「攒够多少新 K 线才值得重新验证」。
+              --apply 会自动执行，但只允许**降低敞口**（停用、降预算、拉总闸）；
+              任何抬高敞口的动作都被不变式挡下并报错。
+              退出码：0 正常/提示，1 告警，2 严重。
 
           list
               列出内置策略与 Strategies/ 下的清单。
