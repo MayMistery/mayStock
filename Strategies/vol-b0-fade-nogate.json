@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "id": "vol-b0-fade-nogate",
+  "name": "B0 无波动门的区间反抽 · 15m（对照组）",
+  "notes": "对照组：同样的反抽，不加任何波动率条件。",
+  "market": {
+    "instId": "BTC-USDT-SWAP",
+    "instType": "SWAP",
+    "bar": "15m"
+  },
+  "params": [
+    {
+      "name": "bbn",
+      "default": 48,
+      "min": 12,
+      "max": 120
+    },
+    {
+      "name": "k",
+      "default": 2,
+      "min": 1,
+      "max": 4
+    }
+  ],
+  "signals": {
+    "longEntry": "close < bb_lower(close, bbn, k)",
+    "longExit": "close > sma(close, bbn)",
+    "shortEntry": "close > bb_upper(close, bbn, k)",
+    "shortExit": "close < sma(close, bbn)"
+  },
+  "sizing": {
+    "mode": "equityPct",
+    "value": 100
+  },
+  "risk": {
+    "leverage": 1,
+    "maxDailyLossPct": 6,
+    "maxHoldBars": 48,
+    "cooldownBars": 0
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "schema": 1,
+  "id": "vol-i-cont-bbexp-trend",
+  "name": "I 连续 · 布林带扩张时顺势 · 1H",
+  "notes": "仓位大小由布林带扩张程度连续调制，方向由趋势给。",
+  "market": {
+    "instId": "BTC-USDT-SWAP",
+    "instType": "SWAP",
+    "bar": "1H"
+  },
+  "params": [
+    {
+      "name": "n",
+      "default": 24,
+      "min": 6,
+      "max": 120
+    },
+    {
+      "name": "kk",
+      "default": 2,
+      "min": 0.5,
+      "max": 5
+    },
+    {
+      "name": "bbn",
+      "default": 20,
+      "min": 10,
+      "max": 60
+    },
+    {
+      "name": "wn",
+      "default": 200,
+      "min": 48,
+      "max": 600
+    }
+  ],
+  "signals": {
+    "exposure": "clamp((close - sma(close, n)) / (kk * atr(n)), -1, 1) * clamp((bb_width(close, bbn, 2) / sma(bb_width(close, bbn, 2), wn) - 1) / 0.5, 0, 1)"
+  },
+  "sizing": {
+    "mode": "equityPct",
+    "value": 100
+  },
+  "risk": {
+    "leverage": 1,
+    "maxExposure": 1,
+    "rebalanceThreshold": 0.05,
+    "maxDailyLossPct": 6
+  }
+}

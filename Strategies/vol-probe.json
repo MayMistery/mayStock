@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "id": "vol-probe",
+  "name": "vol probe",
+  "market": { "instId": "BTC-USDT-SWAP", "instType": "SWAP", "bar": "1H" },
+  "params": [ { "name": "n", "default": 20, "min": 5, "max": 100 } ],
+  "signals": {
+    "exposure": "clamp((close - sma(close, n)) / (2 * atr(n)), -1, 1) * (natr(24) < sma(natr(24), 200))"
+  },
+  "sizing": { "mode": "equityPct", "value": 100 },
+  "risk": { "leverage": 1, "maxExposure": 1, "rebalanceThreshold": 0.05 },
+  "costs": { "feeBps": 2, "slippageBps": 0 }
+}

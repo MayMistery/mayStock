@@ -1,0 +1,53 @@
+{
+  "schema": 1,
+  "id": "vol-c-highvol-fade",
+  "name": "C 高波动区间反抽 · 15m",
+  "notes": "C 是 B 的镜像：只在高波动状态里做均值回复。",
+  "market": {
+    "instId": "BTC-USDT-SWAP",
+    "instType": "SWAP",
+    "bar": "15m"
+  },
+  "params": [
+    {
+      "name": "bbn",
+      "default": 48,
+      "min": 12,
+      "max": 120
+    },
+    {
+      "name": "k",
+      "default": 2,
+      "min": 1,
+      "max": 4
+    },
+    {
+      "name": "nv",
+      "default": 24,
+      "min": 6,
+      "max": 96
+    },
+    {
+      "name": "nl",
+      "default": 192,
+      "min": 48,
+      "max": 600
+    }
+  ],
+  "signals": {
+    "longEntry": "natr(nv) > sma(natr(nv), nl) and close < bb_lower(close, bbn, k)",
+    "longExit": "close > sma(close, bbn)",
+    "shortEntry": "natr(nv) > sma(natr(nv), nl) and close > bb_upper(close, bbn, k)",
+    "shortExit": "close < sma(close, bbn)"
+  },
+  "sizing": {
+    "mode": "equityPct",
+    "value": 100
+  },
+  "risk": {
+    "leverage": 1,
+    "maxDailyLossPct": 6,
+    "maxHoldBars": 48,
+    "cooldownBars": 0
+  }
+}

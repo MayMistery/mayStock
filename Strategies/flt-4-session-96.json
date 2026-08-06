@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "id": "flt-4-session-96",
+  "name": "F4 时段过滤 · 相位 96",
+  "notes": "同一回复信号，只在一天中某个 8 小时区块交易。三个相位 0/96/192 把一天铺满，所以不管数据窗口的相位落在哪，三者合起来一定覆盖亚洲/欧洲/美洲三个时段。若时段之间差异显著，就说明存在日内季节性。",
+  "market": { "instId": "BTC-USDT-SWAP", "instType": "SWAP", "bar": "5m" },
+  "params": [
+    { "name": "lb", "default": 12, "min": 6, "max": 60 },
+    { "name": "k", "default": 1.5, "min": 1, "max": 3 }
+  ],
+  "signals": {
+    "longEntry": "close < bb_lower(close, lb, k) and (bar_index + 96) % 288 < 96",
+    "longExit": "close > sma(close, lb)",
+    "shortEntry": "close > bb_upper(close, lb, k) and (bar_index + 96) % 288 < 96",
+    "shortExit": "close < sma(close, lb)"
+  },
+  "sizing": { "mode": "equityPct", "value": 100 },
+  "risk": { "leverage": 1, "maxDailyLossPct": 6, "maxHoldBars": 36 }
+}

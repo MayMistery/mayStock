@@ -169,8 +169,16 @@ enum Lab {
     ) async throws -> [Candle] {
         let bars = Int((Double(days) * 86_400 / strategy.market.bar.seconds).rounded(.up))
         let target = Swift.min(bars + strategy.warmupBars, BacktestRunner.maxBars)
-        return try await rest.historyCandles(
+        if let cached = CandleCache.load(
+            instId: strategy.market.instId, bar: strategy.market.bar, atLeast: target) {
+            return cached
+        }
+        let fetched = try await rest.historyCandles(
             instId: strategy.market.instId, bar: strategy.market.bar, target: target)
+        CandleCache.save(
+            fetched, instId: strategy.market.instId, bar: strategy.market.bar,
+            requested: target)
+        return fetched
     }
 
     /// Candles plus every series the manifest declares, aligned and reported.
@@ -334,5 +342,101 @@ enum LabError: Error, CustomStringConvertible {
         case .notFound(let path): return "找不到策略清单：\(path)"
         case .usage(let text): return text
         }
+    }
+}
+
+// MARK: - Candle cache
+
+/// On-disk candle cache for the research bench.
+///
+/// Research means running the same window past dozens of strategy variants, and
+/// without this every one of them refetches identical history — slow, and enough
+/// concurrent optimisation runs will rate-limit the account against itself
+/// (HTTP 429), which is how a sweep comes back with half its grid missing.
+///
+/// Deliberately not in `MayStockKit`: the trading runner must never read a
+/// candle from disk. It needs to know the feed is live, and a cache is exactly
+/// the thing that would hide a dead one.
+enum CandleCache {
+    /// How long a window may be reused. Long enough to cover a research
+    /// session, short enough that "today's backtest" means today.
+    static let maxAge: TimeInterval = 3_600
+
+    static var directory: URL {
+        URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("maystock-lab-candles", isDirectory: true)
+    }
+
+    private static func url(instId: String, bar: BarInterval) -> URL {
+        directory.appendingPathComponent("\(instId)-\(bar.rawValue).json")
+    }
+
+    private struct Payload: Codable {
+        var fetchedAt: Date
+        /// How many bars were *asked* for, not how many came back.
+        ///
+        /// The exchange routinely returns fewer than requested — its history
+        /// simply ends. Keying the hit on the delivered count would mean a
+        /// window fetched for 11 520 bars that yielded 9 000 never satisfies a
+        /// request for 11 520, and the cache would miss every single time while
+        /// looking like it worked.
+        var requested: Int
+        var candles: [Cached]
+        struct Cached: Codable {
+            var ts: Date
+            var open: Double
+            var high: Double
+            var low: Double
+            var close: Double
+            var volume: Double
+            var confirmed: Bool
+        }
+    }
+
+    /// A cached window, but only when it is fresh *and* long enough. A shorter
+    /// window silently truncates a longer backtest, which would look like a
+    /// coverage problem in the data rather than a cache miss.
+    static func load(instId: String, bar: BarInterval, atLeast: Int) -> [Candle]? {
+        guard !ProcessInfo.processInfo.environment.keys.contains("MAYSTOCK_NO_CACHE"),
+              let data = try? Data(contentsOf: url(instId: instId, bar: bar)) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let payload = try? decoder.decode(Payload.self, from: data),
+              Date().timeIntervalSince(payload.fetchedAt) < maxAge,
+              payload.candles.count >= atLeast else { return nil }
+        return payload.candles.map {
+            Candle(ts: $0.ts, open: $0.open, high: $0.high, low: $0.low,
+                   close: $0.close, volume: $0.volume, confirmed: $0.confirmed)
+        }
+    }
+
+    static func save(
+        _ candles: [Candle], instId: String, bar: BarInterval, requested: Int
+    ) {
+        guard !candles.isEmpty else { return }
+        // Never shrink a cached window: a 500-day fetch must not be replaced by
+        // a 30-day one just because that ran second.
+        if let existing = try? Data(contentsOf: url(instId: instId, bar: bar)) {
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            if let previous = try? decoder.decode(Payload.self, from: existing),
+               previous.requested > requested,
+               Date().timeIntervalSince(previous.fetchedAt) < maxAge {
+                return
+            }
+        }
+        let payload = Payload(
+            fetchedAt: Date(),
+            requested: requested,
+            candles: candles.map {
+                .init(ts: $0.ts, open: $0.open, high: $0.high, low: $0.low,
+                      close: $0.close, volume: $0.volume, confirmed: $0.confirmed)
+            })
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try? FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+        try? encoder.encode(payload).write(
+            to: url(instId: instId, bar: bar), options: .atomic)
     }
 }

@@ -1,0 +1,9 @@
+{ "schema":1, "id":"hf-b-zscore-reversion", "name":"B 短周期均值回复 · 连续",
+  "notes":"敞口 = 负 z 分数，越偏离越反向。经典日内回复效应。",
+  "market":{"instId":"BTC-USDT-SWAP","instType":"SWAP","bar":"1H"},
+  "params":[{"name":"lookback","default":24,"min":6,"max":96},
+            {"name":"scale","default":2,"min":1,"max":4}],
+  "signals":{"exposure":"clamp(0 - (close - sma(close, lookback)) / (stdev(close, lookback) * scale), -1, 1)"},
+  "sizing":{"mode":"volatilityTarget","value":30},
+  "risk":{"volLookbackBars":72,"maxExposure":1,"rebalanceThreshold":0.02,
+          "leverage":1,"maxDailyLossPct":6} }

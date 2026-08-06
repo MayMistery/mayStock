@@ -1,0 +1,43 @@
+{
+  "schema": 1,
+  "id": "vol-e-expansion-fade",
+  "name": "E 区间扩张反向 · 15m",
+  "notes": "D 的镜像：扩张后反向。",
+  "market": {
+    "instId": "BTC-USDT-SWAP",
+    "instType": "SWAP",
+    "bar": "15m"
+  },
+  "params": [
+    {
+      "name": "an",
+      "default": 48,
+      "min": 10,
+      "max": 200
+    },
+    {
+      "name": "k",
+      "default": 2,
+      "min": 1.2,
+      "max": 5
+    }
+  ],
+  "signals": {
+    "longEntry": "(high - low) > k * ref(atr(an), 1) and close < low + 0.34 * (high - low)",
+    "longExit": "bar_index < 0",
+    "shortEntry": "(high - low) > k * ref(atr(an), 1) and close > low + 0.66 * (high - low)",
+    "shortExit": "bar_index < 0"
+  },
+  "sizing": {
+    "mode": "equityPct",
+    "value": 100
+  },
+  "risk": {
+    "leverage": 1,
+    "maxDailyLossPct": 6,
+    "maxHoldBars": 4,
+    "cooldownBars": 0,
+    "stopLossPct": 1.0,
+    "takeProfitPct": 1.0
+  }
+}

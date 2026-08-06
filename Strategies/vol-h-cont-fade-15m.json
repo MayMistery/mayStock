@@ -1,0 +1,50 @@
+{
+  "schema": 1,
+  "id": "vol-h-cont-fade-15m",
+  "name": "H 连续 · 15m 低波动反抽",
+  "notes": "15m 连续反抽，换手更高，用来测「小 delta 高频」这条路。",
+  "market": {
+    "instId": "BTC-USDT-SWAP",
+    "instType": "SWAP",
+    "bar": "15m"
+  },
+  "params": [
+    {
+      "name": "n",
+      "default": 48,
+      "min": 12,
+      "max": 200
+    },
+    {
+      "name": "kk",
+      "default": 2,
+      "min": 0.5,
+      "max": 5
+    },
+    {
+      "name": "nv",
+      "default": 48,
+      "min": 12,
+      "max": 192
+    },
+    {
+      "name": "nl",
+      "default": 384,
+      "min": 96,
+      "max": 800
+    }
+  ],
+  "signals": {
+    "exposure": "clamp(-(close - sma(close, n)) / (kk * atr(n)), -1, 1) * (natr(nv) < sma(natr(nv), nl))"
+  },
+  "sizing": {
+    "mode": "equityPct",
+    "value": 100
+  },
+  "risk": {
+    "leverage": 1,
+    "maxExposure": 1,
+    "rebalanceThreshold": 0.05,
+    "maxDailyLossPct": 6
+  }
+}

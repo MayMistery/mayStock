@@ -109,9 +109,17 @@ struct LabMain {
         Out.kv("标的", "\(strategy.market.instId) · \(strategy.market.instType.displayName)"
                + " · \(strategy.market.bar.rawValue)")
         Out.kv("费率", schedule.summary)
-        Out.kv("单边成本", "\(PriceFormatter.decimals(schedule.feeBps(for: strategy.market.instType), 2)) bps"
-               + " + 滑点 \(PriceFormatter.plain(schedule.slippageBps)) bps"
-               + " → 往返 \(PriceFormatter.percent(schedule.roundTripCostPct(for: strategy.market.instType), decimals: 3))")
+        // The manifest's own costs win over the account tier, so those are the
+        // numbers the simulation actually charged. Printing the tier here while
+        // charging something else is how a result comes to be trusted for the
+        // wrong reason.
+        let effective = strategy.manifest.costs
+            ?? schedule.costs(for: strategy.market.instType)
+        let overridden = strategy.manifest.costs != nil
+        Out.kv("单边成本", "\(PriceFormatter.decimals(effective.feeBps, 2)) bps"
+               + " + 滑点 \(PriceFormatter.plain(effective.slippageBps)) bps"
+               + " → 往返 \(PriceFormatter.percent((effective.feeBps + effective.slippageBps) / 10_000 * 2 * 100, decimals: 3))"
+               + (overridden ? "（清单自带成本，已覆盖账户档位）" : ""))
 
         let data = try await Lab.fetchMarketData(strategy: strategy, days: days)
         let candles = data.candles

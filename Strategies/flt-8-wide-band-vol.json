@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "id": "flt-8-wide-band-vol",
+  "name": "F8 极端偏离 + 高波动 · 双重过滤",
+  "notes": "本族里最激进的选择性：3 倍标准差偏离，且波动率在高位，且要求 12 小时慢趋势走平。三重过滤叠加，交易笔数会很少 —— 正是要看每笔毛边际能不能被抬到成本线之上。这是本族在「用频率换边际」方向上的极限。",
+  "market": { "instId": "BTC-USDT-SWAP", "instType": "SWAP", "bar": "5m" },
+  "params": [
+    { "name": "lb", "default": 48, "min": 12, "max": 200 },
+    { "name": "k", "default": 3, "min": 2, "max": 5 },
+    { "name": "volLb", "default": 288, "min": 48, "max": 1000 },
+    { "name": "trendN", "default": 144, "min": 48, "max": 576 },
+    { "name": "flat", "default": 1.5, "min": 0.3, "max": 5 }
+  ],
+  "signals": {
+    "longEntry": "close < bb_lower(close, lb, k) and natr(14) > sma(natr(14), volLb) and abs(roc(close, trendN)) < flat",
+    "longExit": "close > sma(close, lb)",
+    "shortEntry": "close > bb_upper(close, lb, k) and natr(14) > sma(natr(14), volLb) and abs(roc(close, trendN)) < flat",
+    "shortExit": "close < sma(close, lb)"
+  },
+  "sizing": { "mode": "equityPct", "value": 100 },
+  "risk": { "leverage": 1, "maxDailyLossPct": 6, "maxHoldBars": 144 }
+}

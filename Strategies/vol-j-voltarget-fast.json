@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "id": "vol-j-voltarget-fast",
+  "name": "J 连续 · 波动目标 · 快速趋势 · 1H",
+  "notes": "波动率目标仓位：低波动时加仓、高波动时减仓，每小时只调一个小 delta。",
+  "market": {
+    "instId": "BTC-USDT-SWAP",
+    "instType": "SWAP",
+    "bar": "1H"
+  },
+  "params": [
+    {
+      "name": "n",
+      "default": 24,
+      "min": 6,
+      "max": 120
+    },
+    {
+      "name": "kk",
+      "default": 1.5,
+      "min": 0.5,
+      "max": 4
+    }
+  ],
+  "signals": {
+    "exposure": "clamp((close - sma(close, n)) / (kk * stdev(close, n)), -1, 1)"
+  },
+  "sizing": {
+    "mode": "volatilityTarget",
+    "value": 40
+  },
+  "risk": {
+    "leverage": 1,
+    "maxExposure": 1,
+    "rebalanceThreshold": 0.05,
+    "volLookbackBars": 72,
+    "maxDailyLossPct": 6
+  }
+}

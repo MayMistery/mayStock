@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "id": "flt-6-gated-continuous",
+  "name": "F6 区间过滤 · 连续敞口",
+  "notes": "把 F1 的过滤器套在连续敞口上：敞口 = 负 z 分数 × regime 开关。成本随换手而不是随名义额走，这是唯一有机会在高频下活下来的形状。rebalanceThreshold 0.02 让每次只动一小块仓位。",
+  "market": { "instId": "BTC-USDT-SWAP", "instType": "SWAP", "bar": "5m" },
+  "params": [
+    { "name": "lb", "default": 24, "min": 6, "max": 96 },
+    { "name": "scale", "default": 2, "min": 1, "max": 4 },
+    { "name": "trendN", "default": 144, "min": 48, "max": 576 },
+    { "name": "flat", "default": 1.0, "min": 0.2, "max": 4 }
+  ],
+  "signals": {
+    "exposure": "clamp(0 - (close - sma(close, lb)) / (stdev(close, lb) * scale), -1, 1) * (abs(roc(close, trendN)) < flat)"
+  },
+  "sizing": { "mode": "volatilityTarget", "value": 30 },
+  "risk": { "volLookbackBars": 72, "maxExposure": 1, "rebalanceThreshold": 0.02, "leverage": 1, "maxDailyLossPct": 6 }
+}

@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "id": "flt-5-htf-pullback",
+  "name": "F5 高周期方向过滤 · 顺势回调",
+  "notes": "方向性过滤而非开关式过滤：只在 1 日趋势向上时买超卖，向下时卖超买。假设：无差别的双向回复在单边行情里一路接刀，把方向锁死能去掉最贵的那一半交易。",
+  "market": { "instId": "BTC-USDT-SWAP", "instType": "SWAP", "bar": "5m" },
+  "params": [
+    { "name": "lb", "default": 12, "min": 6, "max": 60 },
+    { "name": "rsiN", "default": 14, "min": 4, "max": 40 },
+    { "name": "htf", "default": 288, "min": 48, "max": 1000 },
+    { "name": "os", "default": 30, "min": 10, "max": 45 }
+  ],
+  "signals": {
+    "longEntry": "rsi(close, rsiN) < os and close > sma(close, htf)",
+    "longExit": "rsi(close, rsiN) > 50 or close < sma(close, htf)",
+    "shortEntry": "rsi(close, rsiN) > 100 - os and close < sma(close, htf)",
+    "shortExit": "rsi(close, rsiN) < 50 or close > sma(close, htf)"
+  },
+  "sizing": { "mode": "equityPct", "value": 100 },
+  "risk": { "leverage": 1, "maxDailyLossPct": 6, "maxHoldBars": 36 }
+}

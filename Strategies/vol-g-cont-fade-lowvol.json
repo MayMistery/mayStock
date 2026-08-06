@@ -1,0 +1,50 @@
+{
+  "schema": 1,
+  "id": "vol-g-cont-fade-lowvol",
+  "name": "G 连续 · 低波动才反抽 · 1H",
+  "notes": "F 的反号：低波动时做均值回复的连续敞口。",
+  "market": {
+    "instId": "BTC-USDT-SWAP",
+    "instType": "SWAP",
+    "bar": "1H"
+  },
+  "params": [
+    {
+      "name": "n",
+      "default": 24,
+      "min": 6,
+      "max": 120
+    },
+    {
+      "name": "kk",
+      "default": 2,
+      "min": 0.5,
+      "max": 5
+    },
+    {
+      "name": "nv",
+      "default": 24,
+      "min": 6,
+      "max": 96
+    },
+    {
+      "name": "nl",
+      "default": 200,
+      "min": 48,
+      "max": 600
+    }
+  ],
+  "signals": {
+    "exposure": "clamp(-(close - sma(close, n)) / (kk * atr(n)), -1, 1) * (natr(nv) < sma(natr(nv), nl))"
+  },
+  "sizing": {
+    "mode": "equityPct",
+    "value": 100
+  },
+  "risk": {
+    "leverage": 1,
+    "maxExposure": 1,
+    "rebalanceThreshold": 0.05,
+    "maxDailyLossPct": 6
+  }
+}
