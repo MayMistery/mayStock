@@ -403,8 +403,17 @@ enum CandleCache {
         decoder.dateDecodingStrategy = .iso8601
         guard let payload = try? decoder.decode(Payload.self, from: data),
               Date().timeIntervalSince(payload.fetchedAt) < maxAge,
-              payload.candles.count >= atLeast else { return nil }
-        return payload.candles.map {
+              payload.requested >= atLeast else { return nil }
+        // Truncated to what was actually asked for, keeping the most recent
+        // bars — `historyCandles(target:)` returns the newest N.
+        //
+        // Returning the whole cached window instead would silently widen every
+        // shorter request: `--days 20` served from a 124-day cache runs 124
+        // days and labels the result twenty. That is worse than having no
+        // cache, because the number looks right while answering a different
+        // question, and a validation run on a short window would quietly be
+        // re-testing the very history the strategy was fitted on.
+        return payload.candles.suffix(atLeast).map {
             Candle(ts: $0.ts, open: $0.open, high: $0.high, low: $0.low,
                    close: $0.close, volume: $0.volume, confirmed: $0.confirmed)
         }

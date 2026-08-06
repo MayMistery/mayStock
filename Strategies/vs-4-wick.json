@@ -1,9 +1,0 @@
-{ "schema":1, "id":"vs-4-wick", "name":"VS4 上下影失衡 连续 · 5m",
-  "notes":"下影长于上影 = 低位被买回，是买压的痕迹。imb = (下影-上影)/全幅，平滑后作敞口。纯 intrabar 几何，不含任何均线。",
-  "market":{"instId":"BTC-USDT-SWAP","instType":"SWAP","bar":"5m"},
-  "params":[{"name":"smooth","default":24,"min":3,"max":200},
-            {"name":"scale","default":3,"min":1,"max":10}],
-  "signals":{
-    "exposure":"clamp(sma(((min(open, close) - low) - (high - max(open, close))) / max(high - low, close * 0.0002), smooth) * scale, -1, 1)"},
-  "sizing":{"mode":"equityPct","value":100},
-  "risk":{"leverage":1,"maxExposure":1,"rebalanceThreshold":0.05,"maxDailyLossPct":6} }
