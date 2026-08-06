@@ -254,21 +254,21 @@ struct StatisticsTests {
     }
 
     @Test func luckThresholdRisesWithTheNumberOfTries() {
-        let few = Statistics.expectedMaxSharpeUnderNull(trials: 10, years: 1)
-        let many = Statistics.expectedMaxSharpeUnderNull(trials: 10_000, years: 1)
+        let few = TradingKernel.expectedMaxSharpeUnderNull(trials: 10, years: 1)
+        let many = TradingKernel.expectedMaxSharpeUnderNull(trials: 10_000, years: 1)
         #expect(many > few, "more tries means a higher Sharpe is reachable by luck alone")
         #expect(few > 0)
     }
 
     @Test func luckThresholdFallsWithMoreData() {
-        let short = Statistics.expectedMaxSharpeUnderNull(trials: 1_000, years: 0.25)
-        let long = Statistics.expectedMaxSharpeUnderNull(trials: 1_000, years: 4)
+        let short = TradingKernel.expectedMaxSharpeUnderNull(trials: 1_000, years: 0.25)
+        let long = TradingKernel.expectedMaxSharpeUnderNull(trials: 1_000, years: 4)
         #expect(long < short, "a longer sample makes lucky Sharpes harder to come by")
     }
 
     @Test func degenerateInputsAreSafe() {
-        #expect(Statistics.expectedMaxSharpeUnderNull(trials: 1, years: 1) == 0)
-        #expect(Statistics.expectedMaxSharpeUnderNull(trials: 100, years: 0) == 0)
+        #expect(TradingKernel.expectedMaxSharpeUnderNull(trials: 1, years: 1) == 0)
+        #expect(TradingKernel.expectedMaxSharpeUnderNull(trials: 100, years: 0) == 0)
     }
 }
 

@@ -491,3 +491,80 @@ struct LiveVsBacktestBridgeTests {
         #expect(result.tracksShape == nil)
     }
 }
+
+// MARK: - Data quality, pre-trade limits, overfitting
+
+struct KernelGateBridgeTests {
+    @Test("过拟合评估经过 FFI 往返")
+    func overfitRoundTrips() throws {
+        // A modest, believable edge: strong enough to clear a five-trial bar,
+        // not so strong that the probability saturates and proves nothing.
+        var state: UInt64 = 42
+        let series = (0..<2_000).map { _ -> Double in
+            state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            let uniform = Double(state >> 33) / Double(1 << 31)
+            return 0.0006 + (uniform - 0.5) * 0.02
+        }
+        let mean = series.reduce(0, +) / Double(series.count)
+        let sd = (series.map { pow($0 - mean, 2) }.reduce(0, +)
+                  / Double(series.count - 1)).squareRoot()
+        let sharpe = mean / sd * 365.0.squareRoot()
+
+        let few = try TradingKernel.assessOverfit(
+            returns: series, observedSharpe: sharpe, trials: 5)
+        let many = try TradingKernel.assessOverfit(
+            returns: series, observedSharpe: sharpe, trials: 100_000)
+        #expect(few.deflated?.significant == true)
+        // The identical backtest means less once it was picked out of a search.
+        #expect((many.deflated?.probability ?? 1) < (few.deflated?.probability ?? 0))
+    }
+
+    @Test("试的次数越多，运气门槛越高")
+    func theBarRisesWithTrials() {
+        let ten = TradingKernel.expectedMaxSharpeUnderNull(trials: 10, years: 3)
+        let many = TradingKernel.expectedMaxSharpeUnderNull(trials: 10_000, years: 3)
+        #expect(many > ten)
+        #expect(TradingKernel.expectedMaxSharpeUnderNull(trials: 1, years: 3) == 0)
+    }
+
+    @Test("等价曲线的收益率序列")
+    func periodReturnsAreDerivedFromTheCurve() {
+        let curve = [
+            EquityPoint(ts: Date(timeIntervalSince1970: 0), equity: 100, price: 1),
+            EquityPoint(ts: Date(timeIntervalSince1970: 60), equity: 110, price: 1),
+            EquityPoint(ts: Date(timeIntervalSince1970: 120), equity: 99, price: 1),
+        ]
+        let returns = StrategyOptimizer.periodReturns(of: curve)
+        #expect(returns.count == 2)
+        #expect(abs(returns[0] - 0.1) < 1e-9)
+        #expect(abs(returns[1] - (-0.1)) < 1e-9)
+    }
+
+    @Test("交叉验证采样横跨整个排名，不只取头部")
+    func crossValidationSamplingSpansTheRanking() {
+        // Comparing winners against winners would understate the problem the
+        // statistic exists to detect.
+        let candidates = (0..<100).map { index in
+            OptimizationCandidate(
+                id: index, parameters: [:],
+                metrics: BacktestMetrics.empty, score: Double(100 - index), rejection: nil)
+        }
+        let returns = Dictionary(uniqueKeysWithValues: (0..<100).map { index in
+            (index, (0..<40).map { step in Double(index + step) * 0.001 })
+        })
+        let sampled = StrategyOptimizer.sampleForCrossValidation(
+            candidates: candidates, returns: returns, limit: 10)
+        #expect(sampled.count == 10)
+    }
+
+    @Test("样本太短的候选不参与交叉验证")
+    func shortSeriesAreExcluded() {
+        let candidates = [
+            OptimizationCandidate(id: 0, parameters: [:], metrics: BacktestMetrics.empty,
+                                  score: 1, rejection: nil),
+        ]
+        let sampled = StrategyOptimizer.sampleForCrossValidation(
+            candidates: candidates, returns: [0: [0.1, 0.2]])
+        #expect(sampled.isEmpty)
+    }
+}

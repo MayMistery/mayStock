@@ -78,6 +78,22 @@ public struct StrategyAllocation: Codable, Sendable, Equatable, Identifiable {
 
 // MARK: - Portfolio preferences
 
+/// Pause a strategy that keeps getting stopped out inside a short window.
+///
+/// The strategy may be doing exactly what it was designed to do and still be
+/// wrong about the current market: the per-trade stop fires correctly each
+/// time, and the account bleeds out one correct stop-out at a time.
+public struct StoplossGuard: Codable, Sendable, Equatable {
+    /// Stop-outs within the window that trip the guard.
+    public var trades: Int
+    public var lookbackMinutes: Int
+
+    public init(trades: Int = 4, lookbackMinutes: Int = 360) {
+        self.trades = trades
+        self.lookbackMinutes = lookbackMinutes
+    }
+}
+
 public struct StrategyPortfolioPrefs: Codable, Sendable, Equatable {
     /// Demo until the user unlocks live in Settings *and* confirms per strategy.
     public var mode: TradingMode
@@ -94,6 +110,19 @@ public struct StrategyPortfolioPrefs: Codable, Sendable, Equatable {
     public var backtestCapital: Double
     /// Fee model for backtests and cost estimates. Defaults to a fresh account.
     public var feeSchedule: OKXFeeSchedule
+    /// Stop opening new positions once the account has drawn down this far from
+    /// its high-water mark. Portfolio-wide on purpose: a per-strategy daily
+    /// breaker cannot see four strategies losing 4% each, which is exactly the
+    /// day worth stopping. Nil disables it.
+    public var maxDrawdownPct: Double?
+    /// Hard ceiling on one order's notional, in `quoteCurrency`. A backstop
+    /// against a sizing bug rather than a strategy setting — nothing legitimate
+    /// should ever reach it. Nil leaves only the equity-share cap.
+    public var maxOrderNotional: Double?
+    /// Pause a strategy that keeps getting stopped out. Freqtrade's
+    /// StoplossGuard: the strategy may be behaving exactly as designed and
+    /// still be wrong about the current market.
+    public var stoplossGuard: StoplossGuard?
 
     public init(
         mode: TradingMode = .demo,
@@ -103,7 +132,10 @@ public struct StrategyPortfolioPrefs: Codable, Sendable, Equatable {
         emergencyStop: Bool = false,
         allowScriptEngines: Bool = false,
         backtestCapital: Double = 10_000,
-        feeSchedule: OKXFeeSchedule = OKXFeeSchedule()
+        feeSchedule: OKXFeeSchedule = OKXFeeSchedule(),
+        maxDrawdownPct: Double? = 25,
+        maxOrderNotional: Double? = nil,
+        stoplossGuard: StoplossGuard? = StoplossGuard()
     ) {
         self.mode = mode
         self.totalCapital = totalCapital
@@ -113,11 +145,15 @@ public struct StrategyPortfolioPrefs: Codable, Sendable, Equatable {
         self.allowScriptEngines = allowScriptEngines
         self.backtestCapital = backtestCapital
         self.feeSchedule = feeSchedule
+        self.maxDrawdownPct = maxDrawdownPct
+        self.maxOrderNotional = maxOrderNotional
+        self.stoplossGuard = stoplossGuard
     }
 
     private enum CodingKeys: String, CodingKey {
         case mode, totalCapital, quoteCurrency, allocations
         case emergencyStop, allowScriptEngines, backtestCapital, feeSchedule
+        case maxDrawdownPct, maxOrderNotional, stoplossGuard
     }
 
     public init(from decoder: Decoder) throws {
@@ -130,6 +166,13 @@ public struct StrategyPortfolioPrefs: Codable, Sendable, Equatable {
         allowScriptEngines = try c.decodeIfPresent(Bool.self, forKey: .allowScriptEngines) ?? false
         backtestCapital = try c.decodeIfPresent(Double.self, forKey: .backtestCapital) ?? 10_000
         feeSchedule = try c.decodeIfPresent(OKXFeeSchedule.self, forKey: .feeSchedule) ?? OKXFeeSchedule()
+        // Absent means "never configured", which for a protective limit has to
+        // mean the default rather than "off" — a config written before these
+        // existed should gain the protection, not opt out of it.
+        maxDrawdownPct = try c.decodeIfPresent(Double.self, forKey: .maxDrawdownPct) ?? 25
+        maxOrderNotional = try c.decodeIfPresent(Double.self, forKey: .maxOrderNotional)
+        stoplossGuard = try c.decodeIfPresent(StoplossGuard.self, forKey: .stoplossGuard)
+            ?? StoplossGuard()
     }
 
     public var allocatedCapital: Double {

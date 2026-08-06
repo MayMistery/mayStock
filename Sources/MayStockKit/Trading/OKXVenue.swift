@@ -85,6 +85,12 @@ public struct OKXVenue: ExchangeVenue {
         try await bridge.accountSnapshot(mode: mode)
     }
 
+    public func fundingPayments(
+        instId: String?, mode: TradingMode
+    ) async throws -> [FundingPayment] {
+        try await bridge.fundingPayments(instId: instId, mode: mode)
+    }
+
     // MARK: Protective orders
 
     public func protectiveOrders(

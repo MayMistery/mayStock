@@ -197,6 +197,16 @@ pub struct LiveDecision {
     /// treat the flat target as a signal to sell.
     #[serde(rename = "warmingUp")]
     pub warming_up: bool,
+    /// Set when a computed order was refused before it could be sent.
+    ///
+    /// The plan is still reported in full — the caller needs to show what the
+    /// strategy wanted, not just that it was stopped — but `should_trade` is
+    /// false and this says why.
+    pub denied: Option<crate::guard::OrderDenied>,
+    /// Set when the candle series is not fit to trade on. Distinct from
+    /// warming up: there is enough data, it is just not trustworthy.
+    #[serde(rename = "dataQuality")]
+    pub data_quality: Option<crate::quality::DataQuality>,
 }
 
 /// What the runner knows about the account when it asks for a plan.
@@ -215,6 +225,11 @@ pub struct AccountState {
     pub bars_since_exit: Option<usize>,
     /// The daily-loss breaker already tripped today.
     pub halted_today: bool,
+    /// Wall clock, for the staleness check. `None` in a backtest, where
+    /// historical data is stale by definition and the property is meaningless.
+    pub now_ms: Option<i64>,
+    /// Pre-trade limits, applied to whatever sizing produces.
+    pub limits: crate::guard::OrderLimits,
     /// Average entry price of the held position; 0 when flat. Seeds the
     /// trailing anchor, so a position that never moved in its favour trails
     /// from where it was opened rather than from an arbitrary bar.
@@ -230,6 +245,8 @@ impl Default for AccountState {
             leverage_cap: None,
             bars_since_exit: None,
             halted_today: false,
+            now_ms: None,
+            limits: crate::guard::OrderLimits::default(),
             entry_price: 0.0,
         }
     }
@@ -261,6 +278,8 @@ fn idle(reason: &str, current: Option<Direction>, held: f64, bars: usize, ts: i6
         stop_price: None,
         take_profit_price: None,
         trailing_stop_price: trailing,
+        denied: None,
+        data_quality: None,
     }
 }
 
@@ -336,6 +355,23 @@ pub fn decide_live(
 
     let index = candles.len() - 1;
     let bar_ts = candles[index].ts_ms;
+
+    // Judged before a single indicator touches the series. Every one of them
+    // will happily compute a real-looking number from a stale or holed feed,
+    // and standing aside on bad data is the correct behaviour rather than a
+    // failure — so this is a refusal to decide, not a flat target.
+    let quality = crate::quality::inspect(
+        &candles,
+        crate::strategy::bar_seconds(&strategy.manifest.market.bar),
+        account.now_ms,
+    );
+    if !quality.usable {
+        let mut decision = idle(
+            &format!("行情数据不可用：{}", quality.reason),
+            current, account.held_base, candles.len(), bar_ts, false, None);
+        decision.data_quality = Some(quality);
+        return Ok(decision);
+    }
     // The backtester never trades before `warmup_bars`; the live runner must
     // not either, or the first live signal would be one the backtest refused.
     if candles.len() <= strategy.warmup_bars + 1 {
@@ -381,6 +417,8 @@ pub fn decide_live(
                 stop_price: None,
                 take_profit_price: None,
                 trailing_stop_price: None,
+                denied: None,
+                data_quality: None,
             });
         }
     }
@@ -431,15 +469,20 @@ pub fn decide_live(
         // same threshold the backtester honours.
         let threshold = strategy.manifest.risk.rebalance_threshold.max(0.0);
         let drift = (effective - current_exposure).abs();
+        let delta = target_base - account.held_base;
+        let denied = crate::guard::check_order(
+            delta, account.held_base, price, account.equity, &account.limits);
 
         return Ok(LiveDecision {
             target: if effective > 1e-9 { 1 } else if effective < -1e-9 { -1 } else { 0 },
             target_exposure: effective,
             target_base_quantity: target_base,
-            base_delta: target_base - account.held_base,
-            should_trade: drift >= threshold,
+            base_delta: delta,
+            should_trade: drift >= threshold && denied.is_none(),
             halt_daily_loss: false,
-            reason: if drift >= threshold {
+            reason: if let Some(refusal) = &denied {
+                refusal.reason.clone()
+            } else if drift >= threshold {
                 format!("敞口 {current_exposure:.3} → {effective:.3}")
             } else {
                 format!("敞口 {current_exposure:.3} → {effective:.3}，未达再平衡阈值 {threshold:.3}")
@@ -452,6 +495,8 @@ pub fn decide_live(
             stop_price: None,
             take_profit_price: None,
             trailing_stop_price: None,
+            denied,
+            data_quality: None,
         });
     }
 
@@ -552,22 +597,29 @@ pub fn decide_live(
                     stop_price: None,
                     take_profit_price: None,
                     trailing_stop_price: trailing,
+                    denied: None,
+                    data_quality: None,
                 });
             }
         }
     }
 
     let delta = target_base - account.held_base;
+    let denied = crate::guard::check_order(
+        delta, account.held_base, price, account.equity, &account.limits);
     Ok(LiveDecision {
+        denied: denied.clone(),
+        data_quality: None,
         target: Direction::to_i32(target),
         target_exposure: f64::NAN,
         target_base_quantity: target_base,
         base_delta: delta,
-        should_trade: delta.abs() > 1e-12,
+        should_trade: delta.abs() > 1e-12 && denied.is_none(),
         halt_daily_loss: false,
-        reason: match target {
-            Some(d) => format!("信号{}", if d == Direction::Long { "做多" } else { "做空" }),
-            None => "信号平仓".to_string(),
+        reason: match (&denied, target) {
+            (Some(refusal), _) => refusal.reason.clone(),
+            (None, Some(d)) => format!("信号{}", if d == Direction::Long { "做多" } else { "做空" }),
+            (None, None) => "信号平仓".to_string(),
         },
         confirmed_bars: candles.len(),
         bar_ts,

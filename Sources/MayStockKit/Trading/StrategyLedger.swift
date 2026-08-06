@@ -70,6 +70,13 @@ public struct StrategyPositionState: Codable, Sendable, Equatable, Identifiable 
     /// arbitrarily old.
     public var openedAt: Date?
     public var lastFillAt: Date?
+    /// Funding settled on this position, signed: negative when we paid.
+    ///
+    /// Kept apart from `realisedPnL` so the two can be told apart on screen —
+    /// a strategy losing money purely to funding is a different diagnosis from
+    /// one losing it on entries — but it is real money and `netPnL` includes it.
+    public var fundingPaid: Double?
+
     /// Base units per contract (`ctVal`). Swap sizes are counted in contracts,
     /// not coins — one BTC-USDT-SWAP contract is 0.01 BTC — so every P&L and
     /// exposure figure has to scale by it. Optional so ledgers written before
@@ -94,7 +101,7 @@ public struct StrategyPositionState: Codable, Sendable, Equatable, Identifiable 
 
     private enum CodingKeys: String, CodingKey {
         case strategyId, instId, quantity, averagePrice, realisedPnL, feesPaid
-        case fillCount, lastFillAt, contractSize
+        case fillCount, lastFillAt, contractSize, fundingPaid
         // Written under the old name before it was scoped to the current
         // position, so ledgers already on disk keep decoding.
         case openedAt = "firstFillAt"
@@ -121,9 +128,9 @@ public struct StrategyPositionState: Codable, Sendable, Equatable, Identifiable 
         return abs(quantity) * price * multiplier
     }
 
-    /// Realised plus unrealised, net of fees already paid.
+    /// Realised plus unrealised, net of fees and funding.
     public func netPnL(mark: Double?) -> Double {
-        realisedPnL + unrealisedPnL(mark: mark) - feesPaid
+        realisedPnL + unrealisedPnL(mark: mark) - feesPaid + (fundingPaid ?? 0)
     }
 
     /// Return on the capital allocated to this strategy.
@@ -244,6 +251,25 @@ public final class StrategyLedger {
     /// Every fill already on the book, so a caller adopting fills the exchange
     /// executed on its own can tell which ones are genuinely new.
     public var recordedFillIds: Set<String> { Set(fills.map(\.id)) }
+
+    /// Funding settlements already booked, by the exchange's bill id.
+    public private(set) var recordedFundingIds: Set<String> = []
+
+    /// Book a funding settlement against a strategy.
+    ///
+    /// Idempotent on the exchange's bill id, because this is called from a
+    /// polling loop that will see the same settlement on every tick until it
+    /// ages out of the listing.
+    @discardableResult
+    public func recordFunding(_ payment: FundingPayment, strategyId: String) -> Bool {
+        guard !recordedFundingIds.contains(payment.id),
+              var state = positions[strategyId] else { return false }
+        recordedFundingIds.insert(payment.id)
+        state.fundingPaid = (state.fundingPaid ?? 0) + payment.amount
+        positions[strategyId] = state
+        onChanged?()
+        return true
+    }
 
     // MARK: Mutation
 

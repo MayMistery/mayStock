@@ -66,6 +66,15 @@ public protocol ExchangeVenue: Sendable {
 
     func accountSnapshot(mode: TradingMode) async throws -> AccountSnapshot
 
+    /// Funding settled on perpetual positions.
+    ///
+    /// Optional: a venue with no perpetuals, or no way to report the charge,
+    /// inherits an empty default. Booking nothing is honest there; booking a
+    /// guess would not be.
+    func fundingPayments(
+        instId: String?, mode: TradingMode
+    ) async throws -> [FundingPayment]
+
     // MARK: Protective orders
 
     /// The stop and take-profit orders the exchange is currently holding.
@@ -125,6 +134,10 @@ extension ExchangeVenue {
     ) async -> (series: [String: [Double]], coverage: [SeriesCoverage]) {
         ([:], [])
     }
+
+    public func fundingPayments(
+        instId: String?, mode: TradingMode
+    ) async throws -> [FundingPayment] { [] }
 }
 
 /// What the exchange says became of an order we are unsure about.

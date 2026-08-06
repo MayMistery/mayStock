@@ -272,6 +272,7 @@ public final class StrategyRunner {
         // strategy's position can still be closed out from under it, and the
         // ledger has to learn that from somewhere.
         await reconcileExternal(for: host)
+        await bookFunding(for: host)
 
         // Then any level the exchange refused to hold for us. After
         // reconciliation, so a position already closed on the exchange is not
@@ -283,6 +284,7 @@ public final class StrategyRunner {
         // question the panel must answer even with every strategy stopped.
         await sampleEquity(for: host)
         sampleStrategyEquity(for: host)
+        evaluateProtection(for: host)
 
         let active = portfolio.allocations.filter { $0.running && !portfolio.emergencyStop }
         guard !active.isEmpty else { return }
@@ -364,6 +366,46 @@ public final class StrategyRunner {
         host.runnerDidChange()
     }
 
+    // MARK: Funding
+
+    /// Book the funding charged on perpetual positions.
+    ///
+    /// The backtester models funding from real rate history. Live ignored it
+    /// completely, which for a short held across several days is not a rounding
+    /// error — it is the position's whole edge, settled eight-hourly.
+    ///
+    /// Polled on the same slow cadence as equity: settlements happen three
+    /// times a day, and each read costs an authenticated call.
+    private func bookFunding(for host: StrategyRunnerHost) async {
+        let now = Date()
+        if let last = lastFundingPollAt,
+           now.timeIntervalSince(last) < Self.fundingPollInterval { return }
+
+        let held = host.ledger.positions.values.filter {
+            !$0.isFlat && $0.instId.hasSuffix("-SWAP")
+        }
+        guard !held.isEmpty else { return }
+        guard let payments = try? await host.venue.fundingPayments(
+            instId: nil, mode: host.portfolio.mode) else { return }
+        lastFundingPollAt = now
+
+        for payment in payments {
+            // Same attribution rule as an external fill: one owner or none.
+            // Splitting a settlement between two strategies sharing a leg would
+            // be a guess, and funding is small enough per settlement that
+            // skipping is the cheaper error.
+            let claimants = held.filter { $0.instId == payment.instId }
+            guard claimants.count == 1, let owner = claimants.first else { continue }
+            if host.ledger.recordFunding(payment, strategyId: owner.strategyId) {
+                Log.warn("runner: booked funding \(payment.amount) on \(payment.instId)")
+            }
+        }
+    }
+
+    private var lastFundingPollAt: Date?
+    /// Funding settles three times a day; polling faster buys nothing.
+    public static let fundingPollInterval: TimeInterval = 900
+
     // MARK: External position changes
 
     /// Reconcile the ledger against what the exchange actually holds, and book
@@ -386,7 +428,21 @@ public final class StrategyRunner {
     /// derivative position is reported per instrument and is exactly the thing
     /// that gets stopped out, liquidated or auto-deleveraged.
     private func reconcileExternal(for host: StrategyRunnerHost) async {
-        let held = host.ledger.positions.values.filter {
+        var held = host.ledger.positions.values.filter {
+            !$0.isFlat && $0.instId.hasSuffix("-SWAP")
+        }
+        guard !held.isEmpty else {
+            pendingExternal.removeAll()
+            return
+        }
+
+        // Book our *own* fills first. Without this, an order that filled but
+        // whose ingest failed — a dropped response, a CLI hiccup — looks
+        // exactly like an external reduction, and would be booked a second
+        // time at the mark when the real fill arrived on a later tick.
+        await ingestFills(for: Set(held.map { InstrumentKey(instId: $0.instId, instType: .swap) }),
+                          host: host)
+        held = host.ledger.positions.values.filter {
             !$0.isFlat && $0.instId.hasSuffix("-SWAP")
         }
         guard !held.isEmpty else {
@@ -487,6 +543,7 @@ public final class StrategyRunner {
         }
 
         pendingExternal[instId] = nil
+        recordStopOut()
         // A position closed by the exchange is an exit like any other, so the
         // cooldown applies to it. Without this the strategy could re-enter on
         // the very next bar — something the backtest never does after a stop.
@@ -778,7 +835,11 @@ public final class StrategyRunner {
                     barsSinceExit: barsSince(lastExitBar[strategy.id],
                                              latestBar: latestBar, market: market),
                     haltedToday: anchor.halted,
-                    entryPrice: position?.averagePrice ?? 0))
+                    entryPrice: position?.averagePrice ?? 0,
+                    // The kernel has no clock of its own, by design. Staleness
+                    // is the one property it cannot judge without one.
+                    now: Date(),
+                    limits: orderLimits(for: host)))
         } catch {
             update(strategy.id) {
                 $0.status = .failed
@@ -795,6 +856,19 @@ public final class StrategyRunner {
                 $0.status = .warmingUp
                 $0.message = "内核指标预热中（\(decision.confirmedBars) 根）"
             }
+            return
+        }
+
+        // Bad data is a refusal to decide, not a flat target. Acting on the
+        // kernel's silence here would liquidate a position because the feed
+        // hiccupped. `lastActedBar` is deliberately not set, so the moment the
+        // series is clean again this bar gets decided properly.
+        if let quality = decision.dataQuality, !quality.usable {
+            update(strategy.id) {
+                $0.status = .failed
+                $0.message = decision.reason
+            }
+            Log.warn("runner: \(strategy.id) stood down — \(quality.reason)")
             return
         }
 
@@ -828,16 +902,36 @@ public final class StrategyRunner {
     private func barsSince(
         _ since: Date?, latestBar: Candle, market: StrategyMarket
     ) -> Int? {
-        guard let since, market.bar.seconds > 0 else { return nil }
-        return Swift.max(Int(latestBar.ts.timeIntervalSince(since) / market.bar.seconds), 0)
+        guard let since else { return nil }
+        return Self.barsBetween(since, and: latestBar.ts, bar: market.bar)
     }
 
-    /// Bars the current position has been held for, from its first fill.
+    /// Bars the current position has been held for, counted from the bar its
+    /// opening fill landed in.
     private func barsHeldCount(
         position: StrategyPositionState?, latestBar: Candle, market: StrategyMarket
     ) -> Int {
-        guard let first = position?.openedAt, market.bar.seconds > 0 else { return 0 }
-        return Swift.max(Int(latestBar.ts.timeIntervalSince(first) / market.bar.seconds), 0)
+        guard let opened = position?.openedAt else { return 0 }
+        return Self.barsBetween(opened, and: latestBar.ts, bar: market.bar) ?? 0
+    }
+
+    /// Bars between two instants, counting *bars* rather than elapsed time.
+    ///
+    /// Both ends are floored to their bar's opening time first. A fill lands
+    /// part-way through a bar, and dividing the raw interval loses that
+    /// fraction: an entry at 10:05 measured against the 15:00 bar gives 4.9 →
+    /// 4, when the position has in fact been open across 5 bars. The
+    /// backtester counts index arithmetic and has no such rounding, so
+    /// without this every bar-counted rule — the minimum hold, the cooldown,
+    /// and above all the time barrier and the trailing anchor's window — was
+    /// one bar out from the simulation that justified it.
+    static func barsBetween(_ from: Date, and to: Date, bar: BarInterval) -> Int? {
+        let seconds = bar.seconds
+        guard seconds > 0 else { return nil }
+        func barStart(_ date: Date) -> Double {
+            (date.timeIntervalSince1970 / seconds).rounded(.down) * seconds
+        }
+        return Swift.max(Int(((barStart(to) - barStart(from)) / seconds).rounded()), 0)
     }
 
     /// Target direction for this bar, decided by the Rust kernel.
@@ -878,6 +972,83 @@ public final class StrategyRunner {
         } else {
             kernelCache.removeAll()
         }
+    }
+
+    // MARK: Portfolio-level protection
+
+    /// Limits every order is checked against, whatever asked for it.
+    ///
+    /// Two of these are portfolio-wide rather than per strategy, which is the
+    /// point: a per-strategy daily-loss breaker cannot see four strategies
+    /// losing 4% each, and that is the day worth stopping.
+    private func orderLimits(for host: StrategyRunnerHost) -> KernelOrderLimits {
+        var limits = KernelOrderLimits()
+        if let cap = host.portfolio.maxOrderNotional, cap > 0 {
+            limits.maxOrderNotional = cap
+        }
+        // `reducing`, never `halted`: a halted engine cannot close the position
+        // that tripped the breaker, which is the one order it most needs to
+        // send. Closing stays available; opening does not.
+        if protectionTripped != nil { limits.state = .reducing }
+        return limits
+    }
+
+    /// Why the portfolio is currently refusing new exposure, if it is.
+    public private(set) var protectionTripped: String?
+
+    /// Account drawdown from its high-water mark, as a percentage.
+    public private(set) var accountDrawdownPct: Double = 0
+
+    /// Stop opening new positions when the *account* has drawn down past the
+    /// configured limit, and when a strategy keeps getting stopped out.
+    ///
+    /// Freqtrade calls these MaxDrawdown and StoplossGuard. Both exist because
+    /// a strategy can be behaving exactly as designed and still be wrong about
+    /// the current market — the per-trade stop fires each time and the account
+    /// bleeds out one correct stop-out at a time.
+    private func evaluateProtection(for host: StrategyRunnerHost) {
+        guard let equity = accountEquity, equity > 0 else { return }
+        highWaterEquity = Swift.max(highWaterEquity ?? equity, equity)
+        guard let peak = highWaterEquity, peak > 0 else { return }
+        accountDrawdownPct = Swift.max((peak - equity) / peak * 100, 0)
+
+        if let limit = host.portfolio.maxDrawdownPct, limit > 0,
+           accountDrawdownPct >= limit {
+            let reason = "账户自最高点回撤 \(PriceFormatter.percent(accountDrawdownPct))"
+                + "，已达上限 \(PriceFormatter.percent(limit))，只允许减仓"
+            if protectionTripped == nil {
+                Log.warn("runner: portfolio drawdown breaker tripped at \(accountDrawdownPct)%")
+            }
+            protectionTripped = reason
+            return
+        }
+
+        if let guardConfig = host.portfolio.stoplossGuard,
+           guardConfig.trades > 0, guardConfig.lookbackMinutes > 0 {
+            let since = Date().addingTimeInterval(-Double(guardConfig.lookbackMinutes) * 60)
+            let recent = stopOuts.filter { $0 > since }
+            stopOuts = recent
+            if recent.count >= guardConfig.trades {
+                protectionTripped = "\(guardConfig.lookbackMinutes) 分钟内触发了 "
+                    + "\(recent.count) 次止损，暂停开新仓"
+                return
+            }
+        }
+        protectionTripped = nil
+    }
+
+    /// Account equity high-water mark, for the drawdown breaker.
+    private var highWaterEquity: Double?
+    /// When protective exits fired, for the stop-loss guard.
+    private var stopOuts: [Date] = []
+
+    /// Record that a position was closed by a protective level rather than by
+    /// a signal. Called from the reconciliation path, which is the only place
+    /// that learns about an exchange-side stop firing.
+    private func recordStopOut() {
+        stopOuts.append(Date())
+        // Bounded: the guard only ever looks at a trailing window.
+        if stopOuts.count > 200 { stopOuts.removeFirst(stopOuts.count - 200) }
     }
 
     // MARK: Sizing
@@ -1159,6 +1330,15 @@ public final class StrategyRunner {
             localStops[strategyId] = nil
             update(strategyId) { $0.message = "本地\(kind)触发（\(PriceFormatter.plain(price))），正在平仓" }
             await flatten(strategyId: strategyId)
+
+            // Disarming before the order lands would leave the position
+            // unprotected for good if that order failed. Only a position that
+            // is actually gone releases the level.
+            guard host.ledger.position(for: strategyId)?.isFlat ?? true else {
+                localStops[strategyId] = level
+                update(strategyId) { $0.message = "本地\(kind)平仓未成交，仍在盯价" }
+                continue
+            }
             lastExitBar[strategyId] =
                 lastConfirmedBarTime(forStrategy: strategyId, host: host) ?? Date()
         }
@@ -1167,8 +1347,14 @@ public final class StrategyRunner {
     // MARK: Fill attribution
 
     private func ingestFills(for strategies: [CompiledStrategy], host: StrategyRunnerHost) async {
-        let instruments = Set(strategies.map { ($0.market.instId, $0.market.instType) }
-            .map { InstrumentKey(instId: $0.0, instType: $0.1) })
+        await ingestFills(
+            for: Set(strategies.map {
+                InstrumentKey(instId: $0.market.instId, instType: $0.market.instType)
+            }),
+            host: host)
+    }
+
+    private func ingestFills(for instruments: Set<InstrumentKey>, host: StrategyRunnerHost) async {
         guard !instruments.isEmpty else { return }
         let knownIds = host.runnableStrategies.map(\.id)
         let mode = host.portfolio.mode

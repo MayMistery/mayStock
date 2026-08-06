@@ -185,6 +185,11 @@ public struct OptimizationResult: Sendable {
     public let evaluated: Int
     public let candidates: [OptimizationCandidate]
     public let warnings: [String]
+    /// Whether the winner survives having been chosen from `evaluated` tries.
+    public let deflatedSharpe: KernelDeflatedSharpe?
+    /// Whether the *search* found anything, as opposed to the winner being
+    /// the luckiest draw. Nil when there were too few comparable candidates.
+    public let overfitProbability: KernelOverfitProbability?
 
     public var best: OptimizationCandidate? { candidates.first { $0.passes } }
     public var passing: [OptimizationCandidate] { candidates.filter(\.passes) }
@@ -195,7 +200,7 @@ public struct OptimizationResult: Sendable {
     public var luckThresholdSharpe: Double {
         guard let sample = candidates.first?.metrics else { return 0 }
         let bars = Swift.max(sample.spanDays, 1)
-        return Statistics.expectedMaxSharpeUnderNull(trials: evaluated, years: bars / 365.25)
+        return TradingKernel.expectedMaxSharpeUnderNull(trials: evaluated, years: bars / 365.25)
     }
 }
 
@@ -231,11 +236,14 @@ public struct StrategyOptimizer: Sendable {
     ) -> OptimizationResult {
         let searchGrid = grid ?? ParameterGrid(manifest: strategy.manifest)
         var warnings: [String] = []
+        var deflated: KernelDeflatedSharpe?
+        var overfit: KernelOverfitProbability?
 
         guard !searchGrid.isEmpty else {
             return OptimizationResult(
                 objective: objective, gridSize: 0, evaluated: 0, candidates: [],
-                warnings: ["策略没有声明带 min/max 的参数，无可寻优空间"])
+                warnings: ["策略没有声明带 min/max 的参数，无可寻优空间"],
+                deflatedSharpe: nil, overfitProbability: nil)
         }
         if searchGrid.size > limit {
             warnings.append("搜索空间 \(searchGrid.size) 组，超出上限，仅评估前 \(limit) 组")
@@ -244,6 +252,11 @@ public struct StrategyOptimizer: Sendable {
         let combinations = searchGrid.combinations(limit: limit)
         var candidates: [OptimizationCandidate] = []
         candidates.reserveCapacity(combinations.count)
+        // Per-candidate return series, kept for the cross-validation below.
+        // Bounded, because CSCV is combinatorial in the number of blocks and
+        // linear in candidates — a 5 000-point sweep would spend longer being
+        // validated than it did being searched.
+        var returnsById: [Int: [Double]] = [:]
 
         for (index, parameters) in combinations.enumerated() {
             onProgress?(index + 1, combinations.count)
@@ -253,6 +266,7 @@ public struct StrategyOptimizer: Sendable {
             guard let result = try? BacktestEngine(strategy: variant, config: config)
                 .run(candles: candles) else { continue }
             let metrics = result.metrics
+            returnsById[index] = Self.periodReturns(of: result.equityCurve)
             candidates.append(OptimizationCandidate(
                 id: index,
                 parameters: parameters,
@@ -269,7 +283,7 @@ public struct StrategyOptimizer: Sendable {
         // Multiple testing: with enough tries, something always looks good.
         if let best = candidates.first(where: { $0.passes }) {
             let span = Swift.max(best.metrics.spanDays, 1) / 365.25
-            let luck = Statistics.expectedMaxSharpeUnderNull(trials: candidates.count, years: span)
+            let luck = TradingKernel.expectedMaxSharpeUnderNull(trials: candidates.count, years: span)
             if best.metrics.sharpe <= luck {
                 warnings.append(
                     "最优夏普 \(PriceFormatter.ratio(best.metrics.sharpe)) 未超过"
@@ -282,8 +296,44 @@ public struct StrategyOptimizer: Sendable {
                     "每个自由参数仅 \(PriceFormatter.decimals(perParameter, 1)) 笔交易，"
                     + "低于 30 笔的统计下限")
             }
+
+            // The Sharpe comparison above is a point estimate against a point
+            // benchmark. The Deflated Sharpe asks the sharper question — how
+            // *likely* is this result under the null — and takes the return
+            // shape into account, which matters because a naive search
+            // gravitates towards small steady gains punctuated by large losses.
+            if let series = returnsById[best.id], series.count >= 8 {
+                deflated = try? TradingKernel.assessOverfit(
+                    returns: series, observedSharpe: best.metrics.sharpe,
+                    trials: candidates.count,
+                    periodsPerYear: Self.periodsPerYear(
+                        observations: series.count, spanDays: best.metrics.spanDays)).deflated
+                if let deflated, !deflated.significant {
+                    warnings.append(
+                        "去膨胀夏普显著性仅 \(PriceFormatter.percent(deflated.probability * 100, decimals: 0))"
+                        + "，低于 95% —— 考虑到试过 \(candidates.count) 组参数，"
+                        + "这个结果无法与运气区分")
+                }
+            }
         } else {
             warnings.append("没有任何参数组同时满足全部约束")
+        }
+
+        // And the question neither of those asks: is the *selection procedure*
+        // itself sound? PBO cross-validates the choice rather than the winner,
+        // so it catches a search that would have picked a different winner on
+        // any other slice of the data.
+        let sampled = Self.sampleForCrossValidation(candidates: candidates, returns: returnsById)
+        if sampled.count >= 2 {
+            overfit = try? TradingKernel.assessOverfit(
+                returns: [], observedSharpe: 0, trials: candidates.count,
+                candidates: sampled, blocks: 8).overfit
+            if let overfit, overfit.isOverfit {
+                warnings.append(
+                    "回测过拟合概率 \(PriceFormatter.percent(overfit.pbo * 100, decimals: 0))"
+                    + " —— 样本内最优在样本外多半落到中位数以下，问题出在这次搜索本身，"
+                    + "而不是它挑中的那组参数")
+            }
         }
 
         return OptimizationResult(
@@ -291,7 +341,50 @@ public struct StrategyOptimizer: Sendable {
             gridSize: searchGrid.size,
             evaluated: candidates.count,
             candidates: candidates,
-            warnings: warnings)
+            warnings: warnings,
+            deflatedSharpe: deflated,
+            overfitProbability: overfit)
+    }
+}
+
+extension StrategyOptimizer {
+    /// Period-over-period returns from an equity curve.
+    static func periodReturns(of curve: [EquityPoint]) -> [Double] {
+        guard curve.count > 1 else { return [] }
+        return zip(curve, curve.dropFirst()).compactMap { previous, next in
+            guard previous.equity > 0 else { return nil }
+            return next.equity / previous.equity - 1
+        }
+    }
+
+    /// Observations per year implied by the tested window, for annualisation.
+    ///
+    /// Derived from the curve rather than from the bar interval, because the
+    /// equity curve excludes warm-up bars — using the nominal interval would
+    /// annualise a series that is shorter than it claims to be.
+    static func periodsPerYear(observations: Int, spanDays: Double) -> Double {
+        guard spanDays > 0, observations > 1 else { return 365 }
+        return Double(observations) / (spanDays / 365.25)
+    }
+
+    /// Candidates to cross-validate, capped and spread across the ranking.
+    ///
+    /// CSCV compares every half-and-half split of the blocks, so its cost grows
+    /// with the number of candidates; running it over a 5 000-point sweep would
+    /// take longer than the sweep. Sampling evenly across the *sorted* list
+    /// keeps both the strong and the weak end represented, which is what the
+    /// rank statistic needs — sampling only the top would compare winners
+    /// against winners and understate the problem.
+    static func sampleForCrossValidation(
+        candidates: [OptimizationCandidate], returns: [Int: [Double]], limit: Int = 24
+    ) -> [[Double]] {
+        let usable = candidates.compactMap { candidate -> [Double]? in
+            guard let series = returns[candidate.id], series.count >= 32 else { return nil }
+            return series
+        }
+        guard usable.count > limit else { return usable }
+        let stride = Double(usable.count) / Double(limit)
+        return (0..<limit).map { usable[Swift.min(Int(Double($0) * stride), usable.count - 1)] }
     }
 }
 
@@ -359,19 +452,4 @@ public enum Statistics {
             / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1)
     }
 
-    /// Expected highest annualised Sharpe among `trials` independent strategies
-    /// that have **no skill whatsoever**, over `years` of data.
-    ///
-    /// Bailey & López de Prado's expected-maximum-Sharpe: the standard error of
-    /// a Sharpe estimate is roughly `1/√years`, and the maximum of N draws from
-    /// that distribution grows with log N. This is the bar a grid-search winner
-    /// has to clear before it deserves to be called a strategy.
-    public static func expectedMaxSharpeUnderNull(trials: Int, years: Double) -> Double {
-        guard trials > 1, years > 0 else { return 0 }
-        let n = Double(trials)
-        let gamma = 0.5772156649015329   // Euler–Mascheroni
-        let term = (1 - gamma) * inverseNormalCDF(1 - 1 / n)
-            + gamma * inverseNormalCDF(1 - 1 / (n * M_E))
-        return term / years.squareRoot()
-    }
 }
