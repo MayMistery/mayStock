@@ -407,18 +407,20 @@ public enum PortfolioReview {
 
             guard let curve = s.strategyEquity[id], curve.count >= 2 else { continue }
 
-            let liveBars = Int(
-                curve[curve.count - 1].ts.timeIntervalSince(curve[0].ts) / mandate.barSeconds)
             switch Self.timeWeightedDrawdownPct(curve) {
             case .unknown(let why):
                 findings.append(ReviewFinding(
                     code: "drawdown.strategyUnknown",
                     severity: .info,
-                    title: "策略回撤算不出来",
+                    title: "策略回撤还算不出来",
                     detail: "\(id)：\(why)。这里报「算不出」而不是报一个数 —— "
                         + "把调仓造成的台阶当成亏损，会让自动停用规则在每次再平衡后立刻开火。",
-                    remedy: "等曲线积累到足够多带基准的采样点即可，无需干预"))
-            case .value(let drawdown):
+                    remedy: "等曲线再攒几个采样点即可，无需干预"))
+            case .value(let drawdown, let from, _):
+                // Counted from where the *measurable* history starts, not from
+                // where the file starts: a limit may only be enforced over the
+                // stretch it could actually be checked on.
+                let liveBars = Int(s.now.timeIntervalSince(from) / mandate.barSeconds)
                 guard drawdown >= mandate.resampleP95DrawdownPct else { break }
                 if liveBars < policy.minimumLiveBarsBeforeHalt {
                     findings.append(ReviewFinding(
@@ -641,7 +643,12 @@ public enum PortfolioReview {
     }
 
     public enum DrawdownReading: Sendable, Equatable {
-        case value(Double)
+        /// The drawdown, and the stretch of history it was measured over.
+        /// The span travels with the number because a drawdown read off two
+        /// hours is a different claim from one read off two months, and a
+        /// caller that cannot tell them apart will eventually act on the first
+        /// as if it were the second.
+        case value(pct: Double, from: Date, samples: Int)
         case unknown(String)
     }
 
@@ -659,23 +666,36 @@ public enum PortfolioReview {
     /// the mandate's p95 is denominated in. Comparing a limit against a number
     /// computed a different way is a silent unit error wearing a threshold.
     ///
-    /// Returns `.unknown` rather than a number when any interval lacks a basis.
-    /// A missing basis is not a zero and not a carry-forward: it is a fact we do
+    /// Measured over the longest *trailing* run of basis-carrying samples, and
+    /// reports how long that is. Points written before the field existed are
+    /// skipped rather than poisoning the whole reading — a curve is thirty days
+    /// deep, and refusing to look at anything until the last legacy point ages
+    /// out would leave the halt rule blind for a month.
+    ///
+    /// Returns `.unknown` rather than a number when that run is too short. A
+    /// missing basis is not a zero and not a carry-forward: it is a fact we do
     /// not have, and a risk limit must never be compared against a guess.
     public static func timeWeightedDrawdownPct(_ points: [AccountEquityPoint]) -> DrawdownReading {
-        guard points.count >= 2 else { return .unknown("样本不足两点") }
+        var start = points.count
+        while start > 0, let basis = points[start - 1].basis, basis > 0,
+              points[start - 1].equity > 0 {
+            start -= 1
+        }
+        let usable = Array(points[start...])
+        guard usable.count >= 2 else {
+            return .unknown("最近只有 \(usable.count) 个采样点带基准资金，"
+                + "更早的点写于该字段存在之前")
+        }
+
         var value = 1.0
         var peak = 1.0
         var worst = 0.0
-        for index in 1..<points.count {
-            guard let previousBasis = points[index - 1].basis, previousBasis > 0,
-                  let basis = points[index].basis, basis > 0 else {
-                return .unknown("有采样点没有记录基准资金（早于该字段的旧数据）")
-            }
-            let previousEquity = points[index - 1].equity
-            guard previousEquity > 0 else { return .unknown("有采样点的权益不为正") }
-            let previousPnL = previousEquity - previousBasis
-            let pnl = points[index].equity - basis
+        for index in 1..<usable.count {
+            // Force-unwrapped safely: the scan above stopped at the first point
+            // without a positive basis, so every point here has one.
+            let previousEquity = usable[index - 1].equity
+            let previousPnL = previousEquity - usable[index - 1].basis!
+            let pnl = usable[index].equity - usable[index].basis!
             let step = (pnl - previousPnL) / previousEquity
             guard step.isFinite else { return .unknown("区间收益不可用") }
             value *= (1 + step)
@@ -683,7 +703,7 @@ public enum PortfolioReview {
             guard peak > 0 else { continue }
             worst = Swift.max(worst, (peak - value) / peak)
         }
-        return .value(worst * 100)
+        return .value(pct: worst * 100, from: usable[0].ts, samples: usable.count)
     }
 
     /// Standard deviation of hourly returns, in percent.
