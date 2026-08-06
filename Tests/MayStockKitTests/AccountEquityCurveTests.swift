@@ -145,7 +145,9 @@ struct TrailingReturnTests {
         #expect(change.spannedSeconds >= 86_400 * 0.9)
         #expect(!change.isComplete, "a day with 22 hours missing is not a day")
         #expect(change.hasGaps, "spanned but empty in the middle is an outage")
-        #expect(change.missingSeconds > 20 * 3_600)
+        // The Singapore day is ~5.7h old at this instant, and all but the last
+        // half hour of it went unobserved.
+        #expect(change.missingSeconds > 4 * 3_600)
         #expect(change.coverageNote.contains("没有记录"))
     }
 
@@ -167,14 +169,18 @@ struct TrailingReturnTests {
     }
 
     @Test func coverageScalesWithTheWindow() {
-        // The same 2-hour history is a complete 1h window and a partial 1d one.
+        // The same 2-hour history answers the rolling hour completely and the
+        // calendar day only partially — the day began before the curve did.
         let curve = curve(minutes: 120)
         let hour = try! #require(curve.change(over: .hour1, now: at(120), latest: 1_120))
         let day = try! #require(curve.change(over: .day1, now: at(120), latest: 1_120))
         #expect(hour.isComplete)
+        #expect(hour.isAnchored)
         #expect(!day.isComplete)
-        #expect(day.coverage > hour.coverage - 1)  // day coverage ≈ 2/24
-        #expect(abs(day.coverage - 120.0 / 1_440.0) < 1e-9)
+        #expect(!day.isAnchored, "the curve starts after this day's 00:00")
+        #expect(day.coverage < hour.coverage)
+        // Two hours of samples inside a day that is a bit over eight hours old.
+        #expect(abs(day.coveredSeconds - 120 * 60) < 1)
     }
 
     @Test func theLiveEquityIsUsedAsTheEndpoint() {
@@ -211,8 +217,77 @@ struct TrailingReturnTests {
     }
 
     @Test func everyWindowIsOffered() {
-        #expect(EquityWindow.allCases.map(\.label) == ["1h", "1d", "7d"])
-        #expect(EquityWindow.day7.seconds == 7 * 86_400)
+        #expect(EquityWindow.allCases.map(\.label) == ["1h", "今日", "本周"])
+    }
+
+    // MARK: Calendar anchors
+
+    /// Formats an instant in the book's own zone, for readable assertions.
+    private func singapore(_ date: Date, _ format: String = "yyyy-MM-dd HH:mm") -> String {
+        let formatter = DateFormatter()
+        formatter.timeZone = EquityWindow.timeZone
+        // Pinned, or the weekday reads back in whatever language the machine
+        // running the tests happens to be set to.
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = format
+        return formatter.string(from: date)
+    }
+
+    @Test("今日从新加坡时间 00:00 起算")
+    func theDayWindowAnchorsToSingaporeMidnight() {
+        // 1_700_000_000 is 2023-11-15 06:13:20 in Singapore.
+        let now = at(0)
+        #expect(singapore(now) == "2023-11-15 06:13")
+        #expect(singapore(EquityWindow.day1.anchor(now: now)) == "2023-11-15 00:00")
+    }
+
+    @Test("本周从新加坡时间周一 00:00 起算")
+    func theWeekWindowAnchorsToSingaporeMonday() {
+        let now = at(0)                      // a Wednesday
+        let anchor = EquityWindow.day7.anchor(now: now)
+        #expect(singapore(anchor) == "2023-11-13 00:00")
+        #expect(singapore(anchor, "EEEE") == "Monday")
+        // And on the Monday itself the week starts that morning, not a week back.
+        let monday = at(-2 * 24 * 60)        // same clock time, two days earlier
+        #expect(singapore(EquityWindow.day7.anchor(now: monday)) == "2023-11-13 00:00")
+    }
+
+    @Test("开机一秒后三个窗口都有值，而不是空")
+    func everyWindowAnswersImmediately() {
+        // The complaint this exists for: a dash tells the reader nothing. One
+        // sample is enough to price all three — flagged as measured from later
+        // than the label claims, but never withheld.
+        let curve = AccountEquityCurve(mode: .demo)
+        curve.record(equity: 1_000, at: at(0))
+
+        let changes = curve.changes(now: at(0).addingTimeInterval(1), latest: 1_001)
+        #expect(changes.count == 3)
+        for change in changes {
+            #expect(change.changeQuote == 1)
+            #expect(change.changePct != nil)
+            #expect(!change.isAnchored, "a one-second-old curve reaches no anchor")
+            #expect(!change.coverageNote.isEmpty, "and it must say so")
+        }
+    }
+
+    @Test("重启不影响：曲线从磁盘回来，今日仍从 00:00 起算")
+    func aRestartKeepsTheDayAnchored() {
+        // Yesterday evening through this morning, as the persisted file would
+        // hand it back after a relaunch.
+        let stored = stride(from: -600.0, through: 60.0, by: 5.0).map {
+            AccountEquityPoint(ts: at($0), equity: 1_000 + $0 / 10)
+        }
+        let curve = AccountEquityCurve(mode: .demo)
+        curve.replace(points: stored)
+
+        let day = try! #require(curve.change(over: .day1, now: at(60), latest: 1_006))
+        #expect(day.isAnchored, "history reaches back past this morning's 00:00")
+        #expect(day.isComplete)
+        #expect(singapore(day.anchor) == "2023-11-15 00:00")
+        // Measured from the sample at or before midnight, not from the file's
+        // first row — the restart must not move the reference point.
+        #expect(day.referenceTs <= day.anchor)
+        #expect(day.startEquity < 1_000)
     }
 }
 
