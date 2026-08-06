@@ -538,7 +538,10 @@ struct LabMain {
         let spec = AlternativeSeriesSpec(source: source).resolved(against: market)
         let observations = try await AlternativeDataProvider(rest: rest)
             .fetch(spec, bar: bar, days: days)
-        let rawSeries = SeriesAligner.align(observations, to: candles)
+        let rawSeries = SeriesAligner.align(
+            observations, to: candles,
+            timing: spec.isBarBased ? .bar(seconds: bar.seconds) : .instant,
+            candleSeconds: bar.seconds)
         let transform = arguments.string("transform", default: "raw")!
         let aligned = try Lab.applyTransform(transform, to: rawSeries)
         let coverage = SeriesAligner.coverage(

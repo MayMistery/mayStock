@@ -116,7 +116,13 @@ pub struct Trade {
     pub funding: f64,
     #[serde(rename = "netPnL")]
     pub net_pnl: f64,
-    /// Net PnL as a fraction of the equity that existed when the trade opened.
+    /// Net PnL as a **percentage** of the equity that existed when the trade
+    /// opened — 5.0 means +5%, not +500%.
+    ///
+    /// The name says pct and the value is scaled by 100; an earlier comment
+    /// here claimed "as a fraction", which is how a caller came to feed these
+    /// straight into a compounding routine and produce a 100% drawdown on a
+    /// strategy that lost 28%.
     #[serde(rename = "returnPct")]
     pub return_pct: f64,
     pub bars: usize,

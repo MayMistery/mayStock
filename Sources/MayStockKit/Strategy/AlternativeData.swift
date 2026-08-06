@@ -152,7 +152,36 @@ public enum AlternativeSeriesSource: String, Codable, Sendable, CaseIterable {
 }
 
 /// One named external series a manifest wants alongside its candles.
+/// When an observation becomes usable.
+public enum ObservationTiming: Sendable, Equatable {
+    /// Measured over a bar of this length, and therefore known at that bar's
+    /// close. A decision is also taken at a close, so an observation whose bar
+    /// closes at the same instant *is* available — that is the execution model,
+    /// not an assumption.
+    case bar(seconds: Double)
+    /// Published at an instant. One landing exactly on the decision is treated
+    /// as **not yet** available: assuming you held data at the same instant you
+    /// acted on it is the optimistic reading, and optimistic readings are what
+    /// make a backtest lie.
+    case instant
+
+    func isKnown(at decidedAt: TimeInterval, observedAt: Date) -> Bool {
+        let ts = observedAt.timeIntervalSince1970
+        switch self {
+        case .bar(let seconds): return ts + seconds <= decidedAt
+        case .instant: return ts < decidedAt
+        }
+    }
+}
+
 public struct AlternativeSeriesSpec: Codable, Sendable, Equatable {
+    /// Interval to sample this series at, when it is itself bar-based.
+    ///
+    /// Nil means the strategy's own bar. Setting it coarser is the
+    /// higher-timeframe filter — a daily trend gate on an hourly strategy —
+    /// and the aligner only exposes a coarser bar once it has closed, so the
+    /// filter cannot repaint.
+    public var bar: BarInterval?
     public var source: AlternativeSeriesSource
     /// Required for `fundingRate` / `instrumentClose`.
     public var instId: String?
@@ -164,13 +193,22 @@ public struct AlternativeSeriesSpec: Codable, Sendable, Equatable {
 
     public init(
         source: AlternativeSeriesSource, instId: String? = nil,
-        ccy: String? = nil, instType: InstrumentType? = nil
+        ccy: String? = nil, instType: InstrumentType? = nil,
+        bar: BarInterval? = nil
     ) {
         self.source = source
         self.instId = instId
         self.ccy = ccy
         self.instType = instType
+        self.bar = bar
     }
+
+    /// The interval this series is sampled at.
+    public func interval(default market: BarInterval) -> BarInterval { bar ?? market }
+
+    /// True when this source is measured over a bar rather than published at a
+    /// point in time. Only the former needs the closed-bar rule.
+    public var isBarBased: Bool { source == .instrumentClose }
 
     /// Fill in whatever the manifest left implicit, using the strategy's market.
     public func resolved(against market: StrategyMarket) -> AlternativeSeriesSpec {
@@ -243,8 +281,30 @@ public enum SeriesAligner {
     /// and signals are evaluated at its *close*, anything used was already
     /// published when the decision was made. Bars before the first observation
     /// stay NaN, which the evaluator treats as "unknown" and never trades on.
+    /// Step-align an observation series onto the candles.
+    ///
+    /// An observation is usable at bar *i* only once **its own bar has
+    /// closed** by the close of bar *i*. Both intervals matter, which is why
+    /// they are both parameters:
+    ///
+    /// - Same interval: the rule reduces to `observation.ts <= candle.ts`, and
+    ///   the value is the other instrument's close for the same bar — known at
+    ///   the moment the signal is evaluated, which is bar *i*'s close.
+    /// - Coarser observations (a daily filter on an hourly strategy): a candle
+    ///   timestamp is its *open*, so matching on that alone would hand bar *i*
+    ///   the close of a daily bar that still has twenty-three hours to run.
+    ///   That is look-ahead, and it is the exact failure the higher-timeframe
+    ///   literature warns about under the name repainting.
+    ///
+    /// `candleSeconds` is the strategy's own bar length and has no default:
+    /// the answer depends on it, and a caller that has not thought about when
+    /// its decision is taken cannot get a correct alignment by accident.
+    ///
+    /// The two kinds of observation differ at the boundary, and the difference
+    /// is real.
     public static func align(
-        _ observations: [SeriesObservation], to candles: [Candle]
+        _ observations: [SeriesObservation], to candles: [Candle],
+        timing: ObservationTiming = .instant, candleSeconds: Double
     ) -> [Double] {
         var out = [Double](repeating: .nan, count: candles.count)
         guard !observations.isEmpty, !candles.isEmpty else { return out }
@@ -253,7 +313,9 @@ public enum SeriesAligner {
         var cursor = 0
         var current = Double.nan
         for (index, candle) in candles.enumerated() {
-            while cursor < sorted.count, sorted[cursor].ts <= candle.ts {
+            let decidedAt = candle.ts.timeIntervalSince1970 + candleSeconds
+            while cursor < sorted.count,
+                  timing.isKnown(at: decidedAt, observedAt: sorted[cursor].ts) {
                 current = sorted[cursor].value
                 cursor += 1
             }
@@ -373,8 +435,14 @@ public struct AlternativeDataProvider: Sendable {
 
         for (name, raw) in specs.sorted(by: { $0.key < $1.key }) {
             let spec = raw.resolved(against: market)
-            let observations = (try? await fetch(spec, bar: market.bar, days: days)) ?? []
-            let aligned = SeriesAligner.align(observations, to: candles)
+            let interval = spec.interval(default: market.bar)
+            let observations = (try? await fetch(spec, bar: interval, days: days)) ?? []
+            // A coarser series is only usable once its own bar has closed;
+            // matching on open time alone would be look-ahead.
+            let aligned = SeriesAligner.align(
+                observations, to: candles,
+                timing: spec.isBarBased ? .bar(seconds: interval.seconds) : .instant,
+                candleSeconds: market.bar.seconds)
             series[name] = aligned
             coverage.append(SeriesAligner.coverage(
                 name: name, spec: spec, observations: observations, aligned: aligned))

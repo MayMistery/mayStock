@@ -108,8 +108,12 @@ public struct BacktestTrade: Sendable, Equatable, Identifiable {
     public let fees: Double
     public let funding: Double
     public let netPnL: Double
-    /// Net PnL as a fraction of the equity that existed when the trade opened.
+    /// Net PnL as a **percentage** of the equity that existed when the trade
+    /// opened — 5.0 means +5%.
     public let returnPct: Double
+
+    /// The same figure as a fraction, for anything that compounds it.
+    public var returnFraction: Double { returnPct / 100 }
     public let bars: Int
     public let exitReason: TradeExitReason
 
@@ -175,6 +179,18 @@ public struct BacktestResult: Sendable {
     /// retrospectively, so it reports.
     public let dataQuality: KernelDataQuality?
     public let metrics: BacktestMetrics
+
+    /// What the drawdown looks like across plausible orderings of these same
+    /// trades. Nil when there are too few trades to describe a distribution.
+    ///
+    /// Computed lazily: the resampling is thousands of passes over the trade
+    /// list, and most callers of a `BacktestResult` never ask.
+    public var drawdownDistribution: KernelResampleReport? {
+        // Fractions, not percentages: these get compounded.
+        let returns = trades.map(\.returnFraction)
+        guard returns.count >= 10 else { return nil }
+        return (try? TradingKernel.resampleTrades(returns: returns)) ?? nil
+    }
 
     public init(
         strategyId: String, instId: String, bar: BarInterval, start: Date, end: Date,
