@@ -20,6 +20,18 @@ final class StatusItemController: NSObject {
     private var lastRenderAt = Date.distantPast
     private var hoverWorkItem: DispatchWorkItem?
 
+    /// The drawn sparkline, and the sample it was drawn from.
+    ///
+    /// The buffer takes at most one sample per second, so redrawing faster than
+    /// that cannot show anything new — and the redraw is far from free: a
+    /// 60-minute window is 3 600 points to slice, map, downsample and
+    /// rasterise into an NSImage. Doing all of it at the render rate, for every
+    /// status item, is what had an idle menu bar app holding a fifth of a core.
+    private var sparkImage: NSImage?
+    private var sparkImageKey: SparkKey?
+
+    private struct SparkKey: Equatable { let newest: Date?; let minutes: Int }
+
     init(watchItem: WatchItem, session: InstrumentSession, appState: AppState) {
         self.itemID = watchItem.id
         self.watchItem = watchItem
@@ -156,9 +168,11 @@ final class StatusItemController: NSObject {
         let baseFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
         let smallFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
 
-        // Reading these registers observation dependencies:
+        // Reading these registers observation dependencies. `spark` is read as
+        // a whole — that is what registers it — but the window is only *taken*
+        // when the drawing below actually needs one.
         let ticker = session.ticker
-        let sparkPoints = session.spark.window(minutes: watchItem.sparklineMinutes)
+        let spark = session.spark
         let connection = session.connection
         let decimals = watchItem.decimals ?? session.priceDecimals
 
@@ -203,13 +217,20 @@ final class StatusItemController: NSObject {
 
         button.attributedTitle = title
 
-        // Trailing sparkline.
-        if watchItem.style == .sparkline || watchItem.style == .full,
-           let image = SparklineRenderer.image(points: sparkPoints) {
-            button.image = image
+        // Trailing sparkline, redrawn only when the series actually advanced.
+        if watchItem.style == .sparkline || watchItem.style == .full {
+            let key = SparkKey(newest: spark.last?.ts, minutes: watchItem.sparklineMinutes)
+            if key != sparkImageKey || sparkImage == nil {
+                sparkImageKey = key
+                sparkImage = SparklineRenderer.image(
+                    points: spark.window(minutes: watchItem.sparklineMinutes))
+            }
+            button.image = sparkImage
             button.imagePosition = .imageTrailing
         } else {
             button.image = nil
+            sparkImage = nil
+            sparkImageKey = nil
         }
 
         button.toolTip = toolTip(ticker: ticker, connection: connection)

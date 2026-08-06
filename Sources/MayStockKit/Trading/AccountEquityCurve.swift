@@ -14,40 +14,93 @@ public struct AccountEquityPoint: Codable, Sendable, Equatable {
     }
 }
 
-/// The trailing windows the panel reports.
+/// The windows the panel reports.
+///
+/// One rolling, two calendar. The distinction is not cosmetic: "the last 24
+/// hours" and "today" answer different questions, and only the second one is
+/// the question a trader actually asks at 09:00. A calendar window is also
+/// answerable *immediately* — 00:00 today is a real instant, so a curve that
+/// has been recording since yesterday can price it exactly one second after
+/// launch, where a trailing window would still be waiting to fill up.
 public enum EquityWindow: String, CaseIterable, Sendable, Identifiable {
-    case hour1, day1, day7
+    /// Rolling: the last hour, continuously. The interactive one — it moves
+    /// under you while you watch it.
+    case hour1
+    /// Since 00:00 today.
+    case day1
+    /// Since 00:00 Monday.
+    case day7
 
     public var id: String { rawValue }
 
-    public var seconds: TimeInterval {
+    /// The book's trading day. Everything the workbench touches settles
+    /// against a Singapore-hours desk, and a "today" that rolled over at some
+    /// other midnight would put two different days' P&L under one label.
+    public static let timeZone = TimeZone(identifier: "Asia/Singapore") ?? .gmt
+
+    /// Monday-first, in the book's own time zone.
+    public static var calendar: Calendar {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        calendar.firstWeekday = 2      // Monday
+        return calendar
+    }
+
+    /// The instant this window measures from.
+    public func anchor(now: Date = Date()) -> Date {
+        let calendar = Self.calendar
         switch self {
-        case .hour1: return 3_600
-        case .day1: return 86_400
-        case .day7: return 7 * 86_400
+        case .hour1:
+            return now.addingTimeInterval(-3_600)
+        case .day1:
+            return calendar.startOfDay(for: now)
+        case .day7:
+            let components = calendar.dateComponents(
+                [.yearForWeekOfYear, .weekOfYear], from: now)
+            // Falling back to "seven days ago" rather than to nothing: a
+            // calendar that cannot resolve its own week is not a reason to
+            // stop reporting a number.
+            return calendar.date(from: components)
+                ?? calendar.startOfDay(for: now.addingTimeInterval(-7 * 86_400))
         }
     }
 
     public var label: String {
         switch self {
         case .hour1: return "1h"
-        case .day1: return "1d"
-        case .day7: return "7d"
+        case .day1: return "今日"
+        case .day7: return "本周"
+        }
+    }
+
+    /// What the label is short for, spelled out in a tooltip.
+    public var longLabel: String {
+        switch self {
+        case .hour1: return "最近 1 小时（滚动）"
+        case .day1: return "今日 00:00 起（新加坡时间）"
+        case .day7: return "本周一 00:00 起（新加坡时间）"
         }
     }
 }
 
-/// Equity change over a trailing window, carrying an explicit statement of how
-/// much of that window real samples actually cover.
+/// Equity change since a window's anchor, carrying an explicit account of what
+/// the number is really measured from.
 ///
-/// The coverage field is the point of this type. A freshly-installed app has
-/// minutes of history; rendering its 20-minute move under a "7d" label would be
-/// a lie of exactly the kind this codebase refuses to tell elsewhere. Callers
-/// are expected to check `isComplete` before presenting the number plainly.
+/// **The number is always shown.** An earlier version suppressed it whenever
+/// coverage fell short, which for a calendar window is the wrong trade: "since
+/// 00:00 today" is exact the moment there is a sample at or before midnight,
+/// and when there isn't, "+0.4% since 10:23" is strictly more use than a dash.
+/// What must never happen is the number being printed as if it meant something
+/// it doesn't — so the caveats travel with it rather than replacing it.
 public struct EquityChange: Sendable, Equatable {
     public let window: EquityWindow
     public let startEquity: Double
     public let endEquity: Double
+    /// The instant the window asked to measure from.
+    public let anchor: Date
+    /// The sample actually used. Later than `anchor` when history does not
+    /// reach back that far.
+    public let referenceTs: Date
     /// Seconds of the window actually backed by samples, holes excluded.
     public let coveredSeconds: TimeInterval
     /// Seconds between the reference sample and the endpoint.
@@ -57,16 +110,24 @@ public struct EquityChange: Sendable, Equatable {
     /// samples sit a day apart *spans* a day however much of the middle is
     /// missing. Only the second question protects the reader.
     public let spannedSeconds: TimeInterval
+    /// Anchor to endpoint — how long this window currently is. Variable for
+    /// the calendar windows: "today" is 30 seconds long at 00:00:30.
+    public let windowSeconds: TimeInterval
 
     public init(
         window: EquityWindow, startEquity: Double, endEquity: Double,
-        coveredSeconds: TimeInterval, spannedSeconds: TimeInterval
+        anchor: Date, referenceTs: Date,
+        coveredSeconds: TimeInterval, spannedSeconds: TimeInterval,
+        windowSeconds: TimeInterval
     ) {
         self.window = window
         self.startEquity = startEquity
         self.endEquity = endEquity
+        self.anchor = anchor
+        self.referenceTs = referenceTs
         self.coveredSeconds = coveredSeconds
         self.spannedSeconds = spannedSeconds
+        self.windowSeconds = windowSeconds
     }
 
     public var changeQuote: Double { endEquity - startEquity }
@@ -76,39 +137,51 @@ public struct EquityChange: Sendable, Equatable {
         return changeQuote / startEquity * 100
     }
 
-    /// Fraction of the requested window backed by recorded history.
+    /// True when the reference sample predates the anchor, so this really is
+    /// "since 00:00" and not "since whenever we happened to start looking".
+    public var isAnchored: Bool { referenceTs <= anchor }
+
+    /// Fraction of the window backed by recorded history.
     public var coverage: Double {
-        guard window.seconds > 0 else { return 0 }
-        return Swift.min(Swift.max(coveredSeconds, 0) / window.seconds, 1)
+        guard windowSeconds > 0 else { return 1 }
+        return Swift.min(Swift.max(coveredSeconds, 0) / windowSeconds, 1)
     }
 
-    /// Below this the number is a shorter-window return wearing a longer
-    /// window's label, and the UI must say so rather than print it straight.
-    public var isComplete: Bool { coverage >= 0.9 }
+    /// Nothing to disclose: measured from the anchor, with no holes since.
+    public var isComplete: Bool { isAnchored && coverage >= 0.9 }
 
-    /// The window is spanned end to end but pocked with holes — the engine was
-    /// down for part of it, rather than the app being newly installed.
+    /// Anchored, but with stretches nobody observed — the engine was down for
+    /// part of the window rather than the app being new.
     ///
-    /// Worth telling apart, and the more alarming of the two: "we have only
-    /// been recording for 20 minutes" is a fact about the app's age, while
-    /// "18 of these 24 hours were never observed" is a fact about an outage.
-    public var hasGaps: Bool {
-        spannedSeconds >= window.seconds * 0.9 && !isComplete
-    }
+    /// Worth telling apart, and the more alarming of the two: "we only started
+    /// recording at 10:23" is a fact about the app's age, while "6 of these 12
+    /// hours were never observed" is a fact about an outage.
+    public var hasGaps: Bool { isAnchored && coverage < 0.9 }
 
     /// Seconds of the window with no samples behind them at all.
     public var missingSeconds: TimeInterval {
-        Swift.max(Swift.min(window.seconds, spannedSeconds) - coveredSeconds, 0)
+        Swift.max(Swift.min(windowSeconds, spannedSeconds) - coveredSeconds, 0)
     }
 
-    /// Human description of the shortfall, for a tooltip.
+    /// Human description of the caveat, empty when there is none.
     public var coverageNote: String {
-        guard !isComplete else { return "" }
+        if !isAnchored {
+            return "记录从 \(EquityChange.clock(referenceTs)) 才开始，"
+                + "这不是完整的\(window.label)"
+        }
         if hasGaps {
-            return "这 \(window.label) 里有 \(AccountEquityCurve.describe(missingSeconds))"
+            return "\(window.longLabel)里有 \(AccountEquityCurve.describe(missingSeconds))"
                 + "没有记录 —— 引擎当时没在跑"
         }
-        return "仅记录了 \(AccountEquityCurve.describe(coveredSeconds))，不足 \(window.label)"
+        return ""
+    }
+
+    /// Wall-clock time in the book's own zone.
+    static func clock(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.timeZone = EquityWindow.timeZone
+        formatter.dateFormat = "MM-dd HH:mm"
+        return formatter.string(from: date)
     }
 }
 
@@ -180,20 +253,28 @@ public final class AccountEquityCurve {
         // The reference is the last sample at or before the cutoff. With less
         // history than the window, fall back to the oldest sample — and let
         // `coveredSeconds` disclose that it is not a full window.
-        let cutoff = endTs.addingTimeInterval(-window.seconds)
-        let start = points.last(where: { $0.ts <= cutoff }) ?? points.first
+        // The anchor is a real instant, not a length: `now` decides which
+        // midnight or which Monday, and the reference is the last sample at or
+        // before it. Falling back to the oldest sample keeps a number on screen
+        // from the first second — flagged, via `isAnchored`, as measured from
+        // later than it claims.
+        let anchor = window.anchor(now: endTs)
+        let start = points.last(where: { $0.ts <= anchor }) ?? points.first
         guard let start, start.equity > 0 else { return nil }
 
         return EquityChange(
             window: window,
             startEquity: start.equity,
             endEquity: endEquity,
-            // Measured from the cutoff when the window is fully spanned, and
-            // from the oldest sample when it is not — in both cases counting
-            // only the stretches a sample actually stands behind.
+            anchor: anchor,
+            referenceTs: start.ts,
+            // Counted from the anchor when history reaches it and from the
+            // oldest sample when it does not — in both cases counting only the
+            // stretches a sample actually stands behind.
             coveredSeconds: coveredSeconds(
-                from: Swift.max(cutoff, start.ts), to: endTs, now: endTs),
-            spannedSeconds: Swift.max(endTs.timeIntervalSince(start.ts), 0))
+                from: Swift.max(anchor, start.ts), to: endTs, now: endTs),
+            spannedSeconds: Swift.max(endTs.timeIntervalSince(start.ts), 0),
+            windowSeconds: Swift.max(endTs.timeIntervalSince(anchor), 0))
     }
 
     /// Seconds between `from` and `to` that recorded samples actually back.
@@ -242,10 +323,10 @@ public final class AccountEquityCurve {
         EquityWindow.allCases.compactMap { change(over: $0, now: now, latest: liveEquity) }
     }
 
-    /// Points inside a trailing window, for a sparkline.
+    /// Points since a window's anchor, for a sparkline.
     public func window(_ window: EquityWindow, now: Date = Date()) -> [AccountEquityPoint] {
-        let cutoff = now.addingTimeInterval(-window.seconds)
-        return points.filter { $0.ts >= cutoff }
+        let anchor = window.anchor(now: now)
+        return points.filter { $0.ts >= anchor }
     }
 
     // MARK: Mutation

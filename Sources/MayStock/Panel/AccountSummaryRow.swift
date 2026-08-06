@@ -156,17 +156,18 @@ struct AccountSummaryRow: View {
         }
     }
 
-    /// One trailing window.
+    /// One window.
     ///
-    /// A window the recorded history does not yet cover shows a dash and how
-    /// long it has actually been recording — never a number. Falling back to
-    /// the oldest sample would print the same figure under all three labels,
-    /// which reads as three independent measurements agreeing when it is really
-    /// one short measurement repeated. The partial value stays in the tooltip.
+    /// The number is always shown once a single sample exists. "今日" measured
+    /// from 00:00 is exact the moment the curve reaches back that far, and when
+    /// it doesn't, "+0.4% 自 10:23 起" beats a dash — a dash tells the reader
+    /// nothing at all. What the caveats must never do is disappear, so they ride
+    /// alongside the figure as a marker and spell themselves out on hover.
     private func cell(_ window: EquityWindow) -> some View {
         let change = change(window)
         let pct = change?.changePct
-        let ready = change?.isComplete == true && pct != nil
+        let caveat = change.map { !$0.isComplete } ?? false
+        let tint = ChartStyle.trend((pct ?? 0) >= 0)
 
         return VStack(spacing: 1) {
             Text(window.label)
@@ -174,23 +175,24 @@ struct AccountSummaryRow: View {
                 .foregroundStyle(.tertiary)
             // Amount first: "+33 USDT" answers "how much did I make" directly,
             // where a percentage of an unstated base does not.
-            Text(ready ? PriceFormatter.signedMoney(change?.changeQuote ?? 0, decimals: 1) : "—")
+            Text(change.map { PriceFormatter.signedMoney($0.changeQuote, decimals: 1) } ?? "—")
                 .font(.system(size: 11, weight: .semibold)).monospacedDigit()
-                .foregroundStyle(ready ? ChartStyle.trend((pct ?? 0) >= 0) : Color.secondary)
+                .foregroundStyle(change == nil ? Color.secondary : tint)
                 .lineLimit(1).minimumScaleFactor(0.7)
             Group {
-                if ready {
-                    Text(PriceFormatter.signedPercent(pct ?? 0))
-                        .foregroundStyle(ChartStyle.trend((pct ?? 0) >= 0).opacity(0.75))
-                } else if let change, change.coveredSeconds > 0 {
-                    // "缺 6 小时" and "记录 20 分钟" are different problems: one
-                    // says the engine stopped, the other that it is young.
-                    Text(change.hasGaps
-                         ? "缺 \(AccountEquityCurve.describe(change.missingSeconds))"
-                         : "记录 \(AccountEquityCurve.describe(change.coveredSeconds))")
-                        .foregroundStyle(change.hasGaps
-                                         ? AnyShapeStyle(ChartStyle.down.opacity(0.8))
-                                         : AnyShapeStyle(.tertiary))
+                if let change, let pct {
+                    HStack(spacing: 1) {
+                        Text(PriceFormatter.signedPercent(pct))
+                            .foregroundStyle(tint.opacity(0.75))
+                        // A gap is the engine having stopped; a late start is
+                        // just a young curve. Different marks, both explained
+                        // on hover, neither of them hiding the number.
+                        if change.hasGaps {
+                            Text("!").foregroundStyle(ChartStyle.down)
+                        } else if !change.isAnchored {
+                            Text("*").foregroundStyle(.tertiary)
+                        }
+                    }
                 } else {
                     Text("等待记录").foregroundStyle(.tertiary)
                 }
@@ -203,11 +205,12 @@ struct AccountSummaryRow: View {
     }
 
     private func tooltip(_ window: EquityWindow, _ change: EquityChange?) -> String {
-        guard let change, change.coveredSeconds > 0 else {
-            return "尚无 \(window.label) 的权益记录 —— 应用需先运行一段时间才能给出这个窗口的收益率"
+        guard let change else {
+            return "\(window.longLabel)：还没有任何权益采样"
         }
         let range = "\(PriceFormatter.money(change.startEquity)) → "
             + "\(PriceFormatter.money(change.endEquity)) \(StrategyRunner.quoteCurrency)"
-        return change.isComplete ? "\(window.label)：\(range)" : "\(range)（\(change.coverageNote)）"
+        let head = "\(window.longLabel)\n\(range)"
+        return change.coverageNote.isEmpty ? head : "\(head)\n\(change.coverageNote)"
     }
 }
