@@ -12,12 +12,18 @@ public struct WalkForwardFold: Sendable, Identifiable {
     public let outOfSample: BacktestMetrics
     public let outOfSampleTrades: [BacktestTrade]
     public let outOfSampleEquity: [EquityPoint]
+    /// Bars removed from the end of the fitting window because the test's
+    /// indicators are primed on them.
+    public let purgedBars: Int
+    /// Further bars left as a buffer for serial correlation.
+    public let embargoedBars: Int
 
     public init(
         id: Int, inSampleStart: Date, inSampleEnd: Date,
         outOfSampleStart: Date, outOfSampleEnd: Date,
         parameters: [String: Double], inSample: BacktestMetrics, outOfSample: BacktestMetrics,
-        outOfSampleTrades: [BacktestTrade], outOfSampleEquity: [EquityPoint]
+        outOfSampleTrades: [BacktestTrade], outOfSampleEquity: [EquityPoint],
+        purgedBars: Int = 0, embargoedBars: Int = 0
     ) {
         self.id = id
         self.inSampleStart = inSampleStart
@@ -29,6 +35,8 @@ public struct WalkForwardFold: Sendable, Identifiable {
         self.outOfSample = outOfSample
         self.outOfSampleTrades = outOfSampleTrades
         self.outOfSampleEquity = outOfSampleEquity
+        self.purgedBars = purgedBars
+        self.embargoedBars = embargoedBars
     }
 
     /// How much of the fitted edge survived contact with unseen data.
@@ -121,19 +129,30 @@ public struct WalkForwardAnalysis: Sendable {
     public let folds: Int
     /// Share of each cycle spent fitting; the rest is traded blind.
     public let inSampleFraction: Double
+    /// Extra bars dropped from the end of the fitting window, on top of the
+    /// indicator lookback that is always purged.
+    ///
+    /// The embargo exists because purging only removes the bars the test
+    /// *mechanically* depends on. Prices are serially correlated, so the bars
+    /// either side of the boundary describe nearly the same market state, and
+    /// parameters fitted right up to the edge are fitted to the test.
+    /// Expressed as a share of each fold, following López de Prado's 1%.
+    public let embargoFraction: Double
 
     public init(
         strategy: CompiledStrategy,
         config: BacktestConfig = BacktestConfig(),
         objective: OptimizationObjective = OptimizationObjective(),
         folds: Int = 4,
-        inSampleFraction: Double = 0.7
+        inSampleFraction: Double = 0.7,
+        embargoFraction: Double = 0.01
     ) {
         self.strategy = strategy
         self.config = config
         self.objective = objective
         self.folds = Swift.max(folds, 1)
         self.inSampleFraction = Swift.min(Swift.max(inSampleFraction, 0.3), 0.9)
+        self.embargoFraction = Swift.min(Swift.max(embargoFraction, 0), 0.2)
     }
 
     public func run(
@@ -169,15 +188,30 @@ public struct WalkForwardAnalysis: Sendable {
             let split = foldStart + Int(Double(foldEnd - foldStart) * inSampleFraction)
             guard split - foldStart > warmup + 10, foldEnd - split > warmup + 10 else { continue }
 
-            let inSampleCandles = Array(candles[foldStart..<split])
-            // The out-of-sample slice carries its own warm-up so indicators are
-            // primed exactly as they would be live.
+
+            // Purge, then embargo, then test.
+            //
+            // The out-of-sample slice has to carry its own warm-up so that
+            // indicators are primed exactly as they would be live — which means
+            // the bars immediately before the split feed the test's first
+            // signals. Fitting on those same bars is the textbook leak: the
+            // training set contains observations the test set depends on.
+            //
+            // So the fitting window stops `warmup` bars short of them (the
+            // purge), and stops another `embargo` bars short of that, because
+            // purging only removes what the test mechanically needs and prices
+            // either side of a boundary still describe the same market.
+            let embargo = Int(Double(perFold) * embargoFraction)
+            let fitEnd = split - warmup - embargo
+            guard fitEnd - foldStart > warmup + 10 else { continue }
+
+            let inSampleCandles = Array(candles[foldStart..<fitEnd])
             let outStart = Swift.max(split - warmup, 0)
             let outOfSampleCandles = Array(candles[outStart..<foldEnd])
 
             // 1. Fit on the in-sample stretch only. External series are sliced
             //    in lockstep — a shifted series would silently corrupt signals.
-            var inSampleConfig = config.slicing(foldStart..<split)
+            var inSampleConfig = config.slicing(foldStart..<fitEnd)
             inSampleConfig.initialCapital = runningEquity
             var foldConfig = config.slicing(outStart..<foldEnd)
             foldConfig.initialCapital = runningEquity
@@ -203,7 +237,9 @@ public struct WalkForwardAnalysis: Sendable {
                 inSample: winner.metrics,
                 outOfSample: outResult.metrics,
                 outOfSampleTrades: outResult.trades,
-                outOfSampleEquity: outResult.equityCurve))
+                outOfSampleEquity: outResult.equityCurve,
+                purgedBars: warmup,
+                embargoedBars: embargo))
 
             stitched.append(contentsOf: outResult.equityCurve)
             runningEquity = outResult.finalEquity
@@ -226,6 +262,17 @@ public struct WalkForwardAnalysis: Sendable {
 
         if searchGrid.size > 1 {
             warnings.append("每折在 \(searchGrid.size) 组参数中择优，共尝试 \(trials) 次")
+        }
+        // Stated rather than assumed. A walk-forward whose purge and embargo
+        // are not written down cannot be compared with another one, and the
+        // difference between them is the difference between a real
+        // out-of-sample test and a slightly delayed in-sample one.
+        if let first = completed.first {
+            warnings.append(
+                "协议：滚动窗口 \(completed.count) 折，样本内占 "
+                + "\(PriceFormatter.percent(inSampleFraction * 100, decimals: 0))，"
+                + "purge \(first.purgedBars) 根（测试期指标的预热窗口），"
+                + "embargo \(first.embargoedBars) 根（序列相关缓冲）")
         }
         if completed.count < folds {
             warnings.append("\(folds) 折中仅 \(completed.count) 折数据充足")

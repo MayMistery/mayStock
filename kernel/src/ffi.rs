@@ -613,6 +613,41 @@ pub unsafe extern "C" fn ms_calibrate_slippage(
     })
 }
 
+/// How much diversification a book of strategies actually has.
+///
+/// Input JSON: `{"series":[{"name":"a","returns":[…]}, …]}`
+/// Returns a [`crate::reconcile::DiversificationReport`].
+#[no_mangle]
+pub unsafe extern "C" fn ms_diversification(
+    request_json: *const c_char,
+    error_out: *mut *mut c_char,
+) -> *mut c_char {
+    #[derive(serde::Deserialize)]
+    struct Named {
+        name: String,
+        #[serde(default)]
+        returns: Vec<f64>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Request {
+        #[serde(default)]
+        series: Vec<Named>,
+    }
+    guarded(error_out, ptr::null_mut(), || {
+        let text = borrow_str(request_json).ok_or("请求 JSON 为空")?;
+        let request: Request =
+            serde_json::from_str(text).map_err(|e| format!("请求解析失败：{e}"))?;
+        let named: Vec<(String, Vec<f64>)> = request
+            .series
+            .into_iter()
+            .map(|item| (item.name, item.returns))
+            .collect();
+        serde_json::to_string(&crate::reconcile::diversification(&named))
+            .map(to_c_string)
+            .map_err(|e| e.to_string())
+    })
+}
+
 /// How far live equity has drifted from the backtest that justified it.
 ///
 /// Input JSON: `{"live":[{"ts_ms":…,"equity":…}], "backtest":[…]}`

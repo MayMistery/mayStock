@@ -344,6 +344,23 @@ extension TradingKernel {
         ms_expected_max_sharpe(Int64(trials), years)
     }
 
+    /// How much diversification a book of strategies actually has.
+    ///
+    /// Allocating separately to each strategy is not the same as diversifying
+    /// between them: two trend followers on BTC and ETH move together in a
+    /// crash, which is exactly when the diversification was supposed to help.
+    /// Nothing in a per-strategy backtest can reveal that.
+    public static func diversification(
+        _ series: [(name: String, returns: [Double])]
+    ) throws -> KernelDiversification {
+        let request = DiversificationRequest(
+            series: series.map { .init(name: $0.name, returns: $0.returns) })
+        let json = try callReturningString { error in
+            ms_diversification(try? encodeJSON(request), error)
+        }
+        return try JSONDecoder().decode(KernelDiversification.self, from: Data(json.utf8))
+    }
+
     /// How far live equity has drifted from the backtest that justified it.
     public static func compareEquity(
         live: [(ts: Date, equity: Double)], backtest: [(ts: Date, equity: Double)]
@@ -361,6 +378,15 @@ extension TradingKernel {
         }
         return try JSONDecoder().decode(KernelEquityComparison.self, from: Data(json.utf8))
     }
+}
+
+/// Wire shape for `ms_diversification`.
+private struct DiversificationRequest: Encodable {
+    struct Named: Encodable {
+        let name: String
+        let returns: [Double]
+    }
+    let series: [Named]
 }
 
 /// Wire shape for `ms_optimize`.

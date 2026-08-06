@@ -761,3 +761,97 @@ struct KernelFreshnessTests {
             """)
     }
 }
+
+// MARK: - Diversification and validation protocol
+
+struct DiversificationBridgeTests {
+    @Test("三份同样的策略只算一注")
+    func identicalStrategiesAreOneBet() throws {
+        let series = (0..<50).map { sin(Double($0) * 0.3) * 0.01 }
+        let report = try TradingKernel.diversification([
+            (name: "a", returns: series),
+            (name: "b", returns: series),
+            (name: "c", returns: series),
+        ])
+        #expect(abs((report.effectiveBets ?? 0) - 1) < 1e-6)
+        #expect(report.isConcentrated)
+        #expect((report.highestPair?.correlation ?? 0) > 0.99)
+    }
+
+    @Test("互不相关的策略各算一注")
+    func independentStrategiesCountSeparately() throws {
+        let a = (0..<200).map { sin(Double($0) * 0.7) * 0.01 }
+        let b = (0..<200).map { cos(Double($0) * 0.11) * 0.01 }
+        let report = try TradingKernel.diversification([
+            (name: "a", returns: a), (name: "b", returns: b),
+        ])
+        #expect((report.effectiveBets ?? 0) > 1.5)
+        #expect(!report.isConcentrated)
+    }
+
+    @Test("不足两个策略时不作判断")
+    func oneStrategyIsNotAJudgement() throws {
+        let report = try TradingKernel.diversification([
+            (name: "only", returns: Array(repeating: 0.01, count: 20)),
+        ])
+        #expect(report.pairs.isEmpty)
+        #expect(report.isConcentrated == false)
+    }
+}
+
+struct WalkForwardProtocolTests {
+    private func strategy() throws -> CompiledStrategy {
+        let json = """
+        {"schema":1,"id":"wf","name":"WF",
+         "market":{"instId":"BTC-USDT","instType":"SPOT","bar":"1H"},
+         "params":[{"name":"len","default":10,"min":5,"max":20}],
+         "signals":{"longEntry":"close > sma(close, len)",
+                    "longExit":"close < sma(close, len)"},
+         "sizing":{"mode":"equityPct","value":100}}
+        """
+        return try JSONDecoder().decode(
+            StrategyManifest.self, from: Data(json.utf8)).compile()
+    }
+
+    private func candles(_ count: Int) -> [Candle] {
+        (0..<count).map { i in
+            let base = 100 + sin(Double(i) * 0.09) * 15 + Double(i) * 0.01
+            return Candle(
+                ts: Date(timeIntervalSince1970: Double(i) * 3_600),
+                open: base, high: base + 1, low: base - 1, close: base + 0.2,
+                volume: 10, confirmed: true)
+        }
+    }
+
+    @Test("拟合窗口不碰测试期指标依赖的那些 bar")
+    func theFitDoesNotTouchWhatTheTestDependsOn() throws {
+        // The out-of-sample slice primes its indicators on the bars just before
+        // the split. Fitting on those same bars is the textbook leak.
+        let strategy = try strategy()
+        let result = WalkForwardAnalysis(
+            strategy: strategy, config: BacktestConfig(initialCapital: 10_000),
+            folds: 3, inSampleFraction: 0.7, embargoFraction: 0.02
+        ).run(candles: candles(3_000))
+
+        #expect(!result.folds.isEmpty)
+        for fold in result.folds {
+            #expect(fold.purgedBars == strategy.warmupBars)
+            #expect(fold.embargoedBars > 0)
+            // The fitting window ends strictly before the test's first trade.
+            #expect(fold.inSampleEnd < fold.outOfSampleStart)
+        }
+    }
+
+    @Test("验证协议被写进报告，而不是靠默契")
+    func theProtocolIsStated() throws {
+        // A walk-forward whose purge and embargo are not written down cannot be
+        // compared with another one — and the difference between them is the
+        // difference between a real out-of-sample test and a delayed in-sample
+        // one.
+        let result = WalkForwardAnalysis(
+            strategy: try strategy(), config: BacktestConfig(initialCapital: 10_000),
+            folds: 3
+        ).run(candles: candles(3_000))
+        #expect(result.warnings.contains { $0.contains("purge") && $0.contains("embargo") })
+    }
+}

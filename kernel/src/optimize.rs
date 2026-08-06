@@ -119,31 +119,43 @@ pub fn sweep(
         .iter()
         .map(|position| candidates[*position].params.clone())
         .collect();
-    let series: Vec<Vec<f64>> = run_grid(
+    // Keyed by position, not merely ordered: a skipped point would shift a
+    // bare vector and silently pair the winner's Sharpe with somebody else's
+    // return series. These all succeeded in the first pass and `with_params`
+    // is deterministic, so nothing should be missing — which is exactly why an
+    // implicit correspondence is the wrong thing to rely on.
+    let series: Vec<(usize, Vec<f64>)> = run_grid(
         strategy,
         candles,
         &request.config,
         &sampled_grid,
         request.threads,
         &AtomicUsize::new(0),
-        |_, _, result| period_returns(&result.equity_curve),
+        |index, _, result| (index, period_returns(&result.equity_curve)),
     );
 
     let winner = candidates.first();
     let deflated = winner.and_then(|best| {
-        // The winner is the first entry of the sample by construction, since
-        // the sample always includes index 0.
-        let returns = series.first()?;
+        // Position 0 of the sample is the winner by construction; look it up
+        // rather than assuming it survived to the front of the vector.
+        let returns = series.iter().find(|(index, _)| *index == 0).map(|(_, s)| s)?;
         let periods = periods_per_year(returns.len(), best.metrics.span_days);
         crate::overfit::deflated_sharpe(
             returns,
             best.metrics.sharpe,
-            request.grid.len().max(1),
+            // Trials are points that actually produced a result. A grid point
+            // the kernel refused never competed, and counting it would raise
+            // the luck benchmark for a contest it did not enter.
+            candidates.len().max(1),
             periods,
         )
     });
 
-    let usable: Vec<Vec<f64>> = series.into_iter().filter(|s| s.len() >= 32).collect();
+    let usable: Vec<Vec<f64>> = series
+        .into_iter()
+        .map(|(_, s)| s)
+        .filter(|s| s.len() >= 32)
+        .collect();
     let overfit = crate::overfit::probability_of_backtest_overfitting(&usable, request.blocks);
 
     SweepOutcome {
@@ -169,42 +181,47 @@ fn run_grid<T: Send>(
     }
     let workers = resolve_threads(threads, grid.len());
     let next = AtomicUsize::new(0);
-    // One slot per grid point, so results land in grid order regardless of
-    // which worker finished first. A sweep whose output depended on thread
-    // scheduling would not be reproducible, and a backtest that is not
-    // reproducible is not evidence.
-    let slots: Vec<std::sync::Mutex<Option<T>>> =
-        (0..grid.len()).map(|_| std::sync::Mutex::new(None)).collect();
 
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| loop {
-                let index = next.fetch_add(1, Ordering::Relaxed);
-                if index >= grid.len() {
-                    break;
-                }
-                let params = &grid[index];
-                let Some(variant) = strategy.with_params(params) else {
-                    skipped.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                };
-                match backtest::run(&variant, candles, config) {
-                    Ok(result) => {
-                        let value = collect(index, params.clone(), result);
-                        *slots[index].lock().unwrap() = Some(value);
+    // Each worker accumulates locally and the results are merged and sorted at
+    // the end. A shared slot table would need one lock per grid point — five
+    // thousand mutexes to serialise nothing, since no two workers ever touch
+    // the same index.
+    //
+    // Sorting by index is what makes the sweep reproducible: output that
+    // depended on which thread finished first would not be, and a backtest
+    // that is not reproducible is not evidence.
+    let collected: Vec<Vec<(usize, T)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut local: Vec<(usize, T)> = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        if index >= grid.len() {
+                            break;
+                        }
+                        let params = &grid[index];
+                        let Some(variant) = strategy.with_params(params) else {
+                            skipped.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        };
+                        match backtest::run(&variant, candles, config) {
+                            Ok(result) => local.push((index, collect(index, params.clone(), result))),
+                            Err(_) => {
+                                skipped.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                     }
-                    Err(_) => {
-                        skipped.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            });
-        }
+                    local
+                })
+            })
+            .collect();
+        handles.into_iter().filter_map(|h| h.join().ok()).collect()
     });
 
-    slots
-        .into_iter()
-        .filter_map(|slot| slot.into_inner().unwrap())
-        .collect()
+    let mut merged: Vec<(usize, T)> = collected.into_iter().flatten().collect();
+    merged.sort_by_key(|(index, _)| *index);
+    merged.into_iter().map(|(_, value)| value).collect()
 }
 
 fn resolve_threads(requested: usize, work: usize) -> usize {
