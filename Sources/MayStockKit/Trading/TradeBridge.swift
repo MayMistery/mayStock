@@ -361,6 +361,43 @@ public struct TradeBridge: Sendable {
         return Self.parsePositions(json: output)
     }
 
+    /// Resolve an order by its client id.
+    ///
+    /// A timeout is not a rejection: the request may have reached the exchange
+    /// and filled. Absent from the listing is the *only* answer that makes a
+    /// retry safe, so that is the only case reported as `.unknown`.
+    public func orderStatus(
+        instId: String, instType: InstrumentType, clOrdId: String, mode: TradingMode
+    ) async throws -> VenueOrderStatus {
+        let module = instType == .swap ? "swap" : "spot"
+        let output = try await runCLI(
+            [module, "orders", "--instId", instId, "--state", "all"], mode: mode)
+        return Self.parseOrderStatus(json: output, clOrdId: clOrdId)
+    }
+
+    static func parseOrderStatus(json: String, clOrdId: String) -> VenueOrderStatus {
+        var result: VenueOrderStatus = .unknown
+        walkObjects(in: json) { dict in
+            guard (dict["clOrdId"] as? String) == clOrdId else { return }
+            let filled = number(dict, "accFillSz") ?? number(dict, "fillSz") ?? 0
+            let average = number(dict, "avgPx") ?? number(dict, "fillPx") ?? 0
+            switch (dict["state"] as? String) ?? "" {
+            case "filled", "partially_filled":
+                result = .filled(filledSize: filled, averagePrice: average)
+            case "canceled", "mmp_canceled":
+                // A cancel after a partial fill still left us holding something.
+                result = filled > 0
+                    ? .filled(filledSize: filled, averagePrice: average) : .canceled
+            case "live", "pending":
+                result = .live
+            default:
+                result = filled > 0
+                    ? .filled(filledSize: filled, averagePrice: average) : .live
+            }
+        }
+        return result
+    }
+
     /// Recent fills. This is what makes per-strategy attribution auditable:
     /// each row carries the `clOrdId` we tagged the order with.
     public func fills(

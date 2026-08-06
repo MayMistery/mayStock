@@ -326,3 +326,56 @@ struct TradeBridgeRobustnessTests {
         #expect(balances.first { $0.ccy == "USDT" }?.available == 9)
     }
 }
+
+@Suite("Order status resolution")
+struct OrderStatusTests {
+    /// A request that timed out may well have reached the exchange and filled.
+    /// Absent from the listing is the only answer that makes a retry safe —
+    /// everything else means the exchange acted and the ledger must catch up.
+    @Test func anAbsentOrderIsTheOnlySafeRetry() {
+        let json = #"{"data":[{"clOrdId":"msother","state":"filled","accFillSz":"1"}]}"#
+        #expect(TradeBridge.parseOrderStatus(json: json, clOrdId: "msmine") == .unknown)
+        #expect(TradeBridge.parseOrderStatus(json: "[]", clOrdId: "msmine") == .unknown)
+    }
+
+    @Test func aFilledOrderReportsItsSizeAndPrice() {
+        let json = #"""
+        {"data":[{"clOrdId":"msmine","state":"filled","accFillSz":"11.65","avgPx":"64769.39"}]}
+        """#
+        guard case .filled(let size, let price) =
+            TradeBridge.parseOrderStatus(json: json, clOrdId: "msmine") else {
+            Issue.record("expected a fill"); return
+        }
+        #expect(abs(size - 11.65) < 1e-9)
+        #expect(abs(price - 64_769.39) < 1e-6)
+    }
+
+    /// A cancel that followed a partial fill still left a position behind.
+    /// Reporting it as merely "canceled" would lose those coins.
+    @Test func aPartiallyFilledCancelIsStillAFill() {
+        let json = #"""
+        {"data":[{"clOrdId":"msmine","state":"canceled","accFillSz":"3","avgPx":"100"}]}
+        """#
+        #expect(TradeBridge.parseOrderStatus(json: json, clOrdId: "msmine").didExecute)
+    }
+
+    @Test func aCleanCancelIsTerminalAndDidNotExecute() {
+        let json = #"{"data":[{"clOrdId":"msmine","state":"canceled","accFillSz":"0"}]}"#
+        let status = TradeBridge.parseOrderStatus(json: json, clOrdId: "msmine")
+        #expect(status == .canceled)
+        #expect(status.isTerminal)
+        #expect(!status.didExecute)
+    }
+
+    @Test func aWorkingOrderIsNotTerminal() {
+        let json = #"{"data":[{"clOrdId":"msmine","state":"live","accFillSz":"0"}]}"#
+        let status = TradeBridge.parseOrderStatus(json: json, clOrdId: "msmine")
+        #expect(status == .live)
+        #expect(!status.isTerminal)
+    }
+
+    @Test func garbageIsUnknownRatherThanACrash() {
+        #expect(TradeBridge.parseOrderStatus(json: "not json", clOrdId: "x") == .unknown)
+        #expect(TradeBridge.parseOrderStatus(json: "", clOrdId: "x") == .unknown)
+    }
+}

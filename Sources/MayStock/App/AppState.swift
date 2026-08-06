@@ -143,6 +143,14 @@ final class AppState {
             profile: store.config.trading.profile)
     }
 
+    /// The exchange the runner trades through.
+    ///
+    /// Built here rather than injected from outside only because OKX is the one
+    /// venue this app ships with. Everything downstream names `ExchangeVenue`,
+    /// so a second exchange is a new conformance plus a choice made at this
+    /// single line.
+    var venue: any ExchangeVenue { OKXVenue(bridge: tradeBridge) }
+
     var tradingMode: TradingMode { store.config.strategy.mode }
     var liveTradingUnlocked: Bool { store.config.trading.liveTradingUnlocked }
     var ledger: StrategyLedger { tradingMode == .demo ? demoLedger : liveLedger }

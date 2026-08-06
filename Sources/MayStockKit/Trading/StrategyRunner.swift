@@ -39,7 +39,9 @@ public protocol StrategyRunnerHost: AnyObject {
     var liveTradingUnlocked: Bool { get }
     var runnableStrategies: [CompiledStrategy] { get }
     var ledger: StrategyLedger { get }
-    var tradeBridge: TradeBridge { get }
+    /// The exchange this portfolio trades on. A protocol, not a concrete
+    /// client, so a second venue is one conformance rather than an edit here.
+    var venue: any ExchangeVenue { get }
 
     func runnerDidChange()
     func runnerDidHalt(strategyId: String, reason: String)
@@ -104,6 +106,10 @@ public final class StrategyRunner {
     /// engine legitimately takes minutes, and an unattended trading loop that
     /// stops silently is worse than one that errors loudly.
     public static let tickStallTimeout: TimeInterval = 300
+    /// How long an unconfirmed order may stay unresolved before the strategy is
+    /// halted for a human to look at. Long enough to ride out an outage, short
+    /// enough that nobody discovers it a day later.
+    public static let inFlightTimeout: TimeInterval = 600
 
     private weak var host: StrategyRunnerHost?
     private let rest: OKXRESTClient
@@ -125,6 +131,22 @@ public final class StrategyRunner {
     private struct DayAnchor { var day: Date; var equity: Double; var halted: Bool }
     /// Confirmed bar on which each strategy last went flat, for the cooldown.
     private var lastExitBar: [String: Date] = [:]
+    /// Orders whose submission outcome the exchange never confirmed.
+    ///
+    /// A timeout is not a rejection: the request may well have reached the
+    /// venue and filled. Treating it as a failure would leave a real position
+    /// on the exchange that the ledger knows nothing about, so these are
+    /// resolved by asking, on the next tick, what actually happened.
+    private var inFlight: [String: InFlightOrder] = [:]
+
+    private struct InFlightOrder {
+        let strategyId: String
+        let instId: String
+        let instType: InstrumentType
+        let clOrdId: String
+        let submittedAt: Date
+        var attempts: Int
+    }
 
     /// How often the loop wakes. Bar-close detection does the real pacing.
     public static let tickInterval: TimeInterval = 20
@@ -210,6 +232,11 @@ public final class StrategyRunner {
             states[id]?.status = .stopped
         }
 
+        // Anything whose outcome the exchange never confirmed is settled first:
+        // a decision made while a fill is unaccounted for would size against a
+        // position the ledger does not yet know about.
+        await resolveInFlight(for: host)
+
         // Keep every open position marked to market, running or not: a stopped
         // strategy still holds coins, and its P&L must not freeze on screen.
         await refreshMarks(for: host)
@@ -249,6 +276,56 @@ public final class StrategyRunner {
         host.runnerDidChange()
     }
 
+    /// Ask the exchange what became of every order we lost track of.
+    ///
+    /// Absent from the venue's order listing is the only answer that makes a
+    /// retry safe; anything else means the exchange acted on it and the ledger
+    /// must catch up. An order that stays unresolved past `inFlightTimeout` is
+    /// escalated to the user rather than quietly forgotten.
+    private func resolveInFlight(for host: StrategyRunnerHost) async {
+        guard !inFlight.isEmpty else { return }
+        for (key, var pending) in inFlight {
+            let status = try? await host.venue.orderStatus(
+                instId: pending.instId, instType: pending.instType,
+                clOrdId: pending.clOrdId, mode: host.portfolio.mode)
+
+            switch status {
+            case .some(.unknown):
+                // The exchange never saw it. Safe to drop; the next bar will
+                // decide again from a position the ledger correctly believes.
+                inFlight[key] = nil
+                update(pending.strategyId) { $0.message = "未确认订单确认未送达，已丢弃" }
+
+            case .some(let resolved) where resolved.didExecute:
+                inFlight[key] = nil
+                // The fill is real; pull it into the ledger by its tag.
+                if let strategy = host.runnableStrategies.first(where: { $0.id == pending.strategyId }) {
+                    await ingestFills(for: [strategy], host: host)
+                }
+                update(pending.strategyId) { $0.message = "未确认订单实际已成交，已入账" }
+                Log.warn("runner: recovered an unconfirmed fill for \(pending.clOrdId)")
+
+            case .some(let resolved) where resolved.isTerminal:
+                inFlight[key] = nil
+                update(pending.strategyId) { $0.message = "未确认订单已终止（未成交）" }
+
+            default:
+                // Still working, or the query itself failed. Keep asking, but
+                // do not ask forever in silence.
+                pending.attempts += 1
+                inFlight[key] = pending
+                if Date().timeIntervalSince(pending.submittedAt) > Self.inFlightTimeout {
+                    inFlight[key] = nil
+                    host.runnerDidHalt(
+                        strategyId: pending.strategyId,
+                        reason: "订单 \(pending.clOrdId) 状态 \(pending.attempts) 次查询仍未确认，"
+                            + "请到交易所核对后再启动")
+                }
+            }
+        }
+        host.runnerDidChange()
+    }
+
     /// Refresh the mark price of every instrument the ledger has exposure to,
     /// and make sure the ledger knows each one's contract size.
     ///
@@ -258,17 +335,18 @@ public final class StrategyRunner {
     private func refreshMarks(for host: StrategyRunnerHost) async {
         let instruments = Set(host.ledger.positions.values.filter { !$0.isFlat }.map(\.instId))
         for instId in instruments {
-            if let ticker = try? await rest.ticker(instId: instId) {
-                marks[instId] = ticker.last
+            if let price = try? await host.venue.lastPrice(instId: instId), price > 0 {
+                marks[instId] = price
             }
-            host.ledger.setContractSize(await contractSize(for: instId), forInstId: instId)
+            host.ledger.setContractSize(
+                await contractSize(for: instId, venue: host.venue), forInstId: instId)
         }
     }
 
     /// Base units per contract, cached. Spot is one-for-one.
-    private func contractSize(for instId: String) async -> Double {
+    private func contractSize(for instId: String, venue: any ExchangeVenue) async -> Double {
         if let cached = metaCache[instId] { return cached.contractValue ?? 1 }
-        guard let meta = try? await rest.instrumentMeta(instId: instId) else { return 1 }
+        guard let meta = (try? await venue.instrumentMeta(instId: instId)) ?? nil else { return 1 }
         metaCache[instId] = meta
         return meta.contractValue ?? 1
     }
@@ -290,7 +368,7 @@ public final class StrategyRunner {
         if let last = lastEquitySampleAt,
            now.timeIntervalSince(last) < Self.equitySampleInterval { return }
 
-        guard let snapshot = try? await host.tradeBridge.accountSnapshot(mode: host.portfolio.mode)
+        guard let snapshot = try? await host.venue.accountSnapshot(mode: host.portfolio.mode)
         else { return }
         lastEquitySampleAt = now
         accountBalances = snapshot.balances
@@ -305,9 +383,9 @@ public final class StrategyRunner {
             let instId = "\(balance.ccy)-\(Self.quoteCurrency)"
             // Always re-read: a mark cached from an earlier tick would freeze
             // this holding's contribution and flatten the curve.
-            if let ticker = try? await rest.ticker(instId: instId), ticker.last > 0 {
-                marks[instId] = ticker.last
-                total += balance.total * ticker.last
+            if let quoted = try? await host.venue.lastPrice(instId: instId), quoted > 0 {
+                marks[instId] = quoted
+                total += balance.total * quoted
             } else {
                 // Skipping the holding would understate equity and read as a
                 // loss that never happened. Fall back to the exchange's own
@@ -335,9 +413,7 @@ public final class StrategyRunner {
             guard !Self.stableCurrencies.contains(balance.ccy.uppercased()) else { continue }
             let instId = "\(balance.ccy)-\(Self.quoteCurrency)"
             var price = marks[instId]
-            if price == nil, let ticker = try? await rest.ticker(instId: instId) {
-                price = ticker.last
-            }
+            if price == nil { price = try? await host.venue.lastPrice(instId: instId) }
             guard let price, price > 0 else { continue }
             marks[instId] = price
             exposure += balance.total * price
@@ -579,7 +655,7 @@ public final class StrategyRunner {
         // session, so there may be no cached mark — fetch one rather than
         // silently doing nothing with the user's open position.
         if marks[market.instId] == nil {
-            marks[market.instId] = try? await rest.ticker(instId: market.instId).last
+            marks[market.instId] = try? await host.venue.lastPrice(instId: market.instId)
         }
         guard let price = marks[market.instId], price > 0 else {
             update(strategy.id) { $0.message = "取不到行情价，未能下单" }
@@ -624,10 +700,12 @@ public final class StrategyRunner {
             takeProfitTriggerPrice: takeProfitPrice,
             clOrdId: OrderTag.make(strategyId: strategy.id))
 
+        let clOrdId = order.clOrdId ?? ""
         do {
             let mode = host.portfolio.mode
-            _ = try await host.tradeBridge.place(
+            _ = try await host.venue.place(
                 order, mode: mode, liveUnlocked: host.liveTradingUnlocked)
+            inFlight[clOrdId] = nil
             update(strategy.id) {
                 $0.lastOrderAt = Date()
                 $0.message = "\(reason)：\(order.side.displayName) \(PriceFormatter.plain(size))"
@@ -636,11 +714,17 @@ public final class StrategyRunner {
             try? await Task.sleep(nanoseconds: 1_200_000_000)
             await ingestFills(for: [strategy], host: host)
         } catch {
+            // A failed *call* is not a failed *order*. The request may have
+            // reached the exchange and filled; halting here would strand a real
+            // position outside the ledger. Record it and ask the exchange what
+            // happened on the next tick.
+            inFlight[clOrdId] = InFlightOrder(
+                strategyId: strategy.id, instId: market.instId, instType: market.instType,
+                clOrdId: clOrdId, submittedAt: Date(), attempts: 0)
             update(strategy.id) {
-                $0.status = .failed
-                $0.message = "下单失败：\(error)"
+                $0.status = .running
+                $0.message = "下单结果未确认，等待交易所确认：\(error)"
             }
-            host.runnerDidHalt(strategyId: strategy.id, reason: "下单失败：\(error)")
         }
     }
 
@@ -654,7 +738,7 @@ public final class StrategyRunner {
         let mode = host.portfolio.mode
 
         for instrument in instruments {
-            guard let fills = try? await host.tradeBridge.fills(
+            guard let fills = try? await host.venue.fills(
                 instId: instrument.instId, instType: instrument.instType, mode: mode) else { continue }
             host.ledger.ingest(fills, knownStrategyIds: knownIds)
         }
