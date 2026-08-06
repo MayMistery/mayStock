@@ -134,7 +134,8 @@ public final class KernelStrategy: @unchecked Sendable {
                     Int32(current.kernelCode), Int64(max(barsHeld, 0)), externalJSON,
                     account.equity, account.heldBase, account.dayStartEquity,
                     account.leverageCap ?? -1,
-                    Int64(account.barsSinceExit ?? -1), account.haltedToday, error)
+                    Int64(account.barsSinceExit ?? -1), account.haltedToday,
+                    account.entryPrice, error)
             }
             return try JSONDecoder().decode(KernelDecision.self, from: Data(json.utf8))
         }
@@ -270,6 +271,92 @@ extension TradingKernel {
         }
         return try JSONDecoder().decode(KernelMetrics.self, from: Data(json.utf8))
     }
+
+    /// What slippage this account is actually paying.
+    ///
+    /// Every fill is scored against the open of the bar it landed in, because
+    /// that is precisely what the backtester models — so the number that comes
+    /// back is directly comparable to the manifest's `slippageBps` rather than
+    /// merely adjacent to it.
+    public static func calibrateSlippage(
+        fills: [StrategyFill], candles: [Candle], assumedBps: Double
+    ) throws -> KernelSlippageReport {
+        let request = SlippageRequest(
+            fills: fills.map {
+                SlippageRequest.Fill(
+                    ts_ms: Int64(($0.ts.timeIntervalSince1970 * 1000).rounded()),
+                    price: $0.price, side: $0.side == .buy ? 1 : -1)
+            },
+            candles: candles.map(SlippageRequest.Bar.init(swift:)),
+            assumedBps: assumedBps)
+        let json = try callReturningString { error in
+            ms_calibrate_slippage(try? encodeJSON(request), error)
+        }
+        return try JSONDecoder().decode(KernelSlippageReport.self, from: Data(json.utf8))
+    }
+
+    /// How far live equity has drifted from the backtest that justified it.
+    public static func compareEquity(
+        live: [(ts: Date, equity: Double)], backtest: [(ts: Date, equity: Double)]
+    ) throws -> KernelEquityComparison {
+        func samples(_ points: [(ts: Date, equity: Double)]) -> [EquityRequest.Sample] {
+            points.map {
+                EquityRequest.Sample(
+                    ts_ms: Int64(($0.ts.timeIntervalSince1970 * 1000).rounded()),
+                    equity: $0.equity)
+            }
+        }
+        let request = EquityRequest(live: samples(live), backtest: samples(backtest))
+        let json = try callReturningString { error in
+            ms_compare_equity(try? encodeJSON(request), error)
+        }
+        return try JSONDecoder().decode(KernelEquityComparison.self, from: Data(json.utf8))
+    }
+}
+
+/// Wire shape for `ms_calibrate_slippage`.
+///
+/// Candles travel as JSON here rather than through the zero-copy buffer the
+/// hot paths use: this runs once when a report is opened, and matching the
+/// kernel's own field names keeps the request a plain struct on both sides.
+private struct SlippageRequest: Encodable {
+    struct Fill: Encodable {
+        let ts_ms: Int64
+        let price: Double
+        let side: Int
+    }
+    struct Bar: Encodable {
+        let ts_ms: Int64
+        let open: Double
+        let high: Double
+        let low: Double
+        let close: Double
+        let volume: Double
+        let confirmed: UInt8
+
+        init(swift candle: Candle) {
+            ts_ms = Int64((candle.ts.timeIntervalSince1970 * 1000).rounded())
+            open = candle.open
+            high = candle.high
+            low = candle.low
+            close = candle.close
+            volume = candle.volume
+            confirmed = candle.confirmed ? 1 : 0
+        }
+    }
+    let fills: [Fill]
+    let candles: [Bar]
+    let assumedBps: Double
+}
+
+/// Wire shape for `ms_compare_equity`.
+private struct EquityRequest: Encodable {
+    struct Sample: Encodable {
+        let ts_ms: Int64
+        let equity: Double
+    }
+    let live: [Sample]
+    let backtest: [Sample]
 }
 
 /// Wire shape for `ms_metrics_compute`. Mirrors the kernel's own `Trade` and

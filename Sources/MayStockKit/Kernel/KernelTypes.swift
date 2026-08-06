@@ -44,11 +44,16 @@ public struct KernelAccountState: Encodable, Sendable {
     public var barsSinceExit: Int?
     /// The daily-loss breaker already tripped today.
     public var haltedToday: Bool
+    /// Average entry price of the held position, 0 when flat. Seeds the
+    /// trailing anchor so a position that never moved in its favour trails from
+    /// where it opened.
+    public var entryPrice: Double
 
     public init(
         equity: Double = 0, heldBase: Double = 0,
         dayStartEquity: Double = 0, leverageCap: Double? = nil,
-        barsSinceExit: Int? = nil, haltedToday: Bool = false
+        barsSinceExit: Int? = nil, haltedToday: Bool = false,
+        entryPrice: Double = 0
     ) {
         self.equity = equity
         self.heldBase = heldBase
@@ -56,6 +61,7 @@ public struct KernelAccountState: Encodable, Sendable {
         self.leverageCap = leverageCap
         self.barsSinceExit = barsSinceExit
         self.haltedToday = haltedToday
+        self.entryPrice = entryPrice
     }
 }
 
@@ -76,6 +82,9 @@ public struct KernelDecision: Decodable, Sendable, Equatable {
     /// them, rather than this app polling for a price it will miss.
     public let stopPrice: Double?
     public let takeProfitPrice: Double?
+    /// Where the held position's trailing stop now sits, recomputed every bar.
+    /// Nil when the strategy declares no trailing stop or holds nothing.
+    public let trailingStopPrice: Double?
     /// Continuous exposure in −1…+1, or nil for a binary strategy.
     public let targetExposure: Double?
     public let confirmedBars: Int
@@ -90,7 +99,7 @@ public struct KernelDecision: Decodable, Sendable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case target, targetExposure, confirmedBars, barTs, warmingUp
         case targetBaseQuantity, baseDelta, shouldTrade, haltDailyLoss, reason
-        case stopPrice, takeProfitPrice
+        case stopPrice, takeProfitPrice, trailingStopPrice
     }
 
     public init(from decoder: Decoder) throws {
@@ -103,6 +112,7 @@ public struct KernelDecision: Decodable, Sendable, Equatable {
         reason = try c.decode(String.self, forKey: .reason)
         stopPrice = try c.decodeIfPresent(Double.self, forKey: .stopPrice)
         takeProfitPrice = try c.decodeIfPresent(Double.self, forKey: .takeProfitPrice)
+        trailingStopPrice = try c.decodeIfPresent(Double.self, forKey: .trailingStopPrice)
         // Rust writes NaN for "not an exposure strategy"; JSON has no NaN, so
         // it arrives as null.
         targetExposure = try c.decodeIfPresent(Double.self, forKey: .targetExposure)
@@ -267,4 +277,62 @@ public struct KernelBacktestResult: Decodable, Sendable {
 
     public var startTime: Date { Date(timeIntervalSince1970: Double(start) / 1000) }
     public var endTime: Date { Date(timeIntervalSince1970: Double(end) / 1000) }
+}
+
+// MARK: - Live versus backtest
+
+/// What the account is actually paying in slippage, from real fills.
+public struct KernelSlippageReport: Decodable, Sendable, Equatable {
+    /// Fills that could be matched to a bar. A fill outside the candle window
+    /// is not counted rather than scored against a neighbouring bar.
+    public let samples: Int
+    /// Median adverse slippage, in basis points. Negative means the fills came
+    /// in better than the bar's open on balance.
+    public let medianBps: Double?
+    public let meanBps: Double?
+    /// The bad tail — a cost model built on the median alone under-reserves
+    /// exactly when it matters.
+    public let p90Bps: Double?
+    /// What the manifest currently assumes, for the comparison.
+    public let assumedBps: Double
+
+    /// True when the measured median is materially worse than the assumption,
+    /// which is when a backtest built on it is overstating returns.
+    public var understatesCost: Bool {
+        guard let medianBps, samples >= 10 else { return false }
+        return medianBps > assumedBps * 1.5
+    }
+
+    /// The figure to feed back into a backtest, or nil while the sample is too
+    /// small to mean anything. Ten fills is not a lot, but it is enough to
+    /// beat a number that was typed in.
+    public var recommendedBps: Double? {
+        guard samples >= 10, let medianBps else { return nil }
+        return Swift.max(medianBps, 0)
+    }
+}
+
+/// How far live equity has drifted from the backtest that justified it.
+public struct KernelEquityComparison: Decodable, Sendable, Equatable {
+    public let samples: Int
+    public let coveredMs: Int64
+    public let liveReturnPct: Double?
+    public let backtestReturnPct: Double?
+    /// Live minus backtest, in percentage points.
+    public let differencePct: Double?
+    /// Standard deviation of the per-interval return difference, in bps.
+    public let trackingErrorBps: Double?
+    /// Correlation of the two return series. Nil when either curve does not
+    /// vary enough for the ratio to mean anything — undefined, not zero.
+    public let correlation: Double?
+
+    public var covered: TimeInterval { Double(coveredMs) / 1000 }
+
+    /// Live is following the simulation's shape, whatever the level gap.
+    /// A high correlation with a negative gap reads as "same strategy, worse
+    /// costs"; a low one reads as "not doing the same thing at all".
+    public var tracksShape: Bool? {
+        guard let correlation else { return nil }
+        return correlation > 0.8
+    }
 }

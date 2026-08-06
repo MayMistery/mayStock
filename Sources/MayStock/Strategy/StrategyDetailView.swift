@@ -272,6 +272,7 @@ struct StrategyDetailView: View {
             .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 9))
 
             reconciliationPanel
+            LiveVsBacktestPanel(strategy: strategy)
 
             let fills = appState.ledger.fills(for: strategy.id, limit: 50)
             if fills.isEmpty {

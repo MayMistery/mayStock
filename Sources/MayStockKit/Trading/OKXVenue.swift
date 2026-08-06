@@ -84,4 +84,30 @@ public struct OKXVenue: ExchangeVenue {
     public func accountSnapshot(mode: TradingMode) async throws -> AccountSnapshot {
         try await bridge.accountSnapshot(mode: mode)
     }
+
+    // MARK: Protective orders
+
+    public func protectiveOrders(
+        instId: String, instType: InstrumentType, mode: TradingMode
+    ) async throws -> [VenueProtectiveOrder] {
+        try await bridge.protectiveOrders(instId: instId, instType: instType, mode: mode)
+    }
+
+    public func amendProtectiveOrder(
+        instId: String, instType: InstrumentType, algoId: String,
+        stopPrice: Double, mode: TradingMode, liveUnlocked: Bool
+    ) async throws {
+        try await bridge.amendProtectiveOrder(
+            instId: instId, instType: instType, algoId: algoId,
+            stopPrice: stopPrice, mode: mode, liveUnlocked: liveUnlocked)
+    }
+
+    public func placeProtectiveOrder(
+        instId: String, instType: InstrumentType, posSide: PositionSide?,
+        size: Double, stopPrice: Double, mode: TradingMode, liveUnlocked: Bool
+    ) async throws {
+        try await bridge.placeProtectiveOrder(
+            instId: instId, instType: instType, posSide: posSide, size: size,
+            stopPrice: stopPrice, mode: mode, liveUnlocked: liveUnlocked)
+    }
 }

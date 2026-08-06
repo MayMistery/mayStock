@@ -257,6 +257,14 @@ public struct AccountEquityStore: Sendable {
         self.fileURL = directory.appendingPathComponent("equity-\(mode.rawValue).json")
     }
 
+    /// Per-strategy curves live in their own file, keyed by strategy id.
+    public init(directory: URL, mode: TradingMode, perStrategy: Bool) {
+        let name = perStrategy
+            ? "strategy-equity-\(mode.rawValue).json"
+            : "equity-\(mode.rawValue).json"
+        self.fileURL = directory.appendingPathComponent(name)
+    }
+
     private struct Payload: Codable {
         var points: [AccountEquityPoint]
     }
@@ -267,6 +275,25 @@ public struct AccountEquityStore: Sendable {
         decoder.dateDecodingStrategy = .iso8601
         guard let payload = try? decoder.decode(Payload.self, from: data) else { return [] }
         return AccountEquityCurve.normalise(payload.points)
+    }
+
+    /// Load every per-strategy curve from one file.
+    public func loadByStrategy() -> [String: [AccountEquityPoint]] {
+        guard let data = try? Data(contentsOf: fileURL) else { return [:] }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let raw = try? decoder.decode([String: [AccountEquityPoint]].self, from: data)
+        else { return [:] }
+        return raw.mapValues(AccountEquityCurve.normalise)
+    }
+
+    public func save(byStrategy curves: [String: [AccountEquityPoint]]) throws {
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(curves).write(to: fileURL, options: .atomic)
     }
 
     public func save(_ points: [AccountEquityPoint]) throws {

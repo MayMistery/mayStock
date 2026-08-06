@@ -169,6 +169,20 @@ pub struct LiveDecision {
     pub stop_price: Option<f64>,
     #[serde(rename = "takeProfitPrice")]
     pub take_profit_price: Option<f64>,
+    /// Where the trailing stop of the *currently held* position now sits.
+    ///
+    /// Reported on every bar, including bars where the signal has not changed
+    /// and nothing is traded, because the level moves even when the position
+    /// does not. The runner's job is to keep the exchange's stop in step with
+    /// this number; the number itself is computed here, from confirmed bars,
+    /// exactly as the backtester computes it.
+    ///
+    /// Deliberately *not* delegated to the exchange's own trailing-stop order.
+    /// OKX trails on every tick, the backtest trails on bar extremes, and a
+    /// stop that behaves differently in production than in simulation is worth
+    /// less than a slightly slower one that behaves identically.
+    #[serde(rename = "trailingStopPrice")]
+    pub trailing_stop_price: Option<f64>,
     /// Continuous exposure in −1…+1 for exposure strategies; NaN otherwise.
     #[serde(rename = "targetExposure")]
     pub target_exposure: f64,
@@ -201,6 +215,10 @@ pub struct AccountState {
     pub bars_since_exit: Option<usize>,
     /// The daily-loss breaker already tripped today.
     pub halted_today: bool,
+    /// Average entry price of the held position; 0 when flat. Seeds the
+    /// trailing anchor, so a position that never moved in its favour trails
+    /// from where it was opened rather than from an arbitrary bar.
+    pub entry_price: f64,
 }
 
 impl Default for AccountState {
@@ -212,6 +230,7 @@ impl Default for AccountState {
             leverage_cap: None,
             bars_since_exit: None,
             halted_today: false,
+            entry_price: 0.0,
         }
     }
 }
@@ -225,8 +244,9 @@ pub fn can_enter(bars_since_exit: Option<usize>, cooldown: usize) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn idle(reason: &str, current: Option<Direction>, held: f64, bars: usize, ts: i64,
-        warming: bool) -> LiveDecision {
+        warming: bool, trailing: Option<f64>) -> LiveDecision {
     LiveDecision {
         target: Direction::to_i32(current),
         target_exposure: f64::NAN,
@@ -240,7 +260,55 @@ fn idle(reason: &str, current: Option<Direction>, held: f64, bars: usize, ts: i6
         warming_up: warming,
         stop_price: None,
         take_profit_price: None,
+        trailing_stop_price: trailing,
     }
+}
+
+/// Where the held position's trailing stop sits on this bar.
+///
+/// Recomputed from the bars since entry rather than carried between calls: the
+/// runner is a stateless caller by design, and a level derived from data the
+/// exchange can confirm is one that survives a restart.
+fn trailing_level(
+    strategy: &CompiledStrategy,
+    candles: &[Candle],
+    index: usize,
+    current: Option<Direction>,
+    bars_held: usize,
+    entry_price: f64,
+) -> Option<f64> {
+    let direction = current?;
+    let trail_pct = strategy.manifest.risk.trailing_stop_pct?;
+    if !(entry_price > 0.0) {
+        return None;
+    }
+    let start = index.saturating_sub(bars_held);
+    let highs: Vec<f64> = candles[start..=index].iter().map(|c| c.high).collect();
+    let lows: Vec<f64> = candles[start..=index].iter().map(|c| c.low).collect();
+    let anchor = crate::sizing::trail_anchor(direction, entry_price, &highs, &lows);
+    let level = crate::sizing::trailing_stop_level(direction, anchor, trail_pct);
+
+    // The fixed stop the position opened with is the floor this ratchets from,
+    // matching the backtester, where the trail may only tighten `stop_price`.
+    //
+    // Its ATR is read at the bar the entry was *decided* on — one before the
+    // fill — because that is the bar the backtester sizes from. Reading it at
+    // the current bar instead would make the floor drift with volatility, and
+    // a stop that loosens as the market calms is not a stop.
+    let atr = strategy.manifest.risk.atr_stop.map(|spec| {
+        let highs: Vec<f64> = candles.iter().map(|c| c.high).collect();
+        let lows: Vec<f64> = candles.iter().map(|c| c.low).collect();
+        let closes: Vec<f64> = candles.iter().map(|c| c.close).collect();
+        let series = crate::series::atr(&highs, &lows, &closes, spec.period.max(1));
+        series
+            .get(start.saturating_sub(1))
+            .copied()
+            .unwrap_or(f64::NAN)
+    });
+    let opening = crate::sizing::stop_distance(strategy, entry_price, atr).map(|d| {
+        if direction == Direction::Long { entry_price - d } else { entry_price + d }
+    });
+    Some(crate::sizing::ratchet_stop(direction, opening, level))
 }
 
 /// Evaluate a strategy against the latest confirmed bar and size the result.
@@ -263,7 +331,7 @@ pub fn decide_live(
     candles.sort_by_key(|c| c.ts_ms);
 
     if candles.is_empty() {
-        return Ok(idle("无已确认 K 线", None, account.held_base, 0, 0, true));
+        return Ok(idle("无已确认 K 线", None, account.held_base, 0, 0, true, None));
     }
 
     let index = candles.len() - 1;
@@ -272,8 +340,14 @@ pub fn decide_live(
     // not either, or the first live signal would be one the backtest refused.
     if candles.len() <= strategy.warmup_bars + 1 {
         return Ok(idle(
-            "指标预热中", current, account.held_base, candles.len(), bar_ts, true));
+            "指标预热中", current, account.held_base, candles.len(), bar_ts, true, None));
     }
+
+    // The held position's trailing stop, recomputed on every bar — it moves
+    // even when the signal does not, and the runner needs it on the quiet bars
+    // most of all.
+    let trailing = trailing_level(
+        strategy, &candles, index, current, bars_held, account.entry_price);
 
     let price = candles[index].close;
     let manifest_leverage = if strategy.manifest.market.inst_type.allows_leverage() {
@@ -306,6 +380,7 @@ pub fn decide_live(
                 warming_up: false,
                 stop_price: None,
                 take_profit_price: None,
+                trailing_stop_price: None,
             });
         }
     }
@@ -376,6 +451,7 @@ pub fn decide_live(
             // through a stop level; attaching one would fight the rebalancer.
             stop_price: None,
             take_profit_price: None,
+            trailing_stop_price: None,
         });
     }
 
@@ -416,7 +492,7 @@ pub fn decide_live(
     // Binary strategies switch in and out; nothing to do while the side is
     // unchanged.
     if target == current {
-        return Ok(idle("信号未变", target, account.held_base, candles.len(), bar_ts, false));
+        return Ok(idle("信号未变", target, account.held_base, candles.len(), bar_ts, false, trailing));
     }
 
     // Cooldown: reversing straight out of a losing side is the signal working,
@@ -426,7 +502,7 @@ pub fn decide_live(
         && !can_enter(account.bars_since_exit, strategy.manifest.risk.cooldown_bars)
     {
         return Ok(idle(
-            "冷却中", None, account.held_base, candles.len(), bar_ts, false));
+            "冷却中", None, account.held_base, candles.len(), bar_ts, false, trailing));
     }
 
     let mut target_base = 0.0;
@@ -475,6 +551,7 @@ pub fn decide_live(
                     warming_up: false,
                     stop_price: None,
                     take_profit_price: None,
+                    trailing_stop_price: trailing,
                 });
             }
         }
@@ -497,6 +574,11 @@ pub fn decide_live(
         warming_up: false,
         stop_price,
         take_profit_price,
+        // A position being opened or reversed on this bar starts its trail from
+        // the entry, which `stop_price` already expresses; the level below
+        // belongs to the position being *left*, so it must not leak into the
+        // new one.
+        trailing_stop_price: if target == current { trailing } else { None },
     })
 }
 
@@ -662,6 +744,126 @@ mod tests {
             desired_direction(9, Some(Direction::Long), 0, 0, None, None, None, None, None, Some(&targets)),
             Some(Direction::Long)
         );
+    }
+
+    // MARK: Trailing stop
+
+    fn bar(ts: i64, open: f64, high: f64, low: f64, close: f64) -> Candle {
+        Candle { ts_ms: ts, open, high, low, close, volume: 1.0, confirmed: 1 }
+    }
+
+    /// A long that runs up, then pulls back. The trail must follow the peak and
+    /// stay there.
+    fn rally_then_pullback() -> Vec<Candle> {
+        let path = [
+            (100.0, 100.0), (102.0, 101.0), (106.0, 104.0),
+            (110.0, 108.0), (109.0, 105.0), (107.0, 103.0),
+        ];
+        path.iter()
+            .enumerate()
+            .map(|(i, (high, close))| {
+                bar(i as i64 * 3_600_000, close - 0.5, *high, close - 1.0, *close)
+            })
+            .collect()
+    }
+
+    fn trailing_strategy(extra_risk: &str) -> CompiledStrategy {
+        let json = format!(
+            r#"{{"id":"t","market":{{"instId":"BTC-USDT","bar":"1H"}},
+                 "signals":{{"longEntry":"close > 0","longExit":"close < 0"}},
+                 "risk":{{"trailingStopPct":5{extra_risk}}}}}"#
+        );
+        let manifest: crate::strategy::Manifest = serde_json::from_str(&json).unwrap();
+        CompiledStrategy::compile(manifest, &[]).unwrap()
+    }
+
+    fn held_long(strategy: &CompiledStrategy, candles: &[Candle], bars_held: usize)
+        -> LiveDecision
+    {
+        decide_live(
+            strategy,
+            candles,
+            Some(Direction::Long),
+            bars_held,
+            &std::collections::HashMap::new(),
+            AccountState { equity: 10_000.0, held_base: 1.0, entry_price: 100.0,
+                           ..AccountState::default() },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_trail_follows_the_peak_and_does_not_give_it_back() {
+        let strategy = trailing_strategy("");
+        let candles = rally_then_pullback();
+        // Held since bar 0; the peak high is 110.
+        let level = held_long(&strategy, &candles, 5).trailing_stop_price.unwrap();
+        assert!((level - 110.0 * 0.95).abs() < 1e-9,
+                "the trail sits 5% under the highest high, not under the latest one");
+    }
+
+    #[test]
+    fn the_trail_is_reported_on_bars_where_nothing_is_traded() {
+        // The whole point: the level moves on quiet bars, and the runner needs
+        // it precisely then.
+        let strategy = trailing_strategy("");
+        let candles = rally_then_pullback();
+        let decision = held_long(&strategy, &candles, 5);
+        assert!(!decision.should_trade, "no signal change, so no order");
+        assert!(decision.trailing_stop_price.is_some());
+    }
+
+    #[test]
+    fn the_trail_never_loosens_past_the_opening_stop() {
+        // A position that only ever went against us: the anchor stays at the
+        // entry, so the trail implies 5% under 100 = 95. The 3% fixed stop the
+        // position opened with sits at 97, which is tighter — and a trailing
+        // stop that *widened* the protection a position started with would be
+        // worse than having none.
+        let strategy = trailing_strategy(r#","stopLossPct":3"#);
+        let candles: Vec<Candle> = [99.5, 99.0, 98.5, 98.0, 97.6, 97.3]
+            .iter()
+            .enumerate()
+            .map(|(i, close)| bar(i as i64 * 3_600_000, close - 0.5, *close, close - 1.0, *close))
+            .collect();
+        let level = held_long(&strategy, &candles, 5).trailing_stop_price.unwrap();
+        assert!((level - 97.0).abs() < 1e-9, "got {level}");
+    }
+
+    #[test]
+    fn a_flat_strategy_reports_no_trail() {
+        let strategy = trailing_strategy("");
+        let candles = rally_then_pullback();
+        let decision = decide_live(
+            &strategy, &candles, None, 0, &std::collections::HashMap::new(),
+            AccountState { equity: 10_000.0, ..AccountState::default() }).unwrap();
+        assert!(decision.trailing_stop_price.is_none());
+    }
+
+    #[test]
+    fn live_trails_to_the_same_price_the_backtest_does() {
+        // The property the whole design exists for. The backtester folds each
+        // bar into a running anchor as it walks forward; the runner recomputes
+        // from the bars since entry. They must land on the same number.
+        let strategy = trailing_strategy("");
+        let candles = rally_then_pullback();
+        let entry_price = 100.0;
+
+        // What the backtester's step 4 arrives at, expressed as its own fold.
+        let mut simulated: Option<f64> = None;
+        let mut anchor = entry_price;
+        for candle in &candles {
+            anchor = crate::sizing::trail_anchor(
+                Direction::Long, anchor, &[candle.high], &[candle.low]);
+            let level = crate::sizing::trailing_stop_level(Direction::Long, anchor, 5.0);
+            simulated = Some(crate::sizing::ratchet_stop(Direction::Long, simulated, level));
+        }
+
+        let live = held_long(&strategy, &candles, candles.len() - 1)
+            .trailing_stop_price
+            .unwrap();
+        assert!((live - simulated.unwrap()).abs() < 1e-9,
+                "live {live} vs backtest {:?}", simulated);
     }
 
     #[test]

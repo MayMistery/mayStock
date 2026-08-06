@@ -47,6 +47,11 @@ public protocol StrategyRunnerHost: AnyObject {
     func runnerDidHalt(strategyId: String, reason: String)
     /// A fresh reading of total account equity, for the equity curve.
     func runnerDidSampleEquity(_ equity: Double, at ts: Date)
+    /// One strategy's own equity — its allocated capital compounded by its own
+    /// P&L. Kept separate from the account total because that is the series a
+    /// single-strategy backtest can actually be compared against; the account
+    /// curve mixes every strategy together.
+    func runnerDidSampleStrategyEquity(_ strategyId: String, equity: Double, at ts: Date)
 }
 
 // MARK: - Runner
@@ -196,6 +201,14 @@ public final class StrategyRunner {
 
     public func mark(for instId: String) -> Double? { marks[instId] }
 
+    /// Candles the runner already holds for an instrument and interval.
+    ///
+    /// Exposed so a report can score fills against the *same* bars the decision
+    /// was made on, rather than refetching a window that may not line up.
+    public func cachedCandles(instId: String, bar: BarInterval) -> [Candle] {
+        candleCache[CacheKey(instId: instId, bar: bar)] ?? []
+    }
+
     /// Flatten one strategy immediately at market. Used by the stop button and
     /// by the emergency stop.
     public func flatten(strategyId: String) async {
@@ -269,6 +282,7 @@ public final class StrategyRunner {
         // guard below — because "how much money is in this account" is a
         // question the panel must answer even with every strategy stopped.
         await sampleEquity(for: host)
+        sampleStrategyEquity(for: host)
 
         let active = portfolio.allocations.filter { $0.running && !portfolio.emergencyStop }
         guard !active.isEmpty else { return }
@@ -608,6 +622,30 @@ public final class StrategyRunner {
         host.runnerDidSampleEquity(equity, at: now)
     }
 
+    /// Record each allocated strategy's own equity.
+    ///
+    /// Sampled for every allocation, running or not: a stopped strategy still
+    /// holds a position whose value moves, and a curve with a hole in it would
+    /// misreport the return across that gap.
+    private func sampleStrategyEquity(for host: StrategyRunnerHost) {
+        let now = Date()
+        if let last = lastStrategyEquitySampleAt,
+           now.timeIntervalSince(last) < Self.equitySampleInterval { return }
+        let byId = Dictionary(
+            host.runnableStrategies.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var sampled = false
+        for allocation in host.portfolio.allocations {
+            guard let strategy = byId[allocation.strategyId] else { continue }
+            let equity = workingCapital(strategy: strategy, allocation: allocation, host: host)
+            guard equity > 0 else { continue }
+            host.runnerDidSampleStrategyEquity(strategy.id, equity: equity, at: now)
+            sampled = true
+        }
+        if sampled { lastStrategyEquitySampleAt = now }
+    }
+
+    private var lastStrategyEquitySampleAt: Date?
+
     /// Market value of every non-stablecoin holding and derivative position.
     private func measureNonStableExposure(
         snapshot: AccountSnapshot, host: StrategyRunnerHost
@@ -739,7 +777,8 @@ public final class StrategyRunner {
                     leverageCap: allocation.leverageCap,
                     barsSinceExit: barsSince(lastExitBar[strategy.id],
                                              latestBar: latestBar, market: market),
-                    haltedToday: anchor.halted))
+                    haltedToday: anchor.halted,
+                    entryPrice: position?.averagePrice ?? 0))
         } catch {
             update(strategy.id) {
                 $0.status = .failed
@@ -773,6 +812,10 @@ public final class StrategyRunner {
                          stopPrice: decision.stopPrice,
                          takeProfitPrice: decision.takeProfitPrice)
             if decision.target == 0 { lastExitBar[strategy.id] = latestBar.ts }
+        } else if let level = decision.trailingStopPrice {
+            // The position did not change but its stop did. Nothing is traded
+            // here — the level on the exchange is simply moved up behind it.
+            await syncTrailingStop(to: level, strategy: strategy, host: host)
         }
         if decision.haltDailyLoss {
             // Latched for the rest of the UTC day only — the anchor above
@@ -982,6 +1025,96 @@ public final class StrategyRunner {
         try? await Task.sleep(nanoseconds: 1_200_000_000)
         await ingestFills(for: [strategy], host: host)
     }
+
+    // MARK: Trailing stops
+
+    /// Move the exchange's stop up behind the position, to the level the kernel
+    /// computed from confirmed bars.
+    ///
+    /// **Why not OKX's own trailing-stop order.** The exchange has one, and it
+    /// trails on every tick rather than once a bar — strictly tighter. It is
+    /// not used, because the backtest trails on bar extremes: handing the job
+    /// to a mechanism that behaves differently would mean the strategy that
+    /// runs is not the strategy that was tested, and a stop measured against
+    /// the wrong simulation is worth less than a slower one measured against
+    /// the right it. Between bars the previous level stays live on the
+    /// exchange, so the position is never unprotected — it simply tightens at
+    /// the cadence it was tested at.
+    private func syncTrailingStop(
+        to level: Double, strategy: CompiledStrategy, host: StrategyRunnerHost
+    ) async {
+        guard level > 0,
+              let position = host.ledger.position(for: strategy.id), !position.isFlat,
+              let direction = position.direction else { return }
+
+        // The exchange is asked what it is holding rather than trusting a
+        // remembered value: a restart, or a stop that fired, would make any
+        // cached level a fiction.
+        let market = strategy.market
+        guard let existing = try? await host.venue.protectiveOrders(
+            instId: market.instId, instType: market.instType, mode: host.portfolio.mode)
+        else {
+            update(strategy.id) { $0.message = "移动止损：读不到交易所止损单，本次未调整" }
+            return
+        }
+
+        guard let current = existing.first(where: { $0.stopTriggerPrice != nil }) else {
+            // Nothing is protecting the position. That happens when the entry
+            // order's attachment was refused, or after a manual entry.
+            let size = abs(position.quantity)
+            guard size > 0 else { return }
+            do {
+                try await host.venue.placeProtectiveOrder(
+                    instId: market.instId, instType: market.instType,
+                    posSide: market.instType == .swap
+                        ? (direction == .long ? .long : .short) : nil,
+                    size: size, stopPrice: level,
+                    mode: host.portfolio.mode, liveUnlocked: host.liveTradingUnlocked)
+                localStops[strategy.id] = nil
+                update(strategy.id) {
+                    $0.message = "已在交易所补挂移动止损 \(PriceFormatter.plain(level))"
+                }
+            } catch {
+                // Falling back to local enforcement is worse but not nothing.
+                localStops[strategy.id] = LocalStop(
+                    instId: market.instId, direction: direction,
+                    stop: level, takeProfit: nil)
+                update(strategy.id) { $0.message = "交易所止损挂单失败（\(error)），已改为本地执行" }
+            }
+            return
+        }
+
+        // Ratchet: only ever tighten. A level that could loosen would give back
+        // the protection it just gained.
+        let onExchange = current.stopTriggerPrice ?? 0
+        let tighter = direction == .long ? level > onExchange : level < onExchange
+        // Below this the amendment is noise — every call costs a round trip and
+        // OKX rate-limits the algo endpoints.
+        let moved = onExchange > 0 ? abs(level - onExchange) / onExchange : 1
+        guard tighter, moved >= Self.trailingStopMinMove else { return }
+
+        do {
+            try await host.venue.amendProtectiveOrder(
+                instId: market.instId, instType: market.instType, algoId: current.algoId,
+                stopPrice: level, mode: host.portfolio.mode,
+                liveUnlocked: host.liveTradingUnlocked)
+            update(strategy.id) {
+                $0.message = "移动止损 \(PriceFormatter.plain(onExchange))"
+                    + " → \(PriceFormatter.plain(level))"
+            }
+        } catch {
+            // The old level is still live on the exchange, so the position kept
+            // the protection it had; only the tightening was lost.
+            update(strategy.id) {
+                $0.message = "移动止损上移失败，交易所仍按 "
+                    + "\(PriceFormatter.plain(onExchange)) 保护：\(error)"
+            }
+            Log.warn("runner: could not trail the stop for \(strategy.id): \(error)")
+        }
+    }
+
+    /// Relative move below which the stop is left where it is.
+    public static let trailingStopMinMove = 0.001
 
     // MARK: Locally enforced protective levels
 

@@ -216,6 +216,8 @@ pub unsafe extern "C" fn ms_strategy_decide(
     // Negative means the strategy has never held a position.
     bars_since_exit: i64,
     halted_today: bool,
+    // Average entry price of the held position; 0 when flat.
+    entry_price: f64,
     error_out: *mut *mut c_char,
 ) -> *mut c_char {
     guarded(error_out, ptr::null_mut(), || {
@@ -240,6 +242,7 @@ pub unsafe extern "C" fn ms_strategy_decide(
                 leverage_cap: (leverage_cap > 0.0).then_some(leverage_cap),
                 bars_since_exit: (bars_since_exit >= 0).then_some(bars_since_exit as usize),
                 halted_today,
+                entry_price,
             },
         )
         .map_err(|e| e.to_string())?;
@@ -428,7 +431,7 @@ mod tests {
         let mut error: *mut c_char = ptr::null_mut();
         let json = unsafe {
             ms_strategy_decide(handle, bars.as_ptr(), bars.len(), 0, 0, ptr::null(),
-                               10_000.0, 0.0, 10_000.0, -1.0, -1, false, &mut error)
+                               10_000.0, 0.0, 10_000.0, -1.0, -1, false, 0.0, &mut error)
         };
         assert!(error.is_null());
         let value: serde_json::Value = serde_json::from_str(&take_string(json)).unwrap();
@@ -444,7 +447,7 @@ mod tests {
         let mut error: *mut c_char = ptr::null_mut();
         let json =
             unsafe { ms_strategy_decide(handle, ptr::null(), 0, 0, 0, ptr::null(),
-                               10_000.0, 0.0, 10_000.0, -1.0, -1, false, &mut error) };
+                               10_000.0, 0.0, 10_000.0, -1.0, -1, false, 0.0, &mut error) };
         assert!(error.is_null());
         let value: serde_json::Value = serde_json::from_str(&take_string(json)).unwrap();
         assert_eq!(value["target"], 0);
@@ -484,6 +487,64 @@ mod tests {
 ///
 /// The portfolio backtester and the factor tools combine several strategies'
 /// curves and then need the same statistics. Without this they would each
+/// What slippage the account is actually paying, from real fills.
+///
+/// Input JSON: `{"fills":[{"ts_ms":…,"price":…,"side":1}],
+///               "candles":[…], "assumedBps":5}`
+/// Returns a [`crate::reconcile::SlippageReport`].
+#[no_mangle]
+pub unsafe extern "C" fn ms_calibrate_slippage(
+    request_json: *const c_char,
+    error_out: *mut *mut c_char,
+) -> *mut c_char {
+    #[derive(serde::Deserialize)]
+    struct Request {
+        #[serde(default)]
+        fills: Vec<crate::reconcile::ExecutedFill>,
+        #[serde(default)]
+        candles: Vec<Candle>,
+        #[serde(rename = "assumedBps", default)]
+        assumed_bps: f64,
+    }
+    guarded(error_out, ptr::null_mut(), || {
+        let text = borrow_str(request_json).ok_or("请求 JSON 为空")?;
+        let request: Request =
+            serde_json::from_str(text).map_err(|e| format!("请求解析失败：{e}"))?;
+        let report = crate::reconcile::calibrate_slippage(
+            &request.fills, &request.candles, request.assumed_bps);
+        serde_json::to_string(&report)
+            .map(to_c_string)
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// How far live equity has drifted from the backtest that justified it.
+///
+/// Input JSON: `{"live":[{"ts_ms":…,"equity":…}], "backtest":[…]}`
+/// Returns a [`crate::reconcile::EquityComparison`].
+#[no_mangle]
+pub unsafe extern "C" fn ms_compare_equity(
+    request_json: *const c_char,
+    error_out: *mut *mut c_char,
+) -> *mut c_char {
+    #[derive(serde::Deserialize)]
+    struct Request {
+        #[serde(default)]
+        live: Vec<crate::reconcile::EquitySample>,
+        #[serde(default)]
+        backtest: Vec<crate::reconcile::EquitySample>,
+    }
+    guarded(error_out, ptr::null_mut(), || {
+        let text = borrow_str(request_json).ok_or("请求 JSON 为空")?;
+        let request: Request =
+            serde_json::from_str(text).map_err(|e| format!("请求解析失败：{e}"))?;
+        let comparison = crate::reconcile::compare_equity(&request.live, &request.backtest);
+        serde_json::to_string(&comparison)
+            .map(to_c_string)
+            .map_err(|e| e.to_string())
+    })
+}
+
 /// reimplement Sharpe, drawdown and expectancy — which is exactly the
 /// duplication this refactor exists to remove.
 ///
