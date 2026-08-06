@@ -259,6 +259,13 @@ struct StrategyDetailView: View {
                     positionStat("已实现", PriceFormatter.signedMoney(position?.realisedPnL ?? 0),
                                  tint: ChartStyle.trend((position?.realisedPnL ?? 0) >= 0))
                     positionStat("累计手续费", PriceFormatter.money(position?.feesPaid ?? 0))
+                    if let funding = position?.fundingPaid, funding != 0 {
+                        // Shown apart from realised P&L on purpose: a perp
+                        // losing money purely to funding is a different
+                        // diagnosis from one losing it on entries.
+                        positionStat("资金费", PriceFormatter.signedMoney(funding),
+                                     tint: ChartStyle.trend(funding >= 0))
+                    }
                     positionStat("净盈亏", PriceFormatter.signedMoney(appState.netPnL(for: strategy.id)),
                                  tint: ChartStyle.trend(appState.netPnL(for: strategy.id) >= 0))
                     positionStat("收益率",

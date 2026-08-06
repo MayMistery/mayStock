@@ -131,6 +131,25 @@ public struct AccountSnapshot: Sendable, Equatable {
     }
 }
 
+/// One funding settlement on a perpetual position.
+public struct FundingPayment: Sendable, Equatable, Identifiable {
+    /// The exchange's bill id, which is what makes booking it idempotent.
+    public let id: String
+    public let instId: String
+    /// Signed in the settlement currency: negative when we paid.
+    public let amount: Double
+    public let ccy: String
+    public let ts: Date
+
+    public init(id: String, instId: String, amount: Double, ccy: String, ts: Date) {
+        self.id = id
+        self.instId = instId
+        self.amount = amount
+        self.ccy = ccy
+        self.ts = ts
+    }
+}
+
 public struct ExchangePosition: Sendable, Equatable, Identifiable {
     public let instId: String
     public let posSide: PositionSide
@@ -435,6 +454,42 @@ public struct TradeBridge: Sendable {
         if let instId { args += ["--instId", instId] }
         let output = try await runCLI(args, mode: mode)
         return Self.parseFills(json: output)
+    }
+
+    /// Funding settlements charged on perpetual positions.
+    ///
+    /// The backtester models funding from real rate history; live ignored it
+    /// entirely, which for a short held across several days is not a rounding
+    /// error — it is the position's whole edge, paid out eight-hourly.
+    ///
+    /// OKX files these under bill type 8; `balChg` carries the signed amount,
+    /// negative when we paid.
+    public func fundingPayments(
+        instId: String?, mode: TradingMode, limit: Int = 100
+    ) async throws -> [FundingPayment] {
+        var args = ["account", "bills", "--instType", "SWAP", "--limit", String(limit)]
+        if let instId { args += ["--instId", instId] }
+        let output = try await runCLI(args, mode: mode)
+        return Self.parseFundingPayments(json: output, instId: instId)
+    }
+
+    static func parseFundingPayments(json: String, instId: String?) -> [FundingPayment] {
+        var found: [FundingPayment] = []
+        walkObjects(in: json) { dict in
+            // Type 8 is the funding fee. Filtering on it rather than on the
+            // sub-type keeps both the expense and the income side.
+            guard (dict["type"] as? String) == "8" || number(dict, "type") == 8 else { return }
+            guard let billId = dict["billId"] as? String, !billId.isEmpty,
+                  let inst = dict["instId"] as? String,
+                  instId == nil || inst == instId,
+                  let amount = number(dict, "balChg") ?? number(dict, "pnl"),
+                  let ms = number(dict, "ts") else { return }
+            found.append(FundingPayment(
+                id: billId, instId: inst, amount: amount,
+                ccy: (dict["ccy"] as? String) ?? "USDT",
+                ts: Date(timeIntervalSince1970: ms / 1000)))
+        }
+        return found.sorted { $0.ts < $1.ts }
     }
 
     // MARK: Protective orders

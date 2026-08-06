@@ -85,6 +85,8 @@ char *ms_strategy_decide(const MSStrategy *handle,
                          int64_t bars_since_exit, /* negative = never held one */
                          bool halted_today,
                          double entry_price,    /* 0 = flat; seeds the trail */
+                         int64_t now_ms,        /* 0 = skip the staleness check */
+                         const char *limits_json, /* NULL = default limits */
                          char **error_out);
 
 /* --- backtest -------------------------------------------------------- */
@@ -101,6 +103,16 @@ char *ms_backtest_run(const MSStrategy *handle,
  * need the same statistics). Request JSON carries equityCurve, trades,
  * initialCapital, bar and freeParameterCount. Caller frees. */
 char *ms_metrics_compute(const char *request_json, char **error_out);
+
+/* Sharpe the luckiest of `trials` skill-free strategies would be expected to
+ * show over `years` of data — the bar a grid-search winner must clear. */
+double ms_expected_max_sharpe(int64_t trials, double years);
+
+/* How much of a backtest result survives having looked at many candidates:
+ * the Deflated Sharpe Ratio and the probability of backtest overfitting.
+ * Request JSON carries returns, observedSharpe, trials, periodsPerYear and
+ * optionally candidates + blocks for CSCV. Caller frees. */
+char *ms_assess_overfit(const char *request_json, char **error_out);
 
 /* What slippage the account actually pays, measured from real fills against the
  * open of the bar each one landed in. Request JSON carries fills, candles and

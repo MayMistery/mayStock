@@ -218,6 +218,10 @@ pub unsafe extern "C" fn ms_strategy_decide(
     halted_today: bool,
     // Average entry price of the held position; 0 when flat.
     entry_price: f64,
+    // Wall clock for the staleness check; 0 means "do not check".
+    now_ms: i64,
+    // Pre-trade limits as JSON; NULL uses the defaults.
+    limits_json: *const c_char,
     error_out: *mut *mut c_char,
 ) -> *mut c_char {
     guarded(error_out, ptr::null_mut(), || {
@@ -243,6 +247,12 @@ pub unsafe extern "C" fn ms_strategy_decide(
                 bars_since_exit: (bars_since_exit >= 0).then_some(bars_since_exit as usize),
                 halted_today,
                 entry_price,
+                now_ms: (now_ms > 0).then_some(now_ms),
+                limits: match borrow_str(limits_json) {
+                    Some(text) if !text.trim().is_empty() => serde_json::from_str(text)
+                        .map_err(|e| format!("风控限额解析失败：{e}"))?,
+                    _ => crate::guard::OrderLimits::default(),
+                },
             },
         )
         .map_err(|e| e.to_string())?;
@@ -431,7 +441,7 @@ mod tests {
         let mut error: *mut c_char = ptr::null_mut();
         let json = unsafe {
             ms_strategy_decide(handle, bars.as_ptr(), bars.len(), 0, 0, ptr::null(),
-                               10_000.0, 0.0, 10_000.0, -1.0, -1, false, 0.0, &mut error)
+                               10_000.0, 0.0, 10_000.0, -1.0, -1, false, 0.0, 0, ptr::null(), &mut error)
         };
         assert!(error.is_null());
         let value: serde_json::Value = serde_json::from_str(&take_string(json)).unwrap();
@@ -447,7 +457,7 @@ mod tests {
         let mut error: *mut c_char = ptr::null_mut();
         let json =
             unsafe { ms_strategy_decide(handle, ptr::null(), 0, 0, 0, ptr::null(),
-                               10_000.0, 0.0, 10_000.0, -1.0, -1, false, 0.0, &mut error) };
+                               10_000.0, 0.0, 10_000.0, -1.0, -1, false, 0.0, 0, ptr::null(), &mut error) };
         assert!(error.is_null());
         let value: serde_json::Value = serde_json::from_str(&take_string(json)).unwrap();
         assert_eq!(value["target"], 0);
@@ -487,6 +497,65 @@ mod tests {
 ///
 /// The portfolio backtester and the factor tools combine several strategies'
 /// curves and then need the same statistics. Without this they would each
+/// Sharpe the luckiest of `trials` skill-free strategies would be expected to
+/// show over `years` of data. Returns 0 for degenerate inputs.
+#[no_mangle]
+pub extern "C" fn ms_expected_max_sharpe(trials: i64, years: f64) -> f64 {
+    if trials <= 1 || !years.is_finite() || years <= 0.0 {
+        return 0.0;
+    }
+    crate::overfit::expected_max_sharpe_under_null(trials as usize, years)
+}
+
+/// How much of a backtest result survives having looked at many candidates.
+///
+/// Input JSON: `{"returns":[…], "observedSharpe":…, "trials":N,
+///               "periodsPerYear":365, "candidates":[[…],[…]], "blocks":8}`
+/// Returns `{"deflated":…|null, "overfit":…|null}`.
+#[no_mangle]
+pub unsafe extern "C" fn ms_assess_overfit(
+    request_json: *const c_char,
+    error_out: *mut *mut c_char,
+) -> *mut c_char {
+    #[derive(serde::Deserialize)]
+    struct Request {
+        #[serde(default)]
+        returns: Vec<f64>,
+        #[serde(rename = "observedSharpe", default)]
+        observed_sharpe: f64,
+        #[serde(default)]
+        trials: usize,
+        #[serde(rename = "periodsPerYear", default = "default_periods")]
+        periods_per_year: f64,
+        #[serde(default)]
+        candidates: Vec<Vec<f64>>,
+        #[serde(default = "default_blocks")]
+        blocks: usize,
+    }
+    fn default_periods() -> f64 {
+        365.0
+    }
+    fn default_blocks() -> usize {
+        8
+    }
+    guarded(error_out, ptr::null_mut(), || {
+        let text = borrow_str(request_json).ok_or("请求 JSON 为空")?;
+        let request: Request =
+            serde_json::from_str(text).map_err(|e| format!("请求解析失败：{e}"))?;
+        let deflated = crate::overfit::deflated_sharpe(
+            &request.returns, request.observed_sharpe, request.trials,
+            request.periods_per_year);
+        let overfit = crate::overfit::probability_of_backtest_overfitting(
+            &request.candidates, request.blocks);
+        serde_json::to_string(&serde_json::json!({
+            "deflated": deflated,
+            "overfit": overfit,
+        }))
+        .map(to_c_string)
+        .map_err(|e| e.to_string())
+    })
+}
+
 /// What slippage the account is actually paying, from real fills.
 ///
 /// Input JSON: `{"fills":[{"ts_ms":…,"price":…,"side":1}],

@@ -21,13 +21,35 @@ struct AccountSummaryRow: View {
     /// Shown in place of the equity when there is none.
     let placeholder: String
     let change: (EquityWindow) -> EquityChange?
+    /// Why the portfolio is refusing new exposure, when it is.
+    var protection: String? = nil
     var onOpenStudio: () -> Void = {}
+
+    /// A protective breaker the user cannot see is worth nothing — it would
+    /// look like the strategies had simply stopped finding trades.
+    @ViewBuilder
+    private var protectionBanner: some View {
+        if let reason = protection {
+            HStack(spacing: 5) {
+                Image(systemName: "hand.raised.fill")
+                    .font(.system(size: 9)).foregroundStyle(.orange)
+                Text(reason)
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.horizontal, 7).padding(.vertical, 4)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+        }
+    }
 
     var body: some View {
         VStack(spacing: 5) {
             equityRow
             if openPnL != nil { currentPnLRow }
             returnsRow
+            protectionBanner
         }
     }
 

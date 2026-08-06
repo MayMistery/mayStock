@@ -135,7 +135,10 @@ public final class KernelStrategy: @unchecked Sendable {
                     account.equity, account.heldBase, account.dayStartEquity,
                     account.leverageCap ?? -1,
                     Int64(account.barsSinceExit ?? -1), account.haltedToday,
-                    account.entryPrice, error)
+                    account.entryPrice,
+                    account.now.map { Int64(($0.timeIntervalSince1970 * 1000).rounded()) } ?? 0,
+                    try? encodeJSON(account.limits),
+                    error)
             }
             return try JSONDecoder().decode(KernelDecision.self, from: Data(json.utf8))
         }
@@ -295,6 +298,29 @@ extension TradingKernel {
         return try JSONDecoder().decode(KernelSlippageReport.self, from: Data(json.utf8))
     }
 
+    /// How much of a backtest result survives having looked at many candidates.
+    ///
+    /// `returns` are per-period; `candidates` are the per-period return series
+    /// of every strategy the search compared, needed only for the CSCV part.
+    public static func assessOverfit(
+        returns: [Double], observedSharpe: Double, trials: Int,
+        periodsPerYear: Double = 365, candidates: [[Double]] = [], blocks: Int = 8
+    ) throws -> KernelOverfitAssessment {
+        let request = OverfitRequest(
+            returns: returns, observedSharpe: observedSharpe, trials: trials,
+            periodsPerYear: periodsPerYear, candidates: candidates, blocks: blocks)
+        let json = try callReturningString { error in
+            ms_assess_overfit(try? encodeJSON(request), error)
+        }
+        return try JSONDecoder().decode(KernelOverfitAssessment.self, from: Data(json.utf8))
+    }
+
+    /// Sharpe the luckiest of `trials` skill-free strategies would be expected
+    /// to show. The bar a grid-search winner has to clear.
+    public static func expectedMaxSharpeUnderNull(trials: Int, years: Double) -> Double {
+        ms_expected_max_sharpe(Int64(trials), years)
+    }
+
     /// How far live equity has drifted from the backtest that justified it.
     public static func compareEquity(
         live: [(ts: Date, equity: Double)], backtest: [(ts: Date, equity: Double)]
@@ -312,6 +338,16 @@ extension TradingKernel {
         }
         return try JSONDecoder().decode(KernelEquityComparison.self, from: Data(json.utf8))
     }
+}
+
+/// Wire shape for `ms_assess_overfit`.
+private struct OverfitRequest: Encodable {
+    let returns: [Double]
+    let observedSharpe: Double
+    let trials: Int
+    let periodsPerYear: Double
+    let candidates: [[Double]]
+    let blocks: Int
 }
 
 /// Wire shape for `ms_calibrate_slippage`.

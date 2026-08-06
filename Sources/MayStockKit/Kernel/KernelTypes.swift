@@ -48,12 +48,18 @@ public struct KernelAccountState: Encodable, Sendable {
     /// trailing anchor so a position that never moved in its favour trails from
     /// where it opened.
     public var entryPrice: Double
+    /// Wall clock for the staleness check. Nil in a backtest, where historical
+    /// data is stale by definition and the property means nothing.
+    public var now: Date?
+    /// Pre-trade limits applied to whatever sizing produces.
+    public var limits: KernelOrderLimits
 
     public init(
         equity: Double = 0, heldBase: Double = 0,
         dayStartEquity: Double = 0, leverageCap: Double? = nil,
         barsSinceExit: Int? = nil, haltedToday: Bool = false,
-        entryPrice: Double = 0
+        entryPrice: Double = 0, now: Date? = nil,
+        limits: KernelOrderLimits = KernelOrderLimits()
     ) {
         self.equity = equity
         self.heldBase = heldBase
@@ -62,7 +68,52 @@ public struct KernelAccountState: Encodable, Sendable {
         self.barsSinceExit = barsSinceExit
         self.haltedToday = haltedToday
         self.entryPrice = entryPrice
+        self.now = now
+        self.limits = limits
     }
+}
+
+/// What the venue may currently be asked for.
+public enum KernelTradingState: String, Codable, Sendable, Equatable {
+    case active, halted
+    /// Only orders that shrink exposure. What a breaker should trip into
+    /// rather than `halted`, since a halted engine cannot close the position
+    /// that tripped it.
+    case reducing
+}
+
+/// Limits applied to every order regardless of the strategy that asked.
+public struct KernelOrderLimits: Codable, Sendable, Equatable {
+    public var maxOrderNotional: Double?
+    public var maxOrderEquityPct: Double?
+    public var state: KernelTradingState
+
+    public init(
+        maxOrderNotional: Double? = nil,
+        maxOrderEquityPct: Double? = 1_000,
+        state: KernelTradingState = .active
+    ) {
+        self.maxOrderNotional = maxOrderNotional
+        self.maxOrderEquityPct = maxOrderEquityPct
+        self.state = state
+    }
+}
+
+/// Why a computed order was refused before it could be sent.
+public struct KernelOrderDenied: Decodable, Sendable, Equatable {
+    public let reason: String
+    /// True when the refusal is a policy state rather than a suspect order.
+    public let byPolicy: Bool
+}
+
+/// What is wrong with the candle series, if anything.
+public struct KernelDataQuality: Decodable, Sendable, Equatable {
+    public let usable: Bool
+    public let reason: String
+    public let gaps: Int
+    public let duplicates: Int
+    public let malformed: Int
+    public let barsBehind: Double?
 }
 
 public struct KernelDecision: Decodable, Sendable, Equatable {
@@ -92,6 +143,13 @@ public struct KernelDecision: Decodable, Sendable, Equatable {
     /// True while indicators are still warming up. The caller must hold rather
     /// than read the flat target as an instruction to sell.
     public let warmingUp: Bool
+    /// Set when the computed order was refused before it could be sent. The
+    /// plan is still reported in full — the caller needs to show what the
+    /// strategy wanted — but `shouldTrade` is false.
+    public let denied: KernelOrderDenied?
+    /// Set when the candle series is not fit to trade on. Distinct from warming
+    /// up: there is enough data, it is just not trustworthy.
+    public let dataQuality: KernelDataQuality?
 
     public var direction: TradeDirection? { TradeDirection.fromKernelCode(Int32(target)) }
     public var barTime: Date { Date(timeIntervalSince1970: Double(barTs) / 1000) }
@@ -100,6 +158,7 @@ public struct KernelDecision: Decodable, Sendable, Equatable {
         case target, targetExposure, confirmedBars, barTs, warmingUp
         case targetBaseQuantity, baseDelta, shouldTrade, haltDailyLoss, reason
         case stopPrice, takeProfitPrice, trailingStopPrice
+        case denied, dataQuality
     }
 
     public init(from decoder: Decoder) throws {
@@ -119,6 +178,8 @@ public struct KernelDecision: Decodable, Sendable, Equatable {
         confirmedBars = try c.decode(Int.self, forKey: .confirmedBars)
         barTs = try c.decode(Int64.self, forKey: .barTs)
         warmingUp = try c.decode(Bool.self, forKey: .warmingUp)
+        denied = try c.decodeIfPresent(KernelOrderDenied.self, forKey: .denied)
+        dataQuality = try c.decodeIfPresent(KernelDataQuality.self, forKey: .dataQuality)
     }
 }
 
@@ -335,4 +396,37 @@ public struct KernelEquityComparison: Decodable, Sendable, Equatable {
         guard let correlation else { return nil }
         return correlation > 0.8
     }
+}
+
+// MARK: - Overfitting
+
+/// How much of a backtest result is skill, and how much is having looked a lot.
+public struct KernelOverfitAssessment: Decodable, Sendable, Equatable {
+    public let deflated: KernelDeflatedSharpe?
+    public let overfit: KernelOverfitProbability?
+}
+
+public struct KernelDeflatedSharpe: Decodable, Sendable, Equatable {
+    public let observed: Double
+    /// What the luckiest of N skill-free strategies would be expected to show.
+    public let expectedMaxUnderNull: Double
+    /// Probability the observed Sharpe genuinely beats that bar, given the
+    /// sample size, skew and kurtosis.
+    public let probability: Double
+    public let significant: Bool
+    public let trials: Int
+    public let observations: Int
+}
+
+public struct KernelOverfitProbability: Decodable, Sendable, Equatable {
+    /// Share of splits where the in-sample winner ranked below the
+    /// out-of-sample median. Approaching 0.5 means the selection procedure
+    /// carries no information at all.
+    public let pbo: Double
+    public let splits: Int
+    public let candidates: Int
+
+    /// The usual bar. Above this, the *search* is the problem, not the
+    /// individual strategy it picked.
+    public var isOverfit: Bool { pbo > 0.5 }
 }
