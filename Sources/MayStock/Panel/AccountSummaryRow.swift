@@ -14,15 +14,43 @@ struct AccountSummaryRow: View {
     /// Share of equity held in anything that is not a stablecoin. Nil until the
     /// first account read lands.
     var nonStablePct: Double? = nil
+    /// Profit on the book right now. Independent of the trailing windows —
+    /// it needs no recorded history, only a position and a price.
+    var openPnL: Double? = nil
+    var openPnLPct: Double? = nil
     /// Shown in place of the equity when there is none.
     let placeholder: String
     let change: (EquityWindow) -> EquityChange?
     var onOpenStudio: () -> Void = {}
 
     var body: some View {
-        VStack(spacing: 6) {
+        VStack(spacing: 5) {
             equityRow
+            if openPnL != nil { currentPnLRow }
             returnsRow
+        }
+    }
+
+    /// Always-available P&L, so the panel never reports nothing merely because
+    /// the equity curve is young.
+    private var currentPnLRow: some View {
+        let pnl = openPnL ?? 0
+        return HStack(spacing: 5) {
+            Text("当前盈亏")
+                .font(.system(size: 9)).foregroundStyle(.secondary)
+            Text(PriceFormatter.signedMoney(pnl, decimals: 2))
+                .font(.system(size: 12, weight: .semibold)).monospacedDigit()
+                .foregroundStyle(ChartStyle.trend(pnl >= 0))
+                .contentTransition(.numericText())
+                .animation(.snappy(duration: 0.2), value: pnl)
+            if let pct = openPnLPct {
+                Text("(\(PriceFormatter.signedPercent(pct)))")
+                    .font(.system(size: 9, weight: .medium)).monospacedDigit()
+                    .foregroundStyle(ChartStyle.trend(pnl >= 0).opacity(0.75))
+            }
+            Spacer(minLength: 0)
+            Text("持仓盈亏 · 不依赖历史")
+                .font(.system(size: 8)).foregroundStyle(.tertiary)
         }
     }
 

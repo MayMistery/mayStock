@@ -73,6 +73,8 @@ struct PositionStripView: View {
                 mode: appState.tradingMode,
                 equity: appState.accountEquity,
                 nonStablePct: appState.nonStableExposurePct,
+                openPnL: appState.openPnL,
+                openPnLPct: appState.openPnLPct,
                 placeholder: appState.accountError ?? "读取账户余额…",
                 change: { appState.equityChange($0) },
                 onOpenStudio: {

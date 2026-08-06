@@ -154,6 +154,29 @@ final class AppState {
     /// Share of equity exposed to non-stablecoin price risk.
     var nonStableExposurePct: Double? { runner.nonStableExposurePct }
 
+    /// Live profit on everything the book currently holds, plus whatever has
+    /// already been realised, net of fees and funding.
+    ///
+    /// This needs no equity history at all — position, average price and mark
+    /// are all available the moment a position exists. Making it wait for the
+    /// trailing windows to fill was a design mistake: it left a profitable
+    /// account reporting nothing.
+    var openPnL: Double? {
+        let positions = ledger.positions.values.filter { !$0.isFlat || $0.realisedPnL != 0 }
+        guard !positions.isEmpty else { return nil }
+        return positions.reduce(0) { $0 + $1.netPnL(mark: runner.mark(for: $1.instId)) }
+    }
+
+    /// The same profit as a share of the capital actually committed to it.
+    var openPnLPct: Double? {
+        guard let pnl = openPnL else { return nil }
+        let committed = store.config.strategy.allocations
+            .filter { ledger.position(for: $0.strategyId)?.isFlat == false }
+            .reduce(0) { $0 + $1.capital }
+        guard committed > 0 else { return nil }
+        return pnl / committed * 100
+    }
+
     /// Trailing return for the panel, endpoint pinned to the live equity rather
     /// than the last stored sample.
     func equityChange(_ window: EquityWindow) -> EquityChange? {
