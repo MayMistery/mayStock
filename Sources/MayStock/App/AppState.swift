@@ -151,6 +151,9 @@ final class AppState {
     /// Live account equity in USDT, sampled by the runner.
     var accountEquity: Double? { runner.accountEquity }
 
+    /// Share of equity exposed to non-stablecoin price risk.
+    var nonStableExposurePct: Double? { runner.nonStableExposurePct }
+
     /// Trailing return for the panel, endpoint pinned to the live equity rather
     /// than the last stored sample.
     func equityChange(_ window: EquityWindow) -> EquityChange? {

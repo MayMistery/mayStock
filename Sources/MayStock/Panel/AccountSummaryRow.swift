@@ -11,6 +11,9 @@ struct AccountSummaryRow: View {
     let mode: TradingMode
     /// Nil while the first balance read is in flight, or when it failed.
     let equity: Double?
+    /// Share of equity held in anything that is not a stablecoin. Nil until the
+    /// first account read lands.
+    var nonStablePct: Double? = nil
     /// Shown in place of the equity when there is none.
     let placeholder: String
     let change: (EquityWindow) -> EquityChange?
@@ -37,6 +40,17 @@ struct AccountSummaryRow: View {
                 Text(StrategyRunner.quoteCurrency)
                     .font(.system(size: 9)).foregroundStyle(.tertiary)
                     .baselineOffset(-1)
+                if let nonStablePct {
+                    // How much of the account is actually at market risk. A
+                    // book that is 100% stablecoin is flat however many
+                    // strategies are armed.
+                    Text("非稳定币 \(PriceFormatter.decimals(nonStablePct, 1))%")
+                        .font(.system(size: 8, weight: .medium))
+                        .padding(.horizontal, 4).padding(.vertical, 1)
+                        .background(riskTint.opacity(0.16), in: Capsule())
+                        .foregroundStyle(riskTint)
+                        .help("现货币种持仓 + 永续名义额，占账户权益的比例。做空同样计入敞口。")
+                }
             } else {
                 Text(placeholder)
                     .font(.system(size: 10)).foregroundStyle(.tertiary)
@@ -52,6 +66,15 @@ struct AccountSummaryRow: View {
             .buttonStyle(.plain)
             .foregroundStyle(ChartStyle.accent)
             .fixedSize()
+        }
+    }
+
+    /// Green while most of the book is in cash, amber as exposure builds.
+    private var riskTint: Color {
+        switch nonStablePct ?? 0 {
+        case ..<25: return ChartStyle.up
+        case ..<75: return .orange
+        default: return ChartStyle.down
         }
     }
 
@@ -90,20 +113,24 @@ struct AccountSummaryRow: View {
             Text(window.label)
                 .font(.system(size: 8, weight: .medium))
                 .foregroundStyle(.tertiary)
-            Text(ready ? PriceFormatter.signedPercent(pct ?? 0) : "—")
+            // Amount first: "+33 USDT" answers "how much did I make" directly,
+            // where a percentage of an unstated base does not.
+            Text(ready ? PriceFormatter.signedMoney(change?.changeQuote ?? 0, decimals: 1) : "—")
                 .font(.system(size: 11, weight: .semibold)).monospacedDigit()
                 .foregroundStyle(ready ? ChartStyle.trend((pct ?? 0) >= 0) : Color.secondary)
+                .lineLimit(1).minimumScaleFactor(0.7)
             Group {
-                if ready, let change {
-                    Text(PriceFormatter.signedMoney(change.changeQuote, decimals: 0))
+                if ready {
+                    Text(PriceFormatter.signedPercent(pct ?? 0))
+                        .foregroundStyle(ChartStyle.trend((pct ?? 0) >= 0).opacity(0.75))
                 } else if let change, change.coveredSeconds > 0 {
                     Text("记录 \(AccountEquityCurve.describe(change.coveredSeconds))")
+                        .foregroundStyle(.tertiary)
                 } else {
-                    Text("等待记录")
+                    Text("等待记录").foregroundStyle(.tertiary)
                 }
             }
-            .font(.system(size: 8)).monospacedDigit()
-            .foregroundStyle(.tertiary)
+            .font(.system(size: 8, weight: .medium)).monospacedDigit()
             .lineLimit(1).minimumScaleFactor(0.8)
         }
         .frame(maxWidth: .infinity)

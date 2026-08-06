@@ -76,6 +76,24 @@ public final class StrategyRunner {
     public private(set) var accountEquity: Double?
     public private(set) var accountBalances: [AccountBalance] = []
     public private(set) var lastEquitySampleAt: Date?
+    /// Absolute market value of everything that is not a stablecoin: spot coin
+    /// holdings plus the notional of every open derivative position.
+    ///
+    /// Shorts count as exposure, not as a credit — being short 4 ETH is 4 ETH
+    /// of price risk. Netting the two would report a hedged book as flat.
+    public private(set) var nonStableExposure: Double = 0
+
+    /// Fiat-pegged currencies, which carry no price risk worth reporting.
+    public static let stableCurrencies: Set<String> = [
+        "USDT", "USDC", "USD", "DAI", "TUSD", "FDUSD", "PYUSD", "BUSD", "USDD",
+    ]
+
+    /// Non-stable exposure as a share of account equity, or nil until both are
+    /// known.
+    public var nonStableExposurePct: Double? {
+        guard let equity = accountEquity, equity > 0 else { return nil }
+        return nonStableExposure / equity * 100
+    }
 
     /// Everything the workbench trades settles in USDT, and per-strategy P&L is
     /// denominated in it, so equity is reported in it too.
@@ -298,7 +316,36 @@ public final class StrategyRunner {
         guard let equity = snapshot.totalEquity ?? (pricedEverything ? total : nil),
               equity > 0 else { return }
         accountEquity = equity
+        nonStableExposure = await measureNonStableExposure(snapshot: snapshot, host: host)
         host.runnerDidSampleEquity(equity, at: now)
+    }
+
+    /// Market value of every non-stablecoin holding and derivative position.
+    private func measureNonStableExposure(
+        snapshot: AccountSnapshot, host: StrategyRunnerHost
+    ) async -> Double {
+        var exposure = 0.0
+
+        // Spot coin balances.
+        for balance in snapshot.balances where balance.total > 0 {
+            guard !Self.stableCurrencies.contains(balance.ccy.uppercased()) else { continue }
+            let instId = "\(balance.ccy)-\(Self.quoteCurrency)"
+            var price = marks[instId]
+            if price == nil, let ticker = try? await rest.ticker(instId: instId) {
+                price = ticker.last
+            }
+            guard let price, price > 0 else { continue }
+            marks[instId] = price
+            exposure += balance.total * price
+        }
+
+        // Derivative positions, at their own mark and contract size.
+        for state in host.ledger.positions.values where !state.isFlat {
+            guard state.instId.hasSuffix("-SWAP") else { continue }
+            let price = marks[state.instId] ?? state.averagePrice
+            exposure += abs(state.baseQuantity) * price
+        }
+        return exposure
     }
 
     // MARK: Per-strategy evaluation

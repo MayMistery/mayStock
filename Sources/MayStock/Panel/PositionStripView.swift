@@ -72,6 +72,7 @@ struct PositionStripView: View {
             AccountSummaryRow(
                 mode: appState.tradingMode,
                 equity: appState.accountEquity,
+                nonStablePct: appState.nonStableExposurePct,
                 placeholder: appState.accountError ?? "读取账户余额…",
                 change: { appState.equityChange($0) },
                 onOpenStudio: {
