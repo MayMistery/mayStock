@@ -925,7 +925,7 @@ public final class StrategyRunner {
     /// without this every bar-counted rule — the minimum hold, the cooldown,
     /// and above all the time barrier and the trailing anchor's window — was
     /// one bar out from the simulation that justified it.
-    static func barsBetween(_ from: Date, and to: Date, bar: BarInterval) -> Int? {
+    nonisolated static func barsBetween(_ from: Date, and to: Date, bar: BarInterval) -> Int? {
         let seconds = bar.seconds
         guard seconds > 0 else { return nil }
         func barStart(_ date: Date) -> Double {

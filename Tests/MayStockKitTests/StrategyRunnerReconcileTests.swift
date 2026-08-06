@@ -568,3 +568,44 @@ struct KernelGateBridgeTests {
         #expect(sampled.isEmpty)
     }
 }
+
+// MARK: - Protective defaults
+
+struct PortfolioProtectionDefaultTests {
+    @Test("旧配置解码后自动获得保护，而不是默认关闭")
+    func anOlderConfigGainsTheProtection() throws {
+        // Absent means "written before this existed". For a protective limit
+        // that has to mean the default, not "off" — otherwise every existing
+        // install silently opts out of the guard.
+        let json = #"{"mode":"demo","totalCapital":1000,"allocations":[]}"#
+        let prefs = try JSONDecoder().decode(
+            StrategyPortfolioPrefs.self, from: Data(json.utf8))
+        #expect(prefs.maxDrawdownPct == 25)
+        #expect(prefs.stoplossGuard != nil)
+        // The order-notional cap has no safe default, so it stays opt-in; the
+        // equity-share cap in the kernel covers the same failure regardless.
+        #expect(prefs.maxOrderNotional == nil)
+    }
+
+    @Test("显式配置照常生效")
+    func anExplicitValueIsHonoured() throws {
+        let json = #"{"mode":"demo","maxDrawdownPct":10,"maxOrderNotional":5000}"#
+        let prefs = try JSONDecoder().decode(
+            StrategyPortfolioPrefs.self, from: Data(json.utf8))
+        #expect(prefs.maxDrawdownPct == 10)
+        #expect(prefs.maxOrderNotional == 5_000)
+    }
+
+    @Test("按 bar 计数，不按经过的时间")
+    func barsAreCountedAsBarsNotAsElapsedTime() {
+        // An entry at 10:05 against the 15:00 bar has been open across 5 bars.
+        // Dividing the raw interval gives 4.9 → 4, and every bar-counted rule
+        // would then be one bar out from the backtest.
+        let entry = Date(timeIntervalSince1970: 10 * 3_600 + 5 * 60)
+        let latest = Date(timeIntervalSince1970: 15 * 3_600)
+        #expect(StrategyRunner.barsBetween(entry, and: latest, bar: .h1) == 5)
+        // Same bar is zero, and time running backwards never goes negative.
+        #expect(StrategyRunner.barsBetween(latest, and: latest, bar: .h1) == 0)
+        #expect(StrategyRunner.barsBetween(latest, and: entry, bar: .h1) == 0)
+    }
+}
