@@ -183,8 +183,14 @@ struct AccountSummaryRow: View {
                     Text(PriceFormatter.signedPercent(pct ?? 0))
                         .foregroundStyle(ChartStyle.trend((pct ?? 0) >= 0).opacity(0.75))
                 } else if let change, change.coveredSeconds > 0 {
-                    Text("记录 \(AccountEquityCurve.describe(change.coveredSeconds))")
-                        .foregroundStyle(.tertiary)
+                    // "缺 6 小时" and "记录 20 分钟" are different problems: one
+                    // says the engine stopped, the other that it is young.
+                    Text(change.hasGaps
+                         ? "缺 \(AccountEquityCurve.describe(change.missingSeconds))"
+                         : "记录 \(AccountEquityCurve.describe(change.coveredSeconds))")
+                        .foregroundStyle(change.hasGaps
+                                         ? AnyShapeStyle(ChartStyle.down.opacity(0.8))
+                                         : AnyShapeStyle(.tertiary))
                 } else {
                     Text("等待记录").foregroundStyle(.tertiary)
                 }

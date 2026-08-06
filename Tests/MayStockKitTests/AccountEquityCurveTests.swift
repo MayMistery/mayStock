@@ -108,6 +108,64 @@ struct TrailingReturnTests {
         #expect(abs((change.changePct ?? 0) - 2.0) < 1e-9)
     }
 
+    @Test func aWindowFullOfHolesIsNotAFullWindow() {
+        // The one that got away. A day whose first and last samples sit a day
+        // apart *spans* a day however much of the middle is missing — and the
+        // coverage figure used to be exactly that endpoint distance, so an
+        // engine that had been dead for most of the day still reported a
+        // confident 1d return. This is the shape of 2026-08-06: samples for
+        // the first hour, seven hours of nothing, samples again at the end.
+        let curve = AccountEquityCurve(mode: .demo)
+        for minute in 0...60 { curve.record(equity: 1_000, at: at(Double(minute))) }
+        for minute in 480...540 { curve.record(equity: 1_010, at: at(Double(minute))) }
+
+        let change = try! #require(curve.change(over: .day1, now: at(540), latest: 1_010))
+        // Spanned end to end, but only two of those nine hours were observed.
+        #expect(change.spannedSeconds == 540 * 60)
+        // 125 minutes: the two recorded hours, plus one 5-minute continuity
+        // allowance at the hole's leading edge. Not the nine hours it spans.
+        #expect(abs(change.coveredSeconds - 125 * 60) < 1)
+        #expect(!change.isComplete)
+        #expect(change.hasGaps == false, "nine hours is not a spanned 1d window")
+
+        // And against a window it does span end to end: the 1h window sits
+        // wholly inside the second block, so that one is genuinely complete.
+        let hour = try! #require(curve.change(over: .hour1, now: at(540), latest: 1_010))
+        #expect(hour.isComplete)
+    }
+
+    @Test func aSpannedButGappyWindowIsReportedAsAnOutage() {
+        // Same defect, now with the window fully spanned — this is the case
+        // that must read as "the engine was down", not "the app is young".
+        let curve = AccountEquityCurve(mode: .demo)
+        for minute in 0...30 { curve.record(equity: 1_000, at: at(Double(minute))) }
+        for minute in 1_380...1_410 { curve.record(equity: 1_020, at: at(Double(minute))) }
+
+        let change = try! #require(curve.change(over: .day1, now: at(1_410), latest: 1_020))
+        #expect(change.spannedSeconds >= 86_400 * 0.9)
+        #expect(!change.isComplete, "a day with 22 hours missing is not a day")
+        #expect(change.hasGaps, "spanned but empty in the middle is an outage")
+        #expect(change.missingSeconds > 20 * 3_600)
+        #expect(change.coverageNote.contains("没有记录"))
+    }
+
+    @Test func jitterBetweenSamplesIsNotAHole() {
+        // Real sampling runs 60–120s apart, and a tick that waits on a slow
+        // CLI call stretches it further. None of that is downtime, and a
+        // coverage figure that flinched at it would cry wolf every hour.
+        let curve = AccountEquityCurve(mode: .demo)
+        var minute = 0.0
+        var step = 0
+        while minute <= 120 {                      // two hours, so the 1h
+            curve.record(equity: 1_000 + minute, at: at(minute))
+            minute += step % 3 == 0 ? 2 : 1        // window is fully spanned;
+            step += 1                              // spacing alternates 60/120s
+        }
+        let change = try! #require(curve.change(over: .hour1, now: at(120)))
+        #expect(change.isComplete)
+        #expect(change.coverageNote.isEmpty)
+    }
+
     @Test func coverageScalesWithTheWindow() {
         // The same 2-hour history is a complete 1h window and a partial 1d one.
         let curve = curve(minutes: 120)

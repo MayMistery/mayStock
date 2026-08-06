@@ -48,17 +48,25 @@ public struct EquityChange: Sendable, Equatable {
     public let window: EquityWindow
     public let startEquity: Double
     public let endEquity: Double
-    /// Seconds between the reference sample and the endpoint.
+    /// Seconds of the window actually backed by samples, holes excluded.
     public let coveredSeconds: TimeInterval
+    /// Seconds between the reference sample and the endpoint.
+    ///
+    /// Kept apart from `coveredSeconds` because the two answer different
+    /// questions and were once the same number: a curve whose first and last
+    /// samples sit a day apart *spans* a day however much of the middle is
+    /// missing. Only the second question protects the reader.
+    public let spannedSeconds: TimeInterval
 
     public init(
         window: EquityWindow, startEquity: Double, endEquity: Double,
-        coveredSeconds: TimeInterval
+        coveredSeconds: TimeInterval, spannedSeconds: TimeInterval
     ) {
         self.window = window
         self.startEquity = startEquity
         self.endEquity = endEquity
         self.coveredSeconds = coveredSeconds
+        self.spannedSeconds = spannedSeconds
     }
 
     public var changeQuote: Double { endEquity - startEquity }
@@ -78,9 +86,28 @@ public struct EquityChange: Sendable, Equatable {
     /// window's label, and the UI must say so rather than print it straight.
     public var isComplete: Bool { coverage >= 0.9 }
 
+    /// The window is spanned end to end but pocked with holes — the engine was
+    /// down for part of it, rather than the app being newly installed.
+    ///
+    /// Worth telling apart, and the more alarming of the two: "we have only
+    /// been recording for 20 minutes" is a fact about the app's age, while
+    /// "18 of these 24 hours were never observed" is a fact about an outage.
+    public var hasGaps: Bool {
+        spannedSeconds >= window.seconds * 0.9 && !isComplete
+    }
+
+    /// Seconds of the window with no samples behind them at all.
+    public var missingSeconds: TimeInterval {
+        Swift.max(Swift.min(window.seconds, spannedSeconds) - coveredSeconds, 0)
+    }
+
     /// Human description of the shortfall, for a tooltip.
     public var coverageNote: String {
         guard !isComplete else { return "" }
+        if hasGaps {
+            return "这 \(window.label) 里有 \(AccountEquityCurve.describe(missingSeconds))"
+                + "没有记录 —— 引擎当时没在跑"
+        }
         return "仅记录了 \(AccountEquityCurve.describe(coveredSeconds))，不足 \(window.label)"
     }
 }
@@ -161,7 +188,53 @@ public final class AccountEquityCurve {
             window: window,
             startEquity: start.equity,
             endEquity: endEquity,
-            coveredSeconds: Swift.max(endTs.timeIntervalSince(start.ts), 0))
+            // Measured from the cutoff when the window is fully spanned, and
+            // from the oldest sample when it is not — in both cases counting
+            // only the stretches a sample actually stands behind.
+            coveredSeconds: coveredSeconds(
+                from: Swift.max(cutoff, start.ts), to: endTs, now: endTs),
+            spannedSeconds: Swift.max(endTs.timeIntervalSince(start.ts), 0))
+    }
+
+    /// Seconds between `from` and `to` that recorded samples actually back.
+    ///
+    /// This is deliberately not `to - from`, which is what the coverage figure
+    /// used to be computed from. Endpoint distance says nothing about the
+    /// middle: on 2026-08-06 the trading loop was dead for 402 minutes of a
+    /// 544-minute stretch, and because the curve still had a sample at each
+    /// end, the panel reported that day as fully covered and printed a
+    /// confident return across it. Only intervals short enough to be sampling
+    /// jitter count; everything longer is a hole, and holes are the thing the
+    /// reader needs told about.
+    public func coveredSeconds(from: Date, to: Date, now: Date = Date()) -> TimeInterval {
+        guard to > from else { return 0 }
+        var covered: TimeInterval = 0
+        var cursor = from
+        for point in points where point.ts > from {
+            guard point.ts <= to else { break }
+            covered += Swift.min(point.ts.timeIntervalSince(cursor),
+                                 Self.continuityLimit(after: cursor, now: now))
+            cursor = point.ts
+        }
+        // The stretch since the newest sample. Fresh is covered; stale means
+        // the figure on screen is older than its label admits.
+        covered += Swift.min(to.timeIntervalSince(cursor),
+                             Self.continuityLimit(after: cursor, now: now))
+        return Swift.min(Swift.max(covered, 0), to.timeIntervalSince(from))
+    }
+
+    /// Longest silence still read as sampling jitter rather than downtime.
+    ///
+    /// The fine figure is deliberately the same 300s the heartbeat uses to
+    /// declare the engine not trading: the banner and the coverage figure must
+    /// not disagree about whether a stretch of time was covered. Past
+    /// `fineHorizon` the curve is thinned to `coarseInterval` on purpose, so
+    /// judging that region by the fine threshold would report our own
+    /// compaction as an outage.
+    public static let continuityTolerance: TimeInterval = 300
+
+    private static func continuityLimit(after ts: Date, now: Date) -> TimeInterval {
+        ts < now.addingTimeInterval(-fineHorizon) ? coarseInterval * 2 : continuityTolerance
     }
 
     /// Every window at once, in display order.
