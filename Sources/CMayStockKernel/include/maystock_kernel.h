@@ -77,6 +77,10 @@ char *ms_strategy_decide(const MSStrategy *handle,
                          int32_t current,
                          int64_t bars_held,
                          const char *external_json,
+                         double equity,
+                         double held_base,
+                         double day_start_equity,
+                         double leverage_cap,   /* negative = no portfolio cap */
                          char **error_out);
 
 /* --- backtest -------------------------------------------------------- */

@@ -114,18 +114,26 @@ public final class KernelStrategy: @unchecked Sendable {
     ///
     /// This is the same code path the backtester takes on every bar; see the
     /// note on `TradingKernel`.
+    /// Ask the kernel for a complete order plan.
+    ///
+    /// The account figures are inputs because sizing, the rebalance threshold
+    /// and the daily-loss breaker all live in the kernel now. Swift's job is
+    /// to submit `baseDelta` — it no longer decides how big anything should be.
     public func decide(
         candles: [Candle],
         current: TradeDirection?,
         barsHeld: Int = 0,
-        externalSeries: [String: [Double]] = [:]
+        externalSeries: [String: [Double]] = [:],
+        account: KernelAccountState = KernelAccountState()
     ) throws -> KernelDecision {
         let externalJSON = externalSeries.isEmpty ? nil : try encodeJSON(externalSeries)
         return try withKernelCandles(candles) { buffer, count in
             let json = try callReturningString { error in
                 ms_strategy_decide(
                     self.handle, buffer, count,
-                    Int32(current.kernelCode), Int64(max(barsHeld, 0)), externalJSON, error)
+                    Int32(current.kernelCode), Int64(max(barsHeld, 0)), externalJSON,
+                    account.equity, account.heldBase, account.dayStartEquity,
+                    account.leverageCap ?? -1, error)
             }
             return try JSONDecoder().decode(KernelDecision.self, from: Data(json.utf8))
         }

@@ -533,26 +533,11 @@ fn open_position(
         return;
     }
     let manifest = &strategy.manifest;
-    let stop_distance = stop_distance(strategy, price, atr);
+    let stop_distance = crate::sizing::stop_distance(strategy, price, atr);
 
-    let mut notional = match manifest.sizing.mode {
-        SizingMode::EquityPct => *equity * manifest.sizing.value / 100.0 * leverage,
-        SizingMode::FixedQuote => manifest.sizing.value,
-        SizingMode::RiskPerTrade => {
-            let Some(distance) = stop_distance else { return };
-            if !(distance > 0.0) {
-                return;
-            }
-            (*equity * manifest.sizing.value / 100.0) / distance * price
-        }
-        // Only meaningful with a continuous exposure signal; a binary strategy
-        // has no exposure to scale, so it commits its budget.
-        SizingMode::VolatilityTarget => *equity * leverage,
-    };
-    notional = notional.min(*equity * leverage);
-    if !(notional > 0.0) {
-        return;
-    }
+    let Some(notional) = crate::sizing::target_notional(
+        strategy, *equity, price, leverage, stop_distance)
+    else { return };
 
     let quantity = notional / price;
     let fee = notional * fee_rate;
@@ -596,22 +581,6 @@ fn open_position(
         });
     }
     *position = Some(new);
-}
-
-/// Absolute price distance to the protective stop. Two stops configured → the
-/// tighter one governs.
-fn stop_distance(strategy: &CompiledStrategy, entry: f64, atr: Option<f64>) -> Option<f64> {
-    let risk = &strategy.manifest.risk;
-    let mut candidates: Vec<f64> = Vec::new();
-    if let Some(pct) = risk.stop_loss_pct {
-        candidates.push(entry * pct / 100.0);
-    }
-    if let (Some(atr_stop), Some(atr)) = (risk.atr_stop, atr) {
-        if !atr.is_nan() && atr > 0.0 {
-            candidates.push(atr * atr_stop.mult);
-        }
-    }
-    candidates.into_iter().reduce(f64::min)
 }
 
 #[allow(clippy::too_many_arguments)]

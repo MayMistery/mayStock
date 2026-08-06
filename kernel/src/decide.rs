@@ -125,11 +125,32 @@ pub fn desired_direction(
 
 // MARK: - Live decision
 
-/// What the live runner needs to know after one evaluation.
+/// Everything the runner needs in order to place (or withhold) one order.
+///
+/// The runner used to receive only a direction and then size the position
+/// itself in Swift, duplicating the backtester's sizing, its daily-loss gate
+/// and its rebalance threshold. Those three copies are gone: the kernel now
+/// returns a finished plan and Swift's only job is to submit `base_delta`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveDecision {
     /// 1 long, −1 short, 0 flat.
     pub target: i32,
+    /// Position the strategy should hold, in coins (signed).
+    #[serde(rename = "targetBaseQuantity")]
+    pub target_base_quantity: f64,
+    /// Coins to buy (positive) or sell (negative) to get there.
+    #[serde(rename = "baseDelta")]
+    pub base_delta: f64,
+    /// False when the plan is "do nothing" — below the rebalance threshold,
+    /// unsizeable, or already in position.
+    #[serde(rename = "shouldTrade")]
+    pub should_trade: bool,
+    /// The daily-loss circuit breaker has tripped: close out and stand down
+    /// for the rest of the UTC day.
+    #[serde(rename = "haltDailyLoss")]
+    pub halt_daily_loss: bool,
+    /// Human-readable justification, for the runtime status line.
+    pub reason: String,
     /// Continuous exposure in −1…+1 for exposure strategies; NaN otherwise.
     #[serde(rename = "targetExposure")]
     pub target_exposure: f64,
@@ -146,16 +167,57 @@ pub struct LiveDecision {
     pub warming_up: bool,
 }
 
-/// Evaluate a strategy against the latest confirmed bar.
+/// What the runner knows about the account when it asks for a plan.
+#[derive(Debug, Clone, Copy)]
+pub struct AccountState {
+    /// Capital this strategy may deploy, already compounded by its own P&L.
+    pub equity: f64,
+    /// Coins currently held (signed).
+    pub held_base: f64,
+    /// Strategy equity at the start of the current UTC day, for the breaker.
+    pub day_start_equity: f64,
+    /// Cap from the portfolio, if tighter than the manifest's.
+    pub leverage_cap: Option<f64>,
+}
+
+impl Default for AccountState {
+    fn default() -> Self {
+        Self {
+            equity: 0.0,
+            held_base: 0.0,
+            day_start_equity: 0.0,
+            leverage_cap: None,
+        }
+    }
+}
+
+fn idle(reason: &str, current: Option<Direction>, held: f64, bars: usize, ts: i64,
+        warming: bool) -> LiveDecision {
+    LiveDecision {
+        target: Direction::to_i32(current),
+        target_exposure: f64::NAN,
+        target_base_quantity: held,
+        base_delta: 0.0,
+        should_trade: false,
+        halt_daily_loss: false,
+        reason: reason.to_string(),
+        confirmed_bars: bars,
+        bar_ts: ts,
+        warming_up: warming,
+    }
+}
+
+/// Evaluate a strategy against the latest confirmed bar and size the result.
 ///
 /// This is the live counterpart of one iteration of the backtest loop, and it
-/// deliberately shares [`desired_direction`] with it.
+/// deliberately shares [`desired_direction`] and [`crate::sizing`] with it.
 pub fn decide_live(
     strategy: &CompiledStrategy,
     raw_candles: &[Candle],
     current: Option<Direction>,
     bars_held: usize,
     external: &std::collections::HashMap<String, Vec<f64>>,
+    account: AccountState,
 ) -> ExprResult<LiveDecision> {
     let mut candles: Vec<Candle> = raw_candles
         .iter()
@@ -165,13 +227,7 @@ pub fn decide_live(
     candles.sort_by_key(|c| c.ts_ms);
 
     if candles.is_empty() {
-        return Ok(LiveDecision {
-            target: 0,
-            target_exposure: f64::NAN,
-            confirmed_bars: 0,
-            bar_ts: 0,
-            warming_up: true,
-        });
+        return Ok(idle("无已确认 K 线", None, account.held_base, 0, 0, true));
     }
 
     let index = candles.len() - 1;
@@ -179,13 +235,41 @@ pub fn decide_live(
     // The backtester never trades before `warmup_bars`; the live runner must
     // not either, or the first live signal would be one the backtest refused.
     if candles.len() <= strategy.warmup_bars + 1 {
-        return Ok(LiveDecision {
-            target: Direction::to_i32(current),
-            target_exposure: f64::NAN,
-            confirmed_bars: candles.len(),
-            bar_ts,
-            warming_up: true,
-        });
+        return Ok(idle(
+            "指标预热中", current, account.held_base, candles.len(), bar_ts, true));
+    }
+
+    let price = candles[index].close;
+    let manifest_leverage = if strategy.manifest.market.inst_type.allows_leverage() {
+        strategy.manifest.risk.leverage.max(1.0)
+    } else {
+        1.0
+    };
+    let leverage = account
+        .leverage_cap
+        .map_or(manifest_leverage, |cap| manifest_leverage.min(cap));
+
+    // The daily-loss breaker outranks every signal: once it trips the only
+    // legitimate action is to close out. Checked before sizing so a halted
+    // strategy cannot be handed a position to open.
+    if let Some(limit) = strategy.manifest.risk.max_daily_loss_pct {
+        if account.day_start_equity > 0.0
+            && (account.day_start_equity - account.equity) / account.day_start_equity * 100.0
+                >= limit
+        {
+            return Ok(LiveDecision {
+                target: 0,
+                target_exposure: f64::NAN,
+                target_base_quantity: 0.0,
+                base_delta: -account.held_base,
+                should_trade: account.held_base.abs() > 1e-12,
+                halt_daily_loss: true,
+                reason: format!("日内亏损达到 {limit:.1}%，已停止交易"),
+                confirmed_bars: candles.len(),
+                bar_ts,
+                warming_up: false,
+            });
+        }
     }
 
     let mut evaluator = Evaluator::new(&candles, &strategy.params, external);
@@ -219,15 +303,34 @@ pub fn decide_live(
         let cap = strategy.manifest.risk.max_exposure;
         let effective = (bounded * scale).clamp(if allows_short { -cap } else { 0.0 }, cap);
 
+        // Size to the fraction, not merely to its sign.
+        let target_base = if price > 0.0 && account.equity > 0.0 {
+            account.equity * effective * leverage / price
+        } else {
+            0.0
+        };
+        let current_exposure = if account.equity > 0.0 && leverage > 0.0 {
+            account.held_base * price / (account.equity * leverage)
+        } else {
+            0.0
+        };
+        // Rebalancing every bar would churn the edge away in fees; this is the
+        // same threshold the backtester honours.
+        let threshold = strategy.manifest.risk.rebalance_threshold.max(0.0);
+        let drift = (effective - current_exposure).abs();
+
         return Ok(LiveDecision {
-            target: if effective > 1e-9 {
-                1
-            } else if effective < -1e-9 {
-                -1
-            } else {
-                0
-            },
+            target: if effective > 1e-9 { 1 } else if effective < -1e-9 { -1 } else { 0 },
             target_exposure: effective,
+            target_base_quantity: target_base,
+            base_delta: target_base - account.held_base,
+            should_trade: drift >= threshold,
+            halt_daily_loss: false,
+            reason: if drift >= threshold {
+                format!("敞口 {current_exposure:.3} → {effective:.3}")
+            } else {
+                format!("敞口 {current_exposure:.3} → {effective:.3}，未达再平衡阈值 {threshold:.3}")
+            },
             confirmed_bars: candles.len(),
             bar_ts,
             warming_up: false,
@@ -267,9 +370,59 @@ pub fn decide_live(
         None,
     );
 
+    // Binary strategies switch in and out; nothing to do while the side is
+    // unchanged.
+    if target == current {
+        return Ok(idle("信号未变", target, account.held_base, candles.len(), bar_ts, false));
+    }
+
+    let mut target_base = 0.0;
+    if let Some(direction) = target {
+        let highs: Vec<f64> = candles.iter().map(|c| c.high).collect();
+        let lows: Vec<f64> = candles.iter().map(|c| c.low).collect();
+        let closes: Vec<f64> = candles.iter().map(|c| c.close).collect();
+        // The ATR as known at the decision bar, matching the backtester, which
+        // sizes from the bar *before* the fill.
+        let atr = strategy.manifest.risk.atr_stop.map(|spec| {
+            let series = crate::series::atr(&highs, &lows, &closes, spec.period.max(1));
+            series.get(index).copied().unwrap_or(f64::NAN)
+        });
+        let distance = crate::sizing::stop_distance(strategy, price, atr);
+        match crate::sizing::target_notional(strategy, account.equity, price, leverage, distance) {
+            Some(notional) => target_base = notional / price * direction.sign(),
+            None => {
+                // The signal is still the signal. Reporting it as "flat"
+                // because the position cannot be sized would tell the caller
+                // the strategy has no opinion, when in fact it has one it
+                // cannot act on — and a status line saying so is the point.
+                return Ok(LiveDecision {
+                    target: Direction::to_i32(target),
+                    target_exposure: f64::NAN,
+                    target_base_quantity: account.held_base,
+                    base_delta: 0.0,
+                    should_trade: false,
+                    halt_daily_loss: false,
+                    reason: "无法定仓（缺少止损距离或资金为零）".to_string(),
+                    confirmed_bars: candles.len(),
+                    bar_ts,
+                    warming_up: false,
+                });
+            }
+        }
+    }
+
+    let delta = target_base - account.held_base;
     Ok(LiveDecision {
         target: Direction::to_i32(target),
         target_exposure: f64::NAN,
+        target_base_quantity: target_base,
+        base_delta: delta,
+        should_trade: delta.abs() > 1e-12,
+        halt_daily_loss: false,
+        reason: match target {
+            Some(d) => format!("信号{}", if d == Direction::Long { "做多" } else { "做空" }),
+            None => "信号平仓".to_string(),
+        },
         confirmed_bars: candles.len(),
         bar_ts,
         warming_up: false,

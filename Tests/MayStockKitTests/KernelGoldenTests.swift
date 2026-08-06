@@ -339,3 +339,127 @@ struct KernelGoldenTests {
         #expect(TradingKernel.version != "unknown", "the static library must be linked")
     }
 }
+
+/// The property the sizing consolidation exists to guarantee: on the same bar,
+/// with the same capital, the live plan and the backtester open the *same*
+/// position.
+///
+/// Before this, the runner sized in Swift and the backtester in Rust. They had
+/// already drifted — the Swift copy honoured only a percentage stop, so an
+/// ATR-stopped `riskPerTrade` manifest risked 1% of capital per trade in
+/// simulation and committed the entire budget live.
+@Suite("Live sizing matches the backtest")
+struct LiveSizingParityTests {
+
+    private func parity(_ manifestJSON: String, capital: Double = 30_000) throws {
+        let kernel = try KernelStrategy(manifestJSON: manifestJSON)
+        let bars = KernelGoldenTests.candles(900)
+        let result = try kernel.backtest(
+            candles: bars, config: KernelBacktestConfig(initialCapital: capital))
+        let entry = try #require(result.trades.first, "the fixture must actually trade")
+
+        // Replay up to the bar the backtester decided on — the one *before* the
+        // fill, since a signal on bar i fills at the open of bar i+1.
+        let entryIndex = try #require(bars.firstIndex { $0.ts >= entry.entryTime })
+        let decisionBar = max(entryIndex - 1, 0)
+        let plan = try kernel.decide(
+            candles: Array(bars[0...decisionBar]),
+            current: nil,
+            account: KernelAccountState(equity: capital, heldBase: 0, dayStartEquity: capital))
+
+        #expect(plan.shouldTrade, "the backtest opened here, so the plan must too")
+        #expect(plan.direction == entry.direction)
+
+        // The backtester fills at the next open plus slippage; the plan sizes
+        // off the decision bar's close. Compare notional, which is what sizing
+        // actually decides, with room for that one-bar price difference.
+        let planned = abs(plan.targetBaseQuantity) * bars[decisionBar].close
+        let filled = entry.quantity * entry.entryPrice
+        let drift = abs(planned - filled) / filled
+        #expect(drift < 0.05, "planned \(planned) vs filled \(filled)")
+    }
+
+    @Test func equityPercentAgrees() throws {
+        try parity(KernelGoldenTests.manifest(
+            signals: #"{"longEntry": "close > sma(close, 20)", "longExit": "close < sma(close, 20)"}"#,
+            sizing: #"{"mode":"equityPct","value":60}"#))
+    }
+
+    @Test func fixedQuoteAgrees() throws {
+        try parity(KernelGoldenTests.manifest(
+            signals: #"{"longEntry": "close > sma(close, 20)", "longExit": "close < sma(close, 20)"}"#,
+            sizing: #"{"mode":"fixedQuote","value":12000}"#))
+    }
+
+    /// The exact case that had diverged.
+    @Test func riskPerTradeWithAnAtrStopAgrees() throws {
+        try parity(KernelGoldenTests.manifest(
+            signals: #"{"longEntry": "close > sma(close, 20)", "longExit": "close < sma(close, 20)"}"#,
+            sizing: #"{"mode":"riskPerTrade","value":1}"#,
+            risk: #"{"atrStop":{"period":14,"mult":2.5},"leverage":1}"#))
+    }
+
+    @Test func riskPerTradeWithAPercentStopAgrees() throws {
+        try parity(KernelGoldenTests.manifest(
+            signals: #"{"longEntry": "close > sma(close, 20)", "longExit": "close < sma(close, 20)"}"#,
+            sizing: #"{"mode":"riskPerTrade","value":1}"#,
+            risk: #"{"stopLossPct":3,"leverage":1}"#))
+    }
+
+    /// An ATR-stopped riskPerTrade manifest must never commit the whole budget:
+    /// that was the live behaviour, and it is a hundredfold over-bet.
+    @Test func anAtrStoppedStrategyRisksOnePercentNotEverything() throws {
+        let kernel = try KernelStrategy(manifestJSON: KernelGoldenTests.manifest(
+            signals: #"{"longEntry": "close > sma(close, 20)"}"#,
+            sizing: #"{"mode":"riskPerTrade","value":1}"#,
+            risk: #"{"atrStop":{"period":14,"mult":2.5},"leverage":1}"#))
+        let bars = KernelGoldenTests.candles(600)
+        let plan = try kernel.decide(
+            candles: bars, current: nil,
+            account: KernelAccountState(equity: 30_000, dayStartEquity: 30_000))
+        if plan.shouldTrade {
+            let notional = abs(plan.targetBaseQuantity) * bars[bars.count - 1].close
+            #expect(notional < 30_000, "sizing by risk must be under the full budget")
+        }
+    }
+
+    @Test func theDailyLossBreakerIsTheKernelsCall() throws {
+        let kernel = try KernelStrategy(manifestJSON: KernelGoldenTests.manifest(
+            signals: #"{"longEntry": "close > sma(close, 20)"}"#,
+            risk: #"{"maxDailyLossPct":2,"leverage":1}"#))
+        let bars = KernelGoldenTests.candles(600)
+        // Down 5% on the day, against a 2% limit.
+        let plan = try kernel.decide(
+            candles: bars, current: .long,
+            account: KernelAccountState(
+                equity: 28_500, heldBase: 0.4, dayStartEquity: 30_000))
+        #expect(plan.haltDailyLoss)
+        #expect(plan.target == 0)
+        #expect(plan.shouldTrade, "a halt with a position open must close it")
+        #expect(abs(plan.baseDelta + 0.4) < 1e-12, "close exactly what is held")
+    }
+
+    @Test func theRebalanceThresholdIsTheKernelsCall() throws {
+        let json = KernelGoldenTests.manifest(
+            signals: #"{"exposure": "1"}"#,
+            sizing: #"{"mode":"equityPct","value":100}"#,
+            risk: #"{"maxExposure":1,"rebalanceThreshold":0.25,"leverage":1}"#)
+        let kernel = try KernelStrategy(manifestJSON: json)
+        let bars = KernelGoldenTests.candles(600)
+        let price = bars[bars.count - 1].close
+        let full = 30_000 / price
+
+        // Already at target — no trade.
+        let held = try kernel.decide(
+            candles: bars, current: .long,
+            account: KernelAccountState(equity: 30_000, heldBase: full, dayStartEquity: 30_000))
+        #expect(!held.shouldTrade, "\(held.reason)")
+
+        // Flat against a full target — drift of 1.0 clears the 0.25 threshold.
+        let flat = try kernel.decide(
+            candles: bars, current: nil,
+            account: KernelAccountState(equity: 30_000, heldBase: 0, dayStartEquity: 30_000))
+        #expect(flat.shouldTrade)
+        #expect(abs(flat.targetBaseQuantity - full) / full < 1e-9)
+    }
+}

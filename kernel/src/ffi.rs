@@ -208,6 +208,11 @@ pub unsafe extern "C" fn ms_strategy_decide(
     current: i32,
     bars_held: i64,
     external_json: *const c_char,
+    equity: f64,
+    held_base: f64,
+    day_start_equity: f64,
+    // Negative means no portfolio cap tighter than the manifest's.
+    leverage_cap: f64,
     error_out: *mut *mut c_char,
 ) -> *mut c_char {
     guarded(error_out, ptr::null_mut(), || {
@@ -225,6 +230,12 @@ pub unsafe extern "C" fn ms_strategy_decide(
             Direction::from_i32(current),
             bars_held.max(0) as usize,
             &external,
+            decide::AccountState {
+                equity,
+                held_base,
+                day_start_equity,
+                leverage_cap: (leverage_cap > 0.0).then_some(leverage_cap),
+            },
         )
         .map_err(|e| e.to_string())?;
         serde_json::to_string(&decision)
@@ -411,7 +422,8 @@ mod tests {
         let bars = candles(200);
         let mut error: *mut c_char = ptr::null_mut();
         let json = unsafe {
-            ms_strategy_decide(handle, bars.as_ptr(), bars.len(), 0, 0, ptr::null(), &mut error)
+            ms_strategy_decide(handle, bars.as_ptr(), bars.len(), 0, 0, ptr::null(),
+                               10_000.0, 0.0, 10_000.0, -1.0, &mut error)
         };
         assert!(error.is_null());
         let value: serde_json::Value = serde_json::from_str(&take_string(json)).unwrap();
@@ -426,7 +438,8 @@ mod tests {
         let (handle, _) = compile(MANIFEST);
         let mut error: *mut c_char = ptr::null_mut();
         let json =
-            unsafe { ms_strategy_decide(handle, ptr::null(), 0, 0, 0, ptr::null(), &mut error) };
+            unsafe { ms_strategy_decide(handle, ptr::null(), 0, 0, 0, ptr::null(),
+                               10_000.0, 0.0, 10_000.0, -1.0, &mut error) };
         assert!(error.is_null());
         let value: serde_json::Value = serde_json::from_str(&take_string(json)).unwrap();
         assert_eq!(value["target"], 0);

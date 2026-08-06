@@ -34,7 +34,9 @@
 
 ```c
 MSStrategy *ms_strategy_compile(const char *manifest_json, const char *known_series_json, char **err);
-char       *ms_strategy_decide (const MSStrategy *, const MSCandle *, size_t, int32_t current, int64_t held, const char *ext, char **err);
+char       *ms_strategy_decide (const MSStrategy *, const MSCandle *, size_t, int32_t current, int64_t held,
+                                const char *ext, double equity, double held_base,
+                                double day_start_equity, double leverage_cap, char **err);
 char       *ms_backtest_run    (const MSStrategy *, const MSCandle *, size_t, const char *config_json, char **err);
 void        ms_strategy_free(MSStrategy *);
 void        ms_string_free(char *);
@@ -57,6 +59,31 @@ void        ms_string_free(char *);
 刻意没有再写一张校验表：第二张表就是第二个需要与求值器保持同步的东西，
 而它们不同步的那个场景，恰恰就是「策略导入时干干净净，然后在持仓状态下失败」。
 
+## 3.1 `decide` 返回的是完整下单计划，不只是方向
+
+```json
+{ "target": -1, "targetExposure": -0.333, "targetBaseQuantity": -0.2051,
+  "baseDelta": -0.0886, "shouldTrade": true, "haltDailyLoss": false,
+  "reason": "敞口 -0.193 → -0.333" }
+```
+
+**仓位计算、再平衡阈值、日内亏损熔断三样都在内核里**，Swift 只负责把
+`baseDelta` 发出去。运行器里不再出现任何 `sizing.mode` / `maxDailyLossPct` /
+`rebalanceThreshold`。
+
+之前这三样在 Swift 各有一份，而且**已经漂移了**：Swift 的 `riskPerTrade` 只认
+百分比止损，遇到只声明 ATR 止损的清单会回退到满仓 —— 同一份清单，回测每笔冒
+1% 风险，实盘押上全部预算。
+
+`kernel/src/sizing.rs` 是这次抽出来的共用模块，回测的 `open_position` 和实盘的
+`decide_live` 调的是同一个 `target_notional` 与 `stop_distance`。
+[LiveSizingParityTests](../Tests/MayStockKitTests/KernelGoldenTests.swift)
+把这条性质钉死：同一根 K 线、同样的资金，实盘计划开出的名义额必须等于回测开出的。
+
+一个刻意的设计：**取不到仓位大小时，`target` 仍然报出信号方向**，只是
+`shouldTrade` 为 false。把它报成「空仓」会让调用方以为策略没有观点，
+而事实是它有观点但执行不了 —— 状态栏要显示的正是后者。
+
 ## 4.1 迁移已完成，Swift 侧没有第二份实现
 
 已删除：`Indicators.swift`、`StrategyExpression.swift`、`StrategyEvaluator.swift`、
@@ -70,6 +97,8 @@ void        ms_string_free(char *);
 
 - `Statistics`（均值/标准差/下行标准差）—— 相关性、IC、因子回归用的通用统计量，
   不是回测报告的绩效指标。绩效指标只有内核一份。
+- `ForesightAnalysis`（波段识别、完美预知上限、水位可靠性）—— 全代码库唯一刻意
+  使用未来函数的研究工具，不是交易引擎，不参与任何下单决策。
 - `StrategyManifest.marketSeriesNames` —— 只用来阻止 `data` 块跟内置行情变量重名，
   是清单层的策略而非求值逻辑。
 

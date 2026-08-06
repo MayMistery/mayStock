@@ -29,9 +29,41 @@ public struct KernelStrategyInfo: Decodable, Sendable, Equatable {
 
 // MARK: - Live decision
 
+/// What the runner tells the kernel about the account before asking for a plan.
+public struct KernelAccountState: Encodable, Sendable {
+    /// Capital this strategy may deploy, compounded by its own P&L.
+    public var equity: Double
+    /// Coins currently held (signed).
+    public var heldBase: Double
+    /// Strategy equity at the start of the current UTC day.
+    public var dayStartEquity: Double
+    /// Portfolio-level cap, when tighter than the manifest's leverage.
+    public var leverageCap: Double?
+
+    public init(
+        equity: Double = 0, heldBase: Double = 0,
+        dayStartEquity: Double = 0, leverageCap: Double? = nil
+    ) {
+        self.equity = equity
+        self.heldBase = heldBase
+        self.dayStartEquity = dayStartEquity
+        self.leverageCap = leverageCap
+    }
+}
+
 public struct KernelDecision: Decodable, Sendable, Equatable {
     /// 1 long, −1 short, 0 flat.
     public let target: Int
+    /// Position the strategy should hold, in coins (signed).
+    public let targetBaseQuantity: Double
+    /// Coins to buy (positive) or sell (negative) to reach it.
+    public let baseDelta: Double
+    /// False when the plan is to do nothing.
+    public let shouldTrade: Bool
+    /// The daily-loss breaker has tripped.
+    public let haltDailyLoss: Bool
+    /// Why, for the runtime status line.
+    public let reason: String
     /// Continuous exposure in −1…+1, or nil for a binary strategy.
     public let targetExposure: Double?
     public let confirmedBars: Int
@@ -45,11 +77,17 @@ public struct KernelDecision: Decodable, Sendable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case target, targetExposure, confirmedBars, barTs, warmingUp
+        case targetBaseQuantity, baseDelta, shouldTrade, haltDailyLoss, reason
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         target = try c.decode(Int.self, forKey: .target)
+        targetBaseQuantity = try c.decode(Double.self, forKey: .targetBaseQuantity)
+        baseDelta = try c.decode(Double.self, forKey: .baseDelta)
+        shouldTrade = try c.decode(Bool.self, forKey: .shouldTrade)
+        haltDailyLoss = try c.decode(Bool.self, forKey: .haltDailyLoss)
+        reason = try c.decode(String.self, forKey: .reason)
         // Rust writes NaN for "not an exposure strategy"; JSON has no NaN, so
         // it arrives as null.
         targetExposure = try c.decodeIfPresent(Double.self, forKey: .targetExposure)

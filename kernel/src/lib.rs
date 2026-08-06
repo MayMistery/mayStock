@@ -17,6 +17,7 @@ pub mod decide;
 pub mod expr;
 pub mod ffi;
 pub mod series;
+pub mod sizing;
 pub mod strategy;
 
 pub use candle::Candle;

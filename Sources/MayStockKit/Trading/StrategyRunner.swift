@@ -423,38 +423,31 @@ public final class StrategyRunner {
         let position = host.ledger.position(for: strategy.id)
         let current = position?.direction
 
-        // --- Daily loss circuit breaker, on realised + unrealised.
+        // --- Ask the kernel for a complete plan.
+        //
+        // Sizing, the rebalance threshold and the daily-loss breaker all live
+        // in the kernel, next to the backtester that uses the same functions.
+        // This runner used to re-implement all three in Swift, and they had
+        // already drifted: the Swift sizing honoured only a percentage stop, so
+        // an ATR-stopped `riskPerTrade` manifest risked 1% per trade in
+        // simulation and committed the whole budget live.
         let equity = workingCapital(strategy: strategy, allocation: allocation, host: host)
         let today = Self.utcDay(of: Date())
         var anchor = dayAnchors[strategy.id] ?? DayAnchor(day: today, equity: equity)
         if anchor.day != today { anchor = DayAnchor(day: today, equity: equity) }
         dayAnchors[strategy.id] = anchor
-        if let limit = strategy.manifest.risk.maxDailyLossPct, anchor.equity > 0,
-           (anchor.equity - equity) / anchor.equity * 100 >= limit {
-            if let position, !position.isFlat {
-                await submit(baseDelta: -position.baseQuantity, strategy: strategy, host: host,
-                             reason: "日内熔断")
-            }
-            update(strategy.id) {
-                $0.status = .halted
-                $0.message = "日内亏损达到 \(PriceFormatter.decimals(limit, 1))%，已停止交易"
-            }
-            host.runnerDidHalt(strategyId: strategy.id, reason: "日内亏损熔断")
-            lastActedBar[strategy.id] = latestBar.ts
-            return
-        }
 
-        // --- Signals, evaluated by the same kernel the backtester uses.
         let decision: KernelDecision
         do {
-            let held = position.map { state in
-                state.firstFillAt.map { first in
-                    Int(latestBar.ts.timeIntervalSince(first) / market.bar.seconds)
-                } ?? 0
-            } ?? 0
-            decision = try decide(strategy: strategy, candles: confirmed,
-                                  externalSeries: externalSeries, current: current,
-                                  barsHeld: held)
+            decision = try decide(
+                strategy: strategy, candles: confirmed,
+                externalSeries: externalSeries, current: current,
+                barsHeld: barsHeldCount(position: position, latestBar: latestBar, market: market),
+                account: KernelAccountState(
+                    equity: equity,
+                    heldBase: position?.baseQuantity ?? 0,
+                    dayStartEquity: anchor.equity,
+                    leverageCap: allocation.leverageCap))
         } catch {
             update(strategy.id) {
                 $0.status = .failed
@@ -473,59 +466,30 @@ public final class StrategyRunner {
             }
             return
         }
-        let target = decision.direction
 
         lastActedBar[strategy.id] = latestBar.ts
         update(strategy.id) {
-            $0.status = .running
-            $0.message = nil
+            $0.status = decision.haltDailyLoss ? .halted : .running
+            $0.message = decision.reason
             $0.lastEvaluatedAt = Date()
-            $0.targetDirection = target
+            $0.targetDirection = decision.direction
         }
 
-        let price = latestBar.close
-        // Held size in coins. The ledger counts swaps in contracts and
-        // `submit` converts coins back into contracts, so everything between
-        // here and there is denominated in coins.
-        let held = position?.baseQuantity ?? 0
-
-        // --- Continuous strategies hold a *scaled* position, so the target is
-        //     a fraction, not a direction. Sizing off the direction alone —
-        //     which this runner used to do — committed the whole budget
-        //     whatever the signal's conviction, so live ran an exposure the
-        //     backtest never modelled.
-        if let exposure = decision.targetExposure, price > 0, equity > 0 {
-            let manifestLeverage = strategy.manifest.market.instType.allowsLeverage
-                ? Swift.max(strategy.manifest.risk.leverage, 1) : 1
-            let leverage = Swift.min(manifestLeverage, allocation.leverageCap ?? manifestLeverage)
-            let desired = equity * exposure * leverage / price
-            let currentExposure = held * price / (equity * leverage)
-            let drift = abs(exposure - currentExposure)
-            // Rebalancing on every bar would churn fees away; the manifest's
-            // threshold is the same one the backtester honours.
-            let threshold = Swift.max(strategy.manifest.risk.rebalanceThreshold, 0)
-            guard drift >= threshold else {
-                update(strategy.id) {
-                    $0.message = "敞口 \(PriceFormatter.decimals(currentExposure, 3))"
-                        + " → 目标 \(PriceFormatter.decimals(exposure, 3))，未达再平衡阈值"
-                }
-                return
-            }
-            await submit(baseDelta: desired - held, strategy: strategy, host: host,
-                         reason: "敞口调整至 \(PriceFormatter.decimals(exposure, 3))")
-            return
+        if decision.shouldTrade {
+            await submit(baseDelta: decision.baseDelta, strategy: strategy, host: host,
+                         reason: decision.reason)
         }
-
-        // --- Binary strategies switch in and out.
-        guard target != current else { return }
-        var desired = 0.0
-        if let target {
-            let notional = targetNotional(strategy: strategy, allocation: allocation,
-                                          equity: equity, price: price)
-            desired = notional / price * target.sign
+        if decision.haltDailyLoss {
+            host.runnerDidHalt(strategyId: strategy.id, reason: "日内亏损熔断")
         }
-        await submit(baseDelta: desired - held, strategy: strategy, host: host,
-                     reason: target == nil ? "信号平仓" : "信号\(target!.displayName)")
+    }
+
+    /// Bars the current position has been held for, from its first fill.
+    private func barsHeldCount(
+        position: StrategyPositionState?, latestBar: Candle, market: StrategyMarket
+    ) -> Int {
+        guard let first = position?.firstFillAt, market.bar.seconds > 0 else { return 0 }
+        return Swift.max(Int(latestBar.ts.timeIntervalSince(first) / market.bar.seconds), 0)
     }
 
     /// Target direction for this bar, decided by the Rust kernel.
@@ -537,11 +501,11 @@ public final class StrategyRunner {
     private func decide(
         strategy: CompiledStrategy, candles: [Candle],
         externalSeries: [String: [Double]],
-        current: TradeDirection?, barsHeld: Int
+        current: TradeDirection?, barsHeld: Int, account: KernelAccountState
     ) throws -> KernelDecision {
         try kernel(for: strategy).decide(
             candles: candles, current: current,
-            barsHeld: barsHeld, externalSeries: externalSeries)
+            barsHeld: barsHeld, externalSeries: externalSeries, account: account)
     }
 
     /// Compiled kernel strategies, keyed by id.
@@ -579,41 +543,6 @@ public final class StrategyRunner {
         let mark = marks[strategy.market.instId]
         let pnl = state?.netPnL(mark: mark) ?? 0
         return Swift.max(allocation.capital + pnl, 0)
-    }
-
-    private func targetNotional(
-        strategy: CompiledStrategy, allocation: StrategyAllocation,
-        equity: Double, price: Double
-    ) -> Double {
-        let manifest = strategy.manifest
-        let manifestLeverage = manifest.market.instType.allowsLeverage
-            ? Swift.max(manifest.risk.leverage, 1) : 1
-        let leverage = Swift.min(manifestLeverage, allocation.leverageCap ?? manifestLeverage)
-
-        var notional: Double
-        switch manifest.sizing.mode {
-        case .equityPct:
-            notional = equity * manifest.sizing.value / 100 * leverage
-        case .fixedQuote:
-            notional = manifest.sizing.value
-        case .riskPerTrade:
-            guard let stopPct = manifest.risk.stopLossPct, stopPct > 0 else {
-                // ATR-based stops need the indicator; fall back to full sizing
-                // rather than guessing a distance and over-betting.
-                notional = equity * leverage
-                break
-            }
-            notional = equity * (manifest.sizing.value / 100) / (stopPct / 100)
-        case .volatilityTarget:
-            // Only reachable from the binary path, which means the manifest
-            // asked for volatility targeting without declaring an exposure
-            // expression to scale. There is nothing to scale, so commit the
-            // budget — the continuous path above handles the real case.
-            notional = equity * leverage
-        }
-        // Two hard ceilings: the strategy's own budget × leverage, and the
-        // portfolio budget itself. Neither can be argued with by a manifest.
-        return Swift.min(notional, Swift.min(equity, allocation.capital) * leverage)
     }
 
     // MARK: Order submission
