@@ -481,3 +481,41 @@ public struct KernelDiversification: Decodable, Sendable, Equatable {
         return effectiveBets < Double(pairs.count + 1) * 0.6
     }
 }
+
+// MARK: - Trade resampling
+
+public enum KernelResampleMethod: String, Codable, Sendable, Equatable {
+    /// Reorder the observed trades; every trade appears exactly once, so the
+    /// final return cannot move — only the path.
+    case shuffle
+    /// Draw contiguous runs with replacement, preserving streaks. Losing
+    /// streaks are not independent draws, and breaking them up understates the
+    /// tail the exercise exists to measure.
+    case block
+}
+
+/// What else could have happened, given the same trades in a different order.
+public struct KernelResampleReport: Decodable, Sendable, Equatable {
+    public let trades: Int
+    public let iterations: Int
+    /// The figure the backtest actually reported.
+    public let observedDrawdownPct: Double
+    public let drawdownMedianPct: Double
+    public let drawdownP95Pct: Double
+    public let drawdownWorstPct: Double
+    /// Share of orderings that finished below the starting capital.
+    public let lossProbability: Double
+    public let returnP5Pct: Double
+    public let returnP95Pct: Double
+
+    /// The drawdown to size against.
+    ///
+    /// The observed figure is one draw and usually a lucky one; the 95th
+    /// percentile is the honest planning assumption.
+    public var planningDrawdownPct: Double { Swift.max(drawdownP95Pct, observedDrawdownPct) }
+
+    /// True when the backtest's own drawdown materially understates the risk.
+    public var observedIsOptimistic: Bool {
+        observedDrawdownPct > 0 && drawdownP95Pct > observedDrawdownPct * 1.4
+    }
+}

@@ -170,6 +170,24 @@ public struct RobustnessAssessment: Sendable, Equatable {
             notes.append("历史中缺失 \(quality.gaps) 根 K 线（在容忍范围内，但跨越缺口的指标窗口"
                          + "覆盖的市场时间比标称的长）")
         }
+        // The observed drawdown is one draw from a distribution. Sizing an
+        // account against it means sizing against whichever ordering happened
+        // to occur, so the distribution is always reported, not just when it
+        // is alarming.
+        if let resampled = primary.drawdownDistribution {
+            notes.append(
+                "换个成交顺序（\(resampled.iterations) 次重采样）：回撤中位 "
+                + "\(PriceFormatter.percent(resampled.drawdownMedianPct))，95% 分位 "
+                + "\(PriceFormatter.percent(resampled.drawdownP95Pct))，最差 "
+                + "\(PriceFormatter.percent(resampled.drawdownWorstPct))；"
+                + "亏损收场的概率 \(PriceFormatter.percent(resampled.lossProbability * 100))。")
+            if resampled.observedIsOptimistic {
+                notes.append(
+                    "回测报出的 \(PriceFormatter.percent(resampled.observedDrawdownPct)) "
+                    + "只是这次恰好抽到的顺序 —— 定仓请按 "
+                    + "\(PriceFormatter.percent(resampled.planningDrawdownPct))。")
+            }
+        }
         if primary.fundingUnmodelled {
             notes.append("未取到资金费率历史，永续的持仓成本被低估。")
         }

@@ -855,3 +855,131 @@ struct WalkForwardProtocolTests {
         #expect(result.warnings.contains { $0.contains("purge") && $0.contains("embargo") })
     }
 }
+
+// MARK: - Higher-timeframe alignment
+
+struct SeriesAlignmentTests {
+    private func hourly(_ count: Int) -> [Candle] {
+        (0..<count).map { i in
+            Candle(ts: Date(timeIntervalSince1970: Double(i) * 3_600),
+                   open: 1, high: 1, low: 1, close: 1, volume: 1, confirmed: true)
+        }
+    }
+
+    @Test("同周期序列在本 bar 收盘时即可用")
+    func sameIntervalIsUsableAtThisBarsClose() {
+        // The other instrument's close for bar i is known at bar i's close,
+        // which is exactly when the signal is evaluated.
+        let observations = (0..<5).map {
+            SeriesObservation(ts: Date(timeIntervalSince1970: Double($0) * 3_600),
+                              value: Double($0))
+        }
+        let aligned = SeriesAligner.align(
+            observations, to: hourly(5),
+            timing: .bar(seconds: 3_600), candleSeconds: 3_600)
+        #expect(aligned == [0, 1, 2, 3, 4])
+    }
+
+    @Test("日线过滤器要等它自己收盘，不能重绘")
+    func aDailyFilterWaitsForItsOwnClose() {
+        // A daily bar opening at 00:00 closes at 24:00. Matching on open time
+        // would hand the 01:00 hourly bar a close with 23 hours still to run —
+        // 23 hours of look-ahead.
+        let daily = [
+            SeriesObservation(ts: Date(timeIntervalSince1970: 0), value: 100),
+            SeriesObservation(ts: Date(timeIntervalSince1970: 86_400), value: 200),
+        ]
+        let aligned = SeriesAligner.align(
+            daily, to: hourly(30),
+            timing: .bar(seconds: 86_400), candleSeconds: 3_600)
+
+        // Nothing is known until the first daily bar has closed.
+        #expect(aligned[0].isNaN)
+        #expect(aligned[10].isNaN)
+        // The hourly bar opening at 23:00 closes at 24:00 — the moment the
+        // daily bar closes. That is the first bar allowed to see it.
+        #expect(aligned[23] == 100)
+        #expect(aligned[24] == 100)
+        // And the second daily value only after another full day.
+        #expect(aligned[29] == 100)
+    }
+
+    @Test("落在决策同一刻的时点数据算作还不知道")
+    func anObservationLandingOnTheDecisionIsNotYetKnown() {
+        // A funding settlement is not measured over a bar; it happens. One
+        // stamped exactly at bar 0's close is simultaneous with the decision,
+        // and assuming we held it at that instant is the optimistic reading.
+        let settlement = [
+            SeriesObservation(ts: Date(timeIntervalSince1970: 3_600), value: 0.0001),
+        ]
+        let aligned = SeriesAligner.align(
+            settlement, to: hourly(4), timing: .instant, candleSeconds: 3_600)
+        #expect(aligned[0].isNaN)
+        #expect(aligned[1] == 0.0001)
+    }
+
+    @Test("同一刻收盘的同周期 bar 算作已知")
+    func aBarClosingOnTheDecisionIsKnown() {
+        // The other side of the same boundary: bar i's own close is available
+        // when bar i closes. That is the execution model, not an assumption.
+        let observations = [
+            SeriesObservation(ts: Date(timeIntervalSince1970: 0), value: 42),
+        ]
+        let aligned = SeriesAligner.align(
+            observations, to: hourly(2),
+            timing: .bar(seconds: 3_600), candleSeconds: 3_600)
+        #expect(aligned[0] == 42)
+    }
+
+    @Test("发布于本 bar 内的时点数据，本 bar 收盘时已知")
+    func anObservationPublishedInsideTheBarIsKnownAtItsClose() {
+        // The decision is taken at the bar's close, so anything stamped
+        // strictly inside the bar is available to it.
+        let observations = (0..<3).map {
+            SeriesObservation(ts: Date(timeIntervalSince1970: Double($0) * 3_600),
+                              value: Double($0))
+        }
+        #expect(SeriesAligner.align(
+            observations, to: hourly(3), candleSeconds: 3_600) == [0, 1, 2])
+    }
+}
+
+// MARK: - Trade resampling
+
+struct ResampleBridgeTests {
+    /// Alternating wins and losses: the observed drawdown is one trade deep,
+    /// which is a benign ordering and the kind a backtest is lucky to draw.
+    private var alternating: [Double] {
+        (0..<40).map { $0 % 2 == 0 ? 0.05 : -0.04 }
+    }
+
+    @Test("重排后的回撤比回测报的那一个更深")
+    func reorderingFindsAWorseDrawdown() throws {
+        let report = try #require(try TradingKernel.resampleTrades(
+            returns: alternating, iterations: 2_000, method: .shuffle, blockSize: 1))
+        #expect(report.drawdownP95Pct > report.observedDrawdownPct)
+        #expect(report.planningDrawdownPct >= report.observedDrawdownPct)
+        #expect(report.observedIsOptimistic)
+    }
+
+    @Test("同一个种子给同一个答案")
+    func theSameSeedGivesTheSameAnswer() throws {
+        // A risk figure that changed on every run could not be argued with,
+        // and one that cannot be argued with cannot be trusted.
+        let a = try TradingKernel.resampleTrades(returns: alternating, seed: 7)
+        let b = try TradingKernel.resampleTrades(returns: alternating, seed: 7)
+        #expect(a == b)
+    }
+
+    @Test("交易太少时报空，而不是报一个自信的分位数")
+    func tooFewTradesReportsNothing() throws {
+        #expect(try TradingKernel.resampleTrades(returns: [0.01, -0.01, 0.02]) == nil)
+    }
+
+    @Test("重排不改变最终收益，只改变路径")
+    func shufflingMovesThePathNotTheEndpoint() throws {
+        let report = try #require(try TradingKernel.resampleTrades(
+            returns: alternating, iterations: 300, method: .shuffle, blockSize: 1))
+        #expect(abs(report.returnP5Pct - report.returnP95Pct) < 1e-6)
+    }
+}

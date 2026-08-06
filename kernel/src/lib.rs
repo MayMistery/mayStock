@@ -21,6 +21,7 @@ pub mod optimize;
 pub mod overfit;
 pub mod quality;
 pub mod reconcile;
+pub mod resample;
 pub mod series;
 pub mod sizing;
 pub mod strategy;

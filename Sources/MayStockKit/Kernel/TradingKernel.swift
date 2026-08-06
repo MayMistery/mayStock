@@ -344,6 +344,26 @@ extension TradingKernel {
         ms_expected_max_sharpe(Int64(trials), years)
     }
 
+    /// The drawdown distribution behind one backtest's single observed figure.
+    ///
+    /// A backtest reports one maximum drawdown; that is a draw from a
+    /// distribution, and usually a flattering one. If the observed figure is
+    /// 12% and the 95th percentile of the resampled distribution is 22%, then
+    /// 22% is the number position sizing should be built on.
+    public static func resampleTrades(
+        returns: [Double], iterations: Int = 5_000,
+        method: KernelResampleMethod = .block, blockSize: Int = 5, seed: UInt64 = 0x5EED
+    ) throws -> KernelResampleReport? {
+        let request = ResampleRequest(
+            returns: returns, iterations: iterations, method: method,
+            blockSize: blockSize, seed: seed)
+        let json = try callReturningString { error in
+            ms_resample_trades(try? encodeJSON(request), error)
+        }
+        return try JSONDecoder().decode(
+            KernelResampleReport?.self, from: Data(json.utf8))
+    }
+
     /// How much diversification a book of strategies actually has.
     ///
     /// Allocating separately to each strategy is not the same as diversifying
@@ -378,6 +398,15 @@ extension TradingKernel {
         }
         return try JSONDecoder().decode(KernelEquityComparison.self, from: Data(json.utf8))
     }
+}
+
+/// Wire shape for `ms_resample_trades`.
+private struct ResampleRequest: Encodable {
+    let returns: [Double]
+    let iterations: Int
+    let method: KernelResampleMethod
+    let blockSize: Int
+    let seed: UInt64
 }
 
 /// Wire shape for `ms_diversification`.

@@ -19,7 +19,7 @@ struct SeriesAlignerTests {
             SeriesObservation(ts: bars[1].ts, value: 10),
             SeriesObservation(ts: bars[3].ts, value: 20),
         ]
-        let aligned = SeriesAligner.align(observations, to: bars)
+        let aligned = SeriesAligner.align(observations, to: bars, candleSeconds: 3_600)
         #expect(aligned[0].isNaN, "nothing published yet is unknown, not zero")
         #expect(aligned[1] == 10)
         #expect(aligned[2] == 10, "value holds until the next observation")
@@ -28,16 +28,31 @@ struct SeriesAlignerTests {
     }
 
     @Test func neverUsesAnObservationFromTheFuture() {
+        // The guarantee is about the *decision* instant, which is the bar's
+        // close — not its open. A value published during bar 2 is genuinely in
+        // hand when bar 2's signal is evaluated, and refusing it would model a
+        // staleness the live runner does not have. What must never happen is
+        // using something published after that close.
         let bars = candles(4)
-        // Published one second after bar 2 opens — bar 2 must not see it.
         let observations = [
             SeriesObservation(ts: bars[2].ts.addingTimeInterval(1), value: 99),
         ]
-        let aligned = SeriesAligner.align(observations, to: bars)
+        let aligned = SeriesAligner.align(observations, to: bars, candleSeconds: 3_600)
         #expect(aligned[0].isNaN)
         #expect(aligned[1].isNaN)
-        #expect(aligned[2].isNaN, "a value stamped after the bar opened is look-ahead")
+        #expect(aligned[2] == 99, "published inside bar 2, so bar 2's close has it")
         #expect(aligned[3] == 99)
+    }
+
+    @Test func anObservationAfterTheCloseBelongsToTheNextBar() {
+        // The line that matters: one second past bar 1's close is bar 2's data.
+        let bars = candles(4)
+        let observations = [
+            SeriesObservation(ts: bars[1].ts.addingTimeInterval(3_601), value: 7),
+        ]
+        let aligned = SeriesAligner.align(observations, to: bars, candleSeconds: 3_600)
+        #expect(aligned[1].isNaN, "published after bar 1 closed — bar 1 cannot see it")
+        #expect(aligned[2] == 7)
     }
 
     @Test func unorderedObservationsStillAlign() {
@@ -46,21 +61,21 @@ struct SeriesAlignerTests {
             SeriesObservation(ts: bars[3].ts, value: 30),
             SeriesObservation(ts: bars[1].ts, value: 10),
         ]
-        let aligned = SeriesAligner.align(observations, to: bars)
+        let aligned = SeriesAligner.align(observations, to: bars, candleSeconds: 3_600)
         #expect(aligned[1] == 10)
         #expect(aligned[3] == 30)
     }
 
     @Test func emptyInputsAreSafe() {
-        let empty = SeriesAligner.align([], to: candles(3))
+        let empty = SeriesAligner.align([], to: candles(3), candleSeconds: 3_600)
         #expect(empty.allSatisfy { $0.isNaN })
-        #expect(SeriesAligner.align([SeriesObservation(ts: Date(), value: 1)], to: []).isEmpty)
+        #expect(SeriesAligner.align([SeriesObservation(ts: Date(), value: 1)], to: [], candleSeconds: 3_600).isEmpty)
     }
 
     @Test func coverageCountsRealValues() {
         let bars = candles(4)
         let observations = [SeriesObservation(ts: bars[2].ts, value: 5)]
-        let aligned = SeriesAligner.align(observations, to: bars)
+        let aligned = SeriesAligner.align(observations, to: bars, candleSeconds: 3_600)
         let coverage = SeriesAligner.coverage(
             name: "x", spec: AlternativeSeriesSpec(source: .fundingRate),
             observations: observations, aligned: aligned)

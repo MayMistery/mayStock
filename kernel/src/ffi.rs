@@ -613,6 +613,53 @@ pub unsafe extern "C" fn ms_calibrate_slippage(
     })
 }
 
+/// What else could have happened: the drawdown distribution behind one
+/// backtest's single observed figure.
+///
+/// Input JSON: `{"returns":[…], "iterations":5000, "method":"block",
+///               "blockSize":5, "seed":42}`
+/// Returns a [`crate::resample::ResampleReport`], or null when there are too
+/// few trades to describe a distribution.
+#[no_mangle]
+pub unsafe extern "C" fn ms_resample_trades(
+    request_json: *const c_char,
+    error_out: *mut *mut c_char,
+) -> *mut c_char {
+    #[derive(serde::Deserialize)]
+    struct Request {
+        #[serde(default)]
+        returns: Vec<f64>,
+        #[serde(default = "default_iterations")]
+        iterations: usize,
+        #[serde(default)]
+        method: crate::resample::ResampleMethod,
+        #[serde(rename = "blockSize", default = "default_block")]
+        block_size: usize,
+        #[serde(default = "default_seed")]
+        seed: u64,
+    }
+    fn default_iterations() -> usize {
+        5_000
+    }
+    fn default_block() -> usize {
+        5
+    }
+    fn default_seed() -> u64 {
+        0x5EED
+    }
+    guarded(error_out, ptr::null_mut(), || {
+        let text = borrow_str(request_json).ok_or("请求 JSON 为空")?;
+        let request: Request =
+            serde_json::from_str(text).map_err(|e| format!("请求解析失败：{e}"))?;
+        let report = crate::resample::resample_trades(
+            &request.returns, request.iterations, request.method,
+            request.block_size, request.seed);
+        serde_json::to_string(&report)
+            .map(to_c_string)
+            .map_err(|e| e.to_string())
+    })
+}
+
 /// How much diversification a book of strategies actually has.
 ///
 /// Input JSON: `{"series":[{"name":"a","returns":[…]}, …]}`
