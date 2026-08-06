@@ -61,7 +61,14 @@ public struct StrategyPositionState: Codable, Sendable, Equatable, Identifiable 
     public var realisedPnL: Double
     public var feesPaid: Double
     public var fillCount: Int
-    public var firstFillAt: Date?
+    /// When the position *currently* held was opened, or nil while flat.
+    ///
+    /// Scoped to the open position, not to the strategy's history, because
+    /// every rule that reads it — the minimum hold, the time barrier — asks
+    /// "how long has *this* trade been on". An earlier version set it on the
+    /// first fill ever and never cleared it, which made every position look
+    /// arbitrarily old.
+    public var openedAt: Date?
     public var lastFillAt: Date?
     /// Base units per contract (`ctVal`). Swap sizes are counted in contracts,
     /// not coins — one BTC-USDT-SWAP contract is 0.01 BTC — so every P&L and
@@ -83,6 +90,14 @@ public struct StrategyPositionState: Codable, Sendable, Equatable, Identifiable 
     public var isFlat: Bool { abs(quantity) < 1e-12 }
     public var direction: TradeDirection? {
         isFlat ? nil : (quantity > 0 ? .long : .short)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case strategyId, instId, quantity, averagePrice, realisedPnL, feesPaid
+        case fillCount, lastFillAt, contractSize
+        // Written under the old name before it was scoped to the current
+        // position, so ledgers already on disk keep decoding.
+        case openedAt = "firstFillAt"
     }
 
     public init(strategyId: String, instId: String) {
@@ -124,13 +139,13 @@ public struct StrategyPositionState: Codable, Sendable, Equatable, Identifiable 
         defer {
             feesPaid += fill.feeQuote
             fillCount += 1
-            if firstFillAt == nil { firstFillAt = fill.ts }
             lastFillAt = fill.ts
         }
 
         if isFlat {
             quantity = delta
             averagePrice = fill.price
+            openedAt = fill.ts
             return
         }
         if (quantity > 0) == (delta > 0) {
@@ -146,10 +161,14 @@ public struct StrategyPositionState: Codable, Sendable, Equatable, Identifiable 
         let remainder = abs(delta) - closing
         quantity += delta
         if remainder > 1e-12 {
+            // Overshot into the opposite side: that is a new position, and its
+            // clock starts here.
             averagePrice = fill.price
+            openedAt = fill.ts
         } else if abs(quantity) < 1e-12 {
             quantity = 0
             averagePrice = 0
+            openedAt = nil
         }
     }
 }
@@ -221,6 +240,10 @@ public final class StrategyLedger {
     public func quantity(forInstId instId: String) -> Double {
         positions.values.filter { $0.instId == instId }.reduce(0) { $0 + $1.quantity }
     }
+
+    /// Every fill already on the book, so a caller adopting fills the exchange
+    /// executed on its own can tell which ones are genuinely new.
+    public var recordedFillIds: Set<String> { Set(fills.map(\.id)) }
 
     // MARK: Mutation
 

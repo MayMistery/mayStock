@@ -215,6 +215,33 @@ public enum TradeError: Error, CustomStringConvertible, Sendable {
             return "okx CLI 尚未配置 API Key。运行 `okx config` 添加模拟盘密钥后重试。"
         }
     }
+
+    /// The exchange's own verdict, when the failure carries one.
+    ///
+    /// A CLI that could not start, timed out, or died on a socket error says
+    /// nothing about whether the order reached OKX — that outcome is *unknown*
+    /// and has to be resolved by asking. A response carrying a non-zero OKX
+    /// code says something definite: the exchange saw the order and refused it.
+    /// Only the second kind may be treated as "this did not happen".
+    public var exchangeRejection: String? {
+        guard case .cliFailed(let exitCode, let stderr) = self, exitCode > 0,
+              let code = Self.okxCode(in: stderr) else { return nil }
+        let text = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        return "OKX \(code)：\(text.prefix(180))"
+    }
+
+    /// First non-zero OKX status code in a CLI error payload, if any.
+    static func okxCode(in text: String) -> String? {
+        let pattern = #"\"(?:sCode|code)\"\s*:\s*\"?(\d+)\"?"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        for match in regex.matches(in: text, range: range) {
+            guard let found = Range(match.range(at: 1), in: text) else { continue }
+            let code = String(text[found])
+            if code != "0" { return code }
+        }
+        return nil
+    }
 }
 
 // MARK: - Bridge

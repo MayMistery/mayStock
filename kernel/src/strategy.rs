@@ -160,6 +160,15 @@ pub struct Risk {
     pub cooldown_bars: usize,
     #[serde(rename = "minHoldBars", default)]
     pub min_hold_bars: usize,
+    /// The third barrier: close after this many bars whatever the signal says.
+    ///
+    /// A stop and a take-profit bound the price a position may reach but say
+    /// nothing about how long it may sit there. Without a time limit a trade
+    /// whose thesis simply stopped being true — neither stopped out nor
+    /// profitable — occupies the capital indefinitely. `None` means no limit,
+    /// which is the historical behaviour.
+    #[serde(rename = "maxHoldBars")]
+    pub max_hold_bars: Option<usize>,
     #[serde(rename = "maxDailyLossPct")]
     pub max_daily_loss_pct: Option<f64>,
     #[serde(rename = "volLookbackBars", default = "vol_lookback")]
@@ -190,6 +199,7 @@ impl Default for Risk {
             leverage: 1.0,
             cooldown_bars: 0,
             min_hold_bars: 0,
+            max_hold_bars: None,
             max_daily_loss_pct: None,
             vol_lookback_bars: 60,
             max_exposure: 1.0,
@@ -302,6 +312,21 @@ impl CompiledStrategy {
                 message: "现货策略不能声明做空信号（shortEntry / shortExit）".into(),
                 column: 1,
             });
+        }
+
+        // A ceiling below the floor can never be satisfied: the position would
+        // be both forbidden to close and required to be closed. Refuse it here
+        // instead of letting the barrier silently win every time.
+        if let Some(limit) = manifest.risk.max_hold_bars {
+            if limit < manifest.risk.min_hold_bars {
+                return Err(ExprError::Syntax {
+                    message: format!(
+                        "maxHoldBars({limit}) 小于 minHoldBars({})，这两条规则无法同时满足",
+                        manifest.risk.min_hold_bars
+                    ),
+                    column: 1,
+                });
+            }
         }
 
         // Dry-run every expression so an unknown function, a bad arity or a

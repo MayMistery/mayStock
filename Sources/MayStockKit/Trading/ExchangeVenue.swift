@@ -28,6 +28,20 @@ public protocol ExchangeVenue: Sendable {
     /// Nil when the exchange does not publish metadata for the instrument.
     func instrumentMeta(instId: String) async throws -> InstrumentMeta?
 
+    /// The alternative series a manifest declares — funding rates, open
+    /// interest, long/short ratios — aligned to `candles`.
+    ///
+    /// Optional, because these statistics are exchange-specific rather than
+    /// universal: a venue that publishes none inherits the default below and
+    /// returns nothing. That is not silent degradation. An unavailable series
+    /// aligns to NaN, NaN is *unknown* throughout the kernel, and a strategy
+    /// whose signal depends on an unknown never fires — so a venue without the
+    /// data declines to trade rather than trading blind.
+    func alternativeSeries(
+        specs: [String: AlternativeSeriesSpec], market: StrategyMarket,
+        candles: [Candle], days: Int
+    ) async -> (series: [String: [Double]], coverage: [SeriesCoverage])
+
     // MARK: Trading
 
     func place(
@@ -51,6 +65,15 @@ public protocol ExchangeVenue: Sendable {
     func positions(mode: TradingMode, instType: InstrumentType) async throws -> [ExchangePosition]
 
     func accountSnapshot(mode: TradingMode) async throws -> AccountSnapshot
+}
+
+extension ExchangeVenue {
+    public func alternativeSeries(
+        specs: [String: AlternativeSeriesSpec], market: StrategyMarket,
+        candles: [Candle], days: Int
+    ) async -> (series: [String: [Double]], coverage: [SeriesCoverage]) {
+        ([:], [])
+    }
 }
 
 /// What the exchange says became of an order we are unsure about.
