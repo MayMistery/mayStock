@@ -72,6 +72,11 @@ public enum TradeDirection: String, Sendable, Equatable, Codable {
 
     public var sign: Double { self == .long ? 1 : -1 }
     public var displayName: String { self == .long ? "多" : "空" }
+
+    /// Direction implied by a signed size, or nil when there is none to imply.
+    public init?(sign: Double) {
+        if sign > 0 { self = .long } else if sign < 0 { self = .short } else { return nil }
+    }
 }
 
 public enum TradeExitReason: String, Sendable, Equatable, Codable {

@@ -59,6 +59,7 @@ pub fn desired_direction(
     current: Option<Direction>,
     bars_held: usize,
     min_hold: usize,
+    max_hold: Option<usize>,
     long_entry: Option<&[f64]>,
     long_exit: Option<&[f64]>,
     short_entry: Option<&[f64]>,
@@ -80,6 +81,15 @@ pub fn desired_direction(
 
     let wants_long = fires(long_entry);
     let wants_short = fires(short_entry);
+
+    // The time barrier outranks every signal, including a reversal. A position
+    // that has run out of time is closed and left closed; re-entering is a
+    // fresh decision on the next bar, subject to the cooldown like any other.
+    // Letting a reversal bypass it would make the limit unenforceable in
+    // exactly the choppy market it exists for.
+    if current.is_some() && max_hold.is_some_and(|limit| bars_held >= limit) {
+        return None;
+    }
 
     match current {
         None => {
@@ -395,6 +405,7 @@ pub fn decide_live(
         current,
         bars_held,
         strategy.manifest.risk.min_hold_bars,
+        strategy.manifest.risk.max_hold_bars,
         long_entry.as_deref(),
         long_exit.as_deref(),
         short_entry.as_deref(),
@@ -548,7 +559,7 @@ mod tests {
         short_entry: Option<&[f64]>,
         short_exit: Option<&[f64]>,
     ) -> Option<Direction> {
-        desired_direction(1, current, 99, 0, long_entry, long_exit, short_entry, short_exit, None)
+        desired_direction(1, current, 99, 0, None, long_entry, long_exit, short_entry, short_exit, None)
     }
 
     #[test]
@@ -597,14 +608,45 @@ mod tests {
     fn min_hold_defers_the_exit_but_not_the_reversal() {
         // Held 1 bar, minimum 5: the exit is ignored…
         assert_eq!(
-            desired_direction(1, Some(Direction::Long), 1, 5, None, Some(YES), None, None, None),
+            desired_direction(1, Some(Direction::Long), 1, 5, None, None, Some(YES), None, None, None),
             Some(Direction::Long)
         );
         // …but an opposing entry still reverses, because that is the signal
         // working rather than churn.
         assert_eq!(
-            desired_direction(1, Some(Direction::Long), 1, 5, Some(NO), Some(YES), Some(YES), None, None),
+            desired_direction(1, Some(Direction::Long), 1, 5, None, Some(NO), Some(YES), Some(YES), None, None),
             Some(Direction::Short)
+        );
+    }
+
+    #[test]
+    fn the_time_barrier_closes_a_position_that_ran_out_of_bars() {
+        // Held 10 bars with a 10-bar limit and no exit signal in sight.
+        assert_eq!(
+            desired_direction(1, Some(Direction::Long), 10, 0, Some(10), None, Some(NO), None, None, None),
+            None
+        );
+        // One bar short of the limit it is still held.
+        assert_eq!(
+            desired_direction(1, Some(Direction::Long), 9, 0, Some(10), None, Some(NO), None, None, None),
+            Some(Direction::Long)
+        );
+    }
+
+    #[test]
+    fn the_time_barrier_outranks_a_reversal() {
+        // Otherwise a strategy that flips every bar would never age out.
+        assert_eq!(
+            desired_direction(1, Some(Direction::Long), 10, 0, Some(10), Some(NO), None, Some(YES), None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn the_time_barrier_does_not_block_a_fresh_entry() {
+        assert_eq!(
+            desired_direction(1, None, 99, 0, Some(10), Some(YES), None, None, None, None),
+            Some(Direction::Long)
         );
     }
 
@@ -612,12 +654,12 @@ mod tests {
     fn script_targets_override_expressions() {
         let targets = [0, -1, 1];
         assert_eq!(
-            desired_direction(1, None, 0, 0, Some(YES), None, None, None, Some(&targets)),
+            desired_direction(1, None, 0, 0, None, Some(YES), None, None, None, Some(&targets)),
             Some(Direction::Short)
         );
         // Past the end of the script, hold what we have rather than dumping.
         assert_eq!(
-            desired_direction(9, Some(Direction::Long), 0, 0, None, None, None, None, Some(&targets)),
+            desired_direction(9, Some(Direction::Long), 0, 0, None, None, None, None, None, Some(&targets)),
             Some(Direction::Long)
         );
     }

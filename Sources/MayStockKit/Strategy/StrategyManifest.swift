@@ -279,6 +279,11 @@ public struct StrategyRisk: Codable, Sendable, Equatable {
     public var cooldownBars: Int
     /// Bars a position must be held before any exit signal is honoured.
     public var minHoldBars: Int
+    /// The third barrier: close after this many bars whatever the signal says.
+    ///
+    /// A stop and a take-profit bound the price a position may reach but say
+    /// nothing about how long it may sit there. Nil means no limit.
+    public var maxHoldBars: Int?
     /// Halt the strategy for the rest of the UTC day after this much loss.
     public var maxDailyLossPct: Double?
 
@@ -286,7 +291,7 @@ public struct StrategyRisk: Codable, Sendable, Equatable {
         stopLossPct: Double? = nil, takeProfitPct: Double? = nil,
         trailingStopPct: Double? = nil, atrStop: ATRStop? = nil,
         leverage: Double = 1, cooldownBars: Int = 0, minHoldBars: Int = 0,
-        maxDailyLossPct: Double? = nil,
+        maxHoldBars: Int? = nil, maxDailyLossPct: Double? = nil,
         volLookbackBars: Int = 60, maxExposure: Double = 1,
         rebalanceThreshold: Double = 0.1
     ) {
@@ -300,6 +305,7 @@ public struct StrategyRisk: Codable, Sendable, Equatable {
         self.leverage = leverage
         self.cooldownBars = cooldownBars
         self.minHoldBars = minHoldBars
+        self.maxHoldBars = maxHoldBars
         self.maxDailyLossPct = maxDailyLossPct
     }
 
@@ -307,7 +313,7 @@ public struct StrategyRisk: Codable, Sendable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case stopLossPct, takeProfitPct, trailingStopPct, atrStop, leverage
-        case cooldownBars, minHoldBars, maxDailyLossPct
+        case cooldownBars, minHoldBars, maxHoldBars, maxDailyLossPct
         case volLookbackBars, maxExposure, rebalanceThreshold
     }
 
@@ -320,6 +326,7 @@ public struct StrategyRisk: Codable, Sendable, Equatable {
         leverage = try c.decodeIfPresent(Double.self, forKey: .leverage) ?? 1
         cooldownBars = try c.decodeIfPresent(Int.self, forKey: .cooldownBars) ?? 0
         minHoldBars = try c.decodeIfPresent(Int.self, forKey: .minHoldBars) ?? 0
+        maxHoldBars = try c.decodeIfPresent(Int.self, forKey: .maxHoldBars)
         maxDailyLossPct = try c.decodeIfPresent(Double.self, forKey: .maxDailyLossPct)
         volLookbackBars = try c.decodeIfPresent(Int.self, forKey: .volLookbackBars) ?? 60
         maxExposure = try c.decodeIfPresent(Double.self, forKey: .maxExposure) ?? 1

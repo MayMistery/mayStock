@@ -112,7 +112,6 @@ public final class StrategyRunner {
     public static let inFlightTimeout: TimeInterval = 600
 
     private weak var host: StrategyRunnerHost?
-    private let rest: OKXRESTClient
     private var loop: Task<Void, Never>?
 
     /// Kernel strategies, compiled once and reused across ticks.
@@ -148,12 +147,26 @@ public final class StrategyRunner {
         var attempts: Int
     }
 
+    /// A position difference seen once and awaiting a second, agreeing reading.
+    private var pendingExternal: [String: PendingExternal] = [:]
+    private struct PendingExternal { let delta: Double; let seenAt: Date }
+
+    /// How long a position difference must persist before it is believed.
+    /// Longer than two ticks: an order that filled seconds ago is not visible
+    /// on the fills and positions endpoints at the same instant, and booking a
+    /// correction that never happened is as damaging as missing a real one.
+    ///
+    /// Settable so tests can exercise what happens *after* the window without
+    /// waiting it out; two agreeing readings are still required either way.
+    public var externalConfirmDelay: TimeInterval = 45
+    /// Relative size below which a position difference is rounding, not an event.
+    public static let externalTolerance = 0.005
+
     /// How often the loop wakes. Bar-close detection does the real pacing.
     public static let tickInterval: TimeInterval = 20
 
-    public init(host: StrategyRunnerHost, rest: OKXRESTClient = OKXRESTClient()) {
+    public init(host: StrategyRunnerHost) {
         self.host = host
-        self.rest = rest
     }
 
     // MARK: Lifecycle
@@ -241,6 +254,17 @@ public final class StrategyRunner {
         // strategy still holds coins, and its P&L must not freeze on screen.
         await refreshMarks(for: host)
 
+        // What the exchange did on its own — a stop firing, a liquidation —
+        // is checked for every held position, armed or not. A stopped
+        // strategy's position can still be closed out from under it, and the
+        // ledger has to learn that from somewhere.
+        await reconcileExternal(for: host)
+
+        // Then any level the exchange refused to hold for us. After
+        // reconciliation, so a position already closed on the exchange is not
+        // "stopped out" a second time.
+        await enforceLocalStops(for: host)
+
         // Equity is sampled unconditionally — before the "is anything running"
         // guard below — because "how much money is in this account" is a
         // question the panel must answer even with every strategy stopped.
@@ -324,6 +348,188 @@ public final class StrategyRunner {
             }
         }
         host.runnerDidChange()
+    }
+
+    // MARK: External position changes
+
+    /// Reconcile the ledger against what the exchange actually holds, and book
+    /// whatever moved the position without us.
+    ///
+    /// The exchange changes positions on its own more often than the phrase
+    /// "external fill" suggests. The commonest case is not exotic at all: we
+    /// attach the stop to the entry order precisely so the exchange enforces it
+    /// while this app is closed, and when it fires the resulting fill carries
+    /// the exchange's own order id, not our `clOrdId`. `ingestFills` therefore
+    /// skips it and the ledger goes on believing it holds a position that no
+    /// longer exists. Liquidation, ADL and a manual close look the same.
+    ///
+    /// A phantom position is worse than a merely inaccurate one: the next
+    /// decision sizes against coins that are not there, and a flatten would try
+    /// to sell them.
+    ///
+    /// Swaps only. A spot balance mixes this book with coins the user already
+    /// held, so a difference there is not evidence of anything — whereas a
+    /// derivative position is reported per instrument and is exactly the thing
+    /// that gets stopped out, liquidated or auto-deleveraged.
+    private func reconcileExternal(for host: StrategyRunnerHost) async {
+        let held = host.ledger.positions.values.filter {
+            !$0.isFlat && $0.instId.hasSuffix("-SWAP")
+        }
+        guard !held.isEmpty else {
+            pendingExternal.removeAll()
+            return
+        }
+
+        // A failed query must never read as "the exchange holds nothing";
+        // that would book a liquidation on every network hiccup.
+        guard let exchange = try? await host.venue.positions(
+            mode: host.portfolio.mode, instType: .swap) else { return }
+
+        var exchangeByInst: [String: Double] = [:]
+        for position in exchange {
+            exchangeByInst[position.instId, default: 0] += position.quantity
+        }
+        var ledgerByInst: [String: Double] = [:]
+        for state in held { ledgerByInst[state.instId, default: 0] += state.quantity }
+
+        for (instId, ledgerQuantity) in ledgerByInst {
+            let exchangeQuantity = exchangeByInst[instId] ?? 0
+            let delta = exchangeQuantity - ledgerQuantity
+            let scale = Swift.max(abs(ledgerQuantity), abs(exchangeQuantity))
+            guard scale > 0, abs(delta) / scale > Self.externalTolerance else {
+                pendingExternal[instId] = nil
+                continue
+            }
+            // An order we have not heard back from could explain the whole
+            // difference. Settling that comes first.
+            if inFlight.values.contains(where: { $0.instId == instId }) { continue }
+
+            if let seen = pendingExternal[instId],
+               abs(seen.delta - delta) / scale <= Self.externalTolerance {
+                guard Date().timeIntervalSince(seen.seenAt) >= externalConfirmDelay
+                else { continue }
+            } else {
+                pendingExternal[instId] = PendingExternal(delta: delta, seenAt: Date())
+                continue
+            }
+
+            await absorb(delta: delta, ledgerQuantity: ledgerQuantity,
+                         instId: instId, held: held, host: host)
+        }
+    }
+
+    /// Book one confirmed position difference against the strategy that owns it.
+    private func absorb(
+        delta: Double, ledgerQuantity: Double, instId: String,
+        held: [StrategyPositionState], host: StrategyRunnerHost
+    ) async {
+        let claimants = held.filter { $0.instId == instId }
+        guard claimants.count == 1, let owner = claimants.first else {
+            // Two strategies netted into one exchange position cannot be
+            // decomposed. A liquidation hits the net leg, and splitting it
+            // pro-rata would be a guess about whose money was lost — so stop
+            // both rather than write a plausible fiction into the book.
+            for state in claimants {
+                host.runnerDidHalt(
+                    strategyId: state.strategyId,
+                    reason: "\(instId) 交易所仓位与台账相差 \(PriceFormatter.plain(delta)) 张，"
+                        + "该合约由多个策略共用，无法归因，请人工核对")
+            }
+            pendingExternal[instId] = nil
+            return
+        }
+
+        // Only reductions are absorbed. An increase is somebody else's order —
+        // a manual trade, another bot — and folding it into this strategy would
+        // have it trade away a position the user opened deliberately. It stays
+        // visible as unattributed exposure in reconciliation instead.
+        let booked: Double = ledgerQuantity > 0
+            ? Swift.max(Swift.min(delta, 0), -ledgerQuantity)
+            : Swift.min(Swift.max(delta, 0), -ledgerQuantity)
+        guard abs(booked) > 0 else {
+            update(owner.strategyId) {
+                $0.message = "交易所 \(instId) 仓位多出 \(PriceFormatter.plain(delta)) 张"
+                    + "（非本策略下单），未并入台账"
+            }
+            pendingExternal[instId] = nil
+            return
+        }
+
+        var remaining = abs(booked)
+        remaining -= await adoptUntaggedFills(
+            instId: instId, owner: owner, reducing: booked, limit: remaining, host: host)
+
+        if remaining > abs(booked) * 0.01 {
+            // No fill record explains the rest. Book it at the mark so the
+            // *size* is right, which is what every later decision depends on,
+            // and be clear that the price and fee behind the realised P&L are
+            // an estimate rather than a record.
+            let price = marks[instId] ?? owner.averagePrice
+            host.ledger.record(StrategyFill(
+                id: "external-\(instId)-\(Int(Date().timeIntervalSince1970 * 1000))",
+                strategyId: owner.strategyId, instId: instId,
+                side: booked > 0 ? .buy : .sell, price: price, quantity: remaining,
+                feeQuote: 0, ts: Date(), clOrdId: nil, mode: host.portfolio.mode))
+        }
+
+        pendingExternal[instId] = nil
+        // A position closed by the exchange is an exit like any other, so the
+        // cooldown applies to it. Without this the strategy could re-enter on
+        // the very next bar — something the backtest never does after a stop.
+        if host.ledger.position(for: owner.strategyId)?.isFlat ?? true {
+            lastExitBar[owner.strategyId] =
+                lastConfirmedBarTime(forStrategy: owner.strategyId, host: host) ?? Date()
+        }
+        update(owner.strategyId) {
+            $0.message = "交易所已减仓 \(PriceFormatter.plain(abs(booked))) 张"
+                + "（止损/止盈/强平/手动），已补记入账"
+        }
+        Log.warn("runner: absorbed an external \(booked) on \(instId) for \(owner.strategyId)")
+        host.runnerDidChange()
+    }
+
+    /// Adopt the exchange's own fills for this reduction, newest work first.
+    ///
+    /// Preferred over synthesising one, because a real fill carries the real
+    /// price and the real fee — a stop fills at the stop, not at whatever the
+    /// mark happens to be a minute later. Returns the size adopted.
+    private func adoptUntaggedFills(
+        instId: String, owner: StrategyPositionState, reducing booked: Double,
+        limit: Double, host: StrategyRunnerHost
+    ) async -> Double {
+        guard let fills = try? await host.venue.fills(
+            instId: instId, instType: .swap, mode: host.portfolio.mode) else { return 0 }
+
+        let recorded = host.ledger.recordedFillIds
+        let known = host.runnableStrategies.map(\.id)
+        // Nothing older than our last recorded fill: that is history already
+        // accounted for, and adopting it would double-count.
+        let since = owner.lastFillAt ?? .distantPast
+        let wanted = booked > 0 ? 1.0 : -1.0
+
+        var adopted = 0.0
+        for fill in fills.sorted(by: { $0.ts < $1.ts })
+        where fill.ts > since
+            && !recorded.contains(fill.id)
+            && OrderTag.resolveStrategy(fill.clOrdId, among: known) == nil
+            && fill.side.sign * wanted > 0 {
+            guard adopted < limit else { break }
+            host.ledger.record(StrategyFill(
+                exchange: fill, strategyId: owner.strategyId, mode: host.portfolio.mode))
+            adopted += abs(fill.size)
+        }
+        return adopted
+    }
+
+    /// Latest confirmed bar this strategy has cached, for dating an exit.
+    private func lastConfirmedBarTime(
+        forStrategy id: String, host: StrategyRunnerHost
+    ) -> Date? {
+        guard let strategy = host.runnableStrategies.first(where: { $0.id == id }) else {
+            return nil
+        }
+        let key = CacheKey(instId: strategy.market.instId, bar: strategy.market.bar)
+        return candleCache[key]?.last(where: { $0.confirmed })?.ts
     }
 
     /// Refresh the mark price of every instrument the ledger has exposure to,
@@ -443,10 +649,11 @@ public final class StrategyRunner {
         var candles = candleCache[key] ?? []
         do {
             if candles.count < wanted {
-                candles = try await rest.historyCandles(
+                candles = try await host.venue.historyCandles(
                     instId: market.instId, bar: market.bar, target: wanted)
             } else {
-                let recent = try await rest.candles(instId: market.instId, bar: market.bar, target: 100)
+                let recent = try await host.venue.candles(
+                    instId: market.instId, bar: market.bar, target: 100)
                 candles.mergeCandles(recent, cap: wanted + 200)
             }
         } catch {
@@ -478,7 +685,7 @@ public final class StrategyRunner {
         var externalSeries: [String: [Double]] = [:]
         if strategy.usesAlternativeData {
             let days = Int(Double(confirmed.count) * market.bar.seconds / 86_400) + 2
-            let loaded = await AlternativeDataProvider(rest: rest).load(
+            let loaded = await host.venue.alternativeSeries(
                 specs: strategy.manifest.data, market: market,
                 candles: confirmed, days: Swift.max(days, 2))
             externalSeries = loaded.series
@@ -586,7 +793,7 @@ public final class StrategyRunner {
     private func barsHeldCount(
         position: StrategyPositionState?, latestBar: Candle, market: StrategyMarket
     ) -> Int {
-        guard let first = position?.firstFillAt, market.bar.seconds > 0 else { return 0 }
+        guard let first = position?.openedAt, market.bar.seconds > 0 else { return 0 }
         return Swift.max(Int(latestBar.ts.timeIntervalSince(first) / market.bar.seconds), 0)
     }
 
@@ -666,7 +873,7 @@ public final class StrategyRunner {
         if let cached = metaCache[market.instId] {
             meta = cached
         } else {
-            meta = try? await rest.instrumentMeta(instId: market.instId)
+            meta = (try? await host.venue.instrumentMeta(instId: market.instId)) ?? nil
             if let meta { metaCache[market.instId] = meta }
         }
 
@@ -688,43 +895,139 @@ public final class StrategyRunner {
             posSide = leg > 0 ? .long : .short
         }
 
-        let order = OrderRequest(
-            instId: market.instId,
-            instType: market.instType,
-            side: baseDelta > 0 ? .buy : .sell,
-            kind: .market,
-            size: size,
-            sizeUnit: .base,
-            posSide: posSide,
-            stopTriggerPrice: stopPrice,
-            takeProfitTriggerPrice: takeProfitPrice,
-            clOrdId: OrderTag.make(strategyId: strategy.id))
+        func request(withProtection: Bool) -> OrderRequest {
+            OrderRequest(
+                instId: market.instId,
+                instType: market.instType,
+                side: baseDelta > 0 ? .buy : .sell,
+                kind: .market,
+                size: size,
+                sizeUnit: .base,
+                posSide: posSide,
+                stopTriggerPrice: withProtection ? stopPrice : nil,
+                takeProfitTriggerPrice: withProtection ? takeProfitPrice : nil,
+                clOrdId: OrderTag.make(strategyId: strategy.id))
+        }
 
-        let clOrdId = order.clOrdId ?? ""
+        let order = request(withProtection: true)
         do {
-            let mode = host.portfolio.mode
-            _ = try await host.venue.place(
-                order, mode: mode, liveUnlocked: host.liveTradingUnlocked)
-            inFlight[clOrdId] = nil
-            update(strategy.id) {
-                $0.lastOrderAt = Date()
-                $0.message = "\(reason)：\(order.side.displayName) \(PriceFormatter.plain(size))"
-            }
-            // Give the exchange a moment, then book the fill.
-            try? await Task.sleep(nanoseconds: 1_200_000_000)
-            await ingestFills(for: [strategy], host: host)
+            try await place(order, strategy: strategy, host: host, reason: reason)
         } catch {
-            // A failed *call* is not a failed *order*. The request may have
-            // reached the exchange and filled; halting here would strand a real
-            // position outside the ledger. Record it and ask the exchange what
-            // happened on the next tick.
-            inFlight[clOrdId] = InFlightOrder(
-                strategyId: strategy.id, instId: market.instId, instType: market.instType,
-                clOrdId: clOrdId, submittedAt: Date(), attempts: 0)
-            update(strategy.id) {
-                $0.status = .running
-                $0.message = "下单结果未确认，等待交易所确认：\(error)"
+            guard let rejection = (error as? TradeError)?.exchangeRejection else {
+                // A failed *call* is not a failed *order*. The request may have
+                // reached the exchange and filled; halting here would strand a
+                // real position outside the ledger. Record it and ask the
+                // exchange what happened on the next tick.
+                let clOrdId = order.clOrdId ?? ""
+                inFlight[clOrdId] = InFlightOrder(
+                    strategyId: strategy.id, instId: market.instId, instType: market.instType,
+                    clOrdId: clOrdId, submittedAt: Date(), attempts: 0)
+                update(strategy.id) {
+                    $0.status = .running
+                    $0.message = "下单结果未确认，等待交易所确认：\(error)"
+                }
+                return
             }
+
+            // The exchange refused it outright, so nothing is in flight.
+            //
+            // The commonest reason for refusing an order that is otherwise fine
+            // is the attachment: OKX rejects a trigger price it considers too
+            // close to, or too far from, the mark. Abandoning the trade because
+            // its *insurance* was unacceptable is the wrong trade-off — the
+            // signal is still the signal. Send it bare and enforce the levels
+            // from here instead.
+            guard stopPrice != nil || takeProfitPrice != nil else {
+                update(strategy.id) {
+                    $0.status = .failed
+                    $0.message = "交易所拒绝下单：\(rejection)"
+                }
+                return
+            }
+            do {
+                try await place(request(withProtection: false),
+                                strategy: strategy, host: host, reason: reason)
+                if let direction = TradeDirection(sign: baseDelta) {
+                    localStops[strategy.id] = LocalStop(
+                        instId: market.instId, direction: direction,
+                        stop: stopPrice, takeProfit: takeProfitPrice)
+                }
+                update(strategy.id) {
+                    $0.message = "交易所拒绝附加止损（\(rejection)），已改为裸单成交，"
+                        + "止损改由本程序在 tick 上执行——App 关闭期间不受保护"
+                }
+                Log.warn("runner: \(strategy.id) fell back to a locally enforced stop")
+            } catch {
+                update(strategy.id) {
+                    $0.status = .failed
+                    $0.message = "交易所拒绝下单：\(rejection)；去掉止损重试仍失败：\(error)"
+                }
+            }
+        }
+    }
+
+    /// Submit one order and book whatever it filled.
+    private func place(
+        _ order: OrderRequest, strategy: CompiledStrategy,
+        host: StrategyRunnerHost, reason: String
+    ) async throws {
+        _ = try await host.venue.place(
+            order, mode: host.portfolio.mode, liveUnlocked: host.liveTradingUnlocked)
+        inFlight[order.clOrdId ?? ""] = nil
+        update(strategy.id) {
+            $0.lastOrderAt = Date()
+            $0.message = "\(reason)：\(order.side.displayName) \(PriceFormatter.plain(order.size))"
+        }
+        // Give the exchange a moment, then book the fill.
+        try? await Task.sleep(nanoseconds: 1_200_000_000)
+        await ingestFills(for: [strategy], host: host)
+    }
+
+    // MARK: Locally enforced protective levels
+
+    /// Levels this runner has to watch itself, because the exchange refused to
+    /// attach them to the order.
+    ///
+    /// Strictly a fallback, and a weaker one: it only sees the mark at tick
+    /// resolution and not at all while the app is closed, which is exactly why
+    /// the levels ride on the order whenever OKX will accept them. Populated
+    /// only after a refusal, so it can never race an exchange-side stop.
+    private var localStops: [String: LocalStop] = [:]
+
+    private struct LocalStop {
+        let instId: String
+        let direction: TradeDirection
+        let stop: Double?
+        let takeProfit: Double?
+
+        func breach(at price: Double) -> String? {
+            switch direction {
+            case .long:
+                if let stop, price <= stop { return "止损" }
+                if let takeProfit, price >= takeProfit { return "止盈" }
+            case .short:
+                if let stop, price >= stop { return "止损" }
+                if let takeProfit, price <= takeProfit { return "止盈" }
+            }
+            return nil
+        }
+    }
+
+    private func enforceLocalStops(for host: StrategyRunnerHost) async {
+        for (strategyId, level) in localStops {
+            guard let position = host.ledger.position(for: strategyId), !position.isFlat,
+                  position.direction == level.direction else {
+                // The position is gone or reversed; the level no longer applies.
+                localStops[strategyId] = nil
+                continue
+            }
+            guard let price = marks[level.instId],
+                  let kind = level.breach(at: price) else { continue }
+            localStops[strategyId] = nil
+            update(strategyId) { $0.message = "本地\(kind)触发（\(PriceFormatter.plain(price))），正在平仓" }
+            await flatten(strategyId: strategyId)
+            lastExitBar[strategyId] =
+                lastConfirmedBarTime(forStrategy: strategyId, host: host) ?? Date()
         }
     }
 

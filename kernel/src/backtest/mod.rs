@@ -21,7 +21,7 @@ use crate::decide::{desired_direction, Direction};
 use crate::expr::eval::Evaluator;
 use crate::expr::ExprResult;
 use crate::series;
-use crate::strategy::{bar_seconds, CompiledStrategy, SizingMode};
+use crate::strategy::{bar_seconds, CompiledStrategy};
 
 pub use metrics::Metrics;
 
@@ -436,6 +436,7 @@ pub fn run(
                 current,
                 held,
                 manifest.risk.min_hold_bars,
+                manifest.risk.max_hold_bars,
                 long_entry.as_deref(),
                 long_exit.as_deref(),
                 short_entry.as_deref(),

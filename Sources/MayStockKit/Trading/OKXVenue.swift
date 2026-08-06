@@ -41,6 +41,14 @@ public struct OKXVenue: ExchangeVenue {
         try await rest.instrumentMeta(instId: instId)
     }
 
+    public func alternativeSeries(
+        specs: [String: AlternativeSeriesSpec], market: StrategyMarket,
+        candles: [Candle], days: Int
+    ) async -> (series: [String: [Double]], coverage: [SeriesCoverage]) {
+        await AlternativeDataProvider(rest: rest).load(
+            specs: specs, market: market, candles: candles, days: days)
+    }
+
     // MARK: Trading
 
     public func place(
