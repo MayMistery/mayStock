@@ -246,6 +246,7 @@ public final class StrategyRunner {
         }
         isTicking = true
         tickStartedAt = Date()
+        fillsThisTick.removeAll()
         defer { isTicking = false; tickStartedAt = nil; lastTickAt = Date() }
 
         let portfolio = host.portfolio
@@ -568,8 +569,8 @@ public final class StrategyRunner {
         instId: String, owner: StrategyPositionState, reducing booked: Double,
         limit: Double, host: StrategyRunnerHost
     ) async -> Double {
-        guard let fills = try? await host.venue.fills(
-            instId: instId, instType: .swap, mode: host.portfolio.mode) else { return 0 }
+        guard let fills = await fills(
+            for: InstrumentKey(instId: instId, instType: .swap), host: host) else { return 0 }
 
         let recorded = host.ledger.recordedFillIds
         let known = host.runnableStrategies.map(\.id)
@@ -1192,8 +1193,13 @@ public final class StrategyRunner {
             $0.lastOrderAt = Date()
             $0.message = "\(reason)：\(order.side.displayName) \(PriceFormatter.plain(order.size))"
         }
-        // Give the exchange a moment, then book the fill.
+        // Give the exchange a moment, then book the fill. The cached listing
+        // predates this order, so it is dropped first — reading it back would
+        // report the position as unchanged and, on the next tick, look exactly
+        // like an external reduction.
         try? await Task.sleep(nanoseconds: 1_200_000_000)
+        fillsThisTick[InstrumentKey(
+            instId: order.instId, instType: order.instType)] = nil
         await ingestFills(for: [strategy], host: host)
     }
 
@@ -1357,14 +1363,32 @@ public final class StrategyRunner {
     private func ingestFills(for instruments: Set<InstrumentKey>, host: StrategyRunnerHost) async {
         guard !instruments.isEmpty else { return }
         let knownIds = host.runnableStrategies.map(\.id)
-        let mode = host.portfolio.mode
-
         for instrument in instruments {
-            guard let fills = try? await host.venue.fills(
-                instId: instrument.instId, instType: instrument.instType, mode: mode) else { continue }
-            host.ledger.ingest(fills, knownStrategyIds: knownIds)
+            guard let listing = await fills(for: instrument, host: host) else { continue }
+            host.ledger.ingest(listing, knownStrategyIds: knownIds)
         }
     }
+
+    /// Fills for one instrument, fetched at most once per tick.
+    ///
+    /// Reconciliation and the per-strategy ingest both want the same listing,
+    /// and every call spawns an `okx` process and spends an authenticated
+    /// request against the exchange's rate limit. Nothing changes between two
+    /// reads inside a single tick that the tick could act on, so the second
+    /// read buys nothing.
+    private func fills(
+        for instrument: InstrumentKey, host: StrategyRunnerHost
+    ) async -> [ExchangeFill]? {
+        if let cached = fillsThisTick[instrument] { return cached }
+        guard let fresh = try? await host.venue.fills(
+            instId: instrument.instId, instType: instrument.instType,
+            mode: host.portfolio.mode) else { return nil }
+        fillsThisTick[instrument] = fresh
+        return fresh
+    }
+
+    /// Cleared at the top of every tick; see `fills(for:host:)`.
+    private var fillsThisTick: [InstrumentKey: [ExchangeFill]] = [:]
 
     private struct InstrumentKey: Hashable {
         let instId: String

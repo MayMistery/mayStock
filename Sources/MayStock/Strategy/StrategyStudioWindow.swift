@@ -109,6 +109,32 @@ private struct PortfolioHeader: View {
 
     private var portfolio: StrategyPortfolioPrefs { appState.store.config.strategy }
 
+    /// How many independent bets this book actually holds.
+    ///
+    /// Allocating separately to each strategy is not the same as diversifying
+    /// between them. Two trend followers on BTC and ETH move together in a
+    /// crash — exactly when the diversification was supposed to help — so the
+    /// book is one position of double the size, and no per-strategy backtest
+    /// can show that.
+    @ViewBuilder
+    private var diversificationLine: some View {
+        if let report = appState.portfolioDiversification,
+           let effective = report.effectiveBets, !report.pairs.isEmpty {
+            let names = report.highestPair
+            HStack(spacing: 5) {
+                Text("有效独立注数 \(PriceFormatter.decimals(effective, 2)) / \(report.pairs.count + 1)")
+                    .font(.system(size: 10, weight: report.isConcentrated ? .semibold : .regular))
+                    .foregroundStyle(report.isConcentrated ? Color.orange : .secondary)
+                    .monospacedDigit()
+                if let names {
+                    Text("最高相关 \(names.a) ↔ \(names.b) "
+                         + PriceFormatter.decimals(names.correlation, 2))
+                        .font(.system(size: 9)).foregroundStyle(.tertiary).monospacedDigit()
+                }
+            }
+        }
+    }
+
     var body: some View {
         HStack(alignment: .center, spacing: 16) {
             VStack(alignment: .leading, spacing: 3) {
@@ -127,6 +153,7 @@ private struct PortfolioHeader: View {
                      + "已分配 \(PriceFormatter.money(portfolio.allocatedCapital, decimals: 0)) · "
                      + "未分配 \(PriceFormatter.money(portfolio.unallocatedCapital, decimals: 0)) \(portfolio.quoteCurrency)")
                     .font(.system(size: 10)).foregroundStyle(.secondary).monospacedDigit()
+                diversificationLine
             }
 
             Spacer()

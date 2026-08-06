@@ -453,3 +453,31 @@ public struct KernelSweepOutcome: Decodable, Sendable {
     public let deflated: KernelDeflatedSharpe?
     public let overfit: KernelOverfitProbability?
 }
+
+// MARK: - Diversification
+
+public struct KernelCorrelationPair: Decodable, Sendable, Equatable, Identifiable {
+    public let a: String
+    public let b: String
+    public let correlation: Double
+    public var id: String { a + "|" + b }
+}
+
+/// How much diversification a book of strategies actually has.
+public struct KernelDiversification: Decodable, Sendable, Equatable {
+    public let pairs: [KernelCorrelationPair]
+    /// Effective number of independent bets. Falls towards 1 as the book
+    /// converges on one position at N times the size. Nil when any pair's
+    /// correlation is undefined — treating that as zero would count a flat
+    /// strategy as free diversification.
+    public let effectiveBets: Double?
+    public let highestPair: KernelCorrelationPair?
+
+    /// True when the book is materially less diversified than it looks.
+    public var isConcentrated: Bool {
+        guard let effectiveBets, pairs.count >= 1 else { return false }
+        // Two strategies that behave as fewer than 1.5 independent bets are
+        // one bet wearing two names.
+        return effectiveBets < Double(pairs.count + 1) * 0.6
+    }
+}

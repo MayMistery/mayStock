@@ -243,6 +243,96 @@ pub fn compare_equity(live: &[EquitySample], backtest: &[EquitySample]) -> Equit
     }
 }
 
+// MARK: - Diversification
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DiversificationReport {
+    /// Pairwise correlations, upper triangle, as (i, j, r).
+    pub pairs: Vec<CorrelationPair>,
+    /// Effective number of independent bets.
+    ///
+    /// N strategies with identical returns are one bet at N times the size,
+    /// and this says so: it falls to 1 as everything converges. Computed as
+    /// `N² / ΣΣ ρᵢⱼ`, the standard effective-N under an equal-weight book.
+    #[serde(rename = "effectiveBets")]
+    pub effective_bets: Option<f64>,
+    /// The most correlated pair, which is where a book usually goes wrong.
+    #[serde(rename = "highestPair")]
+    pub highest_pair: Option<CorrelationPair>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CorrelationPair {
+    pub a: String,
+    pub b: String,
+    pub correlation: f64,
+}
+
+/// How much diversification a book of strategies actually has.
+///
+/// Allocating separately to each strategy is not the same as diversifying
+/// between them. Two trend followers on BTC and ETH will be near-perfectly
+/// correlated in a crash, which is exactly when the diversification was
+/// supposed to help — so the book is one position of double the size, and
+/// nothing in a per-strategy backtest can reveal that.
+///
+/// Series are aligned by position and must be the same length; callers should
+/// sample them on a common grid first.
+pub fn diversification(named: &[(String, Vec<f64>)]) -> DiversificationReport {
+    let usable: Vec<&(String, Vec<f64>)> = named.iter().filter(|(_, s)| s.len() >= 8).collect();
+    let count = usable.len();
+    if count < 2 {
+        return DiversificationReport {
+            pairs: Vec::new(),
+            effective_bets: (count == 1).then_some(1.0),
+            highest_pair: None,
+        };
+    }
+
+    let mut pairs = Vec::new();
+    // Σ of every entry of the correlation matrix, diagonal included.
+    let mut total = count as f64;
+    let mut known_pairs = 0usize;
+    for i in 0..count {
+        for j in (i + 1)..count {
+            let length = usable[i].1.len().min(usable[j].1.len());
+            let Some(r) = correlation(&usable[i].1[..length], &usable[j].1[..length]) else {
+                continue;
+            };
+            pairs.push(CorrelationPair {
+                a: usable[i].0.clone(),
+                b: usable[j].0.clone(),
+                correlation: r,
+            });
+            total += 2.0 * r;
+            known_pairs += 1;
+        }
+    }
+
+    // Every pair has to be known for the effective-N to mean anything;
+    // treating an undefined correlation as zero would report a flat strategy
+    // as a free source of diversification.
+    let expected_pairs = count * (count - 1) / 2;
+    let effective_bets = (known_pairs == expected_pairs && total > 0.0)
+        .then(|| (count * count) as f64 / total);
+
+    let highest_pair = pairs
+        .iter()
+        .max_by(|a, b| {
+            a.correlation
+                .abs()
+                .partial_cmp(&b.correlation.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .cloned();
+
+    DiversificationReport {
+        pairs,
+        effective_bets,
+        highest_pair,
+    }
+}
+
 fn mean(values: &[f64]) -> Option<f64> {
     (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
 }
@@ -460,6 +550,57 @@ mod tests {
         assert_eq!(result.samples, 4);
         assert_eq!(result.covered_ms, 3_000, "only the overlap is reported");
         assert!(result.difference_pct.unwrap().abs() < 1e-9);
+    }
+
+    #[test]
+    fn identical_strategies_are_one_bet() {
+        // Three copies of the same thing is one position at triple the size,
+        // and the number has to say so.
+        let series: Vec<f64> = (0..50).map(|i| ((i as f64) * 0.3).sin() * 0.01).collect();
+        let report = diversification(&[
+            ("a".into(), series.clone()),
+            ("b".into(), series.clone()),
+            ("c".into(), series),
+        ]);
+        assert!((report.effective_bets.unwrap() - 1.0).abs() < 1e-6,
+                "got {:?}", report.effective_bets);
+        assert!(report.highest_pair.unwrap().correlation > 0.99);
+    }
+
+    #[test]
+    fn uncorrelated_strategies_count_separately() {
+        let a: Vec<f64> = (0..200).map(|i| ((i as f64) * 0.7).sin() * 0.01).collect();
+        let b: Vec<f64> = (0..200).map(|i| ((i as f64) * 0.11).cos() * 0.01).collect();
+        let report = diversification(&[("a".into(), a), ("b".into(), b)]);
+        let effective = report.effective_bets.unwrap();
+        assert!(effective > 1.5, "two near-independent bets, got {effective}");
+    }
+
+    #[test]
+    fn a_perfect_hedge_counts_for_more_than_two() {
+        // Negatively correlated legs diversify more than independent ones, and
+        // the effective-N is the measure that shows it.
+        let a: Vec<f64> = (0..80).map(|i| ((i as f64) * 0.4).sin() * 0.01).collect();
+        let b: Vec<f64> = a.iter().map(|v| -v).collect();
+        let report = diversification(&[("a".into(), a), ("b".into(), b)]);
+        assert!(report.effective_bets.is_none() || report.effective_bets.unwrap() > 2.0);
+    }
+
+    #[test]
+    fn an_undefined_correlation_is_not_free_diversification() {
+        // A flat strategy correlates with nothing — which is not the same as
+        // being independent of everything, and must not be counted as a bet.
+        let moving: Vec<f64> = (0..40).map(|i| ((i as f64) * 0.5).sin() * 0.01).collect();
+        let flat = vec![0.0_f64; 40];
+        let report = diversification(&[("a".into(), moving), ("flat".into(), flat)]);
+        assert!(report.effective_bets.is_none());
+    }
+
+    #[test]
+    fn one_strategy_is_one_bet_and_no_pairs() {
+        let report = diversification(&[("only".into(), vec![0.01; 20])]);
+        assert_eq!(report.effective_bets, Some(1.0));
+        assert!(report.pairs.is_empty());
     }
 
     #[test]

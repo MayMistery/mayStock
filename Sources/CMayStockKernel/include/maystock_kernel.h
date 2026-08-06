@@ -129,6 +129,11 @@ char *ms_assess_overfit(const char *request_json, char **error_out);
  * assumedBps. Caller frees. */
 char *ms_calibrate_slippage(const char *request_json, char **error_out);
 
+/* How much diversification a book of strategies actually has: pairwise
+ * correlations and the effective number of independent bets. Request JSON
+ * carries a series array of {name, returns}. Caller frees. */
+char *ms_diversification(const char *request_json, char **error_out);
+
 /* How far the live equity curve has drifted from the backtest that justified
  * it. Request JSON carries live and backtest sample arrays. Caller frees. */
 char *ms_compare_equity(const char *request_json, char **error_out);

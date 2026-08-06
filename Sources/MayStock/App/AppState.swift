@@ -167,6 +167,36 @@ final class AppState {
         strategyEquityCurves[strategyId]
     }
 
+    /// How many independent bets the allocated book actually holds.
+    ///
+    /// Computed from the live per-strategy equity curves, sampled onto a
+    /// common grid — correlating series of different lengths would compare
+    /// different periods and report whatever the misalignment happened to
+    /// produce. Nil until at least two strategies have enough history.
+    var portfolioDiversification: KernelDiversification? {
+        let curves = store.config.strategy.allocations
+            .compactMap { allocation -> (name: String, points: [AccountEquityPoint])? in
+                guard let curve = strategyEquityCurves[allocation.strategyId],
+                      curve.points.count >= 9 else { return nil }
+                return (allocation.strategyId, curve.points)
+            }
+        guard curves.count >= 2 else { return nil }
+        let length = curves.map(\.points.count).min() ?? 0
+        guard length >= 9 else { return nil }
+
+        let series = curves.map { entry -> (name: String, returns: [Double]) in
+            // The most recent `length` points of each, so every series covers
+            // the same window.
+            let tail = entry.points.suffix(length)
+            let returns = zip(tail, tail.dropFirst()).compactMap { previous, next -> Double? in
+                guard previous.equity > 0 else { return nil }
+                return next.equity / previous.equity - 1
+            }
+            return (entry.name, returns)
+        }
+        return try? TradingKernel.diversification(series)
+    }
+
     /// Live account equity in USDT, sampled by the runner.
     var accountEquity: Double? { runner.accountEquity }
 
