@@ -280,6 +280,8 @@ pub fn run(
         equity_curve,
         liquidations: 0,
         warmup_bars: strategy.warmup_bars,
+        data_quality: crate::quality::inspect(
+            &candles, crate::strategy::bar_seconds(&manifest.market.bar), None),
         funding_unmodelled: manifest.market.inst_type == InstrumentType::Swap
             && config.funding_rates.is_empty(),
         metrics,

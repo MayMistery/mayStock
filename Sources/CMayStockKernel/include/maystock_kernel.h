@@ -104,6 +104,16 @@ char *ms_backtest_run(const MSStrategy *handle,
  * initialCapital, bar and freeParameterCount. Caller frees. */
 char *ms_metrics_compute(const char *request_json, char **error_out);
 
+/* Run a whole parameter sweep inside the kernel: every grid point evaluated in
+ * parallel, only metrics returned, plus the deflated-Sharpe and overfitting
+ * assessment of the winner. Request JSON carries config, grid, threads,
+ * crossValidationSample and blocks. Caller frees. */
+char *ms_optimize(const MSStrategy *handle,
+                  const MSCandle *candles,
+                  size_t candle_count,
+                  const char *request_json,
+                  char **error_out);
+
 /* Sharpe the luckiest of `trials` skill-free strategies would be expected to
  * show over `years` of data — the bar a grid-search winner must clear. */
 double ms_expected_max_sharpe(int64_t trials, double years);

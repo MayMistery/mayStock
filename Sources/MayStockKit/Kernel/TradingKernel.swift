@@ -158,6 +158,29 @@ public final class KernelStrategy: @unchecked Sendable {
         }
     }
 
+    /// Run a whole parameter sweep inside the kernel.
+    ///
+    /// One call instead of one per grid point. The Swift loop it replaces
+    /// re-encoded the manifest and re-parsed every expression for each
+    /// candidate, then decoded a full result — six thousand equity points and
+    /// every trade — to read six numbers off it, serially.
+    public func optimize(
+        candles: [Candle], grid: [[String: Double]],
+        config: KernelBacktestConfig = KernelBacktestConfig(),
+        threads: Int = 0, crossValidationSample: Int = 24, blocks: Int = 8
+    ) throws -> KernelSweepOutcome {
+        let request = SweepRequest(
+            config: config, grid: grid, threads: threads,
+            crossValidationSample: crossValidationSample, blocks: blocks)
+        let requestJSON = try encodeJSON(request)
+        return try withKernelCandles(candles) { buffer, count in
+            let json = try callReturningString { error in
+                ms_optimize(self.handle, buffer, count, requestJSON, error)
+            }
+            return try JSONDecoder().decode(KernelSweepOutcome.self, from: Data(json.utf8))
+        }
+    }
+
     fileprivate static func take(_ error: inout UnsafeMutablePointer<CChar>?) -> String? {
         guard let pointer = error else { return nil }
         defer {
@@ -338,6 +361,15 @@ extension TradingKernel {
         }
         return try JSONDecoder().decode(KernelEquityComparison.self, from: Data(json.utf8))
     }
+}
+
+/// Wire shape for `ms_optimize`.
+private struct SweepRequest: Encodable {
+    let config: KernelBacktestConfig
+    let grid: [[String: Double]]
+    let threads: Int
+    let crossValidationSample: Int
+    let blocks: Int
 }
 
 /// Wire shape for `ms_assess_overfit`.

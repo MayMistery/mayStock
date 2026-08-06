@@ -334,6 +334,9 @@ public struct KernelBacktestResult: Decodable, Sendable {
     /// True when the strategy is a swap but no funding history was supplied —
     /// the result is optimistic by an unknown amount.
     public let fundingUnmodelled: Bool
+    /// What the candle series itself was like. Nil only for a result written
+    /// by a kernel that predates the field.
+    public let dataQuality: KernelDataQuality?
     public let metrics: KernelMetrics
 
     public var startTime: Date { Date(timeIntervalSince1970: Double(start) / 1000) }
@@ -429,4 +432,24 @@ public struct KernelOverfitProbability: Decodable, Sendable, Equatable {
     /// The usual bar. Above this, the *search* is the problem, not the
     /// individual strategy it picked.
     public var isOverfit: Bool { pbo > 0.5 }
+}
+
+// MARK: - Parameter sweep
+
+/// One grid point's result, as the kernel reports it.
+public struct KernelCandidateSummary: Decodable, Sendable {
+    /// Index into the grid as supplied, so the caller can match it back.
+    public let index: Int
+    public let params: [String: Double]
+    public let metrics: KernelMetrics
+}
+
+public struct KernelSweepOutcome: Decodable, Sendable {
+    public let candidates: [KernelCandidateSummary]
+    /// Grid points the kernel refused. Reported rather than silently dropped:
+    /// a sweep that skipped most of its grid found nothing, whatever the
+    /// winner looks like.
+    public let skipped: Int
+    public let deflated: KernelDeflatedSharpe?
+    public let overfit: KernelOverfitProbability?
 }

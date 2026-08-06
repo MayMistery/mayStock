@@ -167,13 +167,21 @@ public struct BacktestResult: Sendable {
     public let warmupBars: Int
     /// True when the strategy is a swap but no funding history was supplied.
     public let fundingUnmodelled: Bool
+    /// Gaps, duplicates and malformed bars in the history this ran over.
+    ///
+    /// A backtest over holed history is not so much wrong as *less than it
+    /// appears*: a 60-bar lookback spanning a gap covers more than 60 bars of
+    /// market. Live refuses such a series outright; a backtest cannot refuse
+    /// retrospectively, so it reports.
+    public let dataQuality: KernelDataQuality?
     public let metrics: BacktestMetrics
 
     public init(
         strategyId: String, instId: String, bar: BarInterval, start: Date, end: Date,
         barCount: Int, initialCapital: Double, finalEquity: Double,
         trades: [BacktestTrade], equityCurve: [EquityPoint], liquidations: Int,
-        warmupBars: Int, fundingUnmodelled: Bool, metrics: BacktestMetrics
+        warmupBars: Int, fundingUnmodelled: Bool,
+        dataQuality: KernelDataQuality? = nil, metrics: BacktestMetrics
     ) {
         self.strategyId = strategyId
         self.instId = instId
@@ -188,6 +196,7 @@ public struct BacktestResult: Sendable {
         self.liquidations = liquidations
         self.warmupBars = warmupBars
         self.fundingUnmodelled = fundingUnmodelled
+        self.dataQuality = dataQuality
         self.metrics = metrics
     }
 }
@@ -265,6 +274,7 @@ extension BacktestResult {
             liquidations: kernel.liquidations,
             warmupBars: kernel.warmupBars,
             fundingUnmodelled: kernel.fundingUnmodelled,
+            dataQuality: kernel.dataQuality,
             metrics: BacktestMetrics(kernel: kernel.metrics))
     }
 }
