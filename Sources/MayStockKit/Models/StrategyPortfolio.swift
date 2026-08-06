@@ -198,6 +198,34 @@ public struct StrategyPortfolioPrefs: Codable, Sendable, Equatable {
         return Swift.max(totalCapital - others, 0)
     }
 
+    /// Budgets that add up to more than the pot.
+    ///
+    /// Not cosmetic: `StrategyRunner.workingCapital` sizes every order against
+    /// the *budget*, never against the account, so four strategies each holding
+    /// a budget of half the account will between them commit twice it.
+    public var isOverAllocated: Bool { allocatedCapital > totalCapital + 1e-6 }
+
+    /// Set the portfolio's capital, bringing the budgets down with it.
+    ///
+    /// `setCapital` refuses to over-allocate on the way in, but nothing used to
+    /// re-check on the way *down*. Lowering the pot left every budget exactly
+    /// where it was, so a book split four ways against a larger account stayed
+    /// split four ways against a smaller one — 已分配 at twice 本金, and a
+    /// 未分配 that had gone negative.
+    ///
+    /// Scaled rather than truncated: how the pot is split between strategies is
+    /// a decision the user made, and halving the pot should halve each share
+    /// rather than starve whichever happens to sort last.
+    public mutating func setTotalCapital(_ amount: Double) {
+        totalCapital = Swift.max(amount, 0)
+        let allocated = allocatedCapital
+        guard allocated > totalCapital, allocated > 0 else { return }
+        let scale = totalCapital / allocated
+        for index in allocations.indices {
+            allocations[index].capital *= scale
+        }
+    }
+
     /// Set a budget, refusing to over-allocate: the value is clamped to what
     /// the portfolio actually has left.
     public mutating func setCapital(_ amount: Double, for strategyId: String) {
