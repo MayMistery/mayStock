@@ -275,10 +275,18 @@ public enum TradeError: Error, CustomStringConvertible, Sendable {
 public struct TradeBridge: Sendable {
     public var explicitCLIPath: String?
     public var profile: String?
+    /// Hard ceiling on one CLI invocation. Settable so a test can exercise the
+    /// watchdog without waiting it out.
+    public var commandTimeout: TimeInterval
 
-    public init(explicitCLIPath: String? = nil, profile: String? = nil) {
+    public init(
+        explicitCLIPath: String? = nil,
+        profile: String? = nil,
+        commandTimeout: TimeInterval = TradeBridge.defaultCommandTimeout
+    ) {
         self.explicitCLIPath = explicitCLIPath
         self.profile = profile
+        self.commandTimeout = commandTimeout
     }
 
     private static let searchPaths = [
@@ -586,119 +594,42 @@ public struct TradeBridge: Sendable {
 
     // MARK: Subprocess plumbing
 
-    /// Hard ceiling on one CLI invocation. The runner ticks every 20s and some
-    /// calls fall back to a second command, so this stays well under that: a
-    /// real invocation takes well under a second.
-    public static let commandTimeout: TimeInterval = 15
+    /// Default ceiling on one CLI invocation. The runner ticks every 20s and
+    /// some calls fall back to a second command, so this stays well under
+    /// that: a real invocation takes well under a second.
+    public static let defaultCommandTimeout: TimeInterval = 15
 
+    /// Run the CLI and hand back its stdout.
+    ///
+    /// The watchdog, the pipe draining and the guarantee that this returns *at
+    /// all* live in `Subprocess`, which exists because getting them subtly
+    /// wrong here once stopped the trading loop dead. See the note on that type.
     private func run(executable: String, arguments: [String]) async throws -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-
         var env = ProcessInfo.processInfo.environment
         let extra = "/opt/homebrew/bin:/usr/local/bin"
         env["PATH"] = extra + ":" + (env["PATH"] ?? "/usr/bin:/bin")
-        process.environment = env
 
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.standardOutput = stdout
-        process.standardError = stderr
-
-        return try await withCheckedThrowingContinuation { continuation in
-            let outcome = SingleResume()
-            do {
-                try process.run()
-            } catch {
-                continuation.resume(throwing: TradeError.cliFailed(
-                    exitCode: -1, stderr: String(describing: error)))
-                return
-            }
-
-            // Drain both pipes **concurrently**. Reading stdout to completion
-            // before touching stderr deadlocks the moment the child fills the
-            // stderr buffer — and the okx CLI writes an update banner there.
-            let collected = PipeBuffers()
-            let group = DispatchGroup()
-            for (pipe, isStdout) in [(stdout, true), (stderr, false)] {
-                group.enter()
-                DispatchQueue.global(qos: .userInitiated).async {
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                    collected.store(data, isStdout: isStdout)
-                    group.leave()
-                }
-            }
-
-            // Watchdog: a wedged CLI gets killed rather than hanging the caller
-            // forever. Without this the strategy runner stops silently.
-            let timeout = Self.commandTimeout
-            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
-                guard process.isRunning else { return }
-                process.terminate()
-                DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
-                    if process.isRunning { kill(process.processIdentifier, SIGKILL) }
-                }
-                if outcome.claim() {
-                    continuation.resume(throwing: TradeError.cliFailed(
-                        exitCode: -1,
-                        stderr: "okx CLI 超过 \(Int(timeout)) 秒未返回，已终止："
-                            + ([executable] + arguments).joined(separator: " ")))
-                }
-            }
-
-            DispatchQueue.global(qos: .userInitiated).async {
-                group.wait()
-                process.waitUntilExit()
-                guard outcome.claim() else { return }   // the watchdog got there first
-                let out = collected.stdoutText
-                if process.terminationStatus == 0 {
-                    continuation.resume(returning: out)
-                } else {
-                    let err = collected.stderrText
-                    continuation.resume(throwing: TradeError.cliFailed(
-                        exitCode: process.terminationStatus,
-                        stderr: err.isEmpty ? out : err))
-                }
-            }
-        }
-    }
-
-    /// Guarantees exactly one of {completion, watchdog} resumes the continuation.
-    private final class SingleResume: @unchecked Sendable {
-        private let lock = NSLock()
-        private var used = false
-
-        func claim() -> Bool {
-            lock.lock()
-            defer { lock.unlock() }
-            if used { return false }
-            used = true
-            return true
-        }
-    }
-
-    /// Thread-safe collection point for the two pipe readers.
-    private final class PipeBuffers: @unchecked Sendable {
-        private let lock = NSLock()
-        private var out = Data()
-        private var err = Data()
-
-        func store(_ data: Data, isStdout: Bool) {
-            lock.lock()
-            defer { lock.unlock() }
-            if isStdout { out = data } else { err = data }
+        let outcome: Subprocess.Outcome
+        do {
+            outcome = try await Subprocess.run(
+                executable: executable, arguments: arguments,
+                environment: env, timeout: commandTimeout)
+        } catch Subprocess.Failure.timedOut(let seconds) {
+            throw TradeError.cliFailed(
+                exitCode: -1,
+                stderr: "okx CLI 超过 \(Int(seconds)) 秒未返回，已终止："
+                    + ([executable] + arguments).joined(separator: " "))
+        } catch Subprocess.Failure.couldNotLaunch(let detail) {
+            throw TradeError.cliFailed(exitCode: -1, stderr: detail)
         }
 
-        var stdoutText: String {
-            lock.lock(); defer { lock.unlock() }
-            return String(data: out, encoding: .utf8) ?? ""
+        let out = outcome.stdoutText
+        guard outcome.exitCode == 0 else {
+            let err = outcome.stderrText
+            throw TradeError.cliFailed(
+                exitCode: outcome.exitCode, stderr: err.isEmpty ? out : err)
         }
-
-        var stderrText: String {
-            lock.lock(); defer { lock.unlock() }
-            return String(data: err, encoding: .utf8) ?? ""
-        }
+        return out
     }
 
     // MARK: Output parsing

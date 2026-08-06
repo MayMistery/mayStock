@@ -217,71 +217,32 @@ public struct ScriptStrategyEngine: Sendable {
 
     // MARK: Subprocess
 
+    /// Feed the script its input and collect its answer.
+    ///
+    /// The deadline, the pipe draining and the guarantee that this returns *at
+    /// all* live in `Subprocess`; this used to carry its own copy, including
+    /// the flaw that let a script which exits while a spawned child keeps
+    /// stdout open suspend the caller for good. See the note on that type.
     private func run(executable: String, input: Data) async throws -> Data {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = spec.args
-        if let workingDirectory { process.currentDirectoryURL = workingDirectory }
-
-        let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
-        process.standardInput = stdin
-        process.standardOutput = stdout
-        process.standardError = stderr
-
-        let timeout = spec.timeoutSeconds
-        return try await withCheckedThrowingContinuation { continuation in
-            let finished = ResultBox()
-            do {
-                try process.run()
-            } catch {
-                continuation.resume(throwing: ScriptEngineError.failed(
-                    exitCode: -1, stderr: String(describing: error)))
-                return
-            }
-
-            // Kill a script that never returns rather than blocking the caller.
-            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
-                guard process.isRunning else { return }
-                process.terminate()
-                if finished.claim() {
-                    continuation.resume(throwing: ScriptEngineError.timedOut(timeout))
-                }
-            }
-
-            DispatchQueue.global(qos: .userInitiated).async {
-                stdin.fileHandleForWriting.write(input)
-                try? stdin.fileHandleForWriting.close()
-
-                let out = stdout.fileHandleForReading.readDataToEndOfFile()
-                let err = stderr.fileHandleForReading.readDataToEndOfFile()
-                process.waitUntilExit()
-                guard finished.claim() else { return }   // already timed out
-
-                if out.count > Self.maxOutputBytes {
-                    continuation.resume(throwing: ScriptEngineError.badOutput(
-                        "输出超过 \(Self.maxOutputBytes / 1_048_576) MB 上限"))
-                } else if process.terminationStatus == 0 {
-                    continuation.resume(returning: out)
-                } else {
-                    continuation.resume(throwing: ScriptEngineError.failed(
-                        exitCode: process.terminationStatus,
-                        stderr: String(data: err, encoding: .utf8) ?? ""))
-                }
-            }
+        let outcome: Subprocess.Outcome
+        do {
+            outcome = try await Subprocess.run(
+                executable: executable, arguments: spec.args,
+                workingDirectory: workingDirectory, stdin: input,
+                timeout: spec.timeoutSeconds,
+                maxOutputBytes: Self.maxOutputBytes)
+        } catch Subprocess.Failure.timedOut(let seconds) {
+            throw ScriptEngineError.timedOut(seconds)
+        } catch Subprocess.Failure.outputTooLarge(let limit) {
+            throw ScriptEngineError.badOutput("输出超过 \(limit / 1_048_576) MB 上限")
+        } catch Subprocess.Failure.couldNotLaunch(let detail) {
+            throw ScriptEngineError.failed(exitCode: -1, stderr: detail)
         }
-    }
 
-    /// Ensures exactly one of {timeout, completion} resumes the continuation.
-    private final class ResultBox: @unchecked Sendable {
-        private let lock = NSLock()
-        private var used = false
-
-        func claim() -> Bool {
-            lock.lock()
-            defer { lock.unlock() }
-            if used { return false }
-            used = true
-            return true
+        guard outcome.exitCode == 0 else {
+            throw ScriptEngineError.failed(
+                exitCode: outcome.exitCode, stderr: outcome.stderrText)
         }
+        return outcome.stdout
     }
 }
