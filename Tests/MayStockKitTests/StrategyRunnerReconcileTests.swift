@@ -1369,3 +1369,64 @@ struct ValidationHonestyTests {
         #expect(assessment.notes.contains { $0.contains("这不是通过") })
     }
 }
+
+// MARK: - The walk-forward must cover the end of the data
+
+struct WalkForwardCoverageTests {
+    private func strategy() throws -> CompiledStrategy {
+        let json = """
+        {"schema":1,"id":"cov","name":"Cov",
+         "market":{"instId":"BTC-USDT","instType":"SPOT","bar":"1D"},
+         "params":[{"name":"L","default":20,"min":10,"max":40}],
+         "signals":{"longEntry":"close > sma(close, L)",
+                    "longExit":"close < sma(close, L)"},
+         "sizing":{"mode":"equityPct","value":100}}
+        """
+        return try JSONDecoder().decode(
+            StrategyManifest.self, from: Data(json.utf8)).compile()
+    }
+
+    private func candles(_ count: Int) -> [Candle] {
+        (0..<count).map { i in
+            let base = 100 + sin(Double(i) * 0.07) * 18 + Double(i) * 0.03
+            return Candle(ts: Date(timeIntervalSince1970: Double(i) * 86_400),
+                          open: base, high: base + 1, low: base - 1, close: base + 0.2,
+                          volume: 10, confirmed: true)
+        }
+    }
+
+    @Test("最后一折跑到数据末尾，不把最近的行情漏掉")
+    func theLastFoldReachesTheEndOfTheData() throws {
+        // Integer division leaves `usable % folds` bars over and the warm-up
+        // prefix belongs to no fold, so the tail was silently excluded. On
+        // daily data with a long lookback that was the most recent twelve
+        // months — a validation that skips the latest year is testing a market
+        // that no longer exists.
+        let bars = candles(1_500)
+        let result = WalkForwardAnalysis(
+            strategy: try strategy(),
+            config: BacktestConfig(initialCapital: 10_000), folds: 4
+        ).run(candles: bars)
+
+        let lastTested = try #require(result.folds.last?.outOfSampleEnd)
+        let lastAvailable = try #require(bars.last?.ts)
+        let uncoveredDays = lastAvailable.timeIntervalSince(lastTested) / 86_400
+        #expect(uncoveredDays < 5, "left \(uncoveredDays) days of the newest data untested")
+    }
+
+    @Test("各折首尾相接，不重叠也不留缝")
+    func foldsAreContiguous() throws {
+        let result = WalkForwardAnalysis(
+            strategy: try strategy(),
+            config: BacktestConfig(initialCapital: 10_000), folds: 4
+        ).run(candles: candles(1_500))
+
+        for (previous, next) in zip(result.folds, result.folds.dropFirst()) {
+            // The next fold's fitting window starts where the last one's blind
+            // stretch ended; a gap would be history nobody looked at.
+            #expect(next.inSampleStart >= previous.outOfSampleStart,
+                    "folds must move forward in time")
+        }
+        #expect(result.folds.count >= 3)
+    }
+}

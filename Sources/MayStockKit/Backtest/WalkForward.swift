@@ -231,7 +231,15 @@ public struct WalkForwardAnalysis: Sendable {
         for index in 0..<folds {
             onProgress?(index + 1, folds)
             let foldStart = index * perFold
-            let foldEnd = Swift.min(foldStart + perFold, candles.count)
+            // The final fold runs to the end of the data. Integer division
+            // leaves `usable % folds` bars over, and the warm-up prefix is
+            // never assigned to any fold either — together that silently
+            // excluded the most recent ~370 daily bars, which is to say the
+            // last twelve months. A validation that skips the most recent year
+            // is testing the market that no longer exists.
+            let foldEnd = index == folds - 1
+                ? candles.count
+                : Swift.min(foldStart + perFold, candles.count)
             let split = foldStart + Int(Double(foldEnd - foldStart) * inSampleFraction)
             guard split - foldStart > warmup + 10, foldEnd - split > warmup + 10 else {
                 skippedForWarmup += 1

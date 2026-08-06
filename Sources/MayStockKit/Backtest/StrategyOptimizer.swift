@@ -326,11 +326,23 @@ public struct StrategyOptimizer: Sendable {
                     "每个自由参数仅 \(PriceFormatter.decimals(perParameter, 1)) 笔交易，"
                     + "低于 30 笔的统计下限")
             }
-            if let deflated, !deflated.significant {
+            // Printed whether it passes or fails. Reporting only failures is
+            // the same silence-reads-as-approval trap fixed elsewhere: a reader
+            // who sees no line cannot tell "significant" from "never computed",
+            // and the second is far more common than the first.
+            if let deflated {
                 warnings.append(
-                    "去膨胀夏普显著性仅 \(PriceFormatter.percent(deflated.probability * 100, decimals: 0))"
-                    + "，低于 95% —— 考虑到试过 \(candidates.count) 组参数，"
-                    + "这个结果无法与运气区分")
+                    deflated.significant
+                        ? "去膨胀夏普显著性 "
+                            + "\(PriceFormatter.percent(deflated.probability * 100, decimals: 0))"
+                            + "（≥ 95%）—— 试过 \(candidates.count) 组参数后仍可与运气区分"
+                        : "去膨胀夏普显著性仅 "
+                            + "\(PriceFormatter.percent(deflated.probability * 100, decimals: 0))"
+                            + "，低于 95% —— 考虑到试过 \(candidates.count) 组参数，"
+                            + "这个结果无法与运气区分")
+            } else {
+                warnings.append(
+                    "去膨胀夏普无法计算（样本或收益序列不足）—— 这不是通过，是没测出来")
             }
         } else {
             warnings.append("没有任何参数组同时满足全部约束")
