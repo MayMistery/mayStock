@@ -78,6 +78,7 @@ struct PositionStripView: View {
                 placeholder: appState.accountError ?? "读取账户余额…",
                 change: { appState.equityChange($0) },
                 protection: appState.runner.protectionTripped,
+                heartbeat: appState.heartbeatWarning,
                 onOpenStudio: {
                     appState.openStrategyStudio(selecting: holdings.first?.state.strategyId)
                 })

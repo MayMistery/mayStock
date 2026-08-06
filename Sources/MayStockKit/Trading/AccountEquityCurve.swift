@@ -306,3 +306,52 @@ public struct AccountEquityStore: Sendable {
         try data.write(to: fileURL, options: .atomic)
     }
 }
+
+// MARK: - Heartbeat
+
+/// When the trading loop last completed a pass.
+///
+/// A dead man's switch rather than a health check: the engine says "I am still
+/// doing useful work", and the *absence* of that signal is what raises the
+/// alarm. An external probe asking "is the process up?" cannot distinguish a
+/// running app from a running app whose loop has stopped — which is precisely
+/// the failure that goes unnoticed, because nothing errors and the panel keeps
+/// showing the last numbers it had.
+///
+/// On disk because the question is "was this trading while I was not
+/// watching", and an in-memory value cannot answer that after a restart.
+public struct HeartbeatStore: Sendable {
+    public let fileURL: URL
+    /// Writes closer together than this are skipped; the tick is far more
+    /// frequent than the resolution this needs, and every write is disk I/O in
+    /// the trading loop.
+    public static let minimumInterval: TimeInterval = 30
+
+    private final class Gate: @unchecked Sendable {
+        var lastWrite: Date?
+    }
+    private let gate = Gate()
+
+    public init(directory: URL) {
+        self.fileURL = directory.appendingPathComponent("heartbeat.json")
+    }
+
+    private struct Payload: Codable { var lastTickAt: Date }
+
+    public func record(_ ts: Date) {
+        if let last = gate.lastWrite, ts.timeIntervalSince(last) < Self.minimumInterval { return }
+        gate.lastWrite = ts
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try? FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? encoder.encode(Payload(lastTickAt: ts)).write(to: fileURL, options: .atomic)
+    }
+
+    public func load() -> Date? {
+        guard let data = try? Data(contentsOf: fileURL) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return (try? decoder.decode(Payload.self, from: data))?.lastTickAt
+    }
+}

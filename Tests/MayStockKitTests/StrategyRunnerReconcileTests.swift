@@ -91,6 +91,8 @@ final class FakeHost: StrategyRunnerHost {
     var halts: [(strategyId: String, reason: String)] = []
 
     func runnerDidChange() {}
+    var completedTicks: [Date] = []
+    func runnerDidCompleteTick(at ts: Date) { completedTicks.append(ts) }
     func runnerDidHalt(strategyId: String, reason: String) {
         halts.append((strategyId, reason))
     }
@@ -981,5 +983,53 @@ struct ResampleBridgeTests {
         let report = try #require(try TradingKernel.resampleTrades(
             returns: alternating, iterations: 300, method: .shuffle, blockSize: 1))
         #expect(abs(report.returnP5Pct - report.returnP95Pct) < 1e-6)
+    }
+}
+
+// MARK: - Heartbeat
+
+@MainActor
+struct HeartbeatTests {
+    private func store() -> HeartbeatStore {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        return HeartbeatStore(directory: directory)
+    }
+
+    @Test("每次 tick 结束都上报心跳")
+    func everyTickReportsAHeartbeat() async {
+        let host = FakeHost()
+        let runner = StrategyRunner(host: host)
+        await runner.tick()
+        await runner.tick()
+        #expect(host.completedTicks.count == 2)
+    }
+
+    @Test("心跳落盘，重启后仍能回答「我没看着的时候它在跑吗」")
+    func theHeartbeatSurvivesARestart() {
+        let store = store()
+        let when = Date(timeIntervalSince1970: 1_700_000_000)
+        store.record(when)
+        // A fresh instance reading the same directory — the restart case.
+        #expect(HeartbeatStore(directory: store.fileURL.deletingLastPathComponent())
+            .load() == when)
+    }
+
+    @Test("写得太密的心跳会被跳过")
+    func writesAreThrottled() {
+        // The tick is far more frequent than this needs, and every write is
+        // disk I/O inside the trading loop.
+        let store = store()
+        let first = Date(timeIntervalSince1970: 1_700_000_000)
+        store.record(first)
+        store.record(first.addingTimeInterval(5))
+        #expect(store.load() == first)
+        store.record(first.addingTimeInterval(HeartbeatStore.minimumInterval + 1))
+        #expect(store.load() != first)
+    }
+
+    @Test("没有心跳文件时不谎报正常")
+    func noHeartbeatIsNotAHealthyOne() {
+        #expect(store().load() == nil)
     }
 }

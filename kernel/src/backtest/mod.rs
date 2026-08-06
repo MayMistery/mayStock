@@ -202,7 +202,15 @@ struct PendingExit {
     reason: ExitReason,
 }
 
-fn utc_day(ts_ms: i64) -> i64 {
+/// Fractional adverse move that wipes the margin backing a position.
+///
+/// Shared with the continuous engine so "when does this get liquidated" has
+/// one definition rather than two that must be kept in step.
+pub(crate) fn liquidation_buffer(maintenance_margin_rate: f64, leverage: f64) -> f64 {
+    (1.0 - maintenance_margin_rate) / leverage
+}
+
+pub(crate) fn utc_day(ts_ms: i64) -> i64 {
     (ts_ms as f64 / 86_400_000.0).floor() as i64
 }
 
@@ -599,7 +607,7 @@ fn open_position(
         });
     }
     if leverage > 1.0 {
-        let buffer = (1.0 - config.maintenance_margin_rate) / leverage;
+        let buffer = liquidation_buffer(config.maintenance_margin_rate, leverage);
         new.liquidation_price = Some(if direction == Direction::Long {
             price * (1.0 - buffer)
         } else {
