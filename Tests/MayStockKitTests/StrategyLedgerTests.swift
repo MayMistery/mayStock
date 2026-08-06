@@ -288,3 +288,92 @@ struct InstrumentUnderlyingTests {
         #expect(StrategyLedger.currencies(of: "").base == "")
     }
 }
+
+@Suite("Perpetual contract sizing")
+@MainActor
+struct PerpetualContractSizingTests {
+    private func shortPosition(instId: String, contracts: Double, at price: Double,
+                               contractSize: Double) -> StrategyPositionState {
+        var state = StrategyPositionState(strategyId: "s", instId: instId)
+        state.contractSize = contractSize
+        state.apply(StrategyFill(
+            id: "1", strategyId: "s", instId: instId, side: .sell,
+            price: price, quantity: contracts, feeQuote: 0,
+            ts: Date(), clOrdId: nil, mode: .demo))
+        return state
+    }
+
+    /// One BTC-USDT-SWAP contract is 0.01 BTC. A 100 USDT adverse move on a
+    /// single contract is a 1 USDT loss, not 100.
+    ///
+    /// This was a live defect: the book held 11.65 BTC contracts and would have
+    /// reported P&L 100× too large, while the exchange showed +27 USDT.
+    @Test func oneBtcContractIsAHundredthOfACoin() {
+        let state = shortPosition(instId: "BTC-USDT-SWAP", contracts: 1,
+                                  at: 64_000, contractSize: 0.01)
+        // Short: price falling 100 is a gain of 100 × 1 × 0.01 = 1.
+        #expect(abs(state.unrealisedPnL(mark: 63_900) - 1) < 1e-9)
+        #expect(abs(state.unrealisedPnL(mark: 64_100) + 1) < 1e-9)
+        #expect(abs(state.baseQuantity + 0.01) < 1e-12)
+    }
+
+    @Test func ethContractsScaleByATenth() {
+        let state = shortPosition(instId: "ETH-USDT-SWAP", contracts: 40.04,
+                                  at: 1_919.58, contractSize: 0.1)
+        // 4.004 ETH short; a 10 USDT drop is a 40.04 USDT gain.
+        #expect(abs(state.baseQuantity + 4.004) < 1e-9)
+        #expect(abs(state.unrealisedPnL(mark: 1_909.58) - 40.04) < 1e-6)
+    }
+
+    @Test func spotIsUnscaled() {
+        var state = StrategyPositionState(strategyId: "s", instId: "BTC-USDT")
+        state.apply(StrategyFill(
+            id: "1", strategyId: "s", instId: "BTC-USDT", side: .buy,
+            price: 64_000, quantity: 0.5, feeQuote: 0,
+            ts: Date(), clOrdId: nil, mode: .demo))
+        #expect(state.multiplier == 1)
+        #expect(abs(state.baseQuantity - 0.5) < 1e-12)
+        #expect(abs(state.unrealisedPnL(mark: 64_100) - 50) < 1e-9)
+    }
+
+    /// Ledgers written before `contractSize` existed decode with it absent.
+    /// They must behave as spot (multiplier 1) rather than crashing or
+    /// silently zeroing the position.
+    @Test func anOlderLedgerDecodesAsUnscaled() throws {
+        let json = """
+        {"strategyId":"s","instId":"BTC-USDT-SWAP","quantity":-11.65,
+         "averagePrice":64769.39,"realisedPnL":0,"feesPaid":3.77,"fillCount":5}
+        """
+        let state = try JSONDecoder().decode(
+            StrategyPositionState.self, from: Data(json.utf8))
+        #expect(state.multiplier == 1)
+        #expect(state.contractSize == nil)
+    }
+
+    /// Teaching the ledger a contract size must fix positions already on the
+    /// book — a restart loads a ledger that predates the knowledge.
+    @Test func learningTheContractSizeCorrectsExistingPositions() {
+        let ledger = StrategyLedger(mode: .demo)
+        ledger.record(StrategyFill(
+            id: "1", strategyId: "s", instId: "BTC-USDT-SWAP", side: .sell,
+            price: 64_000, quantity: 1, feeQuote: 0,
+            ts: Date(), clOrdId: nil, mode: .demo))
+        #expect(ledger.position(for: "s")?.multiplier == 1)
+
+        ledger.setContractSize(0.01, forInstId: "BTC-USDT-SWAP")
+        let corrected = ledger.position(for: "s")
+        #expect(corrected?.multiplier == 0.01)
+        #expect(abs((corrected?.unrealisedPnL(mark: 63_900) ?? 0) - 1) < 1e-9)
+    }
+
+    @Test func aNonsenseContractSizeIsIgnored() {
+        let ledger = StrategyLedger(mode: .demo)
+        ledger.record(StrategyFill(
+            id: "1", strategyId: "s", instId: "BTC-USDT-SWAP", side: .sell,
+            price: 64_000, quantity: 1, feeQuote: 0,
+            ts: Date(), clOrdId: nil, mode: .demo))
+        ledger.setContractSize(0, forInstId: "BTC-USDT-SWAP")
+        ledger.setContractSize(-5, forInstId: "BTC-USDT-SWAP")
+        #expect(ledger.position(for: "s")?.multiplier == 1, "never scale by zero")
+    }
+}

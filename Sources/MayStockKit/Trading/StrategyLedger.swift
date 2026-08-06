@@ -63,6 +63,21 @@ public struct StrategyPositionState: Codable, Sendable, Equatable, Identifiable 
     public var fillCount: Int
     public var firstFillAt: Date?
     public var lastFillAt: Date?
+    /// Base units per contract (`ctVal`). Swap sizes are counted in contracts,
+    /// not coins — one BTC-USDT-SWAP contract is 0.01 BTC — so every P&L and
+    /// exposure figure has to scale by it. Optional so ledgers written before
+    /// this existed still decode; nil means "spot, one-for-one".
+    public var contractSize: Double?
+
+    /// Contracts → coins. 1 for spot and for any position whose size the
+    /// exchange already reports in base units.
+    public var multiplier: Double {
+        guard let contractSize, contractSize > 0 else { return 1 }
+        return contractSize
+    }
+
+    /// Position size in coins rather than contracts, for display.
+    public var baseQuantity: Double { quantity * multiplier }
 
     public var id: String { strategyId + "@" + instId }
     public var isFlat: Bool { abs(quantity) < 1e-12 }
@@ -82,13 +97,13 @@ public struct StrategyPositionState: Codable, Sendable, Equatable, Identifiable 
 
     public func unrealisedPnL(mark: Double?) -> Double {
         guard let mark, !isFlat else { return 0 }
-        return (mark - averagePrice) * quantity
+        return (mark - averagePrice) * quantity * multiplier
     }
 
     /// Absolute exposure in quote currency at the given mark.
     public func exposure(mark: Double?) -> Double {
-        guard let mark else { return abs(quantity) * averagePrice }
-        return abs(quantity) * mark
+        let price = mark ?? averagePrice
+        return abs(quantity) * price * multiplier
     }
 
     /// Realised plus unrealised, net of fees already paid.
@@ -127,7 +142,7 @@ public struct StrategyPositionState: Codable, Sendable, Equatable, Identifiable 
         }
         // Opposing fill: realise on the overlap, then flip if it overshoots.
         let closing = Swift.min(abs(quantity), abs(delta))
-        realisedPnL += (fill.price - averagePrice) * closing * (quantity > 0 ? 1 : -1)
+        realisedPnL += (fill.price - averagePrice) * closing * multiplier * (quantity > 0 ? 1 : -1)
         let remainder = abs(delta) - closing
         quantity += delta
         if remainder > 1e-12 {
@@ -173,6 +188,8 @@ public struct LedgerReconciliation: Sendable, Equatable, Identifiable {
 public final class StrategyLedger {
     public private(set) var fills: [StrategyFill] = []
     public private(set) var positions: [String: StrategyPositionState] = [:]
+    /// Base units per contract, per instrument, learned from exchange metadata.
+    private var contractSizes: [String: Double] = [:]
     public let mode: TradingMode
 
     /// Called whenever the book changes, so the app can persist it.
@@ -207,12 +224,33 @@ public final class StrategyLedger {
 
     // MARK: Mutation
 
+    /// Teach the ledger what one contract of `instId` is worth in coins.
+    ///
+    /// Called from the runner once instrument metadata is known. It updates
+    /// positions already on the book, so a ledger loaded from disk before this
+    /// field existed starts reporting correct P&L on the next tick rather than
+    /// needing to be rebuilt.
+    public func setContractSize(_ size: Double, forInstId instId: String) {
+        guard size > 0 else { return }
+        contractSizes[instId] = size
+        var changed = false
+        for (key, var state) in positions where state.instId == instId {
+            if state.contractSize != size {
+                state.contractSize = size
+                positions[key] = state
+                changed = true
+            }
+        }
+        if changed { onChanged?() }
+    }
+
     public func record(_ fill: StrategyFill) {
         guard !fills.contains(where: { $0.id == fill.id }) else { return }
         fills.append(fill)
         if fills.count > Self.maxFills { fills.removeFirst(fills.count - Self.maxFills) }
         var state = positions[fill.strategyId] ?? StrategyPositionState(
             strategyId: fill.strategyId, instId: fill.instId)
+        state.contractSize = contractSizes[fill.instId] ?? state.contractSize
         state.apply(fill)
         positions[fill.strategyId] = state
         onChanged?()
@@ -254,6 +292,7 @@ public final class StrategyLedger {
         for fill in fills.sorted(by: { $0.ts < $1.ts }) {
             var state = rebuilt[fill.strategyId] ?? StrategyPositionState(
                 strategyId: fill.strategyId, instId: fill.instId)
+            state.contractSize = contractSizes[fill.instId] ?? state.contractSize
             state.apply(fill)
             rebuilt[fill.strategyId] = state
         }

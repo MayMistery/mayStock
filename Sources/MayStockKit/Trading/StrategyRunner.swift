@@ -227,22 +227,42 @@ public final class StrategyRunner {
         host.runnerDidChange()
     }
 
-    /// Refresh the mark price of every instrument the ledger has exposure to.
+    /// Refresh the mark price of every instrument the ledger has exposure to,
+    /// and make sure the ledger knows each one's contract size.
+    ///
+    /// The contract size matters as much as the price: a swap position is
+    /// counted in contracts, so without it every P&L figure is out by the
+    /// multiplier (100× on BTC, 10× on ETH).
     private func refreshMarks(for host: StrategyRunnerHost) async {
         let instruments = Set(host.ledger.positions.values.filter { !$0.isFlat }.map(\.instId))
         for instId in instruments {
-            guard let ticker = try? await rest.ticker(instId: instId) else { continue }
-            marks[instId] = ticker.last
+            if let ticker = try? await rest.ticker(instId: instId) {
+                marks[instId] = ticker.last
+            }
+            host.ledger.setContractSize(await contractSize(for: instId), forInstId: instId)
         }
+    }
+
+    /// Base units per contract, cached. Spot is one-for-one.
+    private func contractSize(for instId: String) async -> Double {
+        if let cached = metaCache[instId] { return cached.contractValue ?? 1 }
+        guard let meta = try? await rest.instrumentMeta(instId: instId) else { return 1 }
+        metaCache[instId] = meta
+        return meta.contractValue ?? 1
     }
 
     /// Read total account equity and hand it to the host for the curve.
     ///
-    /// Equity is computed in the quote currency rather than taken from the
-    /// exchange's USD valuation, because every other number in the workbench —
-    /// budgets, per-strategy P&L, sizing — is denominated that way, and a panel
-    /// that mixes the two would show a "loss" every time USDT drifts off peg.
-    /// The exchange figure is the fallback for when a holding cannot be priced.
+    /// **The exchange's own figure wins.** An earlier version summed the spot
+    /// balances itself, reasoning that every other number here is denominated
+    /// in the quote currency and mixing in a USD valuation would show a "loss"
+    /// whenever USDT drifted off peg. That reasoning only held while the book
+    /// was spot-only: a balance sum cannot see a derivative position's
+    /// unrealised P&L at all, so once perpetual legs opened, equity stopped
+    /// moving and the panel reported no return on a profitable account.
+    ///
+    /// Summing balances ourselves is now only the fallback for a CLI that
+    /// reports no total.
     private func sampleEquity(for host: StrategyRunnerHost) async {
         let now = Date()
         if let last = lastEquitySampleAt,
@@ -275,7 +295,8 @@ public final class StrategyRunner {
             }
         }
 
-        guard let equity = pricedEverything ? total : snapshot.totalEquity, equity > 0 else { return }
+        guard let equity = snapshot.totalEquity ?? (pricedEverything ? total : nil),
+              equity > 0 else { return }
         accountEquity = equity
         host.runnerDidSampleEquity(equity, at: now)
     }

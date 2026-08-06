@@ -52,7 +52,9 @@ struct PositionStripView: View {
     }
     private var mark: Double? { appState.mark(for: instId) }
 
-    private var totalQuantity: Double { holdings.reduce(0) { $0 + $1.state.quantity } }
+    /// Summed in coins, not contracts: one BTC perpetual contract is 0.01 BTC,
+    /// so adding raw sizes across a spot and a swap leg would be nonsense.
+    private var totalQuantity: Double { holdings.reduce(0) { $0 + $1.state.baseQuantity } }
     private var totalNetPnL: Double {
         holdings.reduce(0) { $0 + $1.state.netPnL(mark: mark(for: $1.state)) }
     }
@@ -165,7 +167,7 @@ struct PositionStripView: View {
                 .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 3))
                 .foregroundStyle(.tertiary)
             Spacer(minLength: 2)
-            Text(PriceFormatter.plain(abs(state.quantity)))
+            Text(PriceFormatter.plain(abs(state.baseQuantity)))
                 .font(.system(size: 9)).monospacedDigit().foregroundStyle(.tertiary)
             Text("@ \(PriceFormatter.auto(state.averagePrice))")
                 .font(.system(size: 9)).monospacedDigit().foregroundStyle(.tertiary)
