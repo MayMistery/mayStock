@@ -277,7 +277,7 @@ struct TradeBridgeRobustnessTests {
         // tick never returns, `isTicking` stays true, and trading stops silently.
         let stub = try makeStub("sleep 120")
         defer { try? FileManager.default.removeItem(at: stub.deletingLastPathComponent()) }
-        let bridge = TradeBridge(explicitCLIPath: stub.path)
+        let bridge = TradeBridge(explicitCLIPath: stub.path, commandTimeout: 2)
 
         let started = Date()
         await #expect(throws: TradeError.self) {
@@ -285,8 +285,32 @@ struct TradeBridgeRobustnessTests {
         }
         // `balances` falls back to a second command when the first fails, so
         // the worst case is two timeouts — still far short of the child's 120s.
-        #expect(Date().timeIntervalSince(started) < TradeBridge.commandTimeout * 2 + 10,
+        #expect(Date().timeIntervalSince(started) < bridge.commandTimeout * 2 + 10,
                 "the watchdog must fire well before the child would finish")
+    }
+
+    @Test func aCliThatExitsLeavingAChildOnStdoutStillReturns() async throws {
+        // The one that actually took the engine down. The CLI exits at once,
+        // but a child it spawned inherited stdout and keeps the pipe open, so
+        // nothing ever reaches EOF. The old watchdog asked `process.isRunning`,
+        // saw `false`, concluded there was nothing to kill — and returned
+        // without resuming the caller. The tick never came back, and the panel
+        // went on showing the last numbers it had while nobody managed the
+        // positions. A node CLI's update check does exactly this.
+        let stub = try makeStub("""
+        sleep 120 &
+        echo '{"code":"0","data":[{"details":[{"ccy":"USDT","availBal":"5"}]}]}'
+        exit 0
+        """)
+        defer { try? FileManager.default.removeItem(at: stub.deletingLastPathComponent()) }
+        let bridge = TradeBridge(explicitCLIPath: stub.path, commandTimeout: 2)
+
+        let started = Date()
+        await #expect(throws: TradeError.self) {
+            _ = try await bridge.positions(mode: .demo)
+        }
+        #expect(Date().timeIntervalSince(started) < 20,
+                "the deadline must fire even though the child has already exited")
     }
 
     @Test func heavyStderrDoesNotDeadlockTheReader() async throws {

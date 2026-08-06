@@ -50,8 +50,23 @@ final class FakeVenue: ExchangeVenue, @unchecked Sendable {
         mode: TradingMode, instType: InstrumentType
     ) async throws -> [ExchangePosition] { try positionsResult.get() }
 
+    /// When set, the next `accountSnapshot` never returns — modelling a
+    /// subprocess whose continuation is lost. `releaseWedge()` frees it so the
+    /// test does not leave a task suspended behind it.
+    var wedgeNextAccountSnapshot = false
+    private var wedged: CheckedContinuation<Void, Never>?
+
     func accountSnapshot(mode: TradingMode) async throws -> AccountSnapshot {
-        AccountSnapshot(balances: [], totalEquity: 1_000)
+        if wedgeNextAccountSnapshot {
+            wedgeNextAccountSnapshot = false
+            await withCheckedContinuation { wedged = $0 }
+        }
+        return AccountSnapshot(balances: [], totalEquity: 1_000)
+    }
+
+    func releaseWedge() {
+        wedged?.resume()
+        wedged = nil
     }
 
     // MARK: Protective orders
@@ -1031,5 +1046,52 @@ struct HeartbeatTests {
     @Test("没有心跳文件时不谎报正常")
     func noHeartbeatIsNotAHealthyOne() {
         #expect(store().load() == nil)
+    }
+
+    @Test("单次 tick 永不返回，交易循环仍然继续")
+    func aWedgedTickDoesNotKillTheLoop() async throws {
+        // The failure this whole mechanism exists to catch, reproduced from the
+        // inside. The loop used to `await` each tick, so one call that never
+        // came back ended the engine for good — no error, no exit, just an app
+        // that had stopped managing open positions. The loop now keeps its own
+        // clock and walks away from a tick that overruns.
+        let host = FakeHost()
+        host.fake.wedgeNextAccountSnapshot = true
+
+        let runner = StrategyRunner(host: host)
+        runner.tickInterval = 0.05
+        runner.tickStallTimeout = 0.3
+        runner.start()
+        defer {
+            runner.stop()
+            host.fake.releaseWedge()
+        }
+
+        // Well past the stall deadline: the first tick is still suspended
+        // inside the venue and never will not be.
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+
+        #expect(!host.completedTicks.isEmpty,
+                "a tick that never returns must not stop the loop trading")
+        #expect(runner.isTicking == false,
+                "the replacement tick owns the bookkeeping, and it finished")
+    }
+
+    @Test("被放弃的 tick 不上报心跳")
+    func anAbandonedTickReportsNoHeartbeat() async throws {
+        // Otherwise the dead man's switch reports "still alive" on the strength
+        // of a tick that did no work — papering over the exact failure it is
+        // there to surface.
+        let host = FakeHost()
+        host.fake.wedgeNextAccountSnapshot = true
+        let runner = StrategyRunner(host: host)
+
+        let wedged = Task { await runner.tick() }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        wedged.cancel()
+        host.fake.releaseWedge()
+        await wedged.value
+
+        #expect(host.completedTicks.isEmpty)
     }
 }

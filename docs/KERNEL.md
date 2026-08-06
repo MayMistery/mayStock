@@ -422,6 +422,49 @@ bar *i* 的信号确实握有它，拒绝它等于模拟一个实盘并不存在
 
 心跳告警**盖过**组合保护的横幅：暂停是一个决定，而循环死了是一个没人管的仓位。
 
+## 3.15 心跳报的第一个真警报：子进程把 tick 永久挂住
+
+心跳上线后报出的第一件事不是误报，是真的：**交易循环 143 分钟没有完成一次轮询**。
+根因在 `TradeBridge` 的子进程看门狗里，一行看上去无害的提前返回：
+
+```swift
+DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+    guard process.isRunning else { return }   // ← 没有 resume continuation
+    ...
+}
+```
+
+`okx` CLI 是个 node 程序，它会**留下一个继承了 stdout 的后台子进程**（版本检查之类）。
+于是父进程立刻退出，管道却还开着：`readDataToEndOfFile` 永远读不到 EOF，
+15 秒后看门狗醒来一看 `isRunning == false`，认定「没有要杀的东西」就直接返回了 ——
+**continuation 再也没有人 resume**。调用方就此永久挂起。
+
+在交易循环里，这意味着 tick 再也没有回来。没有报错、没有退出，面板照旧显示它最后
+拿到的数字，只是仓位从此无人管理。这就是 3.14 那个死人开关存在的全部理由，
+而它确实抓住了。
+
+两条修法，都收拢进 `Subprocess`（`okx` 桥和外部脚本引擎此前各写了一份，
+**同一个 bug 也各写了一份**）：
+
+- **超时无条件 resume**。还活着的孩子照杀，已经走掉的照报。进程死没死，
+  跟「调用方该不该被唤醒」本来就是两件事。
+- **改用 readability handler 排空管道，不再阻塞读**。原来每个调用要占住两个线程等
+  EOF；一个反复卡住的 CLI 会把全局队列的线程池耗光，而看门狗自己就排在那个池子上 ——
+  修好第一条也会被第二条重新拖死。
+
+还有一条结构性的：**循环不再 `await` 单次 tick**。
+
+```swift
+runner.beginTick()          // 发射不管落地
+try? await Task.sleep(...)  // 循环自己掐表
+```
+
+原来 `await runner.tick()` 让整个引擎的存活挂在每一次 tick 都必须返回上，
+这个假设一旦破掉就是永久性的。现在超过 `tickStallTimeout` 的 tick 会被
+**取消并替换**：取消而不是遗忘，因为它万一真的返回了，握着的是几分钟前的价格、
+仓位和 K 线 —— `submit` 与逐策略循环都会在下单前先看一眼 `Task.isCancelled`。
+被放弃的 tick 也**不上报心跳**：拿一次没干活的轮询去报平安，正好盖住这套机制要抓的东西。
+
 ## 4.1 迁移已完成，Swift 侧没有第二份实现
 
 已删除：`Indicators.swift`、`StrategyExpression.swift`、`StrategyEvaluator.swift`、

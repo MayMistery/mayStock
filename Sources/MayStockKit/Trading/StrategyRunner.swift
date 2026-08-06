@@ -114,7 +114,11 @@ public final class StrategyRunner {
     /// A tick that has run this long is wedged. Nothing in a low-frequency
     /// engine legitimately takes minutes, and an unattended trading loop that
     /// stops silently is worse than one that errors loudly.
-    public static let tickStallTimeout: TimeInterval = 300
+    ///
+    /// Settable so a test can wedge a tick and watch the loop walk away from
+    /// it without waiting five minutes to see it happen.
+    public var tickStallTimeout: TimeInterval = StrategyRunner.defaultTickStallTimeout
+    public static let defaultTickStallTimeout: TimeInterval = 300
     /// How long an unconfirmed order may stay unresolved before the strategy is
     /// halted for a human to look at. Long enough to ride out an outage, short
     /// enough that nobody discovers it a day later.
@@ -122,6 +126,13 @@ public final class StrategyRunner {
 
     private weak var host: StrategyRunnerHost?
     private var loop: Task<Void, Never>?
+    /// The tick the loop most recently started, so an overrunning one can be
+    /// cancelled instead of silently waited on.
+    private var tickTask: Task<Void, Never>?
+    /// Bumped once per started tick. Only the newest holds the shared
+    /// bookkeeping, so an abandoned tick unwinding late cannot clear the state
+    /// of the one that replaced it.
+    private var tickGeneration = 0
 
     /// Kernel strategies, compiled once and reused across ticks.
     private var kernelCache: [String: KernelStrategy] = [:]
@@ -172,7 +183,9 @@ public final class StrategyRunner {
     public static let externalTolerance = 0.005
 
     /// How often the loop wakes. Bar-close detection does the real pacing.
-    public static let tickInterval: TimeInterval = 20
+    /// Settable for the same reason as `tickStallTimeout`.
+    public var tickInterval: TimeInterval = StrategyRunner.defaultTickInterval
+    public static let defaultTickInterval: TimeInterval = 20
 
     /// Past this without a completed tick, the engine is presumed not to be
     /// trading. Generous against the 20-second interval, because a laptop
@@ -192,15 +205,39 @@ public final class StrategyRunner {
                 // Drop the strong reference before sleeping, so a deallocated
                 // runner ends the loop instead of keeping it alive for a tick.
                 guard let runner = self else { return }
-                await runner.tick()
-                try? await Task.sleep(nanoseconds: UInt64(Self.tickInterval * 1_000_000_000))
+                runner.beginTick()
+                try? await Task.sleep(nanoseconds: UInt64(runner.tickInterval * 1_000_000_000))
             }
         }
+    }
+
+    /// Start a tick, unless one is in flight and still inside its deadline.
+    ///
+    /// Deliberately **not** awaited. The loop's own liveness must not depend on
+    /// any single tick coming back, and it used to: a subprocess whose
+    /// continuation was never resumed took the whole engine down with it — no
+    /// error, no exit, just an app that had quietly stopped managing open
+    /// positions while the panel went on showing the last numbers it had.
+    ///
+    /// So the loop keeps its own clock. A tick that overruns
+    /// `tickStallTimeout` is cancelled and replaced; whether the abandoned one
+    /// ever returns is its own business.
+    private func beginTick() {
+        if let started = tickStartedAt {
+            guard Date().timeIntervalSince(started) > tickStallTimeout else { return }
+            // Cancelled, not merely forgotten: if its await does eventually
+            // return, it must stand down rather than act on a price, a
+            // position and a bar that are all minutes out of date.
+            tickTask?.cancel()
+        }
+        tickTask = Task { [weak self] in await self?.tick() }
     }
 
     public func stop() {
         loop?.cancel()
         loop = nil
+        tickTask?.cancel()
+        tickTask = nil
         for id in states.keys { states[id]?.status = .stopped }
     }
 
@@ -246,22 +283,33 @@ public final class StrategyRunner {
     public func tick() async {
         guard let host else { return }
         if isTicking {
-            // Defence in depth: if a previous tick wedged despite the
-            // per-command timeouts, recover rather than stall forever.
+            // Overlapping ticks would size a second order against a position
+            // the first has not booked yet — so a tick in flight wins, right
+            // up until it has plainly overrun and been abandoned.
             guard let started = tickStartedAt,
-                  Date().timeIntervalSince(started) > Self.tickStallTimeout else { return }
+                  Date().timeIntervalSince(started) > tickStallTimeout else { return }
             Log.warn("strategy runner: tick stalled for "
-                     + "\(Int(Date().timeIntervalSince(started)))s, recovering")
+                     + "\(Int(Date().timeIntervalSince(started)))s, starting a fresh one")
         }
+        tickGeneration += 1
+        let generation = tickGeneration
         isTicking = true
         tickStartedAt = Date()
         fillsThisTick.removeAll()
         defer {
-            isTicking = false
-            tickStartedAt = nil
-            let finished = Date()
-            lastTickAt = finished
-            host.runnerDidCompleteTick(at: finished)
+            if generation == tickGeneration {
+                isTicking = false
+                tickStartedAt = nil
+            }
+            // A cancelled tick did not do the work, and an abandoned one
+            // unwinding minutes later is not evidence that the engine is
+            // alive. Reporting either as a heartbeat would paper over exactly
+            // the failure the heartbeat exists to catch.
+            if !Task.isCancelled {
+                let finished = Date()
+                lastTickAt = finished
+                host.runnerDidCompleteTick(at: finished)
+            }
         }
 
         let portfolio = host.portfolio
@@ -320,6 +368,7 @@ public final class StrategyRunner {
         await ingestFills(for: active.compactMap { byId[$0.strategyId] }, host: host)
 
         for allocation in active {
+            guard !Task.isCancelled else { return }
             guard let strategy = byId[allocation.strategyId] else {
                 update(allocation.strategyId) {
                     $0.status = .failed
@@ -1087,6 +1136,10 @@ public final class StrategyRunner {
         stopPrice: Double? = nil, takeProfitPrice: Double? = nil
     ) async {
         guard abs(baseDelta) > 0 else { return }
+        // An abandoned tick must not place an order when it finally resumes:
+        // by then a fresh tick has already made the call, and this one would
+        // be trading on a decision minutes stale.
+        guard !Task.isCancelled else { return }
         let market = strategy.market
         // A flatten can be requested for a strategy that never ran this
         // session, so there may be no cached mark — fetch one rather than
