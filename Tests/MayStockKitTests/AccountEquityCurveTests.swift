@@ -481,3 +481,64 @@ struct AccountEquityParsingTests {
         #expect(TradeBridge.parseTotalEquity(json: "") == nil)
     }
 }
+
+// MARK: - Capital allocation
+
+/// Budgets are what every order is sized against — `workingCapital` reads the
+/// allocation, never the account — so "已分配 ≤ 本金" is not a display nicety.
+@Suite("Capital allocation")
+struct CapitalAllocationTests {
+    private func portfolio(total: Double, each: Double, count: Int) -> StrategyPortfolioPrefs {
+        var portfolio = StrategyPortfolioPrefs(mode: .demo)
+        portfolio.totalCapital = total
+        portfolio.allocations = (0..<count).map {
+            StrategyAllocation(strategyId: "s\($0)", capital: each)
+        }
+        return portfolio
+    }
+
+    @Test("单个策略分不超本金")
+    func aSingleBudgetCannotOverAllocate() {
+        var book = portfolio(total: 1_000, each: 600, count: 1)
+        book.setCapital(900, for: "s1")          // only 400 left
+        #expect(book.allocation(for: "s1")?.capital == 400)
+        #expect(!book.isOverAllocated)
+    }
+
+    @Test("调低本金时，预算按比例跟着缩")
+    func loweringThePotScalesTheBudgets() {
+        // The shape of the real config: four strategies at half the account
+        // each, then the account is halved. 已分配 used to stay at 159,316
+        // against a 本金 of 79,658 — twice the money that exists.
+        var book = portfolio(total: 159_316, each: 39_829, count: 4)
+        #expect(!book.isOverAllocated)
+
+        book.setTotalCapital(79_658)
+
+        #expect(book.totalCapital == 79_658)
+        #expect(abs(book.allocatedCapital - 79_658) < 1e-6, "budgets must fit the new pot")
+        #expect(!book.isOverAllocated)
+        #expect(book.unallocatedCapital >= 0, "未分配 must never go negative")
+        // Proportional, so the split the user chose survives.
+        for allocation in book.allocations {
+            #expect(abs(allocation.capital - 19_914.5) < 1e-6)
+        }
+    }
+
+    @Test("调高本金不动已有预算")
+    func raisingThePotLeavesBudgetsAlone() {
+        var book = portfolio(total: 1_000, each: 250, count: 2)
+        book.setTotalCapital(5_000)
+        #expect(book.allocatedCapital == 500, "more room is not a reason to spend it")
+        #expect(book.unallocatedCapital == 4_500)
+    }
+
+    @Test("已经超额的旧配置会被认出来")
+    func anAlreadyOverAllocatedConfigIsDetected() {
+        // Loaded from disk, not rewritten behind the user's back — the panel
+        // has to be able to say so.
+        let book = portfolio(total: 79_658, each: 39_829, count: 4)
+        #expect(book.isOverAllocated)
+        #expect(book.unallocatedCapital < 0)
+    }
+}

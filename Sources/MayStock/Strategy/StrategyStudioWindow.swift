@@ -109,6 +109,27 @@ private struct PortfolioHeader: View {
 
     private var portfolio: StrategyPortfolioPrefs { appState.store.config.strategy }
 
+    /// Shown only for a config written before `setTotalCapital` scaled the
+    /// budgets down with the pot.
+    ///
+    /// Left for the user to resolve rather than silently rescaled on load:
+    /// these budgets are what the open positions were sized against, and
+    /// quietly halving them under a live book is not this app's call.
+    @ViewBuilder
+    private var overAllocationWarning: some View {
+        if portfolio.isOverAllocated {
+            let excess = portfolio.allocatedCapital - portfolio.totalCapital
+            let multiple = portfolio.allocatedCapital / max(portfolio.totalCapital, 1)
+            Text("策略预算合计超出本金 \(PriceFormatter.money(excess, decimals: 0))"
+                 + " \(portfolio.quoteCurrency) —— 下单按各自预算定量，不看账户余额，"
+                 + "全部满仓会下到本金的 \(PriceFormatter.decimals(multiple, 1)) 倍。"
+                 + "改一下上方本金即可按比例缩回。")
+                .font(.system(size: 9, weight: .medium))
+                .foregroundStyle(ChartStyle.down)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
     /// How many independent bets this book actually holds.
     ///
     /// Allocating separately to each strategy is not the same as diversifying
@@ -152,7 +173,10 @@ private struct PortfolioHeader: View {
                 Text("运行中 \(portfolio.runningCount)/\(appState.strategies.count) · "
                      + "已分配 \(PriceFormatter.money(portfolio.allocatedCapital, decimals: 0)) · "
                      + "未分配 \(PriceFormatter.money(portfolio.unallocatedCapital, decimals: 0)) \(portfolio.quoteCurrency)")
-                    .font(.system(size: 10)).foregroundStyle(.secondary).monospacedDigit()
+                    .font(.system(size: 10)).monospacedDigit()
+                    .foregroundStyle(portfolio.isOverAllocated
+                                     ? AnyShapeStyle(ChartStyle.down) : AnyShapeStyle(.secondary))
+                overAllocationWarning
                 diversificationLine
             }
 

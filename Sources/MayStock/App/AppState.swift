@@ -350,7 +350,9 @@ final class AppState {
     }
 
     func setTotalCapital(_ amount: Double) {
-        store.update { $0.strategy.totalCapital = max(amount, 0) }
+        // Not a plain assignment: the budgets are sized against this number and
+        // must come down with it. See `StrategyPortfolio.setTotalCapital`.
+        store.update { $0.strategy.setTotalCapital(amount) }
     }
 
     func setMode(_ mode: TradingMode) {
