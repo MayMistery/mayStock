@@ -55,7 +55,12 @@ public protocol StrategyRunnerHost: AnyObject {
     /// P&L. Kept separate from the account total because that is the series a
     /// single-strategy backtest can actually be compared against; the account
     /// curve mixes every strategy together.
-    func runnerDidSampleStrategyEquity(_ strategyId: String, equity: Double, at ts: Date)
+    ///
+    /// `basis` is the budget that equity was measured against, so a later
+    /// re-sizing of the strategy can be told apart from a loss. Without it the
+    /// series has an unmarked cliff at every rebalance.
+    func runnerDidSampleStrategyEquity(
+        _ strategyId: String, equity: Double, basis: Double, at ts: Date)
 }
 
 // MARK: - Runner
@@ -761,7 +766,8 @@ public final class StrategyRunner {
             guard let strategy = byId[allocation.strategyId] else { continue }
             let equity = workingCapital(strategy: strategy, allocation: allocation, host: host)
             guard equity > 0 else { continue }
-            host.runnerDidSampleStrategyEquity(strategy.id, equity: equity, at: now)
+            host.runnerDidSampleStrategyEquity(
+                strategy.id, equity: equity, basis: allocation.capital, at: now)
             sampled = true
         }
         if sampled { lastStrategyEquitySampleAt = now }

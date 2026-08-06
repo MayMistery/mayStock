@@ -338,15 +338,24 @@ public struct StrategyCosts: Codable, Sendable, Equatable {
     /// Taker fee charged on notional, once on entry and once on exit.
     public var feeBps: Double
     /// Adverse price move assumed on every fill.
+    ///
+    /// 1, not the 5 this defaulted to for a long time. The measured top-of-book
+    /// spread on BTC-USDT-SWAP is 0.0155 bps and this account's own impact on
+    /// real fills was 0.06–0.08 bps; see the kernel's `default_slippage` for the
+    /// derivation. Five charged eight basis points of imaginary hurdle on every
+    /// round trip and failed strategies that were fine — a control strategy went
+    /// from -24.30% to -1.75% on nothing but this number.
     public var slippageBps: Double
 
-    public init(feeBps: Double, slippageBps: Double = 5) {
+    public static let defaultSlippageBps: Double = 1
+
+    public init(feeBps: Double, slippageBps: Double = StrategyCosts.defaultSlippageBps) {
         self.feeBps = feeBps
         self.slippageBps = slippageBps
     }
 
     public static func `default`(for instType: InstrumentType) -> StrategyCosts {
-        StrategyCosts(feeBps: instType.defaultFeeBps, slippageBps: 5)
+        StrategyCosts(feeBps: instType.defaultFeeBps)
     }
 }
 
