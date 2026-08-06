@@ -255,6 +255,12 @@ pub struct CompiledStrategy {
     pub exposure: Option<Expr>,
     pub warmup_bars: usize,
     pub free_parameter_count: usize,
+    /// Externally supplied series names this strategy was compiled against.
+    ///
+    /// Retained because `with_params` has to re-validate at the new values, and
+    /// a re-validation that had forgotten the declared series would reject a
+    /// manifest that legitimately reads `funding_rate`.
+    pub known_series: Vec<String>,
 }
 
 impl CompiledStrategy {
@@ -382,6 +388,90 @@ impl CompiledStrategy {
             exposure,
             warmup_bars: warmup,
             free_parameter_count,
+            known_series: known_series.to_vec(),
+        })
+    }
+
+    /// The same strategy with different parameter values.
+    ///
+    /// This is what makes a parameter sweep cheap. A parameter value does not
+    /// change the *parsed* expression — the AST depends only on the source
+    /// text — so a grid point is this struct with a different map, not a fresh
+    /// lex, parse and validate of every rule.
+    ///
+    /// Warm-up *is* recomputed, because indicator periods come from parameters
+    /// and a strategy that needs 200 bars at one setting and 20 at another must
+    /// not be tested as though it always needed 200. That walk is arithmetic
+    /// over an existing tree; the parse it replaces is not.
+    ///
+    /// Returns `None` when the values are outside what the manifest declares,
+    /// or when they produce an expression the evaluator refuses — a period of
+    /// zero, say. A grid point that cannot be evaluated is skipped by the
+    /// caller rather than failing the sweep.
+    pub fn with_params(&self, values: &HashMap<String, f64>) -> Option<Self> {
+        let mut params = self.params.clone();
+        for spec in &self.manifest.params {
+            let Some(raw) = values.get(&spec.name) else { continue };
+            // Clamped to the declared range, exactly as the manifest's own
+            // loader does: a caller cannot widen a parameter's domain by
+            // sending a number from outside it.
+            let clamped = match (spec.min, spec.max) {
+                (Some(lo), Some(hi)) if hi >= lo => raw.clamp(lo, hi),
+                (Some(lo), None) => raw.max(lo),
+                (None, Some(hi)) => raw.min(hi),
+                _ => *raw,
+            };
+            if !clamped.is_finite() {
+                return None;
+            }
+            params.insert(spec.name.clone(), clamped);
+        }
+
+        let known: Vec<&str> = self.known_series.iter().map(|s| s.as_str()).collect();
+        let all: Vec<&Expr> = [
+            self.long_entry.as_ref(),
+            self.long_exit.as_ref(),
+            self.short_entry.as_ref(),
+            self.short_exit.as_ref(),
+            self.exposure.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
+        // The same dry run `compile` does, for the same reason: a period that
+        // becomes illegal at these values must be caught here, not on the bar
+        // where the sweep happens to reach it.
+        let probe = Self::probe_candles();
+        let probe_external: HashMap<String, Vec<f64>> = known
+            .iter()
+            .map(|name| ((*name).to_string(), vec![1.0; probe.len()]))
+            .collect();
+        let mut evaluator = eval::Evaluator::new(&probe, &params, &probe_external);
+        for expr in &all {
+            evaluator.evaluate(expr).ok()?;
+        }
+
+        let mut warmup = all
+            .iter()
+            .map(|e| eval::warmup_bars(e, &params, &known))
+            .max()
+            .unwrap_or(0);
+        if self.manifest.sizing.mode == SizingMode::VolatilityTarget {
+            warmup = warmup.max(self.manifest.risk.vol_lookback_bars + 1);
+        }
+
+        Some(Self {
+            manifest: self.manifest.clone(),
+            params,
+            long_entry: self.long_entry.clone(),
+            long_exit: self.long_exit.clone(),
+            short_entry: self.short_entry.clone(),
+            short_exit: self.short_exit.clone(),
+            exposure: self.exposure.clone(),
+            warmup_bars: warmup,
+            free_parameter_count: self.free_parameter_count,
+            known_series: self.known_series.clone(),
         })
     }
 

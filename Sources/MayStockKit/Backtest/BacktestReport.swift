@@ -163,6 +163,13 @@ public struct RobustnessAssessment: Sendable, Equatable {
         if primary.liquidations > 0 {
             notes.append("回测期内发生 \(primary.liquidations) 次强平 —— 杠杆或止损设置需要复核。")
         }
+        if let quality = primary.dataQuality, !quality.usable {
+            notes.append("行情数据有问题：\(quality.reason)。回看窗口的实际跨度大于它声称的长度，"
+                         + "这份回测的可信度要打折。")
+        } else if let quality = primary.dataQuality, quality.gaps > 0 {
+            notes.append("历史中缺失 \(quality.gaps) 根 K 线（在容忍范围内，但跨越缺口的指标窗口"
+                         + "覆盖的市场时间比标称的长）")
+        }
         if primary.fundingUnmodelled {
             notes.append("未取到资金费率历史，永续的持仓成本被低估。")
         }

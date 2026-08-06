@@ -250,29 +250,58 @@ public struct StrategyOptimizer: Sendable {
         }
 
         let combinations = searchGrid.combinations(limit: limit)
-        var candidates: [OptimizationCandidate] = []
-        candidates.reserveCapacity(combinations.count)
-        // Per-candidate return series, kept for the cross-validation below.
-        // Bounded, because CSCV is combinatorial in the number of blocks and
-        // linear in candidates — a 5 000-point sweep would spend longer being
-        // validated than it did being searched.
-        var returnsById: [Int: [Double]] = [:]
 
-        for (index, parameters) in combinations.enumerated() {
-            onProgress?(index + 1, combinations.count)
-            // A grid point the kernel refuses (a period outside the legal
-            // range, say) is skipped rather than failing the whole sweep.
-            guard let variant = try? strategy.with(parameterValues: parameters) else { continue }
-            guard let result = try? BacktestEngine(strategy: variant, config: config)
-                .run(candles: candles) else { continue }
-            let metrics = result.metrics
-            returnsById[index] = Self.periodReturns(of: result.equityCurve)
-            candidates.append(OptimizationCandidate(
-                id: index,
-                parameters: parameters,
+        // One kernel call for the whole sweep.
+        //
+        // This used to be a Swift loop that, per grid point, re-encoded the
+        // manifest, re-parsed every expression, ran the backtest and decoded a
+        // full result — six thousand equity points and every trade — in order
+        // to read six numbers off it. A parameter value does not change the
+        // parsed expression, so the kernel clones the compiled strategy and
+        // swaps the map instead, evaluates the grid across every core, and
+        // returns metrics only.
+        let costs = strategy.manifest.costs
+            ?? config.feeSchedule.costs(for: strategy.manifest.market.instType)
+        let outcome: KernelSweepOutcome
+        do {
+            outcome = try strategy.kernel.optimize(
+                candles: candles,
+                grid: combinations,
+                config: KernelBacktestConfig(
+                    initialCapital: config.initialCapital,
+                    maintenanceMarginRate: config.maintenanceMarginRate,
+                    fundingRates: config.fundingRates.map {
+                        KernelFundingRate(ts: $0.ts, rate: $0.rate)
+                    },
+                    feeBps: costs.feeBps,
+                    slippageBps: costs.slippageBps,
+                    externalSeries: config.externalSeries,
+                    scriptTargets: nil))
+        } catch {
+            return OptimizationResult(
+                objective: objective, gridSize: searchGrid.size, evaluated: 0,
+                candidates: [], warnings: warnings + ["寻优失败：\(error)"],
+                deflatedSharpe: nil, overfitProbability: nil)
+        }
+        onProgress?(combinations.count, combinations.count)
+        deflated = outcome.deflated
+        overfit = outcome.overfit
+
+        if outcome.skipped > 0 {
+            warnings.append(
+                "\(outcome.skipped) 组参数无法求值已跳过（多半是周期落在合法范围外）")
+        }
+
+        // Scoring and the constraint checks stay here: they are policy over
+        // metrics the kernel already computed, not a second computation.
+        var candidates = outcome.candidates.map { summary -> OptimizationCandidate in
+            let metrics = BacktestMetrics(kernel: summary.metrics)
+            return OptimizationCandidate(
+                id: summary.index,
+                parameters: summary.params,
                 metrics: metrics,
                 score: objective.kind.score(metrics),
-                rejection: objective.rejection(for: metrics)))
+                rejection: objective.rejection(for: metrics))
         }
 
         candidates.sort { lhs, rhs in
@@ -283,7 +312,8 @@ public struct StrategyOptimizer: Sendable {
         // Multiple testing: with enough tries, something always looks good.
         if let best = candidates.first(where: { $0.passes }) {
             let span = Swift.max(best.metrics.spanDays, 1) / 365.25
-            let luck = TradingKernel.expectedMaxSharpeUnderNull(trials: candidates.count, years: span)
+            let luck = TradingKernel.expectedMaxSharpeUnderNull(
+                trials: candidates.count, years: span)
             if best.metrics.sharpe <= luck {
                 warnings.append(
                     "最优夏普 \(PriceFormatter.ratio(best.metrics.sharpe)) 未超过"
@@ -296,44 +326,21 @@ public struct StrategyOptimizer: Sendable {
                     "每个自由参数仅 \(PriceFormatter.decimals(perParameter, 1)) 笔交易，"
                     + "低于 30 笔的统计下限")
             }
-
-            // The Sharpe comparison above is a point estimate against a point
-            // benchmark. The Deflated Sharpe asks the sharper question — how
-            // *likely* is this result under the null — and takes the return
-            // shape into account, which matters because a naive search
-            // gravitates towards small steady gains punctuated by large losses.
-            if let series = returnsById[best.id], series.count >= 8 {
-                deflated = try? TradingKernel.assessOverfit(
-                    returns: series, observedSharpe: best.metrics.sharpe,
-                    trials: candidates.count,
-                    periodsPerYear: Self.periodsPerYear(
-                        observations: series.count, spanDays: best.metrics.spanDays)).deflated
-                if let deflated, !deflated.significant {
-                    warnings.append(
-                        "去膨胀夏普显著性仅 \(PriceFormatter.percent(deflated.probability * 100, decimals: 0))"
-                        + "，低于 95% —— 考虑到试过 \(candidates.count) 组参数，"
-                        + "这个结果无法与运气区分")
-                }
+            if let deflated, !deflated.significant {
+                warnings.append(
+                    "去膨胀夏普显著性仅 \(PriceFormatter.percent(deflated.probability * 100, decimals: 0))"
+                    + "，低于 95% —— 考虑到试过 \(candidates.count) 组参数，"
+                    + "这个结果无法与运气区分")
             }
         } else {
             warnings.append("没有任何参数组同时满足全部约束")
         }
 
-        // And the question neither of those asks: is the *selection procedure*
-        // itself sound? PBO cross-validates the choice rather than the winner,
-        // so it catches a search that would have picked a different winner on
-        // any other slice of the data.
-        let sampled = Self.sampleForCrossValidation(candidates: candidates, returns: returnsById)
-        if sampled.count >= 2 {
-            overfit = try? TradingKernel.assessOverfit(
-                returns: [], observedSharpe: 0, trials: candidates.count,
-                candidates: sampled, blocks: 8).overfit
-            if let overfit, overfit.isOverfit {
-                warnings.append(
-                    "回测过拟合概率 \(PriceFormatter.percent(overfit.pbo * 100, decimals: 0))"
-                    + " —— 样本内最优在样本外多半落到中位数以下，问题出在这次搜索本身，"
-                    + "而不是它挑中的那组参数")
-            }
+        if let overfit, overfit.isOverfit {
+            warnings.append(
+                "回测过拟合概率 \(PriceFormatter.percent(overfit.pbo * 100, decimals: 0))"
+                + " —— 样本内最优在样本外多半落到中位数以下，问题出在这次搜索本身，"
+                + "而不是它挑中的那组参数")
         }
 
         return OptimizationResult(
@@ -344,47 +351,6 @@ public struct StrategyOptimizer: Sendable {
             warnings: warnings,
             deflatedSharpe: deflated,
             overfitProbability: overfit)
-    }
-}
-
-extension StrategyOptimizer {
-    /// Period-over-period returns from an equity curve.
-    static func periodReturns(of curve: [EquityPoint]) -> [Double] {
-        guard curve.count > 1 else { return [] }
-        return zip(curve, curve.dropFirst()).compactMap { previous, next in
-            guard previous.equity > 0 else { return nil }
-            return next.equity / previous.equity - 1
-        }
-    }
-
-    /// Observations per year implied by the tested window, for annualisation.
-    ///
-    /// Derived from the curve rather than from the bar interval, because the
-    /// equity curve excludes warm-up bars — using the nominal interval would
-    /// annualise a series that is shorter than it claims to be.
-    static func periodsPerYear(observations: Int, spanDays: Double) -> Double {
-        guard spanDays > 0, observations > 1 else { return 365 }
-        return Double(observations) / (spanDays / 365.25)
-    }
-
-    /// Candidates to cross-validate, capped and spread across the ranking.
-    ///
-    /// CSCV compares every half-and-half split of the blocks, so its cost grows
-    /// with the number of candidates; running it over a 5 000-point sweep would
-    /// take longer than the sweep. Sampling evenly across the *sorted* list
-    /// keeps both the strong and the weak end represented, which is what the
-    /// rank statistic needs — sampling only the top would compare winners
-    /// against winners and understate the problem.
-    static func sampleForCrossValidation(
-        candidates: [OptimizationCandidate], returns: [Int: [Double]], limit: Int = 24
-    ) -> [[Double]] {
-        let usable = candidates.compactMap { candidate -> [Double]? in
-            guard let series = returns[candidate.id], series.count >= 32 else { return nil }
-            return series
-        }
-        guard usable.count > limit else { return usable }
-        let stride = Double(usable.count) / Double(limit)
-        return (0..<limit).map { usable[Swift.min(Int(Double($0) * stride), usable.count - 1)] }
     }
 }
 

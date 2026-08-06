@@ -155,6 +155,14 @@ pub struct BacktestResult {
     /// True when the strategy is a swap but no funding history was supplied.
     #[serde(rename = "fundingUnmodelled")]
     pub funding_unmodelled: bool,
+    /// What the candle series itself was like.
+    ///
+    /// A backtest run over history with holes in it is not wrong so much as
+    /// *less than it appears*: a 60-bar lookback spanning a gap covers more
+    /// than 60 bars of market. The live path refuses to trade on such a
+    /// series; a backtest cannot refuse retrospectively, so it says so instead.
+    #[serde(rename = "dataQuality")]
+    pub data_quality: crate::quality::DataQuality,
     pub metrics: Metrics,
 }
 
@@ -228,6 +236,10 @@ pub fn run(
     let fee_rate = costs.fee_bps / 10_000.0;
     let slippage = costs.slippage_bps / 10_000.0;
     let leverage = strategy.leverage();
+    // The absolute pre-trade limits, so a sizing bug is capped here exactly as
+    // it would be live. The trading-state machine is *not* applied: a portfolio
+    // drawdown brake is a live risk control, not a rule of the strategy.
+    let limits = crate::guard::OrderLimits::default();
 
     if candles.len() <= 1 {
         return Ok(empty_result(strategy, &candles, config));
@@ -334,6 +346,7 @@ pub fn run(
                             index,
                             &mut equity,
                             leverage,
+                            &limits,
                             fee_rate,
                             atr,
                         );
@@ -499,6 +512,8 @@ pub fn run(
         equity_curve,
         liquidations,
         warmup_bars: strategy.warmup_bars,
+        data_quality: crate::quality::inspect(
+            &candles, bar_seconds(&manifest.market.bar), None),
         funding_unmodelled: manifest.market.inst_type == crate::strategy::InstrumentType::Swap
             && config.funding_rates.is_empty(),
         metrics,
@@ -517,6 +532,7 @@ fn open_position(
     index: usize,
     equity: &mut f64,
     leverage: f64,
+    limits: &crate::guard::OrderLimits,
     fee_rate: f64,
     atr: Option<f64>,
 ) {
@@ -530,7 +546,20 @@ fn open_position(
         strategy, *equity, price, leverage, stop_distance)
     else { return };
 
+    // The same pre-trade limits the live runner applies. Only a sizing bug
+    // ever reaches them, and this is where such a bug should surface: a
+    // backtest that quietly simulated an order live would refuse is a backtest
+    // that cannot be traded.
+    //
+    // Deliberately *not* the live trading-state machine — a portfolio drawdown
+    // brake is a live risk control, not a rule of the strategy, and folding it
+    // into the simulation would test a different strategy than the one written.
     let quantity = notional / price;
+    if crate::guard::check_order(
+        quantity * direction.sign(), 0.0, price, *equity, limits).is_some()
+    {
+        return;
+    }
     let fee = notional * fee_rate;
     *equity -= fee;
 
@@ -724,6 +753,8 @@ fn empty_result(
             .collect(),
         liquidations: 0,
         warmup_bars: strategy.warmup_bars,
+        data_quality: crate::quality::inspect(
+            &candles, bar_seconds(&manifest.market.bar), None),
         funding_unmodelled: manifest.market.inst_type == crate::strategy::InstrumentType::Swap
             && config.funding_rates.is_empty(),
         metrics: Metrics::compute(

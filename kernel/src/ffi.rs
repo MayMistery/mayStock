@@ -497,6 +497,32 @@ mod tests {
 ///
 /// The portfolio backtester and the factor tools combine several strategies'
 /// curves and then need the same statistics. Without this they would each
+/// Run a whole parameter sweep inside the kernel.
+///
+/// Input JSON: `{"config":{…}, "grid":[{"fast":5,"slow":20}, …],
+///               "threads":0, "crossValidationSample":24, "blocks":8}`
+/// Returns a [`crate::optimize::SweepOutcome`].
+#[no_mangle]
+pub unsafe extern "C" fn ms_optimize(
+    handle: *const MSStrategy,
+    candles: *const Candle,
+    candle_count: usize,
+    request_json: *const c_char,
+    error_out: *mut *mut c_char,
+) -> *mut c_char {
+    guarded(error_out, ptr::null_mut(), || {
+        let strategy = &handle.as_ref().ok_or("strategy handle was null")?.inner;
+        let bars = borrow_candles(candles, candle_count);
+        let text = borrow_str(request_json).ok_or("请求 JSON 为空")?;
+        let request: crate::optimize::SweepRequest =
+            serde_json::from_str(text).map_err(|e| format!("寻优请求解析失败：{e}"))?;
+        let outcome = crate::optimize::sweep(strategy, bars, &request);
+        serde_json::to_string(&outcome)
+            .map(to_c_string)
+            .map_err(|e| e.to_string())
+    })
+}
+
 /// Sharpe the luckiest of `trials` skill-free strategies would be expected to
 /// show over `years` of data. Returns 0 for degenerate inputs.
 #[no_mangle]

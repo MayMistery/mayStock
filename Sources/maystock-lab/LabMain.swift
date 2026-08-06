@@ -134,6 +134,11 @@ struct LabMain {
 
         if result.liquidations > 0 { Out.warn("发生 \(result.liquidations) 次强平") }
         if result.fundingUnmodelled { Out.warn("未取到资金费率历史，永续成本被低估") }
+        if let quality = result.dataQuality, !quality.usable {
+            Out.warn("行情数据有问题：\(quality.reason)")
+        } else if let quality = result.dataQuality, quality.gaps > 0 {
+            Out.note("历史中缺失 \(quality.gaps) 根 K 线，跨越缺口的指标窗口比标称的长")
+        }
 
         // The multi-window view the app shows, for the same strategy.
         Out.heading("分窗口")

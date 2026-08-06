@@ -527,45 +527,86 @@ struct KernelGateBridgeTests {
         #expect(TradingKernel.expectedMaxSharpeUnderNull(trials: 1, years: 3) == 0)
     }
 
-    @Test("等价曲线的收益率序列")
-    func periodReturnsAreDerivedFromTheCurve() {
-        let curve = [
-            EquityPoint(ts: Date(timeIntervalSince1970: 0), equity: 100, price: 1),
-            EquityPoint(ts: Date(timeIntervalSince1970: 60), equity: 110, price: 1),
-            EquityPoint(ts: Date(timeIntervalSince1970: 120), equity: 99, price: 1),
-        ]
-        let returns = StrategyOptimizer.periodReturns(of: curve)
-        #expect(returns.count == 2)
-        #expect(abs(returns[0] - 0.1) < 1e-9)
-        #expect(abs(returns[1] - (-0.1)) < 1e-9)
-    }
+    @Test("整轮寻优在内核里跑完，只回来一次")
+    func theSweepRunsInsideTheKernel() throws {
+        let json = """
+        {"schema":1,"id":"sweep-test","name":"Sweep",
+         "market":{"instId":"BTC-USDT","instType":"SPOT","bar":"1H"},
+         "params":[{"name":"fast","default":5,"min":3,"max":10},
+                   {"name":"slow","default":20,"min":15,"max":30}],
+         "signals":{"longEntry":"ema(close, fast) > ema(close, slow)",
+                    "longExit":"ema(close, fast) < ema(close, slow)"},
+         "sizing":{"mode":"equityPct","value":100}}
+        """
+        let manifest = try JSONDecoder().decode(
+            StrategyManifest.self, from: Data(json.utf8))
+        let strategy = try manifest.compile()
 
-    @Test("交叉验证采样横跨整个排名，不只取头部")
-    func crossValidationSamplingSpansTheRanking() {
-        // Comparing winners against winners would understate the problem the
-        // statistic exists to detect.
-        let candidates = (0..<100).map { index in
-            OptimizationCandidate(
-                id: index, parameters: [:],
-                metrics: BacktestMetrics.empty, score: Double(100 - index), rejection: nil)
+        var candles: [Candle] = []
+        for i in 0..<900 {
+            let base = 100 + sin(Double(i) * 0.15) * 12 + Double(i) * 0.02
+            candles.append(Candle(
+                ts: Date(timeIntervalSince1970: Double(i) * 3_600),
+                open: base, high: base + 1, low: base - 1, close: base + 0.2,
+                volume: 10, confirmed: true))
         }
-        let returns = Dictionary(uniqueKeysWithValues: (0..<100).map { index in
-            (index, (0..<40).map { step in Double(index + step) * 0.001 })
-        })
-        let sampled = StrategyOptimizer.sampleForCrossValidation(
-            candidates: candidates, returns: returns, limit: 10)
-        #expect(sampled.count == 10)
+
+        let result = StrategyOptimizer(
+            strategy: strategy,
+            config: BacktestConfig(initialCapital: 10_000),
+            objective: OptimizationObjective(kind: .sharpe)
+        ).run(candles: candles)
+
+        // Every grid point comes back, and each carries the parameters it was
+        // run with — the caller has to be able to reproduce a winner.
+        #expect(result.evaluated == result.candidates.count)
+        #expect(result.evaluated > 1)
+        #expect(result.candidates.allSatisfy { $0.parameters["fast"] != nil })
+        // And the overfitting assessment came back with it, rather than being
+        // a second pass over data Swift had to keep.
+        #expect(result.deflatedSharpe != nil || result.candidates.isEmpty)
     }
 
-    @Test("样本太短的候选不参与交叉验证")
-    func shortSeriesAreExcluded() {
-        let candidates = [
-            OptimizationCandidate(id: 0, parameters: [:], metrics: BacktestMetrics.empty,
-                                  score: 1, rejection: nil),
-        ]
-        let sampled = StrategyOptimizer.sampleForCrossValidation(
-            candidates: candidates, returns: [0: [0.1, 0.2]])
-        #expect(sampled.isEmpty)
+    @Test("寻优结果与逐个回测一致")
+    func theSweepAgreesWithRunningEachBacktest() throws {
+        // The sweep clones a compiled strategy and swaps its parameter map
+        // rather than re-parsing the manifest. That is only sound if it lands
+        // on exactly the same numbers.
+        let json = """
+        {"schema":1,"id":"parity","name":"Parity",
+         "market":{"instId":"BTC-USDT","instType":"SPOT","bar":"1H"},
+         "params":[{"name":"fast","default":5,"min":3,"max":6}],
+         "signals":{"longEntry":"ema(close, fast) > sma(close, 20)",
+                    "longExit":"ema(close, fast) < sma(close, 20)"},
+         "sizing":{"mode":"equityPct","value":100}}
+        """
+        let manifest = try JSONDecoder().decode(
+            StrategyManifest.self, from: Data(json.utf8))
+        let strategy = try manifest.compile()
+
+        var candles: [Candle] = []
+        for i in 0..<600 {
+            let base = 100 + sin(Double(i) * 0.2) * 8 + Double(i) * 0.01
+            candles.append(Candle(
+                ts: Date(timeIntervalSince1970: Double(i) * 3_600),
+                open: base, high: base + 1, low: base - 1, close: base + 0.1,
+                volume: 10, confirmed: true))
+        }
+        let config = BacktestConfig(initialCapital: 10_000)
+
+        let swept = StrategyOptimizer(
+            strategy: strategy, config: config,
+            objective: OptimizationObjective(kind: .sharpe)
+        ).run(candles: candles)
+
+        for candidate in swept.candidates {
+            let variant = try strategy.with(parameterValues: candidate.parameters)
+            let direct = try BacktestEngine(strategy: variant, config: config)
+                .run(candles: candles).metrics
+            #expect(abs(direct.totalReturnPct - candidate.metrics.totalReturnPct) < 1e-9,
+                    "fast=\(candidate.parameters["fast"] ?? -1)")
+            #expect(direct.tradeCount == candidate.metrics.tradeCount)
+        }
     }
 }
 
@@ -607,5 +648,116 @@ struct PortfolioProtectionDefaultTests {
         // Same bar is zero, and time running backwards never goes negative.
         #expect(StrategyRunner.barsBetween(latest, and: latest, bar: .h1) == 0)
         #expect(StrategyRunner.barsBetween(latest, and: entry, bar: .h1) == 0)
+    }
+}
+
+// MARK: - Backtest completeness
+
+struct BacktestCompletenessTests {
+    private func series(_ count: Int, skipping: Set<Int> = []) -> [Candle] {
+        (0..<count).compactMap { i in
+            guard !skipping.contains(i) else { return nil }
+            let base = 100 + Double(i) * 0.05
+            return Candle(
+                ts: Date(timeIntervalSince1970: Double(i) * 3_600),
+                open: base, high: base + 1, low: base - 1, close: base + 0.2,
+                volume: 10, confirmed: true)
+        }
+    }
+
+    private func strategy() throws -> CompiledStrategy {
+        let json = """
+        {"schema":1,"id":"quality","name":"Quality",
+         "market":{"instId":"BTC-USDT","instType":"SPOT","bar":"1H"},
+         "signals":{"longEntry":"close > sma(close, 10)",
+                    "longExit":"close < sma(close, 10)"},
+         "sizing":{"mode":"equityPct","value":100}}
+        """
+        return try JSONDecoder().decode(
+            StrategyManifest.self, from: Data(json.utf8)).compile()
+    }
+
+    @Test("回测报告说明它跑在什么样的数据上")
+    func aBacktestReportsTheHistoryItRanOver() throws {
+        let clean = try BacktestEngine(strategy: strategy(), config: BacktestConfig())
+            .run(candles: series(400))
+        #expect(clean.dataQuality?.usable == true)
+        #expect(clean.dataQuality?.gaps == 0)
+    }
+
+    @Test("历史里的缺口被数出来，而不是无声吞掉")
+    func gapsAreCounted() throws {
+        // A 60-bar lookback that spans a hole covers more than 60 bars of
+        // market. The backtest cannot refuse retrospectively, so it says so.
+        let holed = series(400, skipping: [100, 101, 102, 250])
+        let result = try BacktestEngine(strategy: strategy(), config: BacktestConfig())
+            .run(candles: holed)
+        #expect(result.dataQuality?.gaps == 4)
+    }
+
+    @Test("历史全是洞时，报告直接判定不可用")
+    func aSeriesFullOfHolesIsFlaggedUnusable() throws {
+        let sparse = (0..<200).map { i -> Candle in
+            let base = 100 + Double(i) * 0.05
+            // One bar every three hours on an hourly strategy.
+            return Candle(
+                ts: Date(timeIntervalSince1970: Double(i) * 3 * 3_600),
+                open: base, high: base + 1, low: base - 1, close: base + 0.2,
+                volume: 10, confirmed: true)
+        }
+        let result = try BacktestEngine(strategy: strategy(), config: BacktestConfig())
+            .run(candles: sparse)
+        #expect(result.dataQuality?.usable == false)
+        #expect(result.dataQuality?.reason.contains("缺失") == true)
+    }
+}
+
+// MARK: - Build hygiene
+
+struct KernelFreshnessTests {
+    /// The staged static library must be newer than every kernel source file.
+    ///
+    /// SwiftPM cannot run cargo itself, so `Scripts/build-kernel.sh` stages the
+    /// archive and `swift build` links whatever is there. Editing Rust and
+    /// running `swift test` directly therefore tests the *previous* kernel —
+    /// silently, and with symptoms that look like a logic bug: a field added in
+    /// Rust simply decodes as nil.
+    ///
+    /// This has cost real debugging time twice. A loud failure naming the fix
+    /// is worth more than the comment in the build script.
+    @Test("暂存的内核库不比 Rust 源码旧")
+    func theStagedKernelIsNotStale() throws {
+        let fileManager = FileManager.default
+        // Walk up from this file to the package root.
+        var root = URL(fileURLWithPath: #filePath)
+        while root.pathComponents.count > 1,
+              !fileManager.fileExists(atPath: root.appendingPathComponent("Package.swift").path) {
+            root.deleteLastPathComponent()
+        }
+        let staged = root.appendingPathComponent(".build/kernel/libmaystock_kernel.a")
+        let sources = root.appendingPathComponent("kernel/src")
+        guard fileManager.fileExists(atPath: staged.path),
+              let walker = fileManager.enumerator(at: sources,
+                                                  includingPropertiesForKeys: [.contentModificationDateKey])
+        else { return }   // Not a checkout we can judge; say nothing.
+
+        func modified(_ url: URL) -> Date {
+            (try? url.resourceValues(forKeys: [.contentModificationDateKey])
+                .contentModificationDate) ?? .distantPast
+        }
+        let libraryDate = modified(staged)
+        var newest: (url: URL, date: Date)?
+        for case let url as URL in walker where url.pathExtension == "rs" {
+            let date = modified(url)
+            if date > (newest?.date ?? .distantPast) { newest = (url, date) }
+        }
+        guard let newest else { return }
+
+        #expect(
+            libraryDate >= newest.date,
+            """
+            暂存的 libmaystock_kernel.a 比 \(newest.url.lastPathComponent) 旧，\
+            这次测试跑的是上一版内核。先执行 Scripts/build-kernel.sh 再测。
+            """)
     }
 }

@@ -17,6 +17,7 @@ pub mod decide;
 pub mod expr;
 pub mod ffi;
 pub mod guard;
+pub mod optimize;
 pub mod overfit;
 pub mod quality;
 pub mod reconcile;
