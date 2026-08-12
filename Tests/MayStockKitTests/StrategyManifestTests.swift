@@ -348,3 +348,50 @@ struct StrategyConfigTests {
         #expect(loaded.strategy.allocation(for: "ema-trend")?.running == true)
     }
 }
+
+/// Guards written against the *vocabulary* rather than against today's two
+/// cases: adding a third instrument type has to fail here on the day it is
+/// added, not on the day its multiplier is quietly wrong in the book.
+@Suite("Instrument type vocabulary")
+struct InstrumentTypeVocabularyTests {
+
+    /// One sample id per case. A new case with no sample fails the require
+    /// below, which is the point — the table is the checklist.
+    private static let sampleIds: [InstrumentType: String] = [
+        .spot: "BTC-USDT",
+        .swap: "BTC-USDT-SWAP",
+    ]
+
+    @Test func everyTypeIsRecognisableFromAnInstrumentId() throws {
+        for type in InstrumentType.allCases {
+            let id = try #require(Self.sampleIds[type], "\(type) 缺少样本 instId")
+            #expect(InstrumentType.of(instId: id) == type)
+        }
+    }
+
+    /// A multiplier may only be implied where it cannot be anything else.
+    /// Anything that trades in contracts has to ask the exchange, and "we could
+    /// not ask" must stay distinguishable from "the answer is 1".
+    @Test func onlyUnleveragedTypesMayImplyTheirContractSize() {
+        for type in InstrumentType.allCases {
+            if type.allowsLeverage {
+                #expect(type.impliedContractSize == nil, "\(type) 不该自带面值")
+            } else {
+                #expect(type.impliedContractSize == 1, "\(type) 的面值应恒为 1")
+            }
+        }
+    }
+
+    @Test func aPositionAdmitsWhenItsMultiplierIsNotAFact() throws {
+        for type in InstrumentType.allCases {
+            let id = try #require(Self.sampleIds[type])
+            let untaught = StrategyPositionState(strategyId: "s", instId: id)
+            #expect(untaught.contractSizeIsKnown == (type.impliedContractSize != nil))
+
+            var taught = untaught
+            taught.contractSize = 0.01
+            #expect(taught.contractSizeIsKnown)
+            #expect(taught.multiplier == 0.01)
+        }
+    }
+}

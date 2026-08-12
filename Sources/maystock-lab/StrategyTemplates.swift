@@ -13,7 +13,7 @@ enum StrategyTemplates {
     static func make(
         template: String, name: String, instId: String, bar: BarInterval
     ) throws -> StrategyManifest {
-        let instType: InstrumentType = instId.hasSuffix("-SWAP") ? .swap : .spot
+        let instType = InstrumentType.of(instId: instId)
         let market = StrategyMarket(instId: instId, instType: instType, bar: bar)
 
         switch template {

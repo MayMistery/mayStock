@@ -453,7 +453,7 @@ public final class StrategyRunner {
            now.timeIntervalSince(last) < Self.fundingPollInterval { return }
 
         let held = host.ledger.positions.values.filter {
-            !$0.isFlat && $0.instId.hasSuffix("-SWAP")
+            !$0.isFlat && InstrumentType.of(instId: $0.instId) == .swap
         }
         guard !held.isEmpty else { return }
         guard let payments = try? await host.venue.fundingPayments(
@@ -500,7 +500,7 @@ public final class StrategyRunner {
     /// that gets stopped out, liquidated or auto-deleveraged.
     private func reconcileExternal(for host: StrategyRunnerHost) async {
         var held = host.ledger.positions.values.filter {
-            !$0.isFlat && $0.instId.hasSuffix("-SWAP")
+            !$0.isFlat && InstrumentType.of(instId: $0.instId) == .swap
         }
         guard !held.isEmpty else {
             pendingExternal.removeAll()
@@ -514,7 +514,7 @@ public final class StrategyRunner {
         await ingestFills(for: Set(held.map { InstrumentKey(instId: $0.instId, instType: .swap) }),
                           host: host)
         held = host.ledger.positions.values.filter {
-            !$0.isFlat && $0.instId.hasSuffix("-SWAP")
+            !$0.isFlat && InstrumentType.of(instId: $0.instId) == .swap
         }
         guard !held.isEmpty else {
             pendingExternal.removeAll()
@@ -686,17 +686,37 @@ public final class StrategyRunner {
             if let price = try? await host.venue.lastPrice(instId: instId), price > 0 {
                 marks[instId] = price
             }
-            host.ledger.setContractSize(
-                await contractSize(for: instId, venue: host.venue), forInstId: instId)
+            guard let size = await contractSize(for: instId, venue: host.venue) else {
+                Log.warn("runner: 合约面值未知，本轮不改写 \(instId) 的面值（沿用账上已有值）")
+                continue
+            }
+            host.ledger.setContractSize(size, forInstId: instId)
         }
     }
 
-    /// Base units per contract, cached. Spot is one-for-one.
-    private func contractSize(for instId: String, venue: any ExchangeVenue) async -> Double {
-        if let cached = metaCache[instId] { return cached.contractValue ?? 1 }
-        guard let meta = (try? await venue.instrumentMeta(instId: instId)) ?? nil else { return 1 }
+    /// Base units per contract, cached — or nil when nobody has told us yet.
+    ///
+    /// **A failed lookup must not answer `1`.** It used to, and 1 is a
+    /// perfectly ordinary multiplier: indistinguishable from spot, and from a
+    /// swap whose contract really is one coin. So a single unreachable-exchange
+    /// tick — the machine waking from sleep before the network is up is enough
+    /// — overwrote ETH's correct 0.1 with a fabricated 1 and every figure
+    /// derived from it came out 10× off: the realised P&L booked on the very
+    /// next fill (+921 where the truth was +92), and the exposure the leverage
+    /// breaker reads (76,860 against a real 7,686). Realised P&L is cumulative,
+    /// so learning the right multiplier a tick later does not undo it — the
+    /// wrong number is already on the books.
+    ///
+    /// Only two answers are honest here: what the exchange said, and "unknown".
+    private func contractSize(for instId: String, venue: any ExchangeVenue) async -> Double? {
+        let implied = InstrumentType.of(instId: instId).impliedContractSize
+        if let implied { return implied }
+        if let cached = metaCache[instId] { return cached.contractValue }
+        guard let meta = (try? await venue.instrumentMeta(instId: instId)) ?? nil else {
+            return nil
+        }
         metaCache[instId] = meta
-        return meta.contractValue ?? 1
+        return meta.contractValue
     }
 
     /// Read total account equity and hand it to the host for the curve.
@@ -794,7 +814,7 @@ public final class StrategyRunner {
 
         // Derivative positions, at their own mark and contract size.
         for state in host.ledger.positions.values where !state.isFlat {
-            guard state.instId.hasSuffix("-SWAP") else { continue }
+            guard InstrumentType.of(instId: state.instId) == .swap else { continue }
             let price = marks[state.instId] ?? state.averagePrice
             exposure += abs(state.baseQuantity) * price
         }
@@ -1221,11 +1241,25 @@ public final class StrategyRunner {
             if let meta { metaCache[market.instId] = meta }
         }
 
-        let size = meta?.exchangeSize(forBaseQuantity: abs(baseDelta)) ?? abs(baseDelta)
+        // Same rule as the ledger's: an unknown multiplier is not 1. Falling
+        // back to the coin quantity here would send 13.8 *contracts* where 13.8
+        // ETH was meant — a 10× order, in real size, on a network hiccup. Spot
+        // needs no lookup (`impliedContractSize` answers it), so this only ever
+        // blocks a derivative order we genuinely cannot size.
+        guard let contractSize = meta?.contractValue
+                ?? InstrumentType.of(instId: market.instId).impliedContractSize else {
+            update(strategy.id) { $0.message = "取不到合约面值，未能下单（不拿 1 兜底）" }
+            Log.warn("runner: \(market.instId) 合约面值未知，跳过下单")
+            return
+        }
+        // `exchangeSize` also rounds to the lot step, which needs the same meta.
+        let size = meta?.exchangeSize(forBaseQuantity: abs(baseDelta))
+            ?? abs(baseDelta) / contractSize
         guard size > 0 else {
             update(strategy.id) { $0.message = "调整量低于交易所最小下单量，本次跳过" }
             return
         }
+        host.ledger.setContractSize(contractSize, forInstId: market.instId)
 
         // In OKX's long/short (hedge) account mode every swap order must name
         // the position leg it acts on, and `side` alone does not identify it:

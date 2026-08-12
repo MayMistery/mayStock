@@ -22,11 +22,16 @@ final class FakeVenue: ExchangeVenue, @unchecked Sendable {
     func candles(instId: String, bar: BarInterval, target: Int) async throws -> [Candle] { [] }
     func historyCandles(instId: String, bar: BarInterval, target: Int) async throws -> [Candle] { [] }
     func lastPrice(instId: String) async throws -> Double { price }
+    /// Set to model an exchange we cannot reach — a laptop waking from sleep
+    /// before the network is up is the realistic case.
+    var metaFailure: Error?
+
     /// One BTC-USDT-SWAP contract is 0.01 BTC, as OKX reports it. The runner
     /// re-reads this every tick, so a fixture that omitted it would silently
     /// have the ledger price contracts as coins.
     func instrumentMeta(instId: String) async throws -> InstrumentMeta? {
-        InstrumentMeta(
+        if let metaFailure { throw metaFailure }
+        return InstrumentMeta(
             instId: instId, tickSize: 0.1, lotSize: 1, minSize: 1, contractValue: 0.01)
     }
 
@@ -373,6 +378,59 @@ struct ExchangeRejectionTests {
         // OKX wraps a per-order `sCode` inside an envelope whose own `code` is 0.
         let raw = #"{"code":"0","data":[{"sCode":"51119","sMsg":"Insufficient balance"}]}"#
         #expect(TradeError.okxCode(in: raw) == "51119")
+    }
+}
+
+// MARK: - Contract size
+
+/// The multiplier is the only number in the book that is both invisible on
+/// screen and a factor in every figure derived from it. Getting it from a
+/// fallback rather than from the exchange is therefore silent by construction.
+@MainActor
+struct ContractSizeTests {
+    @Test("交易所查不到面值时，绝不用 1 覆盖账上已知的面值")
+    func anUnreachableExchangeNeverRewritesAKnownContractSize() async {
+        let host = FakeHost()
+        seedLongPosition(host)
+        host.fake.positionsResult = .success([exchangePosition(contracts: 10)])
+        host.fake.metaFailure = URLError(.notConnectedToInternet)
+
+        await runner(for: host).tick()
+
+        #expect(host.ledger.position(for: "alpha")?.contractSize == 0.01)
+    }
+
+    /// The consequence, spelled out: this is the arithmetic that put +921 on
+    /// the books where the truth was +92. A fill landing on the tick after a
+    /// failed lookup must still be priced in contracts.
+    @Test("查不到面值的那一轮之后成交，已实现盈亏仍按合约面值计")
+    func aFillAfterAFailedLookupIsStillPricedInContracts() async {
+        let host = FakeHost()
+        seedLongPosition(host)
+        host.fake.positionsResult = .success([exchangePosition(contracts: 10)])
+        host.fake.metaFailure = URLError(.notConnectedToInternet)
+        await runner(for: host).tick()
+
+        host.ledger.record(StrategyFill(
+            id: "exit-1", strategyId: "alpha", instId: instId, side: .sell,
+            price: 90, quantity: 10, feeQuote: 0,
+            ts: Date(timeIntervalSince1970: 3_000),
+            clOrdId: OrderTag.make(strategyId: "alpha"), mode: .demo))
+
+        // 10 contracts × 0.01 BTC × (90 − 100) = −1, not −100.
+        #expect(abs((host.ledger.position(for: "alpha")?.realisedPnL ?? 0) + 1) < 1e-9)
+    }
+
+    @Test("交易所恢复后面值照常更新")
+    func aReachableExchangeStillTeachesTheLedger() async {
+        let host = FakeHost()
+        seedLongPosition(host)
+        host.ledger.setContractSize(1, forInstId: instId)
+        host.fake.positionsResult = .success([exchangePosition(contracts: 10)])
+
+        await runner(for: host).tick()
+
+        #expect(host.ledger.position(for: "alpha")?.contractSize == 0.01)
     }
 }
 

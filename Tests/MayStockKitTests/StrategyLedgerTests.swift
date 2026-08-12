@@ -164,6 +164,25 @@ struct StrategyLedgerTests {
         #expect(ledger.position(for: "ema-trend")?.realisedPnL == before?.realisedPnL)
     }
 
+    /// Funding is not derived from fills, so a replay cannot re-derive it —
+    /// and the bill ids that make booking idempotent survive the rebuild, so
+    /// dropping it here would delete a real cost that could never come back.
+    @Test func rebuildingKeepsFundingItCannotReplay() {
+        let ledger = StrategyLedger(mode: .demo)
+        let tag = OrderTag.make(strategyId: "ema-trend")
+        ledger.ingest([exchangeFill(id: "1", side: .buy, price: 100, size: 2, clOrdId: tag)],
+                      knownStrategyIds: ["ema-trend"])
+        ledger.recordFunding(
+            FundingPayment(id: "bill-1", instId: "BTC-USDT", amount: -31.19,
+                           ccy: "USDT", ts: Date(timeIntervalSince1970: 1_000)),
+            strategyId: "ema-trend")
+
+        ledger.rebuildPositions()
+
+        #expect(ledger.position(for: "ema-trend")?.fundingPaid == -31.19)
+        #expect(ledger.recordedFundingIds.contains("bill-1"))
+    }
+
     @Test func reconciliationSurfacesUnattributedHoldings() {
         let ledger = StrategyLedger(mode: .demo)
         let tag = OrderTag.make(strategyId: "ema-trend")

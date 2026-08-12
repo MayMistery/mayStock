@@ -23,6 +23,30 @@ public enum InstrumentType: String, Codable, Sendable, CaseIterable {
 
     public var allowsShorting: Bool { self == .swap }
     public var allowsLeverage: Bool { self == .swap }
+
+    /// The instrument family an id names.
+    ///
+    /// OKX encodes it in the id itself, and this is the only place allowed to
+    /// know how. The test spelling `instId.hasSuffix("-SWAP")` used to be
+    /// copied into a dozen call sites, which is fine right up until one of them
+    /// needs to grow a case — futures, options, a venue that spells it
+    /// differently — and eleven others quietly keep the old answer.
+    public static func of(instId: String) -> InstrumentType {
+        instId.hasSuffix("-" + InstrumentType.swap.rawValue) ? .swap : .spot
+    }
+
+    /// Base units per contract when the exchange has nothing to say.
+    ///
+    /// Spot is one-for-one by definition, so its multiplier is *known* without
+    /// asking anyone. A swap's is not: only the exchange's `ctVal` answers it,
+    /// and "we could not reach the exchange" is not an answer. Returning nil
+    /// there is the whole point — see `StrategyPositionState.contractSize`.
+    public var impliedContractSize: Double? {
+        switch self {
+        case .spot: return 1
+        case .swap: return nil
+        }
+    }
 }
 
 public struct StrategyMarket: Codable, Sendable, Equatable {

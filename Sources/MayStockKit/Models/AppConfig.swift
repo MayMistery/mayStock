@@ -59,7 +59,7 @@ public struct WatchItem: Codable, Identifiable, Sendable, Equatable {
         if let label, !label.isEmpty { return label }
         let parts = instId.split(separator: "-")
         let base = parts.first.map(String.init) ?? instId
-        return instId.hasSuffix("-SWAP") ? base + "⚡︎" : base
+        return InstrumentType.of(instId: instId) == .swap ? base + "⚡︎" : base
     }
 
     /// Currency glyph shown before the price in `.full` style.

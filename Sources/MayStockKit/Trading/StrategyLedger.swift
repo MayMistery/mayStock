@@ -83,11 +83,24 @@ public struct StrategyPositionState: Codable, Sendable, Equatable, Identifiable 
     /// this existed still decode; nil means "spot, one-for-one".
     public var contractSize: Double?
 
+    /// Whether the multiplier below is a fact or a guess.
+    ///
+    /// Spot is one-for-one by definition; a swap's only source is the exchange.
+    /// Nothing may book P&L off a guess — see `StrategyRunner.contractSize`.
+    public var contractSizeIsKnown: Bool {
+        if let contractSize, contractSize > 0 { return true }
+        return InstrumentType.of(instId: instId).impliedContractSize != nil
+    }
+
     /// Contracts → coins. 1 for spot and for any position whose size the
     /// exchange already reports in base units.
+    ///
+    /// Still 1 for a swap we have never been told about, because arithmetic
+    /// needs a number — which is exactly why `contractSizeIsKnown` exists and
+    /// why the writers refuse to persist a fabricated one.
     public var multiplier: Double {
-        guard let contractSize, contractSize > 0 else { return 1 }
-        return contractSize
+        if let contractSize, contractSize > 0 { return contractSize }
+        return InstrumentType.of(instId: instId).impliedContractSize ?? 1
     }
 
     /// Position size in coins rather than contracts, for display.
@@ -352,6 +365,12 @@ public final class StrategyLedger {
 
     /// Rebuild every position by replaying the stored fills — the recovery path
     /// when a position looks wrong.
+    /// Rebuild every position by replaying the stored fills.
+    ///
+    /// Funding is carried across rather than replayed: it is not derived from
+    /// fills, it is settled money booked against `recordedFundingIds`, and
+    /// those ids survive the rebuild. Dropping it here would have deleted a
+    /// real cost while leaving the ids that stop it ever being booked again.
     public func rebuildPositions() {
         var rebuilt: [String: StrategyPositionState] = [:]
         for fill in fills.sorted(by: { $0.ts < $1.ts }) {
@@ -360,6 +379,9 @@ public final class StrategyLedger {
             state.contractSize = contractSizes[fill.instId] ?? state.contractSize
             state.apply(fill)
             rebuilt[fill.strategyId] = state
+        }
+        for (key, funding) in positions.compactMapValues(\.fundingPaid) {
+            rebuilt[key]?.fundingPaid = funding
         }
         positions = rebuilt
         onChanged?()
@@ -381,7 +403,7 @@ public final class StrategyLedger {
             exchangeByInst[position.instId, default: 0] += position.quantity
         }
         // Spot exposure is the base-currency balance of each traded pair.
-        for instId in ledgerByInst.keys where !instId.hasSuffix("-SWAP") {
+        for instId in ledgerByInst.keys where InstrumentType.of(instId: instId) == .spot {
             let (base, _) = Self.currencies(of: instId)
             if let balance = spotBalances.first(where: { $0.ccy == base }) {
                 exchangeByInst[instId] = balance.total

@@ -247,7 +247,7 @@ public struct OKXRESTClient: Sendable {
     /// Instrument metadata (tick size → price decimals). Also serves as
     /// validation when the user adds a new instrument.
     public func instrumentMeta(instId: String) async throws -> InstrumentMeta? {
-        let instType = instId.hasSuffix("-SWAP") ? "SWAP" : "SPOT"
+        let instType = InstrumentType.of(instId: instId).rawValue
         let rows = try await get(InstrumentRow.self, path: "api/v5/public/instruments",
                                  query: ["instType": instType, "instId": instId])
         guard let row = rows.first else { return nil }

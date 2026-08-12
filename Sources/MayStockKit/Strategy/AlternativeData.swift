@@ -227,7 +227,7 @@ public struct AlternativeSeriesSpec: Codable, Sendable, Equatable {
 
     /// "BTC-USDT" → "BTC-USDT-SWAP"; already-perpetual ids pass through.
     static func perpetual(for instId: String) -> String {
-        instId.hasSuffix("-SWAP") ? instId : instId + "-SWAP"
+        InstrumentType.of(instId: instId) == .swap ? instId : instId + "-SWAP"
     }
 
     public var description: String {

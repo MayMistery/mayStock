@@ -160,7 +160,7 @@ struct PositionStripView: View {
         let capital = appState.store.config.strategy.allocation(for: state.strategyId)?.capital ?? 0
         let markHere = mark(for: state)
         let pct = state.returnPct(mark: markHere, capital: capital)
-        let isSwap = state.instId.hasSuffix("-SWAP")
+        let isSwap = InstrumentType.of(instId: state.instId) == .swap
         return HStack(spacing: 6) {
             Circle()
                 .fill(ChartStyle.trend(state.quantity > 0))
