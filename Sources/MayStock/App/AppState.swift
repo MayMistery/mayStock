@@ -14,6 +14,10 @@ final class ConfigStore {
     init(directory: URL = ConfigIO.defaultDirectory()) {
         self.io = ConfigIO(directory: directory)
         self.config = io.load()
+        // The app owns this directory, so it is the one process allowed to
+        // keep a readable log there. Nothing else — tests included — writes
+        // anywhere but stderr.
+        Log.useFile(in: directory)
     }
 
     /// Mutate + persist + let AppState react.

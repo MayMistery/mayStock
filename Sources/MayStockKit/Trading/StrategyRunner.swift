@@ -1288,6 +1288,16 @@ public final class StrategyRunner {
         }
 
         let order = request(withProtection: true)
+        // The inputs that decided the size, not just the outcome. Reconstructing
+        // "why did it trade" from the fill alone is impossible: a wrong
+        // multiplier produces an order that looks entirely reasonable on the
+        // wire, and the number that made it wrong is never sent.
+        Log.warn("""
+            runner: 下单 \(strategy.id) \(market.instId) \
+            \(baseDelta > 0 ? "buy" : "sell") \(size) 张（面值 \(contractSize)，\
+            目标变动 \(baseDelta) 币，现持 \
+            \(host.ledger.position(for: strategy.id)?.quantity ?? 0) 张）理由：\(reason)
+            """)
         do {
             try await place(order, strategy: strategy, host: host, reason: reason)
         } catch {

@@ -205,8 +205,66 @@ public final class MarketHub {
 }
 
 /// Minimal logging shim that works on macOS and Linux.
+///
+/// Also appends to a file, and that is not belt-and-braces. A menu bar app is
+/// launched by Finder or `open`, whose stderr goes nowhere anyone can read
+/// afterwards — so every "we degraded and here is why" line this codebase
+/// writes was, in production, addressed to no one. When a strategy flattened a
+/// position on a multiplier it should never have had, there was nothing left to
+/// reconstruct the decision from. A degradation notice that cannot be read
+/// later is a comment, not observability.
 public enum Log {
+    /// Bounded so an unattended process cannot fill the disk over months.
+    static let maxBytes = 4 << 20
+    private static let queue = DispatchQueue(label: "com.maystock.log")
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var destination: URL?
+
+    /// Wire the file sink. Deliberately opt-in and off by default: defaulting
+    /// it to the state directory meant the test suite — which builds runners
+    /// against fake venues — appended its fixtures to the *live* engine log.
+    /// Only a process that owns that directory may write to it, and only the
+    /// app does.
+    public static func useFile(in directory: URL) {
+        lock.lock()
+        destination = directory.appendingPathComponent("engine-log.txt")
+        lock.unlock()
+        // Marks the session boundary. Restarts are the context every other line
+        // needs — a gap in the equity curve, a stale multiplier and a wake from
+        // sleep are the same event, and nothing recorded which.
+        warn("engine: 启动")
+    }
+
     public static func warn(_ message: String) {
-        FileHandle.standardError.write(Data("[maystock] \(message)\n".utf8))
+        let line = "[maystock] \(message)\n"
+        FileHandle.standardError.write(Data(line.utf8))
+        lock.lock()
+        let fileURL = destination
+        lock.unlock()
+        guard let fileURL else { return }
+        let stamped = "\(ISO8601DateFormatter().string(from: Date())) \(line)"
+        queue.async { append(stamped, to: fileURL) }
+    }
+
+    private static func append(_ line: String, to fileURL: URL) {
+        let manager = FileManager.default
+        let path = fileURL.path
+        if let size = (try? manager.attributesOfItem(atPath: path)[.size]) as? Int,
+           size > maxBytes {
+            // Keep the tail: the lines nearest a failure are the ones wanted.
+            if let data = try? Data(contentsOf: fileURL) {
+                try? data.suffix(maxBytes / 2).write(to: fileURL, options: .atomic)
+            }
+        }
+        guard let data = line.data(using: .utf8) else { return }
+        if let handle = try? FileHandle(forWritingTo: fileURL) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+        } else {
+            try? manager.createDirectory(
+                at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? data.write(to: fileURL, options: .atomic)
+        }
     }
 }
