@@ -540,3 +540,170 @@ struct ReviewPolicyStoreTests {
         #expect(daily.barsSinceValidation(now: at(1)) == 0)
     }
 }
+
+// MARK: - Book versus account
+
+/// Every other check reads our own numbers. This is the only one that can
+/// catch arithmetic, because a wrong figure agrees with everything derived
+/// from it — which is exactly how a tenfold P&L survived a full review pass.
+@Suite("账本与交易所对账")
+struct BookDriftTests {
+
+    private static let instId = "ETH-USDT-SWAP"
+
+    private func position(
+        realised: Double = 145.71, fees: Double = 11.33, funding: Double = -45.26,
+        strategyId: String = "eth-short"
+    ) -> StrategyPositionState {
+        var state = StrategyPositionState(strategyId: strategyId, instId: Self.instId)
+        state.contractSize = 0.1
+        state.quantity = -39.46
+        state.averagePrice = 1_886.08
+        state.realisedPnL = realised
+        state.feesPaid = fees
+        state.fundingPaid = funding
+        return state
+    }
+
+    private func totals(
+        earliest: Date = at(-100), tradeIds: Set<String> = ["f1"]
+    ) -> ExchangeBookTotals {
+        ExchangeBookTotals(
+            instId: Self.instId, realisedPnL: 145.71, fees: 11.33, funding: -45.26,
+            earliestBillAt: earliest, tradeIds: tradeIds)
+    }
+
+    private func snapshot(
+        positions: [String: StrategyPositionState],
+        totals: [String: ExchangeBookTotals]?,
+        firstFillAt: Date = at(-50)
+    ) -> ReviewSnapshot {
+        ReviewSnapshot(
+            now: at(0),
+            config: config([allocation("eth-short", capital: 26_552)]),
+            positions: positions,
+            fills: [StrategyFill(
+                id: "f1", strategyId: "eth-short", instId: Self.instId, side: .sell,
+                price: 1_919, quantity: 40, feeQuote: 3.8, ts: firstFillAt,
+                clOrdId: nil, mode: .demo)],
+            exchangeTotals: totals)
+    }
+
+    @Test("三个进钱的字段，任何一个对不上都要报严重")
+    func everyMoneyFieldIsCompared() {
+        // Walked as a table rather than asserted once on realisedPnL: these are
+        // the only three ways money enters the book, and a check that only
+        // guards the field that broke last time guards nothing.
+        let drifts: [(String, StrategyPositionState)] = [
+            ("已实现盈亏", position(realised: 975.03)),
+            ("手续费", position(fees: 22.66)),
+            ("资金费", position(funding: -90.52)),
+        ]
+        for (label, drifted) in drifts {
+            let result = PortfolioReview.bookDrift(
+                snapshot(positions: ["eth-short": drifted], totals: [Self.instId: totals()]),
+                ReviewPolicy())
+            #expect(result.count == 1, "\(label) 没被发现")
+            #expect(result.first?.code == "ledger.drift")
+            #expect(result.first?.severity == .critical)
+            #expect(result.first?.detail.contains(label) == true)
+        }
+    }
+
+    @Test("两边一致时不出声")
+    func agreementIsQuiet() {
+        let result = PortfolioReview.bookDrift(
+            snapshot(positions: ["eth-short": position()], totals: [Self.instId: totals()]),
+            ReviewPolicy())
+        #expect(result.isEmpty)
+    }
+
+    @Test("取不到账单是「没核对」，不是「核对通过」")
+    func unreachableIsNotAPass() {
+        let result = PortfolioReview.bookDrift(
+            snapshot(positions: ["eth-short": position()], totals: nil), ReviewPolicy())
+        #expect(result.map(\.code) == ["ledger.uncheckable"])
+    }
+
+    /// OKX serves a bounded window of bills. A book older than the window
+    /// differs for the window's reason, and crying drift there would train
+    /// everyone to ignore the check.
+    @Test("账单窗口盖不住历史时，报「比不了」而不是报差异")
+    func aShortBillWindowIsNotDrift() {
+        let result = PortfolioReview.bookDrift(
+            snapshot(
+                positions: ["eth-short": position(realised: 975.03)],
+                // The window does not carry our fill: that, not a timestamp
+                // comparison, is what "does not cover" means.
+                totals: [Self.instId: totals(earliest: at(-10), tradeIds: ["someone-else"])],
+                firstFillAt: at(-50)),
+            ReviewPolicy())
+        #expect(result.map(\.code) == ["ledger.uncheckable"])
+    }
+
+    /// The bill for a fill is stamped on or just after the fill. Deciding
+    /// coverage on stamps therefore called a complete window incomplete, and
+    /// the check reported a reason that had nothing to do with the truth.
+    @Test("账单比成交晚几毫秒，不算窗口不够")
+    func aBillStampedAfterItsFillStillCounts() {
+        let result = PortfolioReview.bookDrift(
+            snapshot(
+                positions: ["eth-short": position()],
+                totals: [Self.instId: totals(earliest: at(-50).addingTimeInterval(0.4))],
+                firstFillAt: at(-50)),
+            ReviewPolicy())
+        #expect(result.isEmpty)
+    }
+
+    @Test("同一合约两个策略时不猜归属")
+    func sharedInstrumentsAreNotGuessed() {
+        let result = PortfolioReview.bookDrift(
+            snapshot(
+                positions: [
+                    "eth-short": position(realised: 975.03),
+                    "eth-other": position(realised: 0, strategyId: "eth-other"),
+                ],
+                totals: [Self.instId: totals()]),
+            ReviewPolicy())
+        #expect(result.isEmpty)
+    }
+
+    /// The real bill shape, so a CLI field rename cannot pass silently.
+    @Test("按交易所真实账单字段解析")
+    func parsesTheRealBillShape() {
+        let json = """
+        [{"billId":"1","instId":"ETH-USDT-SWAP","type":"2","subType":"6","pnl":"92.1462",
+          "fee":"-2.58375","balChg":"89.56245","ts":"1786501007000"},
+         {"billId":"2","instId":"ETH-USDT-SWAP","type":"8","subType":"173","pnl":"-32.237933",
+          "fee":"0","balChg":"-32.237933","ts":"1786320000000"}]
+        """
+        let totals = TradeBridge.parseBookTotals(json: [json])["ETH-USDT-SWAP"]
+        #expect(abs((totals?.realisedPnL ?? 0) - 92.1462) < 1e-9)
+        // Fees are filed negative on the wire and held as a positive cost.
+        #expect(abs((totals?.fees ?? 0) - 2.58375) < 1e-9)
+        #expect(abs((totals?.funding ?? 0) + 32.237933) < 1e-9)
+        #expect(totals?.earliestBillAt == Date(timeIntervalSince1970: 1_786_320_000))
+    }
+
+    /// The live listing and the archive overlap. Counting a settlement twice
+    /// because it appeared in both would manufacture the very drift this check
+    /// reports — and it would look exactly like a real bookkeeping defect.
+    @Test("两个窗口重叠的账单只算一次")
+    func overlappingWindowsAreMergedOnBillId() {
+        let live = """
+        [{"billId":"7","instId":"ETH-USDT-SWAP","type":"8","subType":"173","pnl":"-32.24",
+          "fee":"0","balChg":"-32.24","ts":"1786320000000"}]
+        """
+        let archive = """
+        [{"billId":"7","instId":"ETH-USDT-SWAP","type":"8","subType":"173","pnl":"-32.24",
+          "fee":"0","balChg":"-32.24","ts":"1786320000000"},
+         {"billId":"6","instId":"ETH-USDT-SWAP","type":"2","subType":"1","pnl":"0",
+          "fee":"-3.843","balChg":"-3.843","ts":"1786040201000"}]
+        """
+        let totals = TradeBridge.parseBookTotals(json: [live, archive])["ETH-USDT-SWAP"]
+        #expect(abs((totals?.funding ?? 0) + 32.24) < 1e-9)
+        // And the archive extends the window back to the opening trade.
+        #expect(abs((totals?.fees ?? 0) - 3.843) < 1e-9)
+        #expect(totals?.earliestBillAt == Date(timeIntervalSince1970: 1_786_040_201))
+    }
+}

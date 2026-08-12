@@ -27,6 +27,14 @@ extension LabMain {
         let policy = policyStore.load()
 
         let ledger = StrategyLedgerStore(directory: directory, mode: mode).load()
+        // The one input that does not come from our own files. Read-only, and
+        // a failure here degrades to "not checked" rather than to "fine" —
+        // `bookDrift` says so out loud.
+        // Same CLI path and profile the app trades through, so the review reads
+        // the account the engine is actually acting on.
+        let exchangeTotals = try? await TradeBridge(
+            explicitCLIPath: config.trading.cliPath,
+            profile: config.trading.profile).bookTotals(mode: mode)
         let snapshot = ReviewSnapshot(
             now: Date(),
             config: config,
@@ -36,7 +44,8 @@ extension LabMain {
                 directory: directory, mode: mode, perStrategy: true).loadByStrategy(),
             positions: ledger.positions,
             fills: ledger.fills,
-            appRunning: isAppRunning())
+            appRunning: isAppRunning(),
+            exchangeTotals: exchangeTotals)
 
         var result = PortfolioReview.run(snapshot, policy: policy)
 

@@ -185,6 +185,12 @@ public struct ReviewPolicy: Codable, Sendable, Equatable {
     public var measuredSlippageBps: Double
     /// How far the configured value may drift before that matters.
     public var slippageDriftBps: Double
+    /// How far the book's own totals may sit from the exchange's bill ledger
+    /// before that is a defect rather than rounding. In quote currency, and
+    /// tight on purpose: these are the same trades counted twice, so they
+    /// should agree to the cent. Anything looser hides an arithmetic error
+    /// behind a tolerance.
+    public var ledgerDriftToleranceQuote: Double
 
     public var mandates: [StrategyMandate]
 
@@ -202,6 +208,7 @@ public struct ReviewPolicy: Codable, Sendable, Equatable {
         silentTradeAlarmBars: Int = 10,
         measuredSlippageBps: Double = 1.0,
         slippageDriftBps: Double = 2.0,
+        ledgerDriftToleranceQuote: Double = 0.01,
         mandates: [StrategyMandate] = []
     ) {
         self.version = version
@@ -217,6 +224,7 @@ public struct ReviewPolicy: Codable, Sendable, Equatable {
         self.silentTradeAlarmBars = silentTradeAlarmBars
         self.measuredSlippageBps = measuredSlippageBps
         self.slippageDriftBps = slippageDriftBps
+        self.ledgerDriftToleranceQuote = ledgerDriftToleranceQuote
         self.mandates = mandates
     }
 
@@ -231,7 +239,7 @@ public struct ReviewPolicy: Codable, Sendable, Equatable {
         case heartbeatStaleAfter, equityGapAlarm
         case maxAllocationRatio, drawdownWarnFraction, fundingBleedAnnualPct
         case minimumLiveBarsBeforeHalt, revalidateAfterBars, silentTradeAlarmBars
-        case measuredSlippageBps, slippageDriftBps
+        case measuredSlippageBps, slippageDriftBps, ledgerDriftToleranceQuote
         case mandates
     }
 
@@ -264,6 +272,8 @@ public struct ReviewPolicy: Codable, Sendable, Equatable {
             ?? fallback.measuredSlippageBps
         slippageDriftBps = try c.decodeIfPresent(Double.self, forKey: .slippageDriftBps)
             ?? fallback.slippageDriftBps
+        ledgerDriftToleranceQuote = try c.decodeIfPresent(
+            Double.self, forKey: .ledgerDriftToleranceQuote) ?? fallback.ledgerDriftToleranceQuote
         mandates = try c.decodeIfPresent([StrategyMandate].self, forKey: .mandates) ?? []
     }
 }
