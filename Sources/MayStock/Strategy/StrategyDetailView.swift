@@ -289,15 +289,24 @@ struct StrategyDetailView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("成交明细").font(.system(size: 11, weight: .semibold))
                     VStack(spacing: 0) {
-                        tableHeader(["时间", "方向", "价格", "数量", "手续费", "订单标签"])
+                        tableHeader(["时间", "操作", "价格", "数量", "手续费", "兑现净益", "订单标签"])
                         ForEach(fills) { fill in
                             HStack(spacing: 0) {
                                 cell(fill.ts.formatted(date: .numeric, time: .standard))
-                                cell(fill.side.displayName,
+                                // 开仓/平仓，不是买入/卖出：空头账本里「卖出」
+                                // 是建仓，照方向写正好反着读。
+                                cell(fill.actionLabel,
                                      tint: ChartStyle.trend(fill.side == .buy))
                                 cell(PriceFormatter.auto(fill.price))
                                 cell(PriceFormatter.plain(fill.quantity))
                                 cell(PriceFormatter.money(fill.feeQuote, decimals: 4))
+                                // 开仓单没有兑现，留 —；平仓单显示扣掉本笔手续费后的净额。
+                                if let net = fill.netRealisedQuote {
+                                    cell(PriceFormatter.signedMoney(net, decimals: 4),
+                                         tint: ChartStyle.trend(net >= 0))
+                                } else {
+                                    cell("—")
+                                }
                                 cell(fill.clOrdId ?? "—")
                             }
                             .padding(.vertical, 3)

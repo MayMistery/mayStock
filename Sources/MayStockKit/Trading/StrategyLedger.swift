@@ -3,6 +3,20 @@ import Observation
 
 // MARK: - Records
 
+/// What one fill did to the position it landed on. Side alone cannot say: for
+/// a short book a sell *opens* and a buy *closes*, and a table labelled
+/// 买入/卖出 reads exactly backwards from what the money did.
+public enum PositionEffect: String, Codable, Sendable, CaseIterable {
+    /// Started a position from flat.
+    case open
+    /// Grew the existing side.
+    case add
+    /// Reduced or fully closed the existing side.
+    case close
+    /// Closed the whole side and opened the opposite one in the same fill.
+    case flip
+}
+
 public struct StrategyFill: Codable, Sendable, Equatable, Identifiable {
     public let id: String
     public let strategyId: String
@@ -16,11 +30,24 @@ public struct StrategyFill: Codable, Sendable, Equatable, Identifiable {
     public let ts: Date
     public let clOrdId: String?
     public let mode: TradingMode
+    /// Gross P&L this fill crystallised by closing (part of) a position, in
+    /// quote currency. Nil when the fill closed nothing — an opener realises
+    /// nothing, however profitable it later turns out to be.
+    ///
+    /// Stamped by the ledger from `StrategyPositionState.apply`, which is the
+    /// only place the realisation rule lives; fills recorded before the field
+    /// existed stay nil until a rebuild replays them.
+    public var realisedQuote: Double?
+    /// What this fill did to the position — opened, added, closed or flipped.
+    /// Stamped alongside `realisedQuote` from the same `apply` call; nil only
+    /// on records that predate the field and have not been replayed yet.
+    public var positionEffect: PositionEffect?
 
     public init(
         id: String, strategyId: String, instId: String, side: OrderSide,
         price: Double, quantity: Double, feeQuote: Double,
-        ts: Date, clOrdId: String?, mode: TradingMode
+        ts: Date, clOrdId: String?, mode: TradingMode,
+        realisedQuote: Double? = nil, positionEffect: PositionEffect? = nil
     ) {
         self.id = id
         self.strategyId = strategyId
@@ -32,6 +59,8 @@ public struct StrategyFill: Codable, Sendable, Equatable, Identifiable {
         self.ts = ts
         self.clOrdId = clOrdId
         self.mode = mode
+        self.realisedQuote = realisedQuote
+        self.positionEffect = positionEffect
     }
 
     /// Convert an exchange fill, normalising the fee into quote currency.
@@ -49,6 +78,27 @@ public struct StrategyFill: Codable, Sendable, Equatable, Identifiable {
     /// Signed base quantity: positive for buys, negative for sells.
     public var signedQuantity: Double { quantity * side.sign }
     public var notional: Double { price * quantity }
+    /// What this fill banked after its own fee, or nil for a fill that closed
+    /// nothing. The fee is this fill's alone — the opener's fee was already
+    /// shown against the opener.
+    public var netRealisedQuote: Double? { realisedQuote.map { $0 - feeQuote } }
+
+    /// The action in position terms — 开/加/平/反手 crossed with 多/空 — which
+    /// is what the fill *did*, where the raw side is only what was sent. Falls
+    /// back to the side for records that have never been replayed.
+    public var actionLabel: String {
+        guard let effect = positionEffect else { return side.displayName }
+        switch (effect, side) {
+        case (.open, .buy): return "开多"
+        case (.open, .sell): return "开空"
+        case (.add, .buy): return "加多"
+        case (.add, .sell): return "加空"
+        case (.close, .buy): return "平空"
+        case (.close, .sell): return "平多"
+        case (.flip, .buy): return "反手多"
+        case (.flip, .sell): return "反手空"
+        }
+    }
 }
 
 /// Running book for one strategy on one instrument, using average cost.
@@ -154,7 +204,15 @@ public struct StrategyPositionState: Codable, Sendable, Equatable, Identifiable 
 
     /// Apply one fill using average-cost accounting, handling the case where a
     /// fill closes the position and opens the opposite side in one go.
-    public mutating func apply(_ fill: StrategyFill) {
+    ///
+    /// Returns what the fill did to the position and the gross P&L it
+    /// crystallised (nil when it closed nothing). Returned rather than
+    /// recomputed by callers so the rule exists exactly once; the ledger
+    /// stamps both onto the stored fill.
+    @discardableResult
+    public mutating func apply(
+        _ fill: StrategyFill
+    ) -> (effect: PositionEffect, realisedQuote: Double?) {
         let delta = fill.signedQuantity
         defer {
             feesPaid += fill.feeQuote
@@ -166,18 +224,19 @@ public struct StrategyPositionState: Codable, Sendable, Equatable, Identifiable 
             quantity = delta
             averagePrice = fill.price
             openedAt = fill.ts
-            return
+            return (.open, nil)
         }
         if (quantity > 0) == (delta > 0) {
             // Adding to the same side: weighted-average the cost basis.
             let total = abs(quantity) + abs(delta)
             averagePrice = (averagePrice * abs(quantity) + fill.price * abs(delta)) / total
             quantity += delta
-            return
+            return (.add, nil)
         }
         // Opposing fill: realise on the overlap, then flip if it overshoots.
         let closing = Swift.min(abs(quantity), abs(delta))
-        realisedPnL += (fill.price - averagePrice) * closing * multiplier * (quantity > 0 ? 1 : -1)
+        let realised = (fill.price - averagePrice) * closing * multiplier * (quantity > 0 ? 1 : -1)
+        realisedPnL += realised
         let remainder = abs(delta) - closing
         quantity += delta
         if remainder > 1e-12 {
@@ -185,11 +244,14 @@ public struct StrategyPositionState: Codable, Sendable, Equatable, Identifiable 
             // clock starts here.
             averagePrice = fill.price
             openedAt = fill.ts
-        } else if abs(quantity) < 1e-12 {
+            return (.flip, realised)
+        }
+        if abs(quantity) < 1e-12 {
             quantity = 0
             averagePrice = 0
             openedAt = nil
         }
+        return (.close, realised)
     }
 }
 
@@ -319,12 +381,13 @@ public final class StrategyLedger {
 
     public func record(_ fill: StrategyFill) {
         guard !fills.contains(where: { $0.id == fill.id }) else { return }
-        fills.append(fill)
-        if fills.count > Self.maxFills { fills.removeFirst(fills.count - Self.maxFills) }
         var state = positions[fill.strategyId] ?? StrategyPositionState(
             strategyId: fill.strategyId, instId: fill.instId)
         state.contractSize = contractSizes[fill.instId] ?? state.contractSize
-        state.apply(fill)
+        var stamped = fill
+        (stamped.positionEffect, stamped.realisedQuote) = state.apply(fill)
+        fills.append(stamped)
+        if fills.count > Self.maxFills { fills.removeFirst(fills.count - Self.maxFills) }
         positions[fill.strategyId] = state
         onChanged?()
     }
@@ -361,25 +424,64 @@ public final class StrategyLedger {
         fills = newFills
         positions = newPositions
         recordedFundingIds = fundingIds
+        // A loaded ledger already knows its multipliers — the positions carry
+        // them — but the lookup table starts empty, and until instrument
+        // metadata arrived a swap fill would book P&L at multiplier 1. Learn
+        // back what the file already says instead of waiting to be retaught.
+        for state in newPositions.values {
+            if let size = state.contractSize, size > 0 { contractSizes[state.instId] = size }
+        }
+        // Fills persisted before the stamps existed show up here without an
+        // effect (every fill gets one, unlike the realised amount, which is
+        // legitimately nil on openers); give them both by the same replay a
+        // rebuild uses.
+        if fills.contains(where: { $0.positionEffect == nil }) {
+            restamp(from: replay().stampsById)
+        }
+    }
+
+    /// Replay the stored fills chronologically through `apply` — the one place
+    /// the accounting rule lives — yielding the rebuilt positions and each
+    /// fill's stamps.
+    private func replay() -> (
+        positions: [String: StrategyPositionState],
+        stampsById: [String: (effect: PositionEffect, realisedQuote: Double?)]
+    ) {
+        var rebuilt: [String: StrategyPositionState] = [:]
+        var stampsById: [String: (effect: PositionEffect, realisedQuote: Double?)] = [:]
+        for fill in fills.sorted(by: { $0.ts < $1.ts }) {
+            var state = rebuilt[fill.strategyId] ?? StrategyPositionState(
+                strategyId: fill.strategyId, instId: fill.instId)
+            state.contractSize = contractSizes[fill.instId] ?? state.contractSize
+            stampsById[fill.id] = state.apply(fill)
+            rebuilt[fill.strategyId] = state
+        }
+        return (rebuilt, stampsById)
+    }
+
+    private func restamp(
+        from stampsById: [String: (effect: PositionEffect, realisedQuote: Double?)]
+    ) {
+        for index in fills.indices {
+            let stamps = stampsById[fills[index].id]
+            fills[index].positionEffect = stamps?.effect
+            fills[index].realisedQuote = stamps?.realisedQuote
+        }
     }
 
     /// Rebuild every position by replaying the stored fills — the recovery path
     /// when a position looks wrong.
-    /// Rebuild every position by replaying the stored fills.
     ///
     /// Funding is carried across rather than replayed: it is not derived from
     /// fills, it is settled money booked against `recordedFundingIds`, and
     /// those ids survive the rebuild. Dropping it here would have deleted a
     /// real cost while leaving the ids that stop it ever being booked again.
     public func rebuildPositions() {
-        var rebuilt: [String: StrategyPositionState] = [:]
-        for fill in fills.sorted(by: { $0.ts < $1.ts }) {
-            var state = rebuilt[fill.strategyId] ?? StrategyPositionState(
-                strategyId: fill.strategyId, instId: fill.instId)
-            state.contractSize = contractSizes[fill.instId] ?? state.contractSize
-            state.apply(fill)
-            rebuilt[fill.strategyId] = state
-        }
+        let replayed = replay()
+        var rebuilt = replayed.positions
+        // The replay also restamps each fill, so fills recorded before the
+        // stamps existed pick them up on the same pass.
+        restamp(from: replayed.stampsById)
         for (key, funding) in positions.compactMapValues(\.fundingPaid) {
             rebuilt[key]?.fundingPaid = funding
         }

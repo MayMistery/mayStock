@@ -113,6 +113,195 @@ struct StrategyPositionTests {
     }
 }
 
+// MARK: - Realised-per-fill stamps
+
+/// The realisation rule lives once, in `apply`; the stamp is its return value.
+/// The guard here is therefore an invariant over whole fill sequences — the
+/// stamps must sum to the position's realised P&L — rather than a list of
+/// hand-picked cases that only re-prove yesterday's arithmetic.
+@Suite("每笔成交的兑现盖章")
+@MainActor
+struct FillRealisationStampTests {
+    private func fill(
+        _ side: OrderSide, _ price: Double, _ quantity: Double,
+        fee: Double = 0, instId: String = "BTC-USDT", id: String = UUID().uuidString
+    ) -> StrategyFill {
+        StrategyFill(id: id, strategyId: "s", instId: instId, side: side,
+                     price: price, quantity: quantity, feeQuote: fee,
+                     ts: Date(), clOrdId: nil, mode: .demo)
+    }
+
+    @Test("开仓单没有兑现，盖章为空")
+    func openersCarryNoStamp() {
+        let ledger = StrategyLedger(mode: .demo)
+        ledger.record(fill(.buy, 100, 2, fee: 0.2))
+        #expect(ledger.fills.first?.realisedQuote == nil)
+        #expect(ledger.fills.first?.netRealisedQuote == nil)
+    }
+
+    @Test("平仓单盖毛额，净额扣掉本笔手续费")
+    func closersAreStampedNetOfTheirOwnFee() {
+        let ledger = StrategyLedger(mode: .demo)
+        ledger.record(fill(.buy, 100, 4, fee: 0.4))
+        ledger.record(fill(.sell, 150, 1, fee: 0.1))
+        let closer = ledger.fills.last
+        #expect(abs((closer?.realisedQuote ?? 0) - 50) < 1e-9)
+        #expect(abs((closer?.netRealisedQuote ?? 0) - 49.9) < 1e-9,
+                "净额只扣这一笔的手续费；开仓那笔的费用已经在开仓行显示过")
+    }
+
+    @Test("反手单只对平掉的那部分盖章")
+    func aFlipStampsOnlyTheOverlap() {
+        let ledger = StrategyLedger(mode: .demo)
+        ledger.record(fill(.buy, 100, 1))
+        ledger.record(fill(.sell, 120, 3))
+        #expect(abs((ledger.fills.last?.realisedQuote ?? 0) - 20) < 1e-9,
+                "平 1 开 2 空，只有平掉的 1 手算兑现")
+    }
+
+    /// The invariant, walked over a sequence that exercises every branch of
+    /// `apply` — open, add, partial close, full close, flip — on a contract
+    /// with a real multiplier. If a new branch ever realises money without
+    /// returning it, or returns it without booking it, this sum breaks.
+    @Test("全序列不变量：盖章之和等于持仓的已实现盈亏")
+    func stampsSumToThePositionsRealisedPnL() {
+        let ledger = StrategyLedger(mode: .demo)
+        let inst = "ETH-USDT-SWAP"
+        ledger.setContractSize(0.1, forInstId: inst)
+        let sequence: [(OrderSide, Double, Double)] = [
+            (.buy, 1_800, 10),   // open long
+            (.buy, 1_900, 10),   // add
+            (.sell, 1_950, 5),   // partial close
+            (.sell, 1_700, 25),  // close the rest and flip short
+            (.buy, 1_650, 12),   // cover past flat back to long
+            (.sell, 1_640, 2),   // close again
+        ]
+        for (side, price, quantity) in sequence {
+            ledger.record(fill(side, price, quantity, fee: 0.5, instId: inst))
+        }
+        let stamped = ledger.fills.compactMap(\.realisedQuote).reduce(0, +)
+        let booked = ledger.position(for: "s")?.realisedPnL ?? 0
+        #expect(abs(stamped - booked) < 1e-9,
+                "盖章之和 \(stamped) 与账面已实现 \(booked) 不一致")
+        #expect(ledger.fills.allSatisfy { $0.positionEffect != nil },
+                "每笔入账的成交都必须带上开/加/平/反手判定")
+        #expect(ledger.fills.map(\.positionEffect) ==
+                [.open, .add, .close, .flip, .flip, .close],
+                "效果序列要和 apply 的每个分支一一对上")
+    }
+
+    /// Walked off the declaration, not a hand-picked pair: any new effect case
+    /// added to the enum fails here until it gets a label, and no two actions
+    /// may collapse into the same word.
+    @Test("操作标签覆盖整个效果×方向声明，且互不混淆")
+    func actionLabelsCoverTheWholeDeclaration() {
+        var seen: [String: String] = [:]
+        for effect in PositionEffect.allCases {
+            for side in [OrderSide.buy, .sell] {
+                let labelled = StrategyFill(
+                    id: "x", strategyId: "s", instId: "BTC-USDT", side: side,
+                    price: 1, quantity: 1, feeQuote: 0, ts: Date(), clOrdId: nil,
+                    mode: .demo, positionEffect: effect)
+                let label = labelled.actionLabel
+                #expect(!label.isEmpty)
+                #expect(label != side.displayName,
+                        "有效果判定时必须说开/平，不能退回买/卖")
+                let key = "\(effect)-\(side)"
+                #expect(!seen.values.contains(label), "\(key) 与 \(seen.first { $0.value == label }?.key ?? "") 共用了标签 \(label)")
+                seen[key] = label
+            }
+        }
+        let bare = StrategyFill(
+            id: "x", strategyId: "s", instId: "BTC-USDT", side: .buy,
+            price: 1, quantity: 1, feeQuote: 0, ts: Date(), clOrdId: nil, mode: .demo)
+        #expect(bare.actionLabel == OrderSide.buy.displayName,
+                "没重放过的旧记录退回买入/卖出，不硬猜")
+    }
+
+    @Test("重放恢复会给没有盖章的旧成交补章")
+    func rebuildRestampsLegacyFills() {
+        let ledger = StrategyLedger(mode: .demo)
+        ledger.setContractSize(0.1, forInstId: "ETH-USDT-SWAP")
+        ledger.record(fill(.buy, 1_800, 10, instId: "ETH-USDT-SWAP"))
+        ledger.record(fill(.sell, 1_900, 10, instId: "ETH-USDT-SWAP"))
+        let stampedBefore = ledger.fills.map { ($0.realisedQuote, $0.positionEffect) }
+
+        // A ledger written before the stamps existed: same fills, no stamps.
+        var stripped = ledger.fills
+        for index in stripped.indices {
+            stripped[index].realisedQuote = nil
+            stripped[index].positionEffect = nil
+        }
+        ledger.replace(fills: stripped, positions: ledger.positions)
+
+        ledger.rebuildPositions()
+        let after = ledger.fills.map { ($0.realisedQuote, $0.positionEffect) }
+        #expect(after.elementsEqual(stampedBefore, by: ==))
+    }
+
+    /// The load path, not just the explicit rebuild: a ledger written before
+    /// the stamp existed gets its stamps the moment it is read back, using the
+    /// multipliers the persisted positions already carry.
+    @Test("加载旧账本时就地补章，乘数取自持久化仓位")
+    func loadingALegacyLedgerRestampsWithPersistedMultipliers() {
+        let inst = "ETH-USDT-SWAP"
+        var position = StrategyPositionState(strategyId: "s", instId: inst)
+        position.contractSize = 0.1
+        let unstamped = [
+            fill(.sell, 1_900, 10, instId: inst, id: "open"),
+            fill(.buy, 1_800, 10, fee: 0.5, instId: inst, id: "close"),
+        ]
+
+        let ledger = StrategyLedger(mode: .demo)
+        ledger.replace(fills: unstamped, positions: ["s": position])
+
+        let closer = ledger.fills.first { $0.id == "close" }
+        #expect(abs((closer?.realisedQuote ?? 0) - 100) < 1e-9,
+                "空 10 张 @1900 平 @1800，面值 0.1：(1900-1800)×10×0.1 = 100")
+        #expect(closer?.positionEffect == .close)
+        let opener = ledger.fills.first { $0.id == "open" }
+        #expect(opener?.realisedQuote == nil)
+        #expect(opener?.positionEffect == .open)
+    }
+
+    /// A rebuild replays from blank states, so it can only know multipliers
+    /// from the lookup table — which used to start empty after a restart,
+    /// making "load, then rebuild" silently re-book every swap at multiplier 1
+    /// and drop the contract size from the rebuilt position.
+    @Test("加载后立刻重建不会丢乘数")
+    func rebuildingRightAfterLoadKeepsTheMultiplier() {
+        let inst = "ETH-USDT-SWAP"
+        var position = StrategyPositionState(strategyId: "s", instId: inst)
+        position.contractSize = 0.1
+        let history = [
+            fill(.sell, 1_900, 10, instId: inst, id: "open"),
+            fill(.buy, 1_800, 10, instId: inst, id: "close"),
+        ]
+
+        let ledger = StrategyLedger(mode: .demo)
+        ledger.replace(fills: history, positions: ["s": position])
+        ledger.rebuildPositions()
+
+        #expect(ledger.position(for: "s")?.contractSize == 0.1,
+                "重建后的仓位必须还记得面值")
+        #expect(abs((ledger.position(for: "s")?.realisedPnL ?? 0) - 100) < 1e-9,
+                "没有回种 contractSizes 的话这里会按乘数 1 重算成 1000")
+    }
+
+    @Test("旧账本文件没有这个字段也能解码")
+    func legacyLedgerFilesDecodeWithoutTheField() throws {
+        let json = """
+        {"id":"f1","strategyId":"s","instId":"BTC-USDT","side":"buy","price":100,
+         "quantity":1,"feeQuote":0.1,"ts":"2026-08-01T00:00:00Z","mode":"demo"}
+        """
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(StrategyFill.self, from: Data(json.utf8))
+        #expect(decoded.realisedQuote == nil)
+        #expect(decoded.positionEffect == nil)
+    }
+}
+
 // MARK: - Ledger
 
 @Suite("Strategy ledger")
