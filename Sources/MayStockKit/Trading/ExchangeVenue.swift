@@ -22,11 +22,20 @@ public protocol ExchangeVenue: Sendable {
 
     // MARK: Market data
 
+    /// Candles feed signals, and are read from the real market whatever the
+    /// trading mode: a strategy paper-traded on the demo account is the
+    /// strategy that will later run live, and it should see the same bars.
     func candles(instId: String, bar: BarInterval, target: Int) async throws -> [Candle]
     func historyCandles(instId: String, bar: BarInterval, target: Int) async throws -> [Candle]
-    func lastPrice(instId: String) async throws -> Double
+
+    /// Everything an order is priced, sized, valued or chosen from takes the
+    /// trading mode, and reads the environment the order will go to. A demo
+    /// environment's option books and marks are its own and can sit far from
+    /// the real market's; an order priced from the wrong one does not fill,
+    /// and a position valued from the wrong one is not what the account shows.
+    func lastPrice(instId: String, mode: TradingMode) async throws -> Double
     /// Nil when the exchange does not publish metadata for the instrument.
-    func instrumentMeta(instId: String) async throws -> InstrumentMeta?
+    func instrumentMeta(instId: String, mode: TradingMode) async throws -> InstrumentMeta?
 
     /// The price the ledger marks `instId` at, in the quote currency it books
     /// in. For spot and perpetuals that is the last trade. For an option it is
@@ -34,19 +43,19 @@ public protocol ExchangeVenue: Sendable {
     /// underlying — converted at the index, so a held premium is worth what
     /// the account would actually get for it. Defaults to `lastPrice`, which
     /// is right for every family a venue without options trades.
-    func valuationPrice(instId: String) async throws -> Double
+    func valuationPrice(instId: String, mode: TradingMode) async throws -> Double
 
     // MARK: Options
 
     /// Every live contract on an underlying index. Defaults to refusing: a
     /// venue that lists no options must say so rather than answer with an
     /// empty chain the runner would read as "nothing qualifies today".
-    func optionChain(underlying: String) async throws -> [OptionContract]
+    func optionChain(underlying: String, mode: TradingMode) async throws -> [OptionContract]
     /// Bid, ask, mark and index for one contract, read together so the four
     /// numbers describe the same instant.
-    func optionQuote(instId: String) async throws -> OptionQuote
+    func optionQuote(instId: String, mode: TradingMode) async throws -> OptionQuote
     /// The index price of an underlying, e.g. `BTC-USD`.
-    func indexPrice(underlying: String) async throws -> Double
+    func indexPrice(underlying: String, mode: TradingMode) async throws -> Double
 
     // MARK: Account
 
@@ -167,19 +176,19 @@ extension ExchangeVenue {
         instId: String?, mode: TradingMode
     ) async throws -> [FundingPayment] { [] }
 
-    public func valuationPrice(instId: String) async throws -> Double {
-        try await lastPrice(instId: instId)
+    public func valuationPrice(instId: String, mode: TradingMode) async throws -> Double {
+        try await lastPrice(instId: instId, mode: mode)
     }
 
-    public func optionChain(underlying: String) async throws -> [OptionContract] {
+    public func optionChain(underlying: String, mode: TradingMode) async throws -> [OptionContract] {
         throw ExchangeVenueError.unsupported(venueName, "期权链")
     }
 
-    public func optionQuote(instId: String) async throws -> OptionQuote {
+    public func optionQuote(instId: String, mode: TradingMode) async throws -> OptionQuote {
         throw ExchangeVenueError.unsupported(venueName, "期权报价")
     }
 
-    public func indexPrice(underlying: String) async throws -> Double {
+    public func indexPrice(underlying: String, mode: TradingMode) async throws -> Double {
         throw ExchangeVenueError.unsupported(venueName, "指数价")
     }
 
@@ -214,10 +223,25 @@ public struct AccountTradingConfig: Sendable, Equatable {
     /// OKX's `acctLv`: 1 simple, 2 single-currency margin, 3 multi-currency
     /// margin, 4 portfolio margin.
     public let accountLevel: Int?
+    /// OKX's `autoLoan`: whether the account borrows a coin it lacks when an
+    /// order has to be paid in it. Nil when the CLI did not report it.
+    public let autoLoan: Bool?
 
-    public init(positionMode: PositionMode?, accountLevel: Int?) {
+    public init(positionMode: PositionMode?, accountLevel: Int?, autoLoan: Bool? = nil) {
         self.positionMode = positionMode
         self.accountLevel = accountLevel
+        self.autoLoan = autoLoan
+    }
+
+    /// Whether an order can be paid in a coin the account does not hold.
+    ///
+    /// Auto-borrow is an account switch that only the multi-currency and
+    /// portfolio margin modes honour; a simple or single-currency account
+    /// pays from what it holds, whatever the switch says. An unreported
+    /// switch counts as off — the exchange's own refusal is the cost of being
+    /// wrong that way, a wrongly skipped check costs a position.
+    public var borrowsMissingCoin: Bool {
+        (accountLevel ?? 0) >= 3 && autoLoan == true
     }
 
     /// The `tdMode` an option order has to carry. Options are margined by the

@@ -305,8 +305,35 @@ public enum TradeError: Error, CustomStringConvertible, Sendable {
     public var exchangeRejection: String? {
         guard case .cliFailed(let exitCode, let stderr) = self, exitCode > 0,
               let code = Self.okxCode(in: stderr) else { return nil }
-        let text = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-        return "OKX \(code)：\(text.prefix(180))"
+        let words = Self.okxMessage(in: stderr)
+            ?? stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        return "OKX \(code)：\(words.prefix(180))"
+    }
+
+    /// The exchange's own words for a refusal, when the payload carries them.
+    ///
+    /// Three places they can be, matching the three shapes `okxCode` reads:
+    /// `sMsg` on a per-order result, `msg` on the envelope, and the `Error:`
+    /// line of a failure the CLI formatted itself. Without any of them the
+    /// raw payload is all there is, and the caller shows that instead — a
+    /// message that starts with a JSON bracket is worse than one that says
+    /// "insufficient BTC margin", but better than one that says nothing.
+    static func okxMessage(in text: String) -> String? {
+        let patterns = [
+            #"\"sMsg\"\s*:\s*\"([^\"]+)\""#,
+            #"\"msg\"\s*:\s*\"([^\"]+)\""#,
+            #"(?m)^\s*Error:\s*(.+?)\s*$"#,
+        ]
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            for match in regex.matches(in: text, range: range) {
+                guard let found = Range(match.range(at: 1), in: text) else { continue }
+                let words = text[found].trimmingCharacters(in: .whitespacesAndNewlines)
+                if !words.isEmpty { return words }
+            }
+        }
+        return nil
     }
 
     /// First non-zero OKX status code in a CLI error payload, if any.
@@ -477,7 +504,8 @@ public struct TradeBridge: Sendable {
             result = AccountTradingConfig(
                 positionMode: (dict["posMode"] as? String)
                     .flatMap(AccountTradingConfig.PositionMode.init(rawValue:)),
-                accountLevel: number(dict, "acctLv").map { Int($0) })
+                accountLevel: number(dict, "acctLv").map { Int($0) },
+                autoLoan: flag(dict, "autoLoan"))
         }
         return result
     }
@@ -966,6 +994,17 @@ public struct TradeBridge: Sendable {
         if let value = dict[key] as? Double { return value }
         if let value = dict[key] as? Int { return Double(value) }
         return nil
+    }
+
+    /// A switch the CLI passes through as JSON `true` or, on some envelopes,
+    /// as the string `"true"`. Anything else is "not reported".
+    static func flag(_ dict: [String: Any], _ key: String) -> Bool? {
+        if let value = dict[key] as? Bool { return value }
+        switch (dict[key] as? String)?.lowercased() {
+        case "true": return true
+        case "false": return false
+        default: return nil
+        }
     }
 
     static func findString(key: String, in json: String) -> String? {

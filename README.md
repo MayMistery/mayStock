@@ -46,6 +46,9 @@
   price contracts with Black–Scholes off realised volatility (and say so);
   live trading reads the exchange's chain and book and fills with IOC
   limits, with the contract chosen by the same rule the backtest used.
+  Premiums are paid in the settlement coin (BTC); an account that holds
+  none and cannot borrow it is refused before the order, with the shortfall
+  spelled out.
 - **Per-strategy attribution** — the exchange holds one balance, so every
   order carries a `clOrdId` strategy tag and is reconciled against
   `okx spot fills`. Each strategy's position, realised/unrealised P&L and

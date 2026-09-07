@@ -8,10 +8,20 @@ import FoundationNetworking
 /// (limit is 20 requests / 2 seconds).
 public struct OKXRESTClient: Sendable {
     public let baseURL: URL
+    /// Read the demo environment's market data rather than the real market's.
+    ///
+    /// OKX serves both from the same host, told apart by a request header.
+    /// The demo's spot and perpetual prices shadow the real ones, but its
+    /// option books and marks are its own — a demo order priced from the real
+    /// book can sit far outside the book it actually lands in.
+    public let simulated: Bool
     private let session: URLSession
 
-    public init(baseURL: URL = OKXEndpoints.rest, session: URLSession? = nil) {
+    public init(
+        baseURL: URL = OKXEndpoints.rest, session: URLSession? = nil, simulated: Bool = false
+    ) {
         self.baseURL = baseURL
+        self.simulated = simulated
         if let session {
             self.session = session
         } else {
@@ -30,9 +40,9 @@ public struct OKXRESTClient: Sendable {
         let data: [Row]
     }
 
-    private func get<Row: Decodable>(
-        _ type: Row.Type, path: String, query: [String: String]
-    ) async throws -> [Row] {
+    /// The request for one GET, carrying the environment header when this
+    /// client reads the demo.
+    func request(path: String, query: [String: String]) throws -> URLRequest {
         var components = URLComponents(
             url: baseURL.appendingPathComponent(path), resolvingAgainstBaseURL: false)!
         components.queryItems = query.sorted { $0.key < $1.key }
@@ -41,6 +51,16 @@ public struct OKXRESTClient: Sendable {
 
         var request = URLRequest(url: url)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if simulated {
+            request.setValue("1", forHTTPHeaderField: "x-simulated-trading")
+        }
+        return request
+    }
+
+    private func get<Row: Decodable>(
+        _ type: Row.Type, path: String, query: [String: String]
+    ) async throws -> [Row] {
+        let request = try request(path: path, query: query)
 
         let (data, response): (Data, URLResponse)
         do {

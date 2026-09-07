@@ -24,6 +24,12 @@ final class FakeVenue: ExchangeVenue, @unchecked Sendable {
     var autoFill = false
     var autoFillIndexPrice: Double?
     var equity: Double = 1_000
+    /// What `accountSnapshot` reports as held; empty is an account that holds
+    /// nothing in any coin an order might be paid in.
+    var balances: [AccountBalance] = []
+    /// When set, `accountSnapshot` throws it — an exchange that cannot be
+    /// asked what the account holds.
+    var accountSnapshotFailure: Error?
 
     func isReady() async -> Bool { true }
 
@@ -31,7 +37,7 @@ final class FakeVenue: ExchangeVenue, @unchecked Sendable {
     func historyCandles(instId: String, bar: BarInterval, target: Int) async throws -> [Candle] {
         candlesResult
     }
-    func lastPrice(instId: String) async throws -> Double { price }
+    func lastPrice(instId: String, mode: TradingMode) async throws -> Double { price }
 
     // MARK: Options
 
@@ -41,20 +47,20 @@ final class FakeVenue: ExchangeVenue, @unchecked Sendable {
     var indexPrices: [String: Double] = [:]
     var accountConfig: AccountTradingConfig?
 
-    func valuationPrice(instId: String) async throws -> Double {
+    func valuationPrice(instId: String, mode: TradingMode) async throws -> Double {
         if let price = valuationPrices[instId] { return price }
         return price
     }
-    func optionChain(underlying: String) async throws -> [OptionContract] {
+    func optionChain(underlying: String, mode: TradingMode) async throws -> [OptionContract] {
         optionChainResult.filter { $0.underlying == underlying }
     }
-    func optionQuote(instId: String) async throws -> OptionQuote {
+    func optionQuote(instId: String, mode: TradingMode) async throws -> OptionQuote {
         guard let quote = optionQuotes[instId] else {
             throw ExchangeVenueError.unsupported(venueName, "\(instId) 报价")
         }
         return quote
     }
-    func indexPrice(underlying: String) async throws -> Double {
+    func indexPrice(underlying: String, mode: TradingMode) async throws -> Double {
         guard let index = indexPrices[underlying] else {
             throw ExchangeVenueError.unsupported(venueName, "\(underlying) 指数")
         }
@@ -71,7 +77,7 @@ final class FakeVenue: ExchangeVenue, @unchecked Sendable {
     /// One BTC-USDT-SWAP contract is 0.01 BTC, as OKX reports it. The runner
     /// re-reads this every tick, so a fixture that omitted it would silently
     /// have the ledger price contracts as coins.
-    func instrumentMeta(instId: String) async throws -> InstrumentMeta? {
+    func instrumentMeta(instId: String, mode: TradingMode) async throws -> InstrumentMeta? {
         if let metaFailure { throw metaFailure }
         return InstrumentMeta(
             instId: instId, tickSize: 0.1, lotSize: 1, minSize: 1, contractValue: 0.01)
@@ -92,9 +98,13 @@ final class FakeVenue: ExchangeVenue, @unchecked Sendable {
         return OrderResult(ordId: "ord-\(placed.count)", clOrdId: order.clOrdId, raw: "{}")
     }
 
+    /// What the exchange says became of any order asked about; `.unknown`
+    /// models a listing that has not caught up yet.
+    var orderStatusResult: VenueOrderStatus = .unknown
+
     func orderStatus(
         instId: String, instType: InstrumentType, clOrdId: String, mode: TradingMode
-    ) async throws -> VenueOrderStatus { .unknown }
+    ) async throws -> VenueOrderStatus { orderStatusResult }
 
     func fills(
         instId: String?, instType: InstrumentType, mode: TradingMode
@@ -115,7 +125,8 @@ final class FakeVenue: ExchangeVenue, @unchecked Sendable {
             wedgeNextAccountSnapshot = false
             await withCheckedContinuation { wedged = $0 }
         }
-        return AccountSnapshot(balances: [], totalEquity: equity)
+        if let accountSnapshotFailure { throw accountSnapshotFailure }
+        return AccountSnapshot(balances: balances, totalEquity: equity)
     }
 
     func releaseWedge() {
@@ -1593,6 +1604,8 @@ struct OptionRunnerTests {
         host.fake.candlesResult = recentCandles(200)
         host.fake.indexPrices[Self.underlying] = 80_000
         host.fake.accountConfig = AccountTradingConfig(positionMode: .longShort, accountLevel: 3)
+        // The premium is paid in BTC; an account that holds some can buy.
+        host.fake.balances = [AccountBalance(ccy: "BTC", available: 1, total: 1)]
         host.fake.optionChainResult = [
             contract("BTC-USD-260910-80000-C", kind: .call, strike: 80_000, days: 3),
             contract("BTC-USD-260917-79000-C", kind: .call, strike: 79_000, days: 10),
@@ -1705,6 +1718,95 @@ struct OptionRunnerTests {
         await second.tick()
         #expect(again.fake.placed.isEmpty)
         #expect(second.state(for: "opt").message?.contains("盘口太薄") == true)
+    }
+
+    @Test("账户没有结算币又不能借时不下单，并写明缺口")
+    func anUnfundedPremiumIsRefusedBeforeTheOrder() async throws {
+        // The demo account as found: 65,000 USDT, no BTC, auto-borrow off.
+        // The exchange would answer 51008 "Insufficient BTC margin"; the
+        // runner says how much BTC and what to do about it, and sends nothing.
+        let host = try armedHost()
+        host.fake.balances = [AccountBalance(ccy: "USDT", available: 65_000, total: 65_000)]
+        host.fake.accountConfig = AccountTradingConfig(
+            positionMode: .longShort, accountLevel: 3, autoLoan: false)
+        let runner = runner(for: host)
+        await runner.tick()
+
+        #expect(host.fake.placed.isEmpty)
+        let message = try #require(runner.state(for: "opt").message)
+        #expect(message.contains("结算币不足"))
+        #expect(message.contains("BTC 可用 0"))
+        // 59 contracts × 0.01 × 0.0215 = 0.012685 BTC of premium, plus 3 bps
+        // of 0.59 BTC notional = 0.000177 in fee.
+        #expect(message.contains("需约 0.012862 BTC"), "\(message)")
+        #expect(message.contains("换入 BTC"))
+        #expect(runner.state(for: "opt").status == .running, "funding is the account's state, not a fault")
+    }
+
+    @Test("开启自动借币的跨币种账户没有结算币也下单，简单账户则不行")
+    func autoBorrowFundsThePremiumOnlyWhereTheExchangeHonoursIt() async throws {
+        let borrowing = try armedHost()
+        borrowing.fake.balances = []
+        borrowing.fake.accountConfig = AccountTradingConfig(
+            positionMode: .longShort, accountLevel: 3, autoLoan: true)
+        await runner(for: borrowing).tick()
+        #expect(borrowing.fake.placed.count == 1, "the exchange borrows the BTC")
+
+        let simple = try armedHost()
+        simple.fake.balances = []
+        simple.fake.accountConfig = AccountTradingConfig(
+            positionMode: .net, accountLevel: 1, autoLoan: true)
+        let runner = runner(for: simple)
+        await runner.tick()
+        #expect(simple.fake.placed.isEmpty, "a simple account cannot borrow, whatever the switch says")
+        #expect(runner.state(for: "opt").message?.contains("结算币不足") == true)
+    }
+
+    @Test("IOC 到达时盘口已变、被交易所撤单时，状态说未成交而不是说买入了")
+    func anUnfilledIOCIsReportedAsSuch() async throws {
+        // The demo round trip as it first ran: priced from one book, sent
+        // into another, cancelled with fillSz 0 — while the message read
+        // "买入 3" and the ledger, correctly, held nothing.
+        let host = try armedHost()
+        host.fake.autoFill = false
+        host.fake.orderStatusResult = .canceled
+        let runner = runner(for: host)
+        await runner.tick()
+
+        #expect(host.fake.placed.count == 1)
+        #expect(host.ledger.position(for: "opt")?.isFlat ?? true)
+        let message = try #require(runner.state(for: "opt").message)
+        #expect(message.contains("未成交"), "\(message)")
+        #expect(message.contains("已撤单"), "\(message)")
+        #expect(!message.hasSuffix("买入 59"), "\(message)")
+    }
+
+    @Test("成交后状态写明成交数量和均价，部分成交说明其余已撤")
+    func aFillIsReportedWithItsAverage() async throws {
+        let host = try armedHost()
+        host.fake.orderStatusResult = .filled(filledSize: 59, averagePrice: 0.0212)
+        let full = runner(for: host)
+        await full.tick()
+        #expect(full.state(for: "opt").message?.contains("买入 59 已成交 @ 0.0212") == true,
+                "\(full.state(for: "opt").message ?? "")")
+
+        let partial = try armedHost()
+        partial.fake.orderStatusResult = .filled(filledSize: 20, averagePrice: 0.0211)
+        let runner = runner(for: partial)
+        await runner.tick()
+        let message = try #require(runner.state(for: "opt").message)
+        #expect(message.contains("成交 20 @ 0.0211"), "\(message)")
+        #expect(message.contains("其余已撤"), "\(message)")
+    }
+
+    @Test("读不到余额时不猜，交给交易所裁定")
+    func anUnreadableBalanceDefersToTheExchange() async throws {
+        let host = try armedHost()
+        host.fake.balances = []
+        host.fake.accountSnapshotFailure = ExchangeVenueError.unsupported("fake", "余额")
+        let runner = runner(for: host)
+        await runner.tick()
+        #expect(host.fake.placed.count == 1, "an unknown balance is not a known shortfall")
     }
 
     @Test("期权链里没有合格到期时不开仓")

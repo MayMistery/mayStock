@@ -725,10 +725,10 @@ public final class StrategyRunner {
             // The valuation price, not the last trade: for an option that is
             // the exchange's mark converted at the index, in the currency the
             // book keeps.
-            if let price = try? await host.venue.valuationPrice(instId: instId), price > 0 {
+            if let price = try? await host.venue.valuationPrice(instId: instId, mode: host.portfolio.mode), price > 0 {
                 marks[instId] = price
             }
-            guard let size = await contractSize(for: instId, venue: host.venue) else {
+            guard let size = await contractSize(for: instId, host: host) else {
                 Log.warn("runner: 合约面值未知，本轮不改写 \(instId) 的面值（沿用账上已有值）")
                 continue
             }
@@ -750,11 +750,11 @@ public final class StrategyRunner {
     /// wrong number is already on the books.
     ///
     /// Only two answers are honest here: what the exchange said, and "unknown".
-    private func contractSize(for instId: String, venue: any ExchangeVenue) async -> Double? {
+    private func contractSize(for instId: String, host: StrategyRunnerHost) async -> Double? {
         let implied = InstrumentType.of(instId: instId).impliedContractSize
         if let implied { return implied }
         if let cached = metaCache[instId] { return cached.contractValue }
-        guard let meta = (try? await venue.instrumentMeta(instId: instId)) ?? nil else {
+        guard let meta = (try? await host.venue.instrumentMeta(instId: instId, mode: host.portfolio.mode)) ?? nil else {
             return nil
         }
         metaCache[instId] = meta
@@ -793,7 +793,7 @@ public final class StrategyRunner {
             let instId = "\(balance.ccy)-\(Self.quoteCurrency)"
             // Always re-read: a mark cached from an earlier tick would freeze
             // this holding's contribution and flatten the curve.
-            if let quoted = try? await host.venue.lastPrice(instId: instId), quoted > 0 {
+            if let quoted = try? await host.venue.lastPrice(instId: instId, mode: host.portfolio.mode), quoted > 0 {
                 marks[instId] = quoted
                 total += balance.total * quoted
             } else {
@@ -848,7 +848,7 @@ public final class StrategyRunner {
             guard !Self.stableCurrencies.contains(balance.ccy.uppercased()) else { continue }
             let instId = "\(balance.ccy)-\(Self.quoteCurrency)"
             var price = marks[instId]
-            if price == nil { price = try? await host.venue.lastPrice(instId: instId) }
+            if price == nil { price = try? await host.venue.lastPrice(instId: instId, mode: host.portfolio.mode) }
             guard let price, price > 0 else { continue }
             marks[instId] = price
             exposure += balance.total * price
@@ -1283,7 +1283,7 @@ public final class StrategyRunner {
         // session, so there may be no cached mark — fetch one rather than
         // silently doing nothing with the user's open position.
         if marks[market.instId] == nil {
-            marks[market.instId] = try? await host.venue.lastPrice(instId: market.instId)
+            marks[market.instId] = try? await host.venue.lastPrice(instId: market.instId, mode: host.portfolio.mode)
         }
         guard let price = marks[market.instId], price > 0 else {
             update(strategy.id) { $0.message = "取不到行情价，未能下单" }
@@ -1294,7 +1294,7 @@ public final class StrategyRunner {
         if let cached = metaCache[market.instId] {
             meta = cached
         } else {
-            meta = (try? await host.venue.instrumentMeta(instId: market.instId)) ?? nil
+            meta = (try? await host.venue.instrumentMeta(instId: market.instId, mode: host.portfolio.mode)) ?? nil
             if let meta { metaCache[market.instId] = meta }
         }
 
@@ -1501,7 +1501,7 @@ public final class StrategyRunner {
            Date().timeIntervalSince(cached.at) < Self.optionChainTTL {
             return cached.contracts
         }
-        let contracts = try await host.venue.optionChain(underlying: underlying)
+        let contracts = try await host.venue.optionChain(underlying: underlying, mode: host.portfolio.mode)
         optionChains[underlying] = (contracts, Date())
         return contracts
     }
@@ -1515,7 +1515,7 @@ public final class StrategyRunner {
             return listed.meta
         }
         if let cached = metaCache[instId] { return cached }
-        guard let meta = (try? await host.venue.instrumentMeta(instId: instId)) ?? nil else {
+        guard let meta = (try? await host.venue.instrumentMeta(instId: instId, mode: host.portfolio.mode)) ?? nil else {
             return nil
         }
         metaCache[instId] = meta
@@ -1564,7 +1564,7 @@ public final class StrategyRunner {
             update(strategy.id) { $0.message = "读不到 \(underlying) 期权链，未开仓：\(error)" }
             return
         }
-        guard let index = try? await host.venue.indexPrice(underlying: underlying), index > 0 else {
+        guard let index = try? await host.venue.indexPrice(underlying: underlying, mode: host.portfolio.mode), index > 0 else {
             update(strategy.id) { $0.message = "读不到 \(underlying) 指数价，未开仓" }
             return
         }
@@ -1591,7 +1591,7 @@ public final class StrategyRunner {
             return
         }
 
-        guard let quote = try? await host.venue.optionQuote(instId: contract.instId) else {
+        guard let quote = try? await host.venue.optionQuote(instId: contract.instId, mode: host.portfolio.mode) else {
             update(strategy.id) { $0.message = "读不到 \(contract.instId) 报价，未开仓" }
             return
         }
@@ -1625,8 +1625,17 @@ public final class StrategyRunner {
         }
         let tick = contract.tickSize > 0 ? contract.tickSize : 0.0001
         let limit = Self.snapToTick(ask * (1 + Self.optionPriceBuffer), tick: tick, roundingUp: true)
-        let tradeMode = (await accountTradingConfig(host: host)
-            ?? AccountTradingConfig(positionMode: nil, accountLevel: nil)).optionTradeMode
+        let config = await accountTradingConfig(host: host)
+        let tradeMode = (config ?? AccountTradingConfig(positionMode: nil, accountLevel: nil))
+            .optionTradeMode
+        if let funding = await premiumFunding(
+            contract: contract, contracts: contracts, limit: limit,
+            strategy: strategy, config: config, host: host),
+           !funding.isCovered {
+            Log.warn("runner: \(strategy.id) 未下单：\(funding.explanation)")
+            update(strategy.id) { $0.message = "未开仓：\(funding.explanation)" }
+            return
+        }
         host.ledger.setContractSize(contract.contractValue, forInstId: contract.instId)
 
         let order = OrderRequest(
@@ -1663,6 +1672,40 @@ public final class StrategyRunner {
             takeProfit: plan.takeProfitPct.map { entry * (1 + $0 / 100) })
     }
 
+    /// Whether the account can pay the premium for `contracts` of `contract`
+    /// at `limit`, or nil when that cannot be known. The exchange then rules
+    /// on the order itself, and the log says the check was skipped rather
+    /// than passed.
+    private func premiumFunding(
+        contract: OptionContract, contracts: Double, limit: Double,
+        strategy: CompiledStrategy, config: AccountTradingConfig?, host: StrategyRunnerHost
+    ) async -> OptionPremiumFunding? {
+        guard let config else {
+            Log.warn("""
+                runner: \(strategy.id) 读不到账户配置，跳过结算币 \(contract.settleCurrency) \
+                余额检查，由交易所裁定
+                """)
+            return nil
+        }
+        let snapshot: AccountSnapshot
+        do {
+            snapshot = try await host.venue.accountSnapshot(mode: host.portfolio.mode)
+        } catch {
+            Log.warn("""
+                runner: \(strategy.id) 读不到账户余额（\(error)），跳过结算币 \
+                \(contract.settleCurrency) 检查，由交易所裁定
+                """)
+            return nil
+        }
+        return OptionPremiumFunding(
+            settleCurrency: contract.settleCurrency, contracts: contracts,
+            contractValue: contract.contractValue, limitPrice: limit,
+            feeBps: strategy.manifest.effectiveCosts.feeBps,
+            feeCapPctOfPremium: strategy.optionsSpec.feeCapPctOfPremium,
+            available: snapshot.balance(of: contract.settleCurrency)?.available ?? 0,
+            config: config)
+    }
+
     /// Sell the held contract back into its book, whole, with an IOC limit a
     /// little through the bid.
     private func closeOption(
@@ -1673,7 +1716,7 @@ public final class StrategyRunner {
               InstrumentType.of(instId: position.instId) == .option else { return }
         let contracts = abs(position.quantity)
 
-        guard let quote = try? await host.venue.optionQuote(instId: position.instId) else {
+        guard let quote = try? await host.venue.optionQuote(instId: position.instId, mode: host.portfolio.mode) else {
             update(strategy.id) { $0.message = "读不到 \(position.instId) 报价，未能平仓" }
             return
         }
@@ -1731,6 +1774,56 @@ public final class StrategyRunner {
         try? await Task.sleep(nanoseconds: 1_200_000_000)
         fillsThisTick = fillsThisTick.filter { $0.key.instType != order.instType }
         await ingestFills(for: [strategy], host: host)
+        if order.kind != .limit {
+            await reportImmediateOutcome(of: order, strategy: strategy, host: host, reason: reason)
+        }
+    }
+
+    /// What became of an order that resolves on arrival.
+    ///
+    /// A market or IOC order is filled, partly filled or cancelled before the
+    /// placing call returns, so "买入 3" is not yet a fact when it is written:
+    /// an IOC the book never touched leaves the ledger, correctly, holding
+    /// nothing, and a message saying a buy happened next to a book saying it
+    /// did not is the kind of disagreement that gets believed the wrong way
+    /// round. The exchange is asked, and its answer becomes the message.
+    private func reportImmediateOutcome(
+        of order: OrderRequest, strategy: CompiledStrategy,
+        host: StrategyRunnerHost, reason: String
+    ) async {
+        guard let clOrdId = order.clOrdId,
+              let status = try? await host.venue.orderStatus(
+                instId: order.instId, instType: order.instType,
+                clOrdId: clOrdId, mode: host.portfolio.mode) else { return }
+        let side = order.side.displayName
+        let asked = PriceFormatter.plain(order.size)
+        switch status {
+        case .canceled:
+            Log.warn("""
+                runner: \(strategy.id) \(side) \(order.instId) \(asked) 未成交，交易所已撤单\
+                （到达时盘口已不在限价内），台账未记仓位
+                """)
+            update(strategy.id) {
+                $0.message = "\(reason)：\(side) \(asked) 未成交，交易所已撤单，台账未记仓位"
+            }
+        case .filled(let filled, let average)
+            where order.sizeUnit == .base && filled < order.size - 1e-9:
+            update(strategy.id) {
+                $0.message = "\(reason)：\(side) \(asked)，成交 \(PriceFormatter.plain(filled)) "
+                    + "@ \(PriceFormatter.plain(average))，其余已撤"
+            }
+        case .filled(_, let average):
+            update(strategy.id) {
+                $0.message = "\(reason)：\(side) \(asked) 已成交 @ \(PriceFormatter.plain(average))"
+            }
+        case .rejected(let verdict):
+            // A refusal that only the listing reports: the placing call had
+            // returned as if accepted.
+            Log.warn("runner: \(strategy.id) \(side) \(order.instId) \(asked) 被交易所拒绝：\(verdict)")
+            update(strategy.id) { $0.message = "\(reason)：\(side) \(asked) 被交易所拒绝：\(verdict)" }
+        case .live, .unknown:
+            break
+        }
     }
 
     // MARK: Trailing stops
@@ -1919,7 +2012,7 @@ public final class StrategyRunner {
                   prices[underlying] == nil else { continue }
             if let cached = indexThisTick[underlying] {
                 prices[underlying] = cached
-            } else if let price = try? await host.venue.indexPrice(underlying: underlying),
+            } else if let price = try? await host.venue.indexPrice(underlying: underlying, mode: host.portfolio.mode),
                       price > 0 {
                 prices[underlying] = price
                 indexThisTick[underlying] = price

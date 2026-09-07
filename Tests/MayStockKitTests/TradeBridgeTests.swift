@@ -489,19 +489,64 @@ struct TradeBridgeOptionTests {
         #expect(spot.first?.indexPrice == nil)
     }
 
-    @Test("账户配置读出持仓模式和账户等级")
+    @Test("账户配置读出持仓模式、账户等级和自动借币开关")
     func accountConfigIsRead() {
         let json = """
-        [{"acctLv":"3","posMode":"long_short_mode","uid":"1"}]
+        [{"acctLv":"3","posMode":"long_short_mode","uid":"1","autoLoan":false}]
         """
         let config = TradeBridge.parseAccountTradingConfig(json: json)
         #expect(config?.positionMode == .longShort)
         #expect(config?.accountLevel == 3)
         #expect(config?.optionTradeMode == "cross")
-        let net = TradeBridge.parseAccountTradingConfig(json: #"[{"acctLv":"1","posMode":"net_mode"}]"#)
+        #expect(config?.autoLoan == false)
+        let net = TradeBridge.parseAccountTradingConfig(
+            json: #"[{"acctLv":"1","posMode":"net_mode","autoLoan":"true"}]"#)
         #expect(net?.positionMode == .net)
         #expect(net?.optionTradeMode == "cash")
+        #expect(net?.autoLoan == true, "the string spelling counts too")
+        let silent = TradeBridge.parseAccountTradingConfig(json: #"[{"acctLv":"2"}]"#)
+        #expect(silent?.autoLoan == nil, "not reported is not off")
         #expect(TradeBridge.parseAccountTradingConfig(json: "[]") == nil)
+    }
+
+    @Test("只有跨币种 / 组合保证金账户开了自动借币才算能借")
+    func borrowingNeedsBothTheModeAndTheSwitch() {
+        for level in [nil, 1, 2, 3, 4] {
+            for loan in [nil, false, true] {
+                let config = AccountTradingConfig(positionMode: nil, accountLevel: level, autoLoan: loan)
+                let expected = (level ?? 0) >= 3 && loan == true
+                #expect(config.borrowsMissingCoin == expected, "acctLv \(level.map(String.init) ?? "nil") autoLoan \(loan.map(String.init) ?? "nil")")
+            }
+        }
+    }
+
+    @Test("拒单文案用交易所的话，不用原始 JSON")
+    func aRejectionSpeaksTheExchangesWords() {
+        let perOrder = TradeError.cliFailed(exitCode: 1, stderr: """
+            [
+              {
+                "clOrdId": "ms3c9ace0fmtrcq2h4e4",
+                "ordId": "",
+                "sCode": "51008",
+                "sMsg": "Order failed. Insufficient BTC margin in account ",
+                "tag": ""
+              }
+            ]
+            """)
+        #expect(perOrder.exchangeRejection == "OKX 51008：Order failed. Insufficient BTC margin in account")
+
+        let envelope = TradeError.cliFailed(
+            exitCode: 1, stderr: #"{"code":"51000","msg":"Parameter slTriggerPx error","data":[]}"#)
+        #expect(envelope.exchangeRejection == "OKX 51000：Parameter slTriggerPx error")
+
+        let formatted = TradeError.cliFailed(
+            exitCode: 1, stderr: "Error: Parameter ordType error\nCode: 51000\nVersion: 1.4.1")
+        #expect(formatted.exchangeRejection == "OKX 51000：Parameter ordType error")
+
+        // An envelope whose `msg` is empty falls through to the raw payload
+        // rather than to an empty verdict.
+        let wordless = TradeError.cliFailed(exitCode: 1, stderr: #"{"code":"51119","msg":""}"#)
+        #expect(wordless.exchangeRejection == #"OKX 51119：{"code":"51119","msg":""}"#)
     }
 
     @Test("合约面值是 ctVal × ctMult，期权的 0.01 在 ctMult 里")

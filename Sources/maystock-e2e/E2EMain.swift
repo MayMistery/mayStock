@@ -397,12 +397,29 @@ extension E2EMain {
         }
         pass("清单", "买入 \(underlying) 到期 ≥ \(PriceFormatter.plain(minDays)) 天、偏离 "
              + "\(PriceFormatter.plain(moneyness))% 的看涨，权利金预算 \(PriceFormatter.money(budget)) USDT")
+        var allOK = true
+
+        // The premium is paid in the settlement coin, not the USDT the budget
+        // is stated in. Say up front what the account holds and whether it
+        // may borrow, so a refusal below reads as the account's state rather
+        // than the code's.
+        do {
+            let config = try await venue.accountTradingConfig(mode: .demo)
+            let held = try await venue.accountSnapshot(mode: .demo).balance(of: base)?.available ?? 0
+            let level = config.accountLevel.map(String.init) ?? "—"
+            let loan = config.autoLoan.map { $0 ? "开" : "关" } ?? "未知"
+            let fundable = held > 0 || config.borrowsMissingCoin
+            (fundable ? pass : fail)("结算币",
+                "\(base) 可用 \(PriceFormatter.plain(held)) · 账户等级 \(level) · 自动借币 \(loan)"
+                + (fundable ? "" : " —— 没有 \(base) 也不能借，运行器会在下单前拒绝并说明缺口"))
+        } catch {
+            fail("结算币", String(describing: error)); allOK = false
+        }
 
         let host = await MainActor.run {
             DemoOptionHost(strategy: strategy, capital: capital, venue: venue)
         }
         let runner = await MainActor.run { StrategyRunner(host: host) }
-        var allOK = true
 
         // --- 1. Open.
         await runner.tick()
@@ -435,7 +452,7 @@ extension E2EMain {
         } catch {
             fail("交易所持仓", String(describing: error)); allOK = false
         }
-        if let mark = try? await venue.valuationPrice(instId: opened.instId) {
+        if let mark = try? await venue.valuationPrice(instId: opened.instId, mode: .demo) {
             pass("标记价（计价币/单位）", PriceFormatter.money(mark)
                  + " · 浮动盈亏 \(PriceFormatter.signedMoney(opened.unrealisedPnL(mark: mark)))")
         }
