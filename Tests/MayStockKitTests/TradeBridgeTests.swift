@@ -571,3 +571,59 @@ struct OrderStatusListingTests {
         #expect(absent == .unknown)
     }
 }
+
+@Suite("A refusal on stdout is still a refusal")
+struct FailureTextTests {
+    @Test("非零退出时 stdout 里的 sCode 不能被 stderr 的更新横幅盖掉")
+    func theVerdictOnStdoutSurvivesTheNagOnStderr() async throws {
+        // Exactly what the demo account returned for an option order before
+        // options trading was activated: the verdict as JSON on stdout, the
+        // update nag on stderr, exit code 1.
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("maystock-refusal-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let cli = dir.appendingPathComponent("okx")
+        try """
+        #!/bin/sh
+        echo 'Update available for @okx_ai/okx-trade-cli: 1.4.1 -> 1.4.5' >&2
+        echo 'Run: npm install -g @okx_ai/okx-trade-cli' >&2
+        echo '[{"clOrdId":"x","ordId":"","sCode":"51198","sMsg":"activate options trading first"}]'
+        exit 1
+        """.write(to: cli, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cli.path)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let bridge = TradeBridge(explicitCLIPath: cli.path)
+        let order = OrderRequest(
+            instId: "BTC-USD-261225-100000-C", instType: .option, side: .buy, kind: .ioc,
+            size: 3, sizeUnit: .base, limitPrice: 0.021, tradeMode: "cross")
+        do {
+            _ = try await bridge.place(order, mode: .demo)
+            Issue.record("a non-zero exit must throw")
+        } catch let error as TradeError {
+            let rejection = try #require(error.exchangeRejection,
+                                         "the exchange's own verdict is final, not an unconfirmed order")
+            #expect(rejection.contains("51198"))
+            #expect(rejection.contains("activate"))
+            #expect(!error.description.contains("Update available"), "the nag is noise, not the reason")
+        }
+    }
+
+    @Test("CLI 自己格式化的 Code: 行也算裁决，HTTP 状态码不算")
+    func plainTextCodesCountAndHttpStatusesDoNot() {
+        #expect(TradeError.okxCode(in: "Error: Parameter ordType error\nCode: 51000\nVersion: 1.4.1") == "51000")
+        #expect(TradeError.okxCode(in: "Error: HTTP 400 from OKX\nCode: 400\nHint: retry") == nil)
+        #expect(TradeError.okxCode(in: #"{"code":"0","data":[{"sCode":"51119"}]}"#) == "51119")
+    }
+
+    @Test("失败文本合并两路输出并去掉横幅")
+    func failureTextKeepsBothStreamsMinusTheNag() {
+        let text = TradeBridge.failureText(
+            stdout: #"[{"sCode":"51198","sMsg":"activate"}]"#,
+            stderr: "\nUpdate available for @okx_ai/okx-trade-cli: 1.4.1 -> 1.4.5\nRun: npm install -g @okx_ai/okx-trade-cli\nsocket hang up\n")
+        #expect(text.contains("51198"))
+        #expect(text.contains("socket hang up"))
+        #expect(!text.contains("Update available"))
+        #expect(TradeBridge.failureText(stdout: "", stderr: "  \n") == "")
+    }
+}

@@ -310,14 +310,25 @@ public enum TradeError: Error, CustomStringConvertible, Sendable {
     }
 
     /// First non-zero OKX status code in a CLI error payload, if any.
+    ///
+    /// Two spellings, because the CLI uses both: a JSON `sCode`/`code` field
+    /// when it passes the exchange's response through, and a plain
+    /// `Code: 51001` line when it formats the error itself. Only OKX's own
+    /// five-digit codes count; the `Code: 400` of an HTTP failure says the
+    /// gateway refused the call, not that the exchange judged the order.
     static func okxCode(in text: String) -> String? {
-        let pattern = #"\"(?:sCode|code)\"\s*:\s*\"?(\d+)\"?"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let patterns = [
+            #"\"(?:sCode|code)\"\s*:\s*\"?(\d+)\"?"#,
+            #"(?m)^\s*Code:\s*(\d{5})\s*$"#,
+        ]
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
-        for match in regex.matches(in: text, range: range) {
-            guard let found = Range(match.range(at: 1), in: text) else { continue }
-            let code = String(text[found])
-            if code != "0" { return code }
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            for match in regex.matches(in: text, range: range) {
+                guard let found = Range(match.range(at: 1), in: text) else { continue }
+                let code = String(text[found])
+                if code != "0" { return code }
+            }
         }
         return nil
     }
@@ -806,11 +817,33 @@ public struct TradeBridge: Sendable {
 
         let out = outcome.stdoutText
         guard outcome.exitCode == 0 else {
-            let err = outcome.stderrText
             throw TradeError.cliFailed(
-                exitCode: outcome.exitCode, stderr: err.isEmpty ? out : err)
+                exitCode: outcome.exitCode,
+                stderr: Self.failureText(stdout: out, stderr: outcome.stderrText))
         }
         return out
+    }
+
+    /// What a failed invocation actually said.
+    ///
+    /// The CLI prints the exchange's refusal — `sCode`, `sMsg` — to stdout as
+    /// JSON, and its update nag to stderr. "stderr, else stdout" therefore
+    /// handed the runner the nag and dropped the verdict: a 51198 refusal on
+    /// the demo account was reported as an unconfirmed order, which is the
+    /// one thing a definite refusal must never be reported as. Both streams
+    /// are kept, and the nag is not.
+    static func failureText(stdout: String, stderr: String) -> String {
+        let signal = stderr
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .filter { line in
+                !line.contains("Update available for @okx_ai/okx-trade-cli")
+                    && !line.contains("npm install -g @okx_ai/okx-trade-cli")
+            }
+            .joined(separator: "\n")
+        return [stdout, signal]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
     }
 
     // MARK: Output parsing
