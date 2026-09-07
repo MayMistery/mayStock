@@ -2045,7 +2045,10 @@ public final class StrategyRunner {
         for instrument in instruments {
             guard let listing = await fills(for: instrument, host: host) else { continue }
             let indexPrices = await indexPrices(for: listing, host: host)
-            host.ledger.ingest(listing, knownStrategyIds: knownIds, indexPrices: indexPrices)
+            let contractSizes = await contractSizes(for: listing, host: host)
+            host.ledger.ingest(
+                listing, knownStrategyIds: knownIds,
+                indexPrices: indexPrices, contractSizes: contractSizes)
         }
     }
 
@@ -2071,6 +2074,29 @@ public final class StrategyRunner {
 
     /// Cleared at the top of every tick, like `fillsThisTick`.
     private var indexThisTick: [String: Double] = [:]
+
+    /// What one contract is worth, for every instrument in a listing whose
+    /// family does not imply it.
+    ///
+    /// The ledger refuses to book a fill it cannot scale, so the answer has
+    /// to be fetched before the fill is offered rather than after — a listing
+    /// routinely names an instrument no position has ever been held in: the
+    /// contract an option strategy rolled out of, or anything at all on a
+    /// ledger that has just been rebuilt. `contractSize` caches and never
+    /// invents.
+    private func contractSizes(
+        for listing: [ExchangeFill], host: StrategyRunnerHost
+    ) async -> [String: Double] {
+        var sizes: [String: Double] = [:]
+        for fill in listing
+        where InstrumentType.of(instId: fill.instId).impliedContractSize == nil
+            && sizes[fill.instId] == nil {
+            if let size = await contractSize(for: fill.instId, host: host), size > 0 {
+                sizes[fill.instId] = size
+            }
+        }
+        return sizes
+    }
 
     /// Fills for one instrument, fetched at most once per tick.
     ///

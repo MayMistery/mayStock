@@ -441,6 +441,25 @@ public final class StrategyLedger {
             state.contractSize = nil
         }
         state.contractSize = contractSizes[fill.instId] ?? state.contractSize
+        // Never book against a guessed multiplier.
+        //
+        // A position's *unrealised* P&L is recomputed from its state, so a
+        // multiplier learned late still fixes it — which is why teaching the
+        // ledger a contract size updates positions already on the book. The
+        // realised stamp is not like that: `apply` scales it once, appends it
+        // to a cumulative total, and nothing later can take it back. A BTC
+        // option booked at 1 instead of 0.01 realises a hundred times its
+        // true P&L, permanently, and that is exactly what a fresh ledger
+        // reading the exchange's fill history did — it had never held the
+        // contract, so nobody had told it what one is worth. So the fill
+        // waits for the answer instead of being booked on a guess; the
+        // listing is re-read every tick, and the caller teaches the size it
+        // looked up.
+        guard state.contractSizeIsKnown else {
+            Log.warn("ledger: \(fill.instId) 的合约面值未知，成交 \(fill.id) 暂不入账，"
+                     + "等交易所元数据到达后重试")
+            return
+        }
         var stamped = fill
         (stamped.positionEffect, stamped.realisedQuote) = state.apply(fill)
         fills.append(stamped)
@@ -457,11 +476,17 @@ public final class StrategyLedger {
     /// the exchange did not stamp with an index of their own. A fill that can
     /// be converted by neither is left for the next ingest and logged, not
     /// booked at a guess.
+    ///
+    /// `contractSizes`, keyed by instrument, is what one contract is worth in
+    /// base units. Same rule, same reason: a derivative fill whose multiplier
+    /// nobody has supplied is left for the next ingest rather than booked at
+    /// 1 — see `record`.
     @discardableResult
     public func ingest(
         _ exchangeFills: [ExchangeFill], knownStrategyIds: [String],
-        indexPrices: [String: Double] = [:]
+        indexPrices: [String: Double] = [:], contractSizes: [String: Double] = [:]
     ) -> Int {
+        for (instId, size) in contractSizes { setContractSize(size, forInstId: instId) }
         let existing = Set(fills.map(\.id))
         var added = 0
         for fill in exchangeFills.sorted(by: { $0.ts < $1.ts }) {

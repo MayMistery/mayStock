@@ -559,13 +559,13 @@ struct PerpetualContractSizingTests {
     }
 
     /// Teaching the ledger a contract size must fix positions already on the
-    /// book — a restart loads a ledger that predates the knowledge.
+    /// book — a ledger written before the field existed loads without one.
     @Test func learningTheContractSizeCorrectsExistingPositions() {
         let ledger = StrategyLedger(mode: .demo)
-        ledger.record(StrategyFill(
-            id: "1", strategyId: "s", instId: "BTC-USDT-SWAP", side: .sell,
-            price: 64_000, quantity: 1, feeQuote: 0,
-            ts: Date(), clOrdId: nil, mode: .demo))
+        var stale = StrategyPositionState(strategyId: "s", instId: "BTC-USDT-SWAP")
+        stale.quantity = -1
+        stale.averagePrice = 64_000
+        ledger.replace(fills: [], positions: ["s": stale])
         #expect(ledger.position(for: "s")?.multiplier == 1)
 
         ledger.setContractSize(0.01, forInstId: "BTC-USDT-SWAP")
@@ -576,13 +576,55 @@ struct PerpetualContractSizingTests {
 
     @Test func aNonsenseContractSizeIsIgnored() {
         let ledger = StrategyLedger(mode: .demo)
+        ledger.setContractSize(0.01, forInstId: "BTC-USDT-SWAP")
         ledger.record(StrategyFill(
             id: "1", strategyId: "s", instId: "BTC-USDT-SWAP", side: .sell,
             price: 64_000, quantity: 1, feeQuote: 0,
             ts: Date(), clOrdId: nil, mode: .demo))
         ledger.setContractSize(0, forInstId: "BTC-USDT-SWAP")
         ledger.setContractSize(-5, forInstId: "BTC-USDT-SWAP")
-        #expect(ledger.position(for: "s")?.multiplier == 1, "never scale by zero")
+        #expect(ledger.position(for: "s")?.multiplier == 0.01, "never scale by zero")
+    }
+
+    /// The realised stamp is cumulative and taken once, so a multiplier
+    /// learned afterwards cannot repair it. A fill that cannot be scaled
+    /// waits instead of being booked at 1.
+    @Test("面值未知的衍生品成交不入账，知道之后按真面值补记")
+    func aFillIsNotBookedUntilItsContractSizeIsKnown() {
+        let ledger = StrategyLedger(mode: .demo)
+        let call = "BTC-USD-261225-100000-C"
+        let tag = OrderTag.make(strategyId: "s")
+        func fill(_ id: String, _ side: OrderSide, _ price: Double) -> ExchangeFill {
+            ExchangeFill(
+                id: id, instId: call, side: side, posSide: nil, price: price, size: 2,
+                fee: 0, feeCcy: "BTC", ordId: "o" + id, clOrdId: tag,
+                ts: Date(timeIntervalSince1970: 1_000), priceUsd: nil, indexPrice: 80_000)
+        }
+        let listing = [fill("open", .buy, 0.0375), fill("close", .sell, 0.037)]
+
+        // A fresh ledger reading the exchange's history has never held this
+        // contract, so nobody has told it one contract is 0.01 BTC.
+        #expect(ledger.ingest(listing, knownStrategyIds: ["s"]) == 0)
+        #expect(ledger.fills.isEmpty)
+        #expect(ledger.position(for: "s") == nil)
+
+        // The caller looked the size up; both fills book at once, correctly.
+        #expect(ledger.ingest(listing, knownStrategyIds: ["s"],
+                              contractSizes: [call: 0.01]) == 2)
+        let position = try? #require(ledger.position(for: "s"))
+        #expect(position?.isFlat == true)
+        // (0.037 − 0.0375) × 80,000 × 2 contracts × 0.01 BTC = −0.80.
+        #expect(abs((position?.realisedPnL ?? 0) + 0.80) < 1e-6,
+                "realised=\(position?.realisedPnL ?? 0)")
+    }
+
+    @Test("现货不需要谁来教面值")
+    func spotNeedsNoMultiplier() {
+        let ledger = StrategyLedger(mode: .demo)
+        ledger.record(StrategyFill(
+            id: "1", strategyId: "s", instId: "BTC-USDT", side: .buy,
+            price: 64_000, quantity: 0.5, feeQuote: 0, ts: Date(), clOrdId: nil, mode: .demo))
+        #expect(ledger.position(for: "s")?.quantity == 0.5)
     }
 }
 
@@ -651,6 +693,9 @@ struct LedgerFundingTests {
 
     private func ledgerHoldingAPosition() -> StrategyLedger {
         let ledger = StrategyLedger(mode: .demo)
+        // One ETH-USDT-SWAP contract is 0.1 ETH; a ledger that has not been
+        // told refuses the fill rather than booking it at 1.
+        ledger.setContractSize(0.1, forInstId: "ETH-USDT-SWAP")
         ledger.record(StrategyFill(
             id: "f1", strategyId: "eth-short", instId: "ETH-USDT-SWAP", side: .sell,
             price: 1_919.58, quantity: 40, feeQuote: 0,
@@ -767,6 +812,7 @@ struct LedgerOptionTests {
         let ledger = StrategyLedger(mode: .demo)
         let tag = OrderTag.make(strategyId: "s")
         let fills = [exchangeFill(id: "a", indexPrice: nil, clOrdId: tag)]
+        ledger.setContractSize(0.01, forInstId: call)
         #expect(ledger.ingest(fills, knownStrategyIds: ["s"]) == 0, "nothing to convert with")
         #expect(ledger.fills.isEmpty)
         #expect(ledger.ingest(fills, knownStrategyIds: ["s"], indexPrices: ["BTC-USD": 80_000]) == 1)
