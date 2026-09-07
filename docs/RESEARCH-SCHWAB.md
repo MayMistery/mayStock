@@ -161,7 +161,7 @@ thinkorswim 对这个项目唯一的用处是**手工验证**。API 没有模拟
 
 ### 7.3 顺序（依赖最少 → 最多）
 
-0. **今天**：你去开发者门户注册并提交两段申请。等审核的两三周正好做 1。（2026-09-07 已登录门户并打开 Trader API – Individual 的申请弹窗；条款要点见本节末尾。）
+0. **今天**：你去开发者门户注册并提交两段申请。等审核的两三周正好做 1。（2026-09-08：Trader API – Individual 已提交，Dashboard → Subscriptions 显示 **Pending**；Create App 在审批通过前不可用——表单直接提示 *You do not have access to any Active API products*，产品下拉为空。审批通过后再建 App，回调填 `https://127.0.0.1:8182`。条款要点见 §7.5。）
 1. ~~内核与 manifest 的通用化（7.2）~~ **已完成（2026-09-08）**，全部离线测试。
 2. `schwabctl login + candles`，maystock-lab 先跑美股日线研究（日线可回到 1985 年，365 天回测没问题；1H/4H 策略只有约 9 个月的 30 分钟线可重采样，更长要另找数据源）。
 3. `SchwabVenue` + 本地影子撮合；再用最小手数上实盘。
