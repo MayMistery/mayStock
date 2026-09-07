@@ -33,6 +33,12 @@
 - **Alerts** — price cross (with hysteresis), 24h change thresholds,
   volatility within a window; system notifications, optional sound, optional
   shell hook (env vars let you chain the `okx` CLI: alert → order).
+- **Terminal window** — one window with a sidebar: 总览 (account equity with
+  its gap-aware curve, open positions, exchange balances, recent fills, every
+  engine notice), 行情 (the watchlist at full size with the same charts as the
+  panel, plus how each instrument shows in the menu bar), 策略, 告警,
+  账户与连接 and 设置. The bar above every page shows which account is in
+  play, whether it can be reached, and the emergency stop.
 - **Strategy studio** — import a declarative strategy manifest (JSON) and get
   **1/7/30/90/365-day** backtests in one pass: return, drawdown, Sharpe,
   profit factor, and the buy-and-hold benchmark, plus a **robustness badge**
@@ -48,8 +54,12 @@
   and returns only — there is no manual order entry.
 - **Trading** — via OKX's official CLI (Agent Trade Kit). Demo mode by
   default; live trading requires an explicit unlock *and* per-strategy
-  confirmation. MayStock never touches your API keys. **Backtests need no
-  credentials at all — they read public market data.**
+  confirmation. **Demo and live are separate accounts with separate API
+  keys**, so each environment has its own CLI profile; switching verifies the
+  target account (a read-only balance call), explains what will stop, and
+  restarts the trading loop across the boundary so nothing decided under one
+  account executes on the other. MayStock never touches your API keys.
+  **Backtests need no credentials at all — they read public market data.**
 - **Research bench** (`maystock-lab`) — grid optimisation, **walk-forward
   validation**, portfolio backtests with leg correlation, and OKX fee-tier
   modelling (defaults to regular Lv1; `--sync` pulls your account's real
@@ -85,7 +95,9 @@ cd mayStock
 
 The Makefile delegates to the same script, so `make run` works too. Requires
 macOS 15+ and a Swift 6 toolchain. The current release is verified with Apple
-Swift 6.3.2 Command Line Tools.
+Swift 6.3.2 Command Line Tools. With the macOS 27 SDK the Command Line Tools
+lack the SwiftUI macro plugin, so the build script also looks for one in an
+installed Xcode; `swift build` on its own needs `-Xswiftc -plugin-path` there.
 
 Optional trading support:
 
@@ -97,7 +109,7 @@ okx config   # store API keys with the official CLI, not with MayStock
 ## Verify (end-to-end)
 
 ```bash
-./Scripts/make.sh verify   # release build + 32 unit tests + live OKX E2E
+./Scripts/make.sh verify   # release build + unit tests + live OKX E2E
 ```
 
 `maystock-e2e doctor` exercises the exact production code paths: REST
@@ -105,13 +117,22 @@ ticker/metadata/backfill, both WebSockets, live ticks/candles/depth, and
 REST/WS price coherence. `okx` CLI detection is reported separately; trading
 stays hidden in the app until the optional CLI is installed.
 
+```bash
+./Scripts/make.sh snapshot   # draw the panel and every terminal page to dist/snapshots/*.png
+```
+
+A menu bar accessory has no window to screenshot, so the app can render its
+own surfaces: against a *copy* of the state directory, with the trading loop
+off, into real off-screen windows. That is how a layout change gets looked
+at before it ships.
+
 ## Architecture
 
 ```
 MayStockKit   (pure Foundation, Linux-compilable)
   Models/  OKX/  Engine/  Trading/  Util/
 MayStock      (AppKit + SwiftUI menu bar app)
-  App/  StatusBar/  Panel/  Charts/  Settings/  Support/
+  App/  StatusBar/  Panel/  Charts/  Terminal/  Design/  Support/
 maystock-e2e  (E2E driver & diagnostics CLI)
 Tests/MayStockKitTests   (swift-testing, fixture-driven)
 ```

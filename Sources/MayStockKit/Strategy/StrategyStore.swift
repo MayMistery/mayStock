@@ -1,5 +1,24 @@
 import Foundation
 
+/// A strategy file the library holds but cannot run, and why.
+public struct BrokenStrategy: Sendable, Identifiable {
+    /// The manifest's id when it decoded, else the file's stem.
+    public let id: String
+    public let name: String
+    public let file: String
+    /// Nil when the file did not even decode.
+    public let manifest: StrategyManifest?
+    public let reason: String
+
+    public init(id: String, name: String, file: String, manifest: StrategyManifest?, reason: String) {
+        self.id = id
+        self.name = name
+        self.file = file
+        self.manifest = manifest
+        self.reason = reason
+    }
+}
+
 /// On-disk home for imported strategy manifests.
 ///
 /// One JSON file per strategy under `Application Support/MayStock/Strategies`.
@@ -19,28 +38,52 @@ public struct StrategyStore: Sendable {
     // MARK: Reading
 
     public func load() -> [StrategyManifest] {
+        loadAll().manifests
+    }
+
+    /// Every JSON file in the library: the manifests that decoded, and the
+    /// files that did not, each with the reason.
+    ///
+    /// A file that fails to decode used to be skipped without a word. That is
+    /// the wrong silence for a trading app: a manifest written by a newer
+    /// build — an engine kind this build has never heard of, say — simply
+    /// vanished from the list, and its budget went with it.
+    public func loadAll() -> (manifests: [StrategyManifest], undecodable: [BrokenStrategy]) {
         let fm = FileManager.default
         guard let entries = try? fm.contentsOfDirectory(
-            at: directory, includingPropertiesForKeys: nil) else { return [] }
-        return entries
-            .filter { $0.pathExtension.lowercased() == "json" }
-            .compactMap { try? StrategyManifest.load(from: $0) }
-            .sorted { $0.name.localizedCompare($1.name) == .orderedAscending }
+            at: directory, includingPropertiesForKeys: nil) else { return ([], []) }
+        var manifests: [StrategyManifest] = []
+        var undecodable: [BrokenStrategy] = []
+        for url in entries where url.pathExtension.lowercased() == "json" {
+            do {
+                manifests.append(try StrategyManifest.load(from: url))
+            } catch {
+                let id = url.deletingPathExtension().lastPathComponent
+                undecodable.append(BrokenStrategy(
+                    id: id, name: id, file: url.lastPathComponent, manifest: nil,
+                    reason: "清单无法解析：\(error)"))
+            }
+        }
+        manifests.sort { $0.name.localizedCompare($1.name) == .orderedAscending }
+        return (manifests, undecodable)
     }
 
     /// Compiled strategies plus the ones that failed, so the UI can show *why*
     /// a file the user imported earlier no longer runs.
-    public func loadCompiled() -> (ready: [CompiledStrategy], broken: [(StrategyManifest, String)]) {
+    public func loadCompiled() -> (ready: [CompiledStrategy], broken: [BrokenStrategy]) {
+        let loaded = loadAll()
         var ready: [CompiledStrategy] = []
-        var broken: [(StrategyManifest, String)] = []
-        for manifest in load() {
+        var broken = loaded.undecodable
+        for manifest in loaded.manifests {
             do {
                 ready.append(try manifest.compile())
             } catch {
-                broken.append((manifest, String(describing: error)))
+                broken.append(BrokenStrategy(
+                    id: manifest.id, name: manifest.name, file: fileURL(for: manifest.id).lastPathComponent,
+                    manifest: manifest, reason: String(describing: error)))
             }
         }
-        return (ready, broken)
+        return (ready, broken.sorted { $0.name.localizedCompare($1.name) == .orderedAscending })
     }
 
     // MARK: Writing

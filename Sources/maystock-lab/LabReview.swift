@@ -32,9 +32,7 @@ extension LabMain {
         // `bookDrift` says so out loud.
         // Same CLI path and profile the app trades through, so the review reads
         // the account the engine is actually acting on.
-        let exchangeTotals = try? await TradeBridge(
-            explicitCLIPath: config.trading.cliPath,
-            profile: config.trading.profile).bookTotals(mode: mode)
+        let exchangeTotals = try? await TradeBridge(prefs: config.trading).bookTotals(mode: mode)
         let snapshot = ReviewSnapshot(
             now: Date(),
             config: config,

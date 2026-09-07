@@ -246,6 +246,18 @@ public final class StrategyRunner {
         for id in states.keys { states[id]?.status = .stopped }
     }
 
+    /// Stop, abandoning any tick in flight, and start a fresh loop.
+    ///
+    /// Used when the account the loop is acting on changes. A tick that began
+    /// under one mode reads `host.portfolio.mode` fresh at every call, so
+    /// letting it run on would let a decision sized against the demo book be
+    /// sent to the live account. Cancelling it first makes the switch a clean
+    /// boundary: nothing decided before it is executed after it.
+    public func restart() {
+        stop()
+        start()
+    }
+
     public func state(for strategyId: String) -> StrategyRuntimeState {
         states[strategyId] ?? StrategyRuntimeState()
     }
@@ -731,6 +743,18 @@ public final class StrategyRunner {
     ///
     /// Summing balances ourselves is now only the fallback for a CLI that
     /// reports no total.
+    /// Re-read the account right now, ignoring the sampling interval.
+    ///
+    /// Read-only — the same balance and price reads the tick performs, and
+    /// nothing else — so a refresh button and the snapshot renderer can use
+    /// it without touching the exchange. The curve still applies its own
+    /// minimum spacing, so a burst of refreshes cannot pad the history.
+    public func sampleEquityNow() async {
+        guard let host else { return }
+        lastEquitySampleAt = nil
+        await sampleEquity(for: host)
+    }
+
     private func sampleEquity(for host: StrategyRunnerHost) async {
         let now = Date()
         if let last = lastEquitySampleAt,
@@ -1300,6 +1324,9 @@ public final class StrategyRunner {
             """)
         do {
             try await place(order, strategy: strategy, host: host, reason: reason)
+        } catch is CancellationError {
+            // Never sent. Nothing to resolve, nothing to record.
+            return
         } catch {
             guard let rejection = (error as? TradeError)?.exchangeRejection else {
                 // A failed *call* is not a failed *order*. The request may have
@@ -1359,6 +1386,12 @@ public final class StrategyRunner {
         _ order: OrderRequest, strategy: CompiledStrategy,
         host: StrategyRunnerHost, reason: String
     ) async throws {
+        // The last check before the wire. `submit` checked on entry, but it
+        // awaits instrument metadata between there and here, and a mode switch
+        // cancels this task synchronously before it changes the mode — so a
+        // check that runs after the switch sees the cancellation, and one that
+        // runs before it places the order before the switch can happen.
+        try Task.checkCancellation()
         _ = try await host.venue.place(
             order, mode: host.portfolio.mode, liveUnlocked: host.liveTradingUnlocked)
         inFlight[order.clOrdId ?? ""] = nil

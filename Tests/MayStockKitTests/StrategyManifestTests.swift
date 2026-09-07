@@ -298,7 +298,7 @@ struct StrategyStoreTests {
         let loaded = store.loadCompiled()
         #expect(loaded.ready.isEmpty)
         #expect(loaded.broken.count == 1)
-        #expect(loaded.broken.first?.1.contains("杠杆") == true)
+        #expect(loaded.broken.first?.reason.contains("杠杆") == true)
     }
 }
 
