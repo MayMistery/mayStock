@@ -1,0 +1,22 @@
+{
+  "schema" : 1,
+  "id" : "12-btc-options-trend",
+  "name" : "BTC 期权趋势（EMA 交叉买入看涨/看跌）",
+  "version" : "1.0.0",
+  "author" : "MayStock examples",
+  "notes" : "信号读 BTC-USDT 现货 K 线，仓位是 BTC-USD 期权：金叉买入看涨、死叉买入看跌，只买不卖，单笔最大亏损即权利金。每次动用预算的 10% 买最近一个到期 ≥ 14 天的平值合约，权利金亏 50% 止损、赚 150% 止盈，到期按内在价值结算。回测按 Black–Scholes 用 60 根实现波动率 × 1.2 定价 —— 是模型价，不是历史成交价，OKX 不提供已到期合约的行情；它能回答的只是「方向信号能否赚回权利金」。实盘用交易所真实盘口，IOC 限价成交。",
+  "market" : { "instId" : "BTC-USDT", "instType" : "OPTION", "bar" : "4H" },
+  "params" : [
+    { "name" : "fast", "default" : 12, "min" : 4,  "max" : 60,  "label" : "快线周期" },
+    { "name" : "slow", "default" : 26, "min" : 10, "max" : 200, "label" : "慢线周期" }
+  ],
+  "signals" : {
+    "longEntry"  : "ema(close, fast) crosses_above ema(close, slow)",
+    "longExit"   : "ema(close, fast) crosses_below ema(close, slow)",
+    "shortEntry" : "ema(close, fast) crosses_below ema(close, slow)",
+    "shortExit"  : "ema(close, fast) crosses_above ema(close, slow)"
+  },
+  "sizing" : { "mode" : "equityPct", "value" : 10 },
+  "risk" : { "stopLossPct" : 50, "takeProfitPct" : 150, "cooldownBars" : 1, "volLookbackBars" : 60, "leverage" : 1, "minHoldBars" : 0 },
+  "options" : { "uly" : "BTC-USD", "minDaysToExpiry" : 14, "moneynessPct" : 0, "impliedVolMultiplier" : 1.2 }
+}

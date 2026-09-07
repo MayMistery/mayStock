@@ -29,7 +29,7 @@ let package = Package(
             name: "MayStock",
             dependencies: ["MayStockKit"],
             path: "Sources/MayStock",
-            exclude: ["SupportingFiles", "Resources", "Features"],
+            exclude: ["SupportingFiles", "Resources"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         // End-to-end test driver / diagnostics CLI (runs anywhere).

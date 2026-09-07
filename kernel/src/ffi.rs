@@ -490,6 +490,26 @@ mod tests {
     }
 
     #[test]
+    fn option_selection_round_trips_through_json() {
+        let request = CString::new(
+            r#"{"kind":"call","spot":100000,"nowMs":0,"minDaysToExpiry":7,
+                "candidates":[{"instId":"soon","strike":100000,"expiryMs":86400000,"kind":"call"},
+                              {"instId":"right","strike":100000,"expiryMs":864000000,"kind":"call"}]}"#,
+        )
+        .unwrap();
+        let mut error: *mut c_char = ptr::null_mut();
+        let json = unsafe { ms_option_select(request.as_ptr(), &mut error) };
+        assert!(error.is_null());
+        let value: serde_json::Value = serde_json::from_str(&take_string(json)).unwrap();
+        assert_eq!(value["instId"], "right");
+
+        let empty = CString::new(r#"{"kind":"put","spot":100,"nowMs":0,"minDaysToExpiry":7}"#).unwrap();
+        let json = unsafe { ms_option_select(empty.as_ptr(), &mut error) };
+        assert!(error.is_null());
+        assert_eq!(take_string(json), "null", "no candidate is an answer, not an error");
+    }
+
+    #[test]
     fn the_version_string_is_stable_and_not_owned_by_the_caller() {
         let a = unsafe { CStr::from_ptr(ms_kernel_version()) };
         let b = unsafe { CStr::from_ptr(ms_kernel_version()) };
@@ -725,6 +745,28 @@ pub unsafe extern "C" fn ms_compare_equity(
             serde_json::from_str(text).map_err(|e| format!("请求解析失败：{e}"))?;
         let comparison = crate::reconcile::compare_equity(&request.live, &request.backtest);
         serde_json::to_string(&comparison)
+            .map(to_c_string)
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Pick the contract an option strategy would buy from a listed chain, by
+/// the same rule the backtester applies to its modelled chain.
+///
+/// Request JSON is a [`crate::options::SelectionRequest`]; the result is the
+/// chosen candidate as JSON, or the literal `null` when nothing in the chain
+/// qualifies — an ordinary outcome, not an error.
+#[no_mangle]
+pub unsafe extern "C" fn ms_option_select(
+    request_json: *const c_char,
+    error_out: *mut *mut c_char,
+) -> *mut c_char {
+    guarded(error_out, ptr::null_mut(), || {
+        let text = borrow_str(request_json).ok_or("请求 JSON 为空")?;
+        let request: crate::options::SelectionRequest =
+            serde_json::from_str(text).map_err(|e| format!("期权合约筛选请求解析失败：{e}"))?;
+        let chosen = crate::options::select_contract(&request);
+        serde_json::to_string(&chosen)
             .map(to_c_string)
             .map_err(|e| e.to_string())
     })

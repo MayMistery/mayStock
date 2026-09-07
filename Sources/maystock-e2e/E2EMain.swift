@@ -8,6 +8,8 @@ import MayStockKit
 ///   maystock-e2e alert-sim             alert engine simulation (offline)
 ///   maystock-e2e trade-doctor          okx CLI detection + public call
 ///   maystock-e2e strategy-doctor       compile presets + real multi-window backtest
+///   maystock-e2e option-demo           buy and sell one option on the DEMO account,
+///                                      through the runner's own order path
 ///
 /// Exit code 0 = pass. Non-zero = failure (CI-friendly).
 @main
@@ -17,6 +19,8 @@ struct E2EMain {
         let command = args.first ?? "doctor"
         let ok: Bool
         switch command {
+        case "option-demo":
+            ok = await optionDemo(Array(args.dropFirst()))
         case "doctor":
             ok = await doctor(instId: args.count > 1 ? args[1] : "BTC-USDT")
         case "watch":
@@ -282,6 +286,26 @@ struct E2EMain {
             fail("永续合约面值", String(describing: error)); allOK = false
         }
 
+        // 3b. An option is sized by ctVal × ctMult — the 0.01 lives in the
+        //     multiplier, so a chain that read only ctVal would size every
+        //     order a hundredfold.
+        do {
+            let chain = try await rest.optionChain(underlying: "BTC-USD")
+            if let sample = chain.first, chain.count > 10 {
+                let ok = abs(sample.contractValue - 0.01) < 1e-12
+                (ok ? pass : fail)("期权链",
+                     "\(chain.count) 张合约，\(sample.instId) 每张 \(PriceFormatter.plain(sample.contractValue)) BTC")
+                if !ok { allOK = false }
+                let quote = try await rest.optionQuote(instId: sample.instId)
+                pass("期权报价", "标记 \(quote.mark.map(PriceFormatter.plain) ?? "—") BTC · 指数 "
+                     + PriceFormatter.plain(quote.indexPrice))
+            } else {
+                fail("期权链", "只拿到 \(chain.count) 张合约"); allOK = false
+            }
+        } catch {
+            fail("期权链", String(describing: error)); allOK = false
+        }
+
         // 4. A real five-window report.
         guard let strategy = compiled.first else { return false }
         do {
@@ -313,6 +337,191 @@ struct E2EMain {
         print(allOK ? "\nstrategy doctor: PASS" : "\nstrategy doctor: FAIL")
         return allOK
     }
+}
+
+// MARK: - option-demo
+
+/// A real round trip on the **demo** account: the runner reads the chain,
+/// picks a contract by the kernel's rule, buys it with an IOC limit, books the
+/// fill in the ledger, and is then asked to flatten. Every number printed is
+/// read back from the exchange, not from what the code intended to do.
+///
+/// Demo only, by construction: the host reports live as locked, the mode is
+/// `.demo`, and `TradeBridge` refuses a live order without the unlock. There
+/// is no flag that changes that.
+///
+///   option-demo [--underlying BTC-USD] [--budget 60] [--min-days 2]
+///               [--moneyness 0] [--capital 500]
+extension E2EMain {
+    static func optionDemo(_ raw: [String]) async -> Bool {
+        var flags: [String: String] = [:]
+        var index = 0
+        while index < raw.count {
+            if raw[index].hasPrefix("--"), index + 1 < raw.count {
+                flags[String(raw[index].dropFirst(2))] = raw[index + 1]
+                index += 2
+            } else {
+                index += 1
+            }
+        }
+        let underlying = flags["underlying"] ?? "BTC-USD"
+        let budget = Double(flags["budget"] ?? "") ?? 60
+        let minDays = Double(flags["min-days"] ?? "") ?? 2
+        let moneyness = Double(flags["moneyness"] ?? "") ?? 0
+        let capital = Double(flags["capital"] ?? "") ?? 500
+        let base = String(underlying.split(separator: "-").first ?? "BTC")
+
+        print("MayStock option demo · \(underlying) · 模拟盘 · \(Date())")
+        let bridge = TradeBridge()
+        guard await bridge.detectCLI() != nil, bridge.hasCredentials() else {
+            fail("okx CLI", "未安装或未配置凭证"); return false
+        }
+        let venue = OKXVenue(bridge: bridge)
+
+        // A strategy whose long signal is always on, so the first tick opens,
+        // sized as a fixed premium spend so the contract count is predictable.
+        let manifest = StrategyManifest(
+            id: "e2e-option-demo",
+            name: "模拟盘期权验收",
+            market: StrategyMarket(instId: "\(base)-USDT", instType: .option, bar: .h1),
+            signals: StrategySignals(longEntry: "close > 0"),
+            sizing: StrategySizing(mode: .fixedQuote, value: budget),
+            risk: StrategyRisk(stopLossPct: 50, takeProfitPct: 150, volLookbackBars: 24),
+            options: StrategyOptionsSpec(
+                uly: underlying, minDaysToExpiry: minDays, moneynessPct: moneyness))
+        let strategy: CompiledStrategy
+        do {
+            strategy = try manifest.compile()
+        } catch {
+            fail("compile", String(describing: error)); return false
+        }
+        pass("清单", "买入 \(underlying) 到期 ≥ \(PriceFormatter.plain(minDays)) 天、偏离 "
+             + "\(PriceFormatter.plain(moneyness))% 的看涨，权利金预算 \(PriceFormatter.money(budget)) USDT")
+        var allOK = true
+
+        // The premium is paid in the settlement coin, not the USDT the budget
+        // is stated in. Say up front what the account holds and whether it
+        // may borrow, so a refusal below reads as the account's state rather
+        // than the code's.
+        do {
+            let config = try await venue.accountTradingConfig(mode: .demo)
+            let held = try await venue.accountSnapshot(mode: .demo).balance(of: base)?.available ?? 0
+            let level = config.accountLevel.map(String.init) ?? "—"
+            let loan = config.autoLoan.map { $0 ? "开" : "关" } ?? "未知"
+            let fundable = held > 0 || config.borrowsMissingCoin
+            (fundable ? pass : fail)("结算币",
+                "\(base) 可用 \(PriceFormatter.plain(held)) · 账户等级 \(level) · 自动借币 \(loan)"
+                + (fundable ? "" : " —— 没有 \(base) 也不能借，运行器会在下单前拒绝并说明缺口"))
+        } catch {
+            fail("结算币", String(describing: error)); allOK = false
+        }
+
+        let host = await MainActor.run {
+            DemoOptionHost(strategy: strategy, capital: capital, venue: venue)
+        }
+        let runner = await MainActor.run { StrategyRunner(host: host) }
+
+        // --- 1. Open.
+        await runner.tick()
+        let entryState = await runner.state(for: strategy.id)
+        print("  · 运行器：\(entryState.status.displayName) · \(entryState.message ?? "—")")
+        let opened = await host.ledger.position(for: strategy.id)
+        guard let opened, !opened.isFlat else {
+            fail("开仓", "台账没有仓位：\(entryState.message ?? "无说明")")
+            return false
+        }
+        pass("开仓入账", "\(opened.instId) \(PriceFormatter.plain(opened.quantity)) 张 · 权利金均价 "
+             + "\(PriceFormatter.money(opened.averagePrice)) USDT/单位 · 手续费 "
+             + "\(PriceFormatter.money(opened.feesPaid, decimals: 4)) USDT · 面值 "
+             + "\(PriceFormatter.plain(opened.multiplier))")
+
+        // The exchange's own view of the same position.
+        do {
+            let positions = try await venue.positions(mode: .demo, instType: .option)
+            if let mine = positions.first(where: { $0.instId == opened.instId }) {
+                let agree = abs(mine.quantity - opened.quantity) < 1e-9
+                (agree ? pass : fail)("交易所持仓",
+                    "\(mine.instId) \(PriceFormatter.plain(mine.quantity)) 张 · 均价 "
+                    + "\(PriceFormatter.plain(mine.averagePrice)) \(base) · 标记 "
+                    + "\(mine.markPrice.map(PriceFormatter.plain) ?? "—") · 浮盈 "
+                    + "\(PriceFormatter.plain(mine.unrealisedPnL))")
+                if !agree { allOK = false }
+            } else {
+                fail("交易所持仓", "交易所没有 \(opened.instId) 的仓位"); allOK = false
+            }
+        } catch {
+            fail("交易所持仓", String(describing: error)); allOK = false
+        }
+        if let mark = try? await venue.valuationPrice(instId: opened.instId, mode: .demo) {
+            pass("标记价（计价币/单位）", PriceFormatter.money(mark)
+                 + " · 浮动盈亏 \(PriceFormatter.signedMoney(opened.unrealisedPnL(mark: mark)))")
+        }
+
+        // --- 2. Close, through the same path the studio's 平仓 button takes.
+        await runner.flatten(strategyId: strategy.id, reason: "模拟盘验收平仓")
+        let exitState = await runner.state(for: strategy.id)
+        print("  · 运行器：\(exitState.status.displayName) · \(exitState.message ?? "—")")
+        let closed = await host.ledger.position(for: strategy.id)
+        if let closed, closed.isFlat {
+            pass("平仓入账", "已实现 \(PriceFormatter.signedMoney(closed.realisedPnL)) USDT · 手续费合计 "
+                 + "\(PriceFormatter.money(closed.feesPaid, decimals: 4)) · 净 "
+                 + "\(PriceFormatter.signedMoney(closed.netPnL(mark: nil)))")
+        } else {
+            fail("平仓入账", "台账仍持有 \(PriceFormatter.plain(closed?.quantity ?? 0)) 张："
+                 + (exitState.message ?? "无说明"))
+            allOK = false
+        }
+        do {
+            let positions = try await venue.positions(mode: .demo, instType: .option)
+            if let left = positions.first(where: { $0.instId == opened.instId }), left.quantity != 0 {
+                fail("交易所持仓", "仍有 \(PriceFormatter.plain(left.quantity)) 张 \(left.instId)，请到模拟盘手动处理")
+                allOK = false
+            } else {
+                pass("交易所持仓", "已无 \(opened.instId) 仓位")
+            }
+        } catch {
+            fail("交易所持仓", String(describing: error)); allOK = false
+        }
+
+        let fills = await host.ledger.fills(for: strategy.id)
+        for fill in fills.reversed() {
+            print("  · 成交 \(fill.actionLabel) \(PriceFormatter.plain(fill.quantity)) 张 @ "
+                  + "\(PriceFormatter.money(fill.price)) USDT/单位 · 费 "
+                  + "\(PriceFormatter.money(fill.feeQuote, decimals: 4)) · \(fill.clOrdId ?? "—")")
+        }
+        let halts = await host.halts
+        for halt in halts { fail("熔断", halt) }
+        if !halts.isEmpty { allOK = false }
+        print(allOK ? "\noption demo: PASS" : "\noption demo: FAIL")
+        return allOK
+    }
+}
+
+/// An in-memory host for the demo round trip: one armed option strategy,
+/// demo mode, live locked, nothing persisted.
+@MainActor
+final class DemoOptionHost: StrategyRunnerHost {
+    var portfolio: StrategyPortfolioPrefs
+    let liveTradingUnlocked = false
+    var runnableStrategies: [CompiledStrategy]
+    let ledger = StrategyLedger(mode: .demo)
+    let venue: any ExchangeVenue
+    var halts: [String] = []
+
+    init(strategy: CompiledStrategy, capital: Double, venue: any ExchangeVenue) {
+        var portfolio = StrategyPortfolioPrefs(mode: .demo, totalCapital: capital)
+        portfolio.setCapital(capital, for: strategy.id)
+        portfolio.setRunning(true, for: strategy.id)
+        self.portfolio = portfolio
+        self.runnableStrategies = [strategy]
+        self.venue = venue
+    }
+
+    func runnerDidChange() {}
+    func runnerDidCompleteTick(at ts: Date) {}
+    func runnerDidHalt(strategyId: String, reason: String) { halts.append("\(strategyId)：\(reason)") }
+    func runnerDidSampleEquity(_ equity: Double, at ts: Date) {}
+    func runnerDidSampleStrategyEquity(_ strategyId: String, equity: Double, basis: Double, at ts: Date) {}
 }
 
 // MARK: - Helpers

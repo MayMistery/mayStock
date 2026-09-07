@@ -79,3 +79,31 @@ maystock-lab portfolio 01-btc-ema-trend 02-eth-rsi-reversion \
 所以「BTC + ETH」几乎**不构成分散**——组合回撤不会比单腿低多少。
 真正的分散要来自**低相关的信号逻辑**（例如趋势 + 回归），而不是两个高度同步的标的。
 命令输出里的「分散化」一行就是在量化这件事。
+
+## 12-btc-options-trend.json — 期权趋势（买看涨 / 买看跌）
+
+信号读 `BTC-USDT` 的 4H K 线，仓位却是 `BTC-USD` 期权：EMA 金叉买入看涨、死叉买入看跌，
+**只买不卖**，单笔最大亏损就是权利金。
+
+```
+"market":  { "instId": "BTC-USDT", "instType": "OPTION", "bar": "4H" },
+"sizing":  { "mode": "equityPct", "value": 10 },
+"risk":    { "stopLossPct": 50, "takeProfitPct": 150, "volLookbackBars": 60 },
+"options": { "minDaysToExpiry": 14, "moneynessPct": 0 }
+```
+
+**要点**
+
+- `sizing` 在期权上的含义是**拿多少比例的资金买权利金**：`equityPct: 10` 每次动用 10%。
+  `riskPerTrade` 在这里是同一个意思，因为权利金就是全部风险，不需要止损距离。
+- `stopLossPct` / `takeProfitPct` **相对权利金**，不是相对标的价：权利金亏 50% 止损、赚 150% 止盈。
+  `atrStop`、`trailingStopPct`、`exposure`、杠杆在期权清单里都会被拒绝。
+- **回测是模型价，不是历史成交价**。OKX 不提供已到期合约的行情，所以回测用 Black–Scholes
+  按标的实现波动率 × `impliedVolMultiplier`（默认 1.2）定价。它能回答的只有
+  「方向信号赚不赚得回权利金」；报告里会明确标注。
+- 实盘读交易所期权链和盘口，挑合约的规则与回测是同一个函数：最近一个到期 ≥ 14 天的平值合约，
+  以 IOC 限价（卖一上浮 2%）成交。没有卖盘、或卖一离标记价太远时不开仓并说明原因。
+- **权利金用 BTC 付，不是 USDT。** 账户里要有 BTC（或在跨币种 / 组合保证金模式下开启自动借币），
+  否则运行器下单前就会拒绝，并写明「可用多少、需要多少、缺多少」；它不会替你把 USDT 换成 BTC。
+- 到期未平的合约由交易所按内在价值结算，运行器在对账时补记为「到期结算」；
+  信号仍在的话，下一根 K 线会买入下一个到期。

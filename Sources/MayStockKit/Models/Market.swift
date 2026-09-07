@@ -276,6 +276,85 @@ public struct DepthProfile: Sendable, Equatable {
     }
 }
 
+// MARK: - Options
+
+/// Call or put. The raw values match the kernel's `OptionKind`, which is
+/// where the direction arithmetic lives — Swift only names and displays it.
+public enum OptionKind: String, Codable, Sendable, CaseIterable, Equatable {
+    case call, put
+
+    public var displayName: String { self == .call ? "看涨" : "看跌" }
+}
+
+/// One listed option contract, as the exchange describes it.
+public struct OptionContract: Sendable, Equatable, Identifiable {
+    public let instId: String
+    /// The index it settles against, e.g. `BTC-USD`.
+    public let underlying: String
+    public let kind: OptionKind
+    public let strike: Double
+    public let expiry: Date
+    /// Underlying units one contract covers: OKX's `ctVal × ctMult`, 0.01 BTC
+    /// for a BTC option.
+    public let contractValue: Double
+    public let tickSize: Double
+    public let lotSize: Double
+    public let minSize: Double
+    /// The coin premiums and fees are paid in.
+    public let settleCurrency: String
+
+    public var id: String { instId }
+
+    public init(
+        instId: String, underlying: String, kind: OptionKind, strike: Double, expiry: Date,
+        contractValue: Double, tickSize: Double, lotSize: Double, minSize: Double,
+        settleCurrency: String
+    ) {
+        self.instId = instId
+        self.underlying = underlying
+        self.kind = kind
+        self.strike = strike
+        self.expiry = expiry
+        self.contractValue = contractValue
+        self.tickSize = tickSize
+        self.lotSize = lotSize
+        self.minSize = minSize
+        self.settleCurrency = settleCurrency
+    }
+
+    /// The same contract in the shape the order path already understands.
+    public var meta: InstrumentMeta {
+        InstrumentMeta(
+            instId: instId, tickSize: tickSize, lotSize: lotSize, minSize: minSize,
+            contractValue: contractValue)
+    }
+}
+
+/// One option's market, all at once: the book in the settlement coin per unit
+/// of underlying (how OKX quotes it), the mark in the same unit, and the
+/// index that converts either into the quote currency the book keeps.
+public struct OptionQuote: Sendable, Equatable {
+    public let instId: String
+    public let bid: Double?
+    public let ask: Double?
+    public let mark: Double?
+    public let indexPrice: Double
+    public let ts: Date
+
+    public init(instId: String, bid: Double?, ask: Double?, mark: Double?, indexPrice: Double, ts: Date) {
+        self.instId = instId
+        self.bid = bid
+        self.ask = ask
+        self.mark = mark
+        self.indexPrice = indexPrice
+        self.ts = ts
+    }
+
+    /// The mark in quote currency per unit of underlying — what the ledger
+    /// books a premium at.
+    public var markQuote: Double? { mark.map { $0 * indexPrice } }
+}
+
 // MARK: - Instrument metadata
 
 /// Static exchange metadata for an instrument (from `GET /api/v5/public/instruments`).
@@ -284,8 +363,10 @@ public struct InstrumentMeta: Sendable, Equatable {
     public let tickSize: Double // e.g. 0.1 for BTC-USDT
     public let lotSize: Double
     public let minSize: Double
-    /// Base units per contract (`ctVal`). Swap order sizes are counted in
-    /// contracts, not coins — 1 BTC-USDT-SWAP contract is 0.01 BTC. Nil for spot.
+    /// Base units per contract: OKX's `ctVal × ctMult`. Order sizes on
+    /// derivatives are counted in contracts, not coins — 1 BTC-USDT-SWAP
+    /// contract is 0.01 BTC, and so is one BTC option, where `ctVal` is 1 and
+    /// the multiplier carries the 0.01. Nil for spot.
     public let contractValue: Double?
 
     public init(
@@ -297,6 +378,15 @@ public struct InstrumentMeta: Sendable, Equatable {
         self.lotSize = lotSize
         self.minSize = minSize
         self.contractValue = contractValue
+    }
+
+    /// The units one contract covers, from the two fields OKX splits it
+    /// across. `ctMult` is 1 on every perpetual and 0.01 on a BTC option;
+    /// reading `ctVal` alone would size an option order a hundredfold.
+    public static func contractValue(ctVal: Double?, ctMult: Double?) -> Double? {
+        guard let ctVal, ctVal > 0 else { return nil }
+        let multiplier = (ctMult ?? 1) > 0 ? (ctMult ?? 1) : 1
+        return ctVal * multiplier
     }
 
     /// Convert a base-currency quantity into the units the exchange expects,

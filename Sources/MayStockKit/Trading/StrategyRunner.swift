@@ -249,6 +249,18 @@ public final class StrategyRunner {
         for id in states.keys { states[id]?.status = .stopped }
     }
 
+    /// Stop, abandoning any tick in flight, and start a fresh loop.
+    ///
+    /// Used when the account the loop is acting on changes. A tick that began
+    /// under one mode reads `host.portfolio.mode` fresh at every call, so
+    /// letting it run on would let a decision sized against the demo book be
+    /// sent to the live account. Cancelling it first makes the switch a clean
+    /// boundary: nothing decided before it is executed after it.
+    public func restart() {
+        stop()
+        start()
+    }
+
     public func state(for strategyId: String) -> StrategyRuntimeState {
         states[strategyId] ?? StrategyRuntimeState()
     }
@@ -263,17 +275,34 @@ public final class StrategyRunner {
         candleCache[CacheKey(instId: instId, bar: bar)] ?? []
     }
 
-    /// Flatten one strategy immediately at market. Used by the stop button and
-    /// by the emergency stop.
-    public func flatten(strategyId: String) async {
+    /// Flatten one strategy immediately at market. Used by the stop button,
+    /// the emergency stop and the locally enforced protective levels; `reason`
+    /// is what the fill is recorded against, so a stop-out does not read as a
+    /// manual close afterwards.
+    public func flatten(strategyId: String, reason: String = "手动平仓") async {
         guard let host,
               let strategy = host.runnableStrategies.first(where: { $0.id == strategyId }),
               let position = host.ledger.position(for: strategyId), !position.isFlat else { return }
+        // An option is sold back into its own book, not sized in coins.
+        if position.venue.instrumentType(of: position.instId) == .option {
+            await closeOption(strategy: strategy, host: host, reason: reason)
+            return
+        }
         // baseQuantity, not quantity: a swap position is counted in contracts, and
         // submit() converts base units back into contracts itself. Passing
         // contracts here would have tried to sell 11.65 BTC instead of 0.1165.
         await submit(baseDelta: -position.baseQuantity, strategy: strategy, host: host,
-                     reason: "手动平仓")
+                     reason: reason)
+    }
+
+    /// Snap a price to the instrument's tick, with a hair of tolerance so
+    /// `0.02 × 0.98 / 0.0001` — which floating point makes 195.99999999999997 —
+    /// still lands on 196 rather than one tick too far.
+    nonisolated static func snapToTick(_ price: Double, tick: Double, roundingUp: Bool) -> Double {
+        guard tick > 0 else { return price }
+        let steps = price / tick
+        let snapped = roundingUp ? (steps - 1e-9).rounded(.up) : (steps + 1e-9).rounded(.down)
+        return (snapped * tick * 1e10).rounded() / 1e10
     }
 
     /// Stop everything and flatten every open strategy position.
@@ -304,6 +333,7 @@ public final class StrategyRunner {
         isTicking = true
         tickStartedAt = Date()
         fillsThisTick.removeAll()
+        indexThisTick.removeAll()
         defer {
             if generation == tickGeneration {
                 isTicking = false
@@ -456,7 +486,7 @@ public final class StrategyRunner {
            now.timeIntervalSince(last) < Self.fundingPollInterval { return }
 
         let held = host.ledger.positions.values.filter {
-            !$0.isFlat && $0.venue.instrumentType(of: $0.instId) == .swap
+            !$0.isFlat && $0.venue.instrumentType(of: $0.instId).settlesFunding
         }
         guard !held.isEmpty else { return }
         guard let payments = try? await host.venue.fundingPayments(
@@ -497,14 +527,18 @@ public final class StrategyRunner {
     /// decision sizes against coins that are not there, and a flatten would try
     /// to sell them.
     ///
-    /// Swaps only. A spot balance mixes this book with coins the user already
-    /// held, so a difference there is not evidence of anything — whereas a
-    /// derivative position is reported per instrument and is exactly the thing
-    /// that gets stopped out, liquidated or auto-deleveraged.
+    /// Derivatives only. A spot balance mixes this book with coins the user
+    /// already held, so a difference there is not evidence of anything —
+    /// whereas a derivative position is reported per instrument and is exactly
+    /// the thing that gets stopped out, liquidated, auto-deleveraged or, for
+    /// an option, settled at expiry.
     private func reconcileExternal(for host: StrategyRunnerHost) async {
-        var held = host.ledger.positions.values.filter {
-            !$0.isFlat && $0.venue.instrumentType(of: $0.instId) == .swap
+        func heldDerivatives() -> [StrategyPositionState] {
+            host.ledger.positions.values.filter {
+                !$0.isFlat && $0.venue.instrumentType(of: $0.instId).isDerivative
+            }
         }
+        var held = heldDerivatives()
         guard !held.isEmpty else {
             pendingExternal.removeAll()
             return
@@ -514,27 +548,34 @@ public final class StrategyRunner {
         // whose ingest failed — a dropped response, a CLI hiccup — looks
         // exactly like an external reduction, and would be booked a second
         // time at the mark when the real fill arrived on a later tick.
-        await ingestFills(for: Set(held.map { InstrumentKey(instId: $0.instId, instType: .swap) }),
-                          host: host)
-        held = host.ledger.positions.values.filter {
-            !$0.isFlat && $0.venue.instrumentType(of: $0.instId) == .swap
-        }
+        await ingestFills(
+            for: Set(held.map {
+                InstrumentKey(instId: $0.instId, instType: $0.venue.instrumentType(of: $0.instId))
+            }),
+            host: host)
+        held = heldDerivatives()
         guard !held.isEmpty else {
             pendingExternal.removeAll()
             return
         }
 
         // A failed query must never read as "the exchange holds nothing";
-        // that would book a liquidation on every network hiccup.
-        guard let exchange = try? await host.venue.positions(
-            mode: host.portfolio.mode, instType: .swap) else { return }
-
+        // that would book a liquidation on every network hiccup. Each family
+        // is asked separately, and only a family that answered is judged.
         var exchangeByInst: [String: Double] = [:]
-        for position in exchange {
-            exchangeByInst[position.instId, default: 0] += position.quantity
+        var answered: Set<InstrumentType> = []
+        for instType in Set(held.map { $0.venue.instrumentType(of: $0.instId) }) {
+            guard let exchange = try? await host.venue.positions(
+                mode: host.portfolio.mode, instType: instType) else { continue }
+            answered.insert(instType)
+            for position in exchange {
+                exchangeByInst[position.instId, default: 0] += position.quantity
+            }
         }
         var ledgerByInst: [String: Double] = [:]
-        for state in held { ledgerByInst[state.instId, default: 0] += state.quantity }
+        for state in held where answered.contains(state.venue.instrumentType(of: state.instId)) {
+            ledgerByInst[state.instId, default: 0] += state.quantity
+        }
 
         for (instId, ledgerQuantity) in ledgerByInst {
             let exchangeQuantity = exchangeByInst[instId] ?? 0
@@ -626,9 +667,11 @@ public final class StrategyRunner {
             lastExitBar[owner.strategyId] =
                 lastConfirmedBarTime(forStrategy: owner.strategyId, host: host) ?? Date()
         }
+        let causes = host.venue.venue.instrumentType(of: instId) == .option
+            ? "止损/止盈/到期结算/手动" : "止损/止盈/强平/手动"
         update(owner.strategyId) {
             $0.message = "交易所已减仓 \(PriceFormatter.plain(abs(booked))) 张"
-                + "（止损/止盈/强平/手动），已补记入账"
+                + "（\(causes)），已补记入账"
         }
         Log.warn("runner: absorbed an external \(booked) on \(instId) for \(owner.strategyId)")
         host.runnerDidChange()
@@ -644,7 +687,9 @@ public final class StrategyRunner {
         limit: Double, host: StrategyRunnerHost
     ) async -> Double {
         guard let fills = await fills(
-            for: InstrumentKey(instId: instId, instType: .swap), host: host) else { return 0 }
+            for: InstrumentKey(
+                instId: instId, instType: host.venue.venue.instrumentType(of: instId)),
+            host: host) else { return 0 }
 
         let recorded = host.ledger.recordedFillIds
         let known = host.runnableStrategies.map(\.id)
@@ -652,6 +697,10 @@ public final class StrategyRunner {
         // accounted for, and adopting it would double-count.
         let since = owner.lastFillAt ?? .distantPast
         let wanted = booked > 0 ? 1.0 : -1.0
+        // An option fill the exchange did not stamp with an index converts at
+        // this tick's reading; one that can be converted by neither is left
+        // for the mark-priced correction below rather than booked at a guess.
+        let indexPrices = await indexPrices(for: fills, host: host)
 
         var adopted = 0.0
         for fill in fills.sorted(by: { $0.ts < $1.ts })
@@ -660,9 +709,11 @@ public final class StrategyRunner {
             && OrderTag.resolveStrategy(fill.clOrdId, among: known) == nil
             && fill.side.sign * wanted > 0 {
             guard adopted < limit else { break }
-            host.ledger.record(StrategyFill(
+            let index = host.venue.venue.optionUnderlying(of: fill.instId).flatMap { indexPrices[$0] }
+            guard let adoptedFill = StrategyFill(
                 exchange: fill, strategyId: owner.strategyId, mode: host.portfolio.mode,
-                venue: host.venue.venue))
+                venue: host.venue.venue, indexPrice: index) else { continue }
+            host.ledger.record(adoptedFill)
             adopted += abs(fill.size)
         }
         return adopted
@@ -688,10 +739,13 @@ public final class StrategyRunner {
     private func refreshMarks(for host: StrategyRunnerHost) async {
         let instruments = Set(host.ledger.positions.values.filter { !$0.isFlat }.map(\.instId))
         for instId in instruments {
-            if let price = try? await host.venue.lastPrice(instId: instId), price > 0 {
+            // The valuation price, not the last trade: for an option that is
+            // the exchange's mark converted at the index, in the currency the
+            // book keeps.
+            if let price = try? await host.venue.valuationPrice(instId: instId, mode: host.portfolio.mode), price > 0 {
                 marks[instId] = price
             }
-            guard let size = await contractSize(for: instId, venue: host.venue) else {
+            guard let size = await contractSize(for: instId, host: host) else {
                 Log.warn("runner: 合约面值未知，本轮不改写 \(instId) 的面值（沿用账上已有值）")
                 continue
             }
@@ -713,11 +767,11 @@ public final class StrategyRunner {
     /// wrong number is already on the books.
     ///
     /// Only two answers are honest here: what the exchange said, and "unknown".
-    private func contractSize(for instId: String, venue: any ExchangeVenue) async -> Double? {
-        let implied = venue.venue.instrumentType(of: instId).impliedContractSize
+    private func contractSize(for instId: String, host: StrategyRunnerHost) async -> Double? {
+        let implied = host.venue.venue.instrumentType(of: instId).impliedContractSize
         if let implied { return implied }
         if let cached = metaCache[instId] { return cached.contractValue }
-        guard let meta = (try? await venue.instrumentMeta(instId: instId)) ?? nil else {
+        guard let meta = (try? await host.venue.instrumentMeta(instId: instId, mode: host.portfolio.mode)) ?? nil else {
             return nil
         }
         metaCache[instId] = meta
@@ -736,6 +790,18 @@ public final class StrategyRunner {
     ///
     /// Summing balances ourselves is now only the fallback for a CLI that
     /// reports no total.
+    /// Re-read the account right now, ignoring the sampling interval.
+    ///
+    /// Read-only — the same balance and price reads the tick performs, and
+    /// nothing else — so a refresh button and the snapshot renderer can use
+    /// it without touching the exchange. The curve still applies its own
+    /// minimum spacing, so a burst of refreshes cannot pad the history.
+    public func sampleEquityNow() async {
+        guard let host else { return }
+        lastEquitySampleAt = nil
+        await sampleEquity(for: host)
+    }
+
     private func sampleEquity(for host: StrategyRunnerHost) async {
         let now = Date()
         if let last = lastEquitySampleAt,
@@ -757,7 +823,7 @@ public final class StrategyRunner {
             let instId = venue.spotInstId(base: balance.ccy)
             // Always re-read: a mark cached from an earlier tick would freeze
             // this holding's contribution and flatten the curve.
-            if let quoted = try? await host.venue.lastPrice(instId: instId), quoted > 0 {
+            if let quoted = try? await host.venue.lastPrice(instId: instId, mode: host.portfolio.mode), quoted > 0 {
                 marks[instId] = quoted
                 total += balance.total * quoted
             } else {
@@ -812,17 +878,18 @@ public final class StrategyRunner {
             guard !Self.stableCurrencies.contains(balance.ccy.uppercased()) else { continue }
             let instId = host.venue.venue.spotInstId(base: balance.ccy)
             var price = marks[instId]
-            if price == nil { price = try? await host.venue.lastPrice(instId: instId) }
+            if price == nil { price = try? await host.venue.lastPrice(instId: instId, mode: host.portfolio.mode) }
             guard let price, price > 0 else { continue }
             marks[instId] = price
             exposure += balance.total * price
         }
 
-        // Derivative positions, at their own mark and contract size.
+        // Derivative positions, at their own mark and contract size. For an
+        // option that is the premium's current value — what would be lost if
+        // it went to zero — not the notional it controls.
         for state in host.ledger.positions.values where !state.isFlat {
-            guard state.venue.instrumentType(of: state.instId) == .swap else { continue }
-            let price = marks[state.instId] ?? state.averagePrice
-            exposure += abs(state.baseQuantity) * price
+            guard state.venue.instrumentType(of: state.instId).isDerivative else { continue }
+            exposure += state.exposure(mark: marks[state.instId])
         }
         return exposure
     }
@@ -902,14 +969,19 @@ public final class StrategyRunner {
         // --- One decision per closed bar.
         guard lastActedBar[strategy.id] != latestBar.ts else {
             update(strategy.id) {
+                // A failure that has since cleared no longer applies; a note
+                // written while running — an exchange-side stop the book just
+                // absorbed, a refused entry — is the last thing the reader
+                // needs wiped by a quiet bar.
+                if $0.status != .running { $0.message = nil }
                 $0.status = .running
-                $0.message = nil
             }
             return
         }
 
         let position = host.ledger.position(for: strategy.id)
-        let current = position?.direction
+        // The view the position expresses, not its sign: a long put is short.
+        let current = position?.signalDirection
 
         // --- Ask the kernel for a complete plan.
         //
@@ -941,7 +1013,7 @@ public final class StrategyRunner {
                 barsHeld: barsHeldCount(position: position, latestBar: latestBar, market: market),
                 account: KernelAccountState(
                     equity: equity,
-                    heldBase: position?.baseQuantity ?? 0,
+                    heldBase: position?.kernelHeldBase ?? 0,
                     dayStartEquity: anchor.equity,
                     leverageCap: allocation.leverageCap,
                     barsSinceExit: barsSince(lastExitBar[strategy.id],
@@ -993,10 +1065,16 @@ public final class StrategyRunner {
         }
 
         if decision.shouldTrade {
-            await submit(baseDelta: decision.baseDelta, strategy: strategy, host: host,
-                         reason: decision.reason,
-                         stopPrice: decision.stopPrice,
-                         takeProfitPrice: decision.takeProfitPrice)
+            if let plan = decision.optionPlan {
+                // The kernel picked the contract *rule* and the premium; the
+                // exchange's chain and quotes turn that into an order.
+                await executeOptionPlan(plan, strategy: strategy, host: host, reason: decision.reason)
+            } else {
+                await submit(baseDelta: decision.baseDelta, strategy: strategy, host: host,
+                             reason: decision.reason,
+                             stopPrice: decision.stopPrice,
+                             takeProfitPrice: decision.takeProfitPrice)
+            }
             if decision.target == 0 { lastExitBar[strategy.id] = latestBar.ts }
         } else if let level = decision.trailingStopPrice {
             // The position did not change but its stop did. Nothing is traded
@@ -1217,7 +1295,10 @@ public final class StrategyRunner {
         strategy: CompiledStrategy, allocation: StrategyAllocation, host: StrategyRunnerHost
     ) -> Double {
         let state = host.ledger.position(for: strategy.id)
-        let mark = marks[strategy.market.instId]
+        // Marked at the position's *own* instrument. For spot and perpetuals
+        // that is the market the strategy watches; for an option it is the
+        // contract, whose premium is not the underlying's price.
+        let mark = state.flatMap { marks[$0.instId] }
         let pnl = state?.netPnL(mark: mark) ?? 0
         return Swift.max(allocation.capital + pnl, 0)
     }
@@ -1238,7 +1319,7 @@ public final class StrategyRunner {
         // session, so there may be no cached mark — fetch one rather than
         // silently doing nothing with the user's open position.
         if marks[market.instId] == nil {
-            marks[market.instId] = try? await host.venue.lastPrice(instId: market.instId)
+            marks[market.instId] = try? await host.venue.lastPrice(instId: market.instId, mode: host.portfolio.mode)
         }
         guard let price = marks[market.instId], price > 0 else {
             update(strategy.id) { $0.message = "取不到行情价，未能下单" }
@@ -1249,7 +1330,7 @@ public final class StrategyRunner {
         if let cached = metaCache[market.instId] {
             meta = cached
         } else {
-            meta = (try? await host.venue.instrumentMeta(instId: market.instId)) ?? nil
+            meta = (try? await host.venue.instrumentMeta(instId: market.instId, mode: host.portfolio.mode)) ?? nil
             if let meta { metaCache[market.instId] = meta }
         }
 
@@ -1276,13 +1357,20 @@ public final class StrategyRunner {
         // the position leg it acts on, and `side` alone does not identify it:
         // "sell" opens a short but also closes a long. The leg is whichever
         // position we currently hold, or — from flat — whichever the delta is
-        // opening. Spot has no such concept and must not send the field.
+        // opening. A net-mode account names no leg at all, and refuses one.
+        // Spot has no such concept and must not send the field.
+        let heldContracts = host.ledger.position(for: strategy.id)?.quantity ?? 0
         var posSide: PositionSide?
-        if market.instType == .swap {
-            let held = host.ledger.position(for: strategy.id)?.quantity ?? 0
-            let leg = abs(held) > 1e-12 ? held : baseDelta
-            posSide = leg > 0 ? .long : .short
+        if market.instType.usesPositionSide {
+            let leg = abs(heldContracts) > 1e-12 ? heldContracts : baseDelta
+            posSide = await positionSide(forLeg: leg, host: host)
         }
+        // An order that shrinks a derivative position says so, and the
+        // exchange then refuses to let it overshoot into the opposite side.
+        let heldBase = host.ledger.position(for: strategy.id)?.baseQuantity ?? 0
+        let reduces = market.instType.isDerivative && abs(heldBase) > 1e-12
+            && (baseDelta > 0) != (heldBase > 0)
+            && abs(baseDelta) <= abs(heldBase) + 1e-12
 
         func request(withProtection: Bool) -> OrderRequest {
             OrderRequest(
@@ -1293,6 +1381,7 @@ public final class StrategyRunner {
                 size: size,
                 sizeUnit: .base,
                 posSide: posSide,
+                reduceOnly: reduces,
                 stopTriggerPrice: withProtection ? stopPrice : nil,
                 takeProfitTriggerPrice: withProtection ? takeProfitPrice : nil,
                 clOrdId: OrderTag.make(strategyId: strategy.id))
@@ -1309,59 +1398,418 @@ public final class StrategyRunner {
             目标变动 \(baseDelta) 币，现持 \
             \(host.ledger.position(for: strategy.id)?.quantity ?? 0) 张）理由：\(reason)
             """)
+        guard case .rejected(let rejection) = await placeOrTrack(
+            order, strategy: strategy, host: host, reason: reason) else { return }
+
+        // The exchange refused it outright, so nothing is in flight.
+        //
+        // The commonest reason for refusing an order that is otherwise fine
+        // is the attachment: OKX rejects a trigger price it considers too
+        // close to, or too far from, the mark. Abandoning the trade because
+        // its *insurance* was unacceptable is the wrong trade-off — the
+        // signal is still the signal. Send it bare and enforce the levels
+        // from here instead.
+        guard stopPrice != nil || takeProfitPrice != nil else {
+            update(strategy.id) {
+                $0.status = .failed
+                $0.message = "交易所拒绝下单：\(rejection)"
+            }
+            return
+        }
+        switch await placeOrTrack(
+            request(withProtection: false), strategy: strategy, host: host, reason: reason) {
+        case .accepted:
+            if let direction = TradeDirection(sign: baseDelta) {
+                localStops[strategy.id] = LocalStop(
+                    instId: market.instId, direction: direction,
+                    stop: stopPrice, takeProfit: takeProfitPrice)
+            }
+            update(strategy.id) {
+                $0.message = "交易所拒绝附加止损（\(rejection)），已改为裸单成交，"
+                    + "止损改由本程序在 tick 上执行——App 关闭期间不受保护"
+            }
+            Log.warn("runner: \(strategy.id) fell back to a locally enforced stop")
+        case .unconfirmed:
+            // Tracked in flight like any other unanswered call; the levels are
+            // armed once the fill is known.
+            break
+        case .cancelled:
+            return
+        case .rejected(let again):
+            update(strategy.id) {
+                $0.status = .failed
+                $0.message = "交易所拒绝下单：\(rejection)；去掉止损重试仍失败：\(again)"
+            }
+        }
+    }
+
+    private enum PlacementOutcome {
+        case accepted
+        /// The loop was cancelled before the order was sent. The caller
+        /// leaves the strategy exactly as it found it.
+        case cancelled
+        /// The call failed without a verdict from the exchange; the order is
+        /// being tracked and will be resolved by asking.
+        case unconfirmed
+        /// The exchange saw the order and refused it — final, nothing in flight.
+        case rejected(String)
+    }
+
+    /// Place an order and say what a failure means.
+    ///
+    /// A failed *call* is not a failed *order*. The request may have reached
+    /// the exchange and filled; halting on it would strand a real position
+    /// outside the ledger. Such an order is recorded in flight and resolved
+    /// by asking the exchange on the next tick. Only a response carrying the
+    /// exchange's own refusal is final.
+    private func placeOrTrack(
+        _ order: OrderRequest, strategy: CompiledStrategy,
+        host: StrategyRunnerHost, reason: String
+    ) async -> PlacementOutcome {
         do {
             try await place(order, strategy: strategy, host: host, reason: reason)
+            return .accepted
+        } catch is CancellationError {
+            // Never sent: the loop was cancelled — a mode switch, a stop —
+            // before the order reached the wire. Nothing to resolve, nothing
+            // to record.
+            return .cancelled
         } catch {
-            guard let rejection = (error as? TradeError)?.exchangeRejection else {
-                // A failed *call* is not a failed *order*. The request may have
-                // reached the exchange and filled; halting here would strand a
-                // real position outside the ledger. Record it and ask the
-                // exchange what happened on the next tick.
-                let clOrdId = order.clOrdId ?? ""
-                inFlight[clOrdId] = InFlightOrder(
-                    strategyId: strategy.id, instId: market.instId, instType: market.instType,
-                    clOrdId: clOrdId, submittedAt: Date(), attempts: 0)
-                update(strategy.id) {
-                    $0.status = .running
-                    $0.message = "下单结果未确认，等待交易所确认：\(error)"
-                }
-                return
+            if let rejection = (error as? TradeError)?.exchangeRejection {
+                return .rejected(rejection)
             }
+            let clOrdId = order.clOrdId ?? ""
+            inFlight[clOrdId] = InFlightOrder(
+                strategyId: strategy.id, instId: order.instId, instType: order.instType,
+                clOrdId: clOrdId, submittedAt: Date(), attempts: 0)
+            update(strategy.id) {
+                $0.status = .running
+                $0.message = "下单结果未确认，等待交易所确认：\(error)"
+            }
+            return .unconfirmed
+        }
+    }
 
-            // The exchange refused it outright, so nothing is in flight.
-            //
-            // The commonest reason for refusing an order that is otherwise fine
-            // is the attachment: OKX rejects a trigger price it considers too
-            // close to, or too far from, the mark. Abandoning the trade because
-            // its *insurance* was unacceptable is the wrong trade-off — the
-            // signal is still the signal. Send it bare and enforce the levels
-            // from here instead.
-            guard stopPrice != nil || takeProfitPrice != nil else {
-                update(strategy.id) {
-                    $0.status = .failed
-                    $0.message = "交易所拒绝下单：\(rejection)"
-                }
-                return
+    // MARK: Account configuration
+
+    /// The leg a perpetual order names. A long/short account names the side
+    /// the position is on; a net-mode account names `net`, and sending `long`
+    /// there is refused with an error that says nothing about why.
+    private func positionSide(forLeg leg: Double, host: StrategyRunnerHost) async -> PositionSide {
+        if await accountTradingConfig(host: host)?.positionMode == .net { return .net }
+        return leg > 0 ? .long : .short
+    }
+
+    /// How often the account's derivative settings are re-read. They change
+    /// only when the user changes them, and each read is an authenticated
+    /// call.
+    public static let accountConfigTTL: TimeInterval = 3_600
+    private var accountConfigCache: (config: AccountTradingConfig, at: Date)?
+
+    /// The account's position mode and margin level, cached. Nil when it has
+    /// never been readable, in which case callers fall back to the long/short
+    /// mode this app has always assumed — and the log says the read failed,
+    /// so a rejected order can be traced to it.
+    private func accountTradingConfig(host: StrategyRunnerHost) async -> AccountTradingConfig? {
+        if let cached = accountConfigCache,
+           Date().timeIntervalSince(cached.at) < Self.accountConfigTTL {
+            return cached.config
+        }
+        do {
+            let config = try await host.venue.accountTradingConfig(mode: host.portfolio.mode)
+            accountConfigCache = (config, Date())
+            return config
+        } catch {
+            Log.warn("runner: 读不到账户配置（\(error)），仓位模式沿用上次读数或按 long/short 处理")
+            return accountConfigCache?.config
+        }
+    }
+
+    // MARK: Option execution
+
+    /// How far above the ask a buy may pay, and below the bid a sell may
+    /// accept, so an IOC order clears a thin book without chasing it.
+    public static let optionPriceBuffer = 0.02
+    /// An ask this far above the exchange's mark is not a price; it is an
+    /// empty book with a placeholder in it, and buying there hands the
+    /// premium to whoever left it.
+    public static let optionMaxAskOverMark = 0.25
+    /// How long a fetched chain is reused. Listings change at settlement,
+    /// three times a day at most.
+    public static let optionChainTTL: TimeInterval = 600
+    private var optionChains: [String: (contracts: [OptionContract], at: Date)] = [:]
+
+    private func optionChain(
+        underlying: String, host: StrategyRunnerHost
+    ) async throws -> [OptionContract] {
+        if let cached = optionChains[underlying],
+           Date().timeIntervalSince(cached.at) < Self.optionChainTTL {
+            return cached.contracts
+        }
+        let contracts = try await host.venue.optionChain(underlying: underlying, mode: host.portfolio.mode)
+        optionChains[underlying] = (contracts, Date())
+        return contracts
+    }
+
+    /// The contract's tick and lot, from the chain already fetched or the
+    /// exchange's metadata.
+    private func optionContractMeta(instId: String, host: StrategyRunnerHost) async -> InstrumentMeta? {
+        if let listed = optionChains.values
+            .flatMap(\.contracts)
+            .first(where: { $0.instId == instId }) {
+            return listed.meta
+        }
+        if let cached = metaCache[instId] { return cached }
+        guard let meta = (try? await host.venue.instrumentMeta(instId: instId, mode: host.portfolio.mode)) ?? nil else {
+            return nil
+        }
+        metaCache[instId] = meta
+        return meta
+    }
+
+    /// Carry out the kernel's option plan.
+    private func executeOptionPlan(
+        _ plan: KernelOptionPlan, strategy: CompiledStrategy,
+        host: StrategyRunnerHost, reason: String
+    ) async {
+        guard !Task.isCancelled else { return }
+        switch plan.action {
+        case .close:
+            await closeOption(strategy: strategy, host: host, reason: reason)
+        case .open:
+            await openOption(plan, strategy: strategy, host: host, reason: reason)
+        case .flip:
+            await closeOption(strategy: strategy, host: host, reason: reason)
+            // Only a book that is actually flat takes the new contract. A
+            // close that did not fill leaves the old one, and the next bar
+            // decides again from what is really held.
+            guard host.ledger.position(for: strategy.id)?.isFlat ?? true else { return }
+            await openOption(plan, strategy: strategy, host: host, reason: reason)
+        }
+    }
+
+    /// Buy the contract the plan asks for: chain → selection rule → quote →
+    /// whole contracts the budget affords → an IOC limit a little through the
+    /// ask.
+    private func openOption(
+        _ plan: KernelOptionPlan, strategy: CompiledStrategy,
+        host: StrategyRunnerHost, reason: String
+    ) async {
+        guard let kind = plan.kind else { return }
+        guard host.ledger.position(for: strategy.id)?.isFlat ?? true else {
+            update(strategy.id) { $0.message = "已持有期权仓位，未再开仓" }
+            return
+        }
+        let underlying = strategy.optionsSpec.resolvedUnderlying(for: strategy.market)
+
+        let chain: [OptionContract]
+        do {
+            chain = try await optionChain(underlying: underlying, host: host)
+        } catch {
+            update(strategy.id) { $0.message = "读不到 \(underlying) 期权链，未开仓：\(error)" }
+            return
+        }
+        guard let index = try? await host.venue.indexPrice(underlying: underlying, mode: host.portfolio.mode), index > 0 else {
+            update(strategy.id) { $0.message = "读不到 \(underlying) 指数价，未开仓" }
+            return
+        }
+
+        let chosen: KernelOptionCandidate?
+        do {
+            chosen = try TradingKernel.selectOptionContract(
+                kind: kind, spot: index, now: Date(),
+                minDaysToExpiry: plan.minDaysToExpiry, moneynessPct: plan.moneynessPct,
+                strikeStep: plan.strikeStep,
+                candidates: chain.map(KernelOptionCandidate.init(contract:)))
+        } catch {
+            update(strategy.id) {
+                $0.status = .failed
+                $0.message = "期权合约筛选失败：\(error)"
             }
-            do {
-                try await place(request(withProtection: false),
-                                strategy: strategy, host: host, reason: reason)
-                if let direction = TradeDirection(sign: baseDelta) {
-                    localStops[strategy.id] = LocalStop(
-                        instId: market.instId, direction: direction,
-                        stop: stopPrice, takeProfit: takeProfitPrice)
-                }
-                update(strategy.id) {
-                    $0.message = "交易所拒绝附加止损（\(rejection)），已改为裸单成交，"
-                        + "止损改由本程序在 tick 上执行——App 关闭期间不受保护"
-                }
-                Log.warn("runner: \(strategy.id) fell back to a locally enforced stop")
-            } catch {
-                update(strategy.id) {
-                    $0.status = .failed
-                    $0.message = "交易所拒绝下单：\(rejection)；去掉止损重试仍失败：\(error)"
-                }
+            return
+        }
+        guard let chosen, let contract = chain.first(where: { $0.instId == chosen.instId }) else {
+            update(strategy.id) {
+                $0.message = "\(underlying) 期权链里没有到期 ≥ "
+                    + "\(PriceFormatter.plain(plan.minDaysToExpiry)) 天的\(kind.displayName)合约，未开仓"
             }
+            return
+        }
+
+        guard let quote = try? await host.venue.optionQuote(instId: contract.instId, mode: host.portfolio.mode) else {
+            update(strategy.id) { $0.message = "读不到 \(contract.instId) 报价，未开仓" }
+            return
+        }
+        guard let ask = quote.ask, ask > 0, quote.indexPrice > 0 else {
+            update(strategy.id) { $0.message = "\(contract.instId) 没有卖盘，未开仓" }
+            return
+        }
+        if let mark = quote.mark, mark > 0, ask > mark * (1 + Self.optionMaxAskOverMark) {
+            update(strategy.id) {
+                $0.message = "\(contract.instId) 卖一 \(PriceFormatter.plain(ask)) 高出标记价 "
+                    + "\(PriceFormatter.plain(mark)) 超过 \(Int(Self.optionMaxAskOverMark * 100))%，"
+                    + "盘口太薄，未开仓"
+            }
+            return
+        }
+
+        // The exchange quotes in the settlement coin per unit of underlying;
+        // the budget is in quote currency, so the ask converts at the same
+        // index the fill will be booked at.
+        let premiumQuotePerUnit = ask * quote.indexPrice
+        let perContract = premiumQuotePerUnit * contract.contractValue
+        let lot = contract.lotSize > 0 ? contract.lotSize : 1
+        let contracts = perContract > 0
+            ? (plan.premiumBudget / perContract / lot).rounded(.down) * lot : 0
+        guard contracts >= Swift.max(contract.minSize, lot), contracts > 0 else {
+            update(strategy.id) {
+                $0.message = "权利金预算 \(PriceFormatter.money(plan.premiumBudget)) 买不起一张 "
+                    + "\(contract.instId)（每张约 \(PriceFormatter.money(perContract))），未开仓"
+            }
+            return
+        }
+        let tick = contract.tickSize > 0 ? contract.tickSize : 0.0001
+        let limit = Self.snapToTick(ask * (1 + Self.optionPriceBuffer), tick: tick, roundingUp: true)
+        let config = await accountTradingConfig(host: host)
+        let tradeMode = (config ?? AccountTradingConfig(positionMode: nil, accountLevel: nil))
+            .optionTradeMode
+        if let funding = await premiumFunding(
+            contract: contract, contracts: contracts, limit: limit,
+            strategy: strategy, config: config, host: host),
+           !funding.isCovered {
+            Log.warn("runner: \(strategy.id) 未下单：\(funding.explanation)")
+            update(strategy.id) { $0.message = "未开仓：\(funding.explanation)" }
+            return
+        }
+        host.ledger.setContractSize(contract.contractValue, forInstId: contract.instId)
+
+        let order = OrderRequest(
+            instId: contract.instId, instType: .option, side: .buy, kind: .ioc,
+            size: contracts, sizeUnit: .base, limitPrice: limit,
+            clOrdId: OrderTag.make(strategyId: strategy.id), tradeMode: tradeMode)
+        Log.warn("""
+            runner: 期权下单 \(strategy.id) 买入 \(contract.instId) \
+            \(PriceFormatter.plain(contracts)) 张 @≤\(PriceFormatter.plain(limit)) \
+            \(contract.settleCurrency)（卖一 \(PriceFormatter.plain(ask))，\
+            指数 \(PriceFormatter.plain(quote.indexPrice))，每张 \(PriceFormatter.money(perContract))，\
+            预算 \(PriceFormatter.money(plan.premiumBudget))，tdMode \(tradeMode)）理由：\(reason)
+            """)
+        switch await placeOrTrack(order, strategy: strategy, host: host, reason: reason) {
+        case .rejected(let rejection):
+            update(strategy.id) {
+                $0.status = .failed
+                $0.message = "交易所拒绝期权下单：\(rejection)"
+            }
+            return
+        case .cancelled:
+            return
+        case .accepted, .unconfirmed:
+            break
+        }
+
+        // Protective levels on the premium itself, watched here. The
+        // exchange's option stops trigger on a coin-denominated price that
+        // would have to be re-converted on every tick, and a long option's loss
+        // is bounded by the premium in any case.
+        guard plan.stopLossPct != nil || plan.takeProfitPct != nil,
+              let position = host.ledger.position(for: strategy.id), !position.isFlat,
+              position.instId == contract.instId, position.averagePrice > 0 else { return }
+        let entry = position.averagePrice
+        localStops[strategy.id] = LocalStop(
+            instId: contract.instId, direction: .long,
+            stop: plan.stopLossPct.map { entry * (1 - $0 / 100) },
+            takeProfit: plan.takeProfitPct.map { entry * (1 + $0 / 100) })
+    }
+
+    /// Whether the account can pay the premium for `contracts` of `contract`
+    /// at `limit`, or nil when that cannot be known. The exchange then rules
+    /// on the order itself, and the log says the check was skipped rather
+    /// than passed.
+    private func premiumFunding(
+        contract: OptionContract, contracts: Double, limit: Double,
+        strategy: CompiledStrategy, config: AccountTradingConfig?, host: StrategyRunnerHost
+    ) async -> OptionPremiumFunding? {
+        guard let config else {
+            Log.warn("""
+                runner: \(strategy.id) 读不到账户配置，跳过结算币 \(contract.settleCurrency) \
+                余额检查，由交易所裁定
+                """)
+            return nil
+        }
+        let snapshot: AccountSnapshot
+        do {
+            snapshot = try await host.venue.accountSnapshot(mode: host.portfolio.mode)
+        } catch {
+            Log.warn("""
+                runner: \(strategy.id) 读不到账户余额（\(error)），跳过结算币 \
+                \(contract.settleCurrency) 检查，由交易所裁定
+                """)
+            return nil
+        }
+        guard let costs = strategy.manifest.effectiveCosts(under: host.portfolio.feeSchedules) else {
+            Log.warn("runner: \(strategy.id) 没有可用的费率模型，跳过结算币 "
+                     + "\(contract.settleCurrency) 检查，由交易所裁定")
+            return nil
+        }
+        return OptionPremiumFunding(
+            settleCurrency: contract.settleCurrency, contracts: contracts,
+            contractValue: contract.contractValue, limitPrice: limit,
+            fees: costs.fees,
+            feeCapPctOfPremium: strategy.optionsSpec.feeCapPctOfPremium,
+            available: snapshot.balance(of: contract.settleCurrency)?.available ?? 0,
+            config: config)
+    }
+
+    /// Sell the held contract back into its book, whole, with an IOC limit a
+    /// little through the bid.
+    private func closeOption(
+        strategy: CompiledStrategy, host: StrategyRunnerHost, reason: String
+    ) async {
+        guard !Task.isCancelled,
+              let position = host.ledger.position(for: strategy.id), !position.isFlat,
+              position.venue.instrumentType(of: position.instId) == .option else { return }
+        let contracts = abs(position.quantity)
+
+        guard let quote = try? await host.venue.optionQuote(instId: position.instId, mode: host.portfolio.mode) else {
+            update(strategy.id) { $0.message = "读不到 \(position.instId) 报价，未能平仓" }
+            return
+        }
+        guard let bid = quote.bid, bid > 0 else {
+            update(strategy.id) {
+                $0.message = "\(position.instId) 没有买盘，未能平仓；到期时交易所按内在价值结算"
+            }
+            return
+        }
+        let tick = (await optionContractMeta(instId: position.instId, host: host))?.tickSize ?? 0.0001
+        let step = tick > 0 ? tick : 0.0001
+        let limit = Swift.max(
+            Self.snapToTick(bid * (1 - Self.optionPriceBuffer), tick: step, roundingUp: false), step)
+        let tradeMode = (await accountTradingConfig(host: host)
+            ?? AccountTradingConfig(positionMode: nil, accountLevel: nil)).optionTradeMode
+
+        let order = OrderRequest(
+            instId: position.instId, instType: .option,
+            side: position.quantity > 0 ? .sell : .buy, kind: .ioc,
+            size: contracts, sizeUnit: .base, limitPrice: limit, reduceOnly: true,
+            clOrdId: OrderTag.make(strategyId: strategy.id), tradeMode: tradeMode)
+        Log.warn("""
+            runner: 期权平仓 \(strategy.id) \(order.side.displayName) \(position.instId) \
+            \(PriceFormatter.plain(contracts)) 张 @≥\(PriceFormatter.plain(limit))（买一 \
+            \(PriceFormatter.plain(bid))，指数 \(PriceFormatter.plain(quote.indexPrice))）理由：\(reason)
+            """)
+        switch await placeOrTrack(order, strategy: strategy, host: host, reason: reason) {
+        case .rejected(let rejection):
+            update(strategy.id) {
+                $0.status = .failed
+                $0.message = "交易所拒绝期权平仓：\(rejection)"
+            }
+        case .cancelled:
+            return
+        case .accepted, .unconfirmed:
+            break
+        }
+        if host.ledger.position(for: strategy.id)?.isFlat ?? true {
+            localStops[strategy.id] = nil
         }
     }
 
@@ -1370,6 +1818,12 @@ public final class StrategyRunner {
         _ order: OrderRequest, strategy: CompiledStrategy,
         host: StrategyRunnerHost, reason: String
     ) async throws {
+        // The last check before the wire. `submit` checked on entry, but it
+        // awaits instrument metadata between there and here, and a mode switch
+        // cancels this task synchronously before it changes the mode — so a
+        // check that runs after the switch sees the cancellation, and one that
+        // runs before it places the order before the switch can happen.
+        try Task.checkCancellation()
         _ = try await host.venue.place(
             order, mode: host.portfolio.mode, liveUnlocked: host.liveTradingUnlocked)
         inFlight[order.clOrdId ?? ""] = nil
@@ -1382,9 +1836,58 @@ public final class StrategyRunner {
         // report the position as unchanged and, on the next tick, look exactly
         // like an external reduction.
         try? await Task.sleep(nanoseconds: 1_200_000_000)
-        fillsThisTick[InstrumentKey(
-            instId: order.instId, instType: order.instType)] = nil
+        fillsThisTick = fillsThisTick.filter { $0.key.instType != order.instType }
         await ingestFills(for: [strategy], host: host)
+        if order.kind != .limit {
+            await reportImmediateOutcome(of: order, strategy: strategy, host: host, reason: reason)
+        }
+    }
+
+    /// What became of an order that resolves on arrival.
+    ///
+    /// A market or IOC order is filled, partly filled or cancelled before the
+    /// placing call returns, so "买入 3" is not yet a fact when it is written:
+    /// an IOC the book never touched leaves the ledger, correctly, holding
+    /// nothing, and a message saying a buy happened next to a book saying it
+    /// did not is the kind of disagreement that gets believed the wrong way
+    /// round. The exchange is asked, and its answer becomes the message.
+    private func reportImmediateOutcome(
+        of order: OrderRequest, strategy: CompiledStrategy,
+        host: StrategyRunnerHost, reason: String
+    ) async {
+        guard let clOrdId = order.clOrdId,
+              let status = try? await host.venue.orderStatus(
+                instId: order.instId, instType: order.instType,
+                clOrdId: clOrdId, mode: host.portfolio.mode) else { return }
+        let side = order.side.displayName
+        let asked = PriceFormatter.plain(order.size)
+        switch status {
+        case .canceled:
+            Log.warn("""
+                runner: \(strategy.id) \(side) \(order.instId) \(asked) 未成交，交易所已撤单\
+                （到达时盘口已不在限价内），台账未记仓位
+                """)
+            update(strategy.id) {
+                $0.message = "\(reason)：\(side) \(asked) 未成交，交易所已撤单，台账未记仓位"
+            }
+        case .filled(let filled, let average)
+            where order.sizeUnit == .base && filled < order.size - 1e-9:
+            update(strategy.id) {
+                $0.message = "\(reason)：\(side) \(asked)，成交 \(PriceFormatter.plain(filled)) "
+                    + "@ \(PriceFormatter.plain(average))，其余已撤"
+            }
+        case .filled(_, let average):
+            update(strategy.id) {
+                $0.message = "\(reason)：\(side) \(asked) 已成交 @ \(PriceFormatter.plain(average))"
+            }
+        case .rejected(let verdict):
+            // A refusal that only the listing reports: the placing call had
+            // returned as if accepted.
+            Log.warn("runner: \(strategy.id) \(side) \(order.instId) \(asked) 被交易所拒绝：\(verdict)")
+            update(strategy.id) { $0.message = "\(reason)：\(side) \(asked) 被交易所拒绝：\(verdict)" }
+        case .live, .unknown:
+            break
+        }
     }
 
     // MARK: Trailing stops
@@ -1519,7 +2022,8 @@ public final class StrategyRunner {
                   let kind = level.breach(at: price) else { continue }
             localStops[strategyId] = nil
             update(strategyId) { $0.message = "本地\(kind)触发（\(PriceFormatter.plain(price))），正在平仓" }
-            await flatten(strategyId: strategyId)
+            await flatten(strategyId: strategyId,
+                          reason: "本地\(kind)触发（\(PriceFormatter.plain(price))）")
 
             // Disarming before the order lands would leave the position
             // unprotected for good if that order failed. Only a position that
@@ -1537,11 +2041,18 @@ public final class StrategyRunner {
     // MARK: Fill attribution
 
     private func ingestFills(for strategies: [CompiledStrategy], host: StrategyRunnerHost) async {
-        await ingestFills(
-            for: Set(strategies.map {
-                InstrumentKey(instId: $0.market.instId, instType: $0.market.instType)
-            }),
-            host: host)
+        await ingestFills(for: Set(strategies.map(instrumentKey(for:))), host: host)
+    }
+
+    /// Where a strategy's fills are listed.
+    ///
+    /// An option strategy's fills land on whichever contract it holds, which
+    /// changes at every roll — so its listing is the whole option book, and
+    /// attribution by tag does the rest.
+    private func instrumentKey(for strategy: CompiledStrategy) -> InstrumentKey {
+        strategy.isOptionStrategy
+            ? InstrumentKey(instId: nil, instType: .option)
+            : InstrumentKey(instId: strategy.market.instId, instType: strategy.market.instType)
     }
 
     private func ingestFills(for instruments: Set<InstrumentKey>, host: StrategyRunnerHost) async {
@@ -1549,8 +2060,58 @@ public final class StrategyRunner {
         let knownIds = host.runnableStrategies.map(\.id)
         for instrument in instruments {
             guard let listing = await fills(for: instrument, host: host) else { continue }
-            host.ledger.ingest(listing, knownStrategyIds: knownIds, venue: host.venue.venue)
+            let indexPrices = await indexPrices(for: listing, host: host)
+            let contractSizes = await contractSizes(for: listing, host: host)
+            host.ledger.ingest(
+                listing, knownStrategyIds: knownIds, venue: host.venue.venue,
+                indexPrices: indexPrices, contractSizes: contractSizes)
         }
+    }
+
+    /// Index prices for the option fills in a listing that the exchange did
+    /// not stamp with one, read once per underlying per tick.
+    private func indexPrices(
+        for listing: [ExchangeFill], host: StrategyRunnerHost
+    ) async -> [String: Double] {
+        var prices: [String: Double] = [:]
+        for fill in listing where fill.indexPrice == nil && (fill.priceUsd ?? 0) <= 0 {
+            guard let underlying = host.venue.venue.optionUnderlying(of: fill.instId),
+                  prices[underlying] == nil else { continue }
+            if let cached = indexThisTick[underlying] {
+                prices[underlying] = cached
+            } else if let price = try? await host.venue.indexPrice(underlying: underlying, mode: host.portfolio.mode),
+                      price > 0 {
+                prices[underlying] = price
+                indexThisTick[underlying] = price
+            }
+        }
+        return prices
+    }
+
+    /// Cleared at the top of every tick, like `fillsThisTick`.
+    private var indexThisTick: [String: Double] = [:]
+
+    /// What one contract is worth, for every instrument in a listing whose
+    /// family does not imply it.
+    ///
+    /// The ledger refuses to book a fill it cannot scale, so the answer has
+    /// to be fetched before the fill is offered rather than after — a listing
+    /// routinely names an instrument no position has ever been held in: the
+    /// contract an option strategy rolled out of, or anything at all on a
+    /// ledger that has just been rebuilt. `contractSize` caches and never
+    /// invents.
+    private func contractSizes(
+        for listing: [ExchangeFill], host: StrategyRunnerHost
+    ) async -> [String: Double] {
+        var sizes: [String: Double] = [:]
+        for fill in listing
+        where host.venue.venue.instrumentType(of: fill.instId).impliedContractSize == nil
+            && sizes[fill.instId] == nil {
+            if let size = await contractSize(for: fill.instId, host: host), size > 0 {
+                sizes[fill.instId] = size
+            }
+        }
+        return sizes
     }
 
     /// Fills for one instrument, fetched at most once per tick.
@@ -1575,7 +2136,8 @@ public final class StrategyRunner {
     private var fillsThisTick: [InstrumentKey: [ExchangeFill]] = [:]
 
     private struct InstrumentKey: Hashable {
-        let instId: String
+        /// Nil lists every instrument of the family.
+        let instId: String?
         let instType: InstrumentType
     }
 

@@ -300,7 +300,7 @@ struct StrategyStoreTests {
         let loaded = store.loadCompiled()
         #expect(loaded.ready.isEmpty)
         #expect(loaded.broken.count == 1)
-        #expect(loaded.broken.first?.1.contains("杠杆") == true)
+        #expect(loaded.broken.first?.reason.contains("杠杆") == true)
     }
 }
 
@@ -361,7 +361,7 @@ struct InstrumentTypeVocabularyTests {
     /// type with no sample fails the require below, which is the point — the
     /// table is the checklist.
     private static let sampleIds: [Venue: [InstrumentType: String]] = [
-        .okx: [.spot: "BTC-USDT", .swap: "BTC-USDT-SWAP"],
+        .okx: [.spot: "BTC-USDT", .swap: "BTC-USDT-SWAP", .option: "BTC-USD-260926-80000-C"],
         .schwab: [.stock: "AAPL"],
     ]
 
@@ -371,7 +371,13 @@ struct InstrumentTypeVocabularyTests {
             for type in venue.instrumentTypes {
                 let id = try #require(samples[type], "\(venue) 的 \(type) 缺少样本 instId")
                 #expect(venue.instrumentType(of: id) == type)
-                #expect(venue.currencies(of: id).quote == venue.quoteCurrency)
+                let (base, quote) = venue.currencies(of: id)
+                #expect(!base.isEmpty, "\(venue) \(type)")
+                // An option names its settlement index (BTC-USD) rather than
+                // the book's currency; every other family is quoted in the
+                // currency the account settles in.
+                #expect(type == .option || quote == venue.quoteCurrency,
+                        "\(venue) \(type) 的计价币读成了 \(quote)")
             }
         }
     }
@@ -410,5 +416,132 @@ struct InstrumentTypeVocabularyTests {
                 #expect(taught.multiplier == 0.01)
             }
         }
+    }
+}
+
+// MARK: - Option manifests
+
+@Suite("期权策略清单")
+struct OptionManifestTests {
+    private func decode(_ json: String) throws -> StrategyManifest {
+        try JSONDecoder().decode(StrategyManifest.self, from: Data(json.utf8))
+    }
+
+    private let json = """
+    {
+      "schema": 1, "id": "opt", "name": "Option trend",
+      "market": { "instId": "BTC-USDT", "instType": "OPTION", "bar": "4H" },
+      "signals": {
+        "longEntry": "close > sma(close, 20)", "longExit": "close < sma(close, 20)",
+        "shortEntry": "close < sma(close, 20)", "shortExit": "close > sma(close, 20)"
+      },
+      "sizing": { "mode": "equityPct", "value": 10 },
+      "risk": { "stopLossPct": 50, "takeProfitPct": 150, "volLookbackBars": 30 },
+      "options": { "minDaysToExpiry": 14, "moneynessPct": 2 }
+    }
+    """
+
+    @Test("期权清单能解码、编译，并推导标的指数")
+    func decodesAndCompiles() throws {
+        let manifest = try decode(json)
+        let compiled = try manifest.compile()
+        #expect(compiled.isOptionStrategy)
+        #expect(compiled.canGoShort, "a put is a legitimate bearish view")
+        #expect(compiled.optionsSpec.minDaysToExpiry == 14)
+        #expect(compiled.optionsSpec.moneynessPct == 2)
+        #expect(compiled.optionsSpec.resolvedUnderlying(for: manifest.market) == "BTC-USD")
+        #expect(compiled.warmupBars >= 31, "the pricing model needs its volatility window primed")
+        // Round-trips with the block intact.
+        let again = try JSONDecoder().decode(StrategyManifest.self, from: manifest.encoded())
+        #expect(again == manifest)
+    }
+
+    @Test("options 块省略时全部取默认")
+    func theBlockDefaults() throws {
+        let stripped = json.replacingOccurrences(
+            of: #""options": { "minDaysToExpiry": 14, "moneynessPct": 2 }"#, with: #""options": null"#)
+        let compiled = try decode(stripped).compile()
+        #expect(compiled.optionsSpec == StrategyOptionsSpec())
+        #expect(compiled.optionsSpec.minDaysToExpiry == 7)
+    }
+
+    @Test("现货清单带 options 块会被拒绝")
+    func anOptionsBlockOnSpotIsRefused() throws {
+        var manifest = StrategyLibrary.emaTrend
+        manifest.options = StrategyOptionsSpec(moneynessPct: 5)
+        #expect(throws: StrategyManifestError.self) { _ = try manifest.compile() }
+    }
+
+    @Test("期权策略拒绝引擎做不到的东西，且说出来的是策略的话不是表达式的话")
+    func unsupportedRiskRulesAreRefusedWithTheirOwnWording() throws {
+        var manifest = try decode(json)
+        manifest.risk.trailingStopPct = 5
+        do {
+            _ = try manifest.compile()
+            Issue.record("a trailing stop must be refused on an option strategy")
+        } catch let error as StrategyManifestError {
+            guard case .rejectedByKernel(let reason) = error else {
+                Issue.record("expected the kernel's own verdict, got \(error)"); return
+            }
+            #expect(reason.contains("trailingStopPct"))
+            #expect(!error.description.hasPrefix("signals"))
+        }
+    }
+
+    @Test("单笔风险模式在期权上不需要止损：权利金就是风险")
+    func riskPerTradeNeedsNoStopOnOptions() throws {
+        var manifest = try decode(json)
+        manifest.sizing = StrategySizing(mode: .riskPerTrade, value: 2)
+        manifest.risk = StrategyRisk(volLookbackBars: 30)
+        _ = try manifest.compile()
+    }
+
+    @Test("从 instId 认出期权、永续和现货")
+    func instrumentFamiliesAreReadOffTheId() {
+        #expect(Venue.okx.instrumentType(of: "BTC-USD-260926-80000-C") == .option)
+        #expect(Venue.okx.instrumentType(of: "ETH-USD-261225-3000-P") == .option)
+        #expect(Venue.okx.instrumentType(of: "BTC-USDT-SWAP") == .swap)
+        #expect(Venue.okx.instrumentType(of: "BTC-USDT") == .spot)
+        // A dated future is not an option, and neither is a typo.
+        #expect(Venue.okx.instrumentType(of: "BTC-USD-260926") == .spot)
+        #expect(Venue.okx.instrumentType(of: "BTC-USD-260926-80000-X") == .spot)
+        #expect(Venue.okx.optionKind(of: "BTC-USD-260926-80000-C") == .call)
+        #expect(Venue.okx.optionKind(of: "BTC-USD-260926-80000-P") == .put)
+        #expect(Venue.okx.optionUnderlying(of: "BTC-USD-260926-80000-C") == "BTC-USD")
+        #expect(Venue.okx.optionUnderlying(of: "BTC-USDT") == nil)
+        // An option id means nothing on a venue that lists no options: it is
+        // a ticker like any other, not a contract spelled the OKX way.
+        #expect(Venue.schwab.instrumentType(of: "BTC-USD-260926-80000-C") == .stock)
+        #expect(Venue.schwab.optionKind(of: "BTC-USD-260926-80000-C") == nil)
+    }
+
+    /// Every family declares its own behaviour; nothing may fall through to
+    /// "whatever spot does" by accident.
+    @Test("每个品种家族都声明了自己的行为")
+    func everyFamilyDeclaresItself() {
+        for family in InstrumentType.allCases {
+            #expect(!family.displayName.isEmpty)
+            // OKX has a CLI module for exactly the families it lists.
+            #expect((family.cliModule != nil) == Venue.okx.trades(family), "\(family)")
+            #expect(family.tradesInContracts == (family.impliedContractSize == nil),
+                    "\(family): a contract multiplier is known without asking only in base units")
+            #expect(!family.usesPositionSide || family.isDerivative)
+            #expect(!family.settlesFunding || family.isDerivative)
+        }
+        #expect(InstrumentType.option.isDerivative)
+        #expect(!InstrumentType.option.usesPositionSide)
+        #expect(!InstrumentType.option.settlesFunding)
+        #expect(InstrumentType.option.allowsShorting && !InstrumentType.option.allowsLeverage)
+    }
+
+    @Test("内置示例里的期权清单能编译")
+    func theShippedOptionExampleCompiles() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let url = root.appendingPathComponent("Strategies/examples/12-btc-options-trend.json")
+        let manifest = try StrategyManifest.load(from: url)
+        let compiled = try manifest.compile()
+        #expect(compiled.isOptionStrategy)
+        #expect(compiled.optionsSpec.resolvedUnderlying(for: manifest.market) == "BTC-USD")
     }
 }

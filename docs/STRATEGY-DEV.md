@@ -44,8 +44,8 @@ make lab ARGS="fees --tier lv1"
 
   "market": {
     "venue": "okx",               // okx | schwab；省略视为 okx
-    "instId": "BTC-USDT",         // okx：任意 OKX 标的；schwab：美股代码，如 SPY
-    "instType": "SPOT",           // okx：SPOT | SWAP；schwab：STOCK（见 §1.1）
+    "instId": "BTC-USDT",         // okx：任意 OKX 标的（OPTION 时是信号所读的标的，见 §1.2）；schwab：美股代码，如 SPY
+    "instType": "SPOT",           // okx：SPOT | SWAP | OPTION；schwab：STOCK（见 §1.1）
     "bar": "1H"                   // 1m 5m 15m 1H 4H 1D 1W
   },
 
@@ -64,6 +64,7 @@ make lab ARGS="fees --tier lv1"
   "risk":   { "stopLossPct": 4, "cooldownBars": 1 },
   "costs":  { "feeBps": 10, "slippageBps": 5 },  // 或 "fees": [组件…]，见 §3；省略则按该交易所的费率表
 
+  "options": { "minDaysToExpiry": 14, "moneynessPct": 0 },  // 仅 OPTION，见 §1.2
   "data":   { "funding": { "source": "fundingRate" } },   // 见 §2.5
   "engine": { "kind": "declarative" }                     // 或 script，见 §2.6
 }
@@ -75,12 +76,70 @@ make lab ARGS="fees --tier lv1"
 |-------|----------|--------|------|------|------|
 | `okx` | `SPOT` | USDT | 7×24 | 否 | 1 |
 | `okx` | `SWAP` | USDT | 7×24 | 是 | 1~50，逐仓 |
+| `okx` | `OPTION` | USDT（权利金以结算币付） | 7×24 | 是（买看跌，见 §1.2） | 1，杠杆内生于合约 |
 | `schwab` | `STOCK` | USD | 纽交所交易日：节假日、提前收盘、夏令时都由内核日历处理 | 是（保证金账户） | 1~2（Reg T） |
 
 这张表不是文档说了算：规则在内核 `kernel/src/strategy.rs` 的 `InstrumentPolicy` 里，
 Swift 通过 `ms_instrument_policy` 读取同一份，清单编译时按它拒绝越界的做空与杠杆。
 时间换算（一年多少根、持仓多少根、「一天」从哪里到哪里）同样只有内核的
 `MarketCalendar` 一份，Swift 侧经 `KernelCalendar` 询问，不自己做 `天数 × 86400 / bar` 的算术。
+### 1.2 期权：信号读标的，仓位是合约
+
+`instType = "OPTION"` 时，`market.instId` 是**信号所读的标的**（如 `BTC-USDT`），
+仓位则是它的期权合约：做多信号买入看涨，做空信号买入看跌。**只买不卖**——
+卖出期权亏损无上限且靠交易所保证金约束，引擎不建模，也就不许写。
+每笔的最大亏损就是权利金，所以 `equityPct` 和 `riskPerTrade` 在这里是一个意思：
+拿资金的多少比例去买权利金。
+
+```jsonc
+"market":  { "instId": "BTC-USDT", "instType": "OPTION", "bar": "4H" },
+"signals": { "longEntry": "…", "longExit": "…", "shortEntry": "…", "shortExit": "…" },
+"sizing":  { "mode": "equityPct", "value": 10 },          // 每次动用 10% 预算买权利金
+"risk":    { "stopLossPct": 50, "takeProfitPct": 150, "volLookbackBars": 60 },
+"options": {
+  "uly": "BTC-USD",              // 结算指数；省略则由标的推导（BTC-USDT → BTC-USD）
+  "minDaysToExpiry": 14,         // 买最近一个到期 ≥ 14 天的合约（默认 7）
+  "moneynessPct": 0,             // 行权价偏离现价的百分比，正为价外；0 = 平值
+  "impliedVolMultiplier": 1.2,   // 回测定价用：隐含波动 = 实现波动 × 1.2（默认）
+  "strikeStep": 1000,            // 回测模型的行权价网格；省略 = 现价的 1%
+  "contractMultiplier": 0.01,    // 回测模型每张合约的标的数量；实盘读交易所元数据
+  "feeCapPctOfPremium": 12.5     // OKX 手续费上限：权利金的 12.5%
+}
+```
+
+| 条款 | 期权策略里的含义 |
+|------|------|
+| `stopLossPct` / `takeProfitPct` | **相对权利金**（不是标的价）：权利金亏 50% 止损、赚 150% 止盈 |
+| `atrStop` / `trailingStopPct` / `exposure` / `volatilityTarget` / `leverage > 1` | 不支持，导入即拒绝并说明原因 |
+| `volLookbackBars` | 回测定价用的实现波动率窗口；同时决定预热长度 |
+| `cooldownBars` / `minHoldBars` / `maxHoldBars` / `maxDailyLossPct` | 与其它品种相同 |
+| 到期 | 持到期即按内在价值结算；只要信号仍在，下一根重新买入下一个到期 |
+
+**回测是模型定价，不是历史成交价。** OKX 不提供已到期合约的行情，所以回测用
+Black–Scholes（无风险利率取 0）按标的收盘价与实现波动率 × `impliedVolMultiplier`
+给每根 K 线定价：入场按下根开盘价定价并加滑点，止损止盈按**收盘**判定，
+到期在含到期时刻的那根**开盘**按内在价值结算、不收手续费。手续费按 OKX 规则：
+名义额 × 费率，封顶权利金的 `feeCapPctOfPremium`%。它能诚实回答的只有一个问题：
+**方向信号赚不赚得回权利金**；某一天的权利金到底多少，是模型的猜测。
+报告和工作台都会标注这一点。
+
+**实盘用交易所真实盘口。** 运行器读期权链，用与回测**同一个**筛选函数
+（内核 `select_contract`）挑合约，再读买一/卖一/标记价/指数价，
+把权利金预算按 `卖一 × 指数 × 每张标的量` 换算成整张数，以 **IOC 限价单**
+（卖一上浮 2%）成交；平仓是 reduceOnly 的 IOC 卖单（买一下浮 2%）。
+没有卖盘、或卖一高出标记价 25% 以上（空盘口里的占位挂单），不开仓并说明。
+**权利金和手续费以合约的结算币支付**（BTC 期权是 BTC），预算里的 USDT 不会被自动换成 BTC：
+账户要持有足够的结算币，或在跨币种 / 组合保证金模式下开启自动借币（交易所计息）。
+运行器下单前按 `张数 × 每张标的量 × 限价 + 手续费` 核对可用余额，不够就不下单，
+并在策略状态里写明可用多少、需要多少、缺多少；能不能借由账户配置决定，本程序不替你换币。
+**报价读下单的那个环境。** 模拟盘的期权盘口和标记价是模拟盘自己的，可能与真实市场相差数倍
+（同一合约真实卖一 0.021、模拟盘卖一 0.0375）；运行器在模拟盘模式下读模拟盘的盘口、标记价、
+指数与合约列表来定价、算张数、估值和选合约，实盘则读真实市场。信号用的 K 线始终读真实市场——
+模拟盘跑的必须是将来实盘要跑的那个策略。IOC 单到达时若盘口已不在限价内，交易所会撤单，
+策略状态会写明「未成交，已撤单」，不会把发出去的数量当成买到的。
+止损止盈按权利金标记价在本程序 tick 上执行——App 关闭期间不设防，
+但多头期权的亏损本来就以权利金为限。到期后交易所结算掉仓位，
+运行器在对账时按标记价补记为「到期结算」。
 
 ### params 的三种写法
 
@@ -133,7 +192,7 @@ Swift 通过 `ms_instrument_policy` 读取同一份，清单编译时按它拒�
 | `stopLossPct` / `takeProfitPct` | 相对入场价的百分比 |
 | `trailingStopPct` | 移动止损；水位按每根收盘更新，只约束**之后**的 K 线 |
 | `atrStop` | `{ "period": 14, "mult": 2.5 }`；与 `stopLossPct` 并存时**取更紧的那个** |
-| `leverage` | 上限由品种决定（§1.1）：现货 1、永续 50、美股 2；越界在导入时被拒 |
+| `leverage` | 上限由品种决定（§1.1）：现货 1、永续 50、期权 1（杠杆内生于合约）、美股 2；越界在导入时被拒 |
 | `cooldownBars` | 平仓后需等待的根数才允许再入场（反手不受限） |
 | `minHoldBars` | 持仓至少这么多根才响应离场**信号**；止损不受限 |
 | `maxDailyLossPct` | 交易日内亏损达标即平仓并停到次日；「一天」按该市场的日历算（OKX 为 UTC 日，美股为纽约交易日） |
@@ -260,7 +319,7 @@ out: {"target":["flat","long", ..., null]}   // 每根一个
 
 **边界**（这是脚本策略能被安全使用的前提）：
 
-- 默认**禁用**。CLI 需 `--allow-scripts`，App 需在 设置 → 交易 中显式开启。
+- 默认**禁用**。CLI 需 `--allow-scripts`，App 需在 账户与连接 → 组合风控 中显式开启。
 - 脚本**只决定方向**，不决定仓位、不下单。止损、冷却、最短持仓、
   资金预算、日内熔断、急停仍由清单与工作台控制。
 - 超时强杀、输出大小上限、长度与取值严格校验。
@@ -474,7 +533,7 @@ BTC 与 ETH 的日收益长期高度相关，**「BTC + ETH」本身不构成分
 
 1. `walkforward` 通过 → 把 `Strategies/<id>.json` 拖进 MayStock 策略工作台。
 2. 先在**模拟盘**分配小仓位跑，对比实盘成交与回测假设的偏差。
-3. 设置 → 交易 里解锁实盘，再在工作台逐个策略切换。
+3. 账户与连接页里解锁实盘、切换到实盘（切换前会验证实盘账户），再逐个策略在实盘启动（每个都要确认）。
 4. 每笔订单都会带 `clOrdId` 策略标签，工作台按标签与 `okx spot fills` 对账，
    对不上的部分显式标为「未归因」。
 

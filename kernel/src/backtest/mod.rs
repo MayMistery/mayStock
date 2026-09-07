@@ -11,6 +11,7 @@
 
 pub mod continuous;
 pub mod metrics;
+pub mod options;
 
 use std::collections::HashMap;
 
@@ -95,6 +96,8 @@ pub enum ExitReason {
     Liquidation,
     DailyLossHalt,
     EndOfData,
+    /// An option contract reached its settlement and paid its intrinsic value.
+    Expiry,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,7 +240,7 @@ pub(crate) fn liquidation_buffer(regime: MarginRegime, maintenance_margin_rate: 
 fn resolve_costs(strategy: &CompiledStrategy, config: &BacktestConfig) -> ExprResult<Costs> {
     strategy
         .costs(config.fees.as_deref(), config.slippage_bps)
-        .map_err(|message| ExprError::Syntax { message, column: 1 })
+        .map_err(ExprError::Policy)
 }
 
 /// Maintenance margin the simulation liquidates against.
@@ -274,6 +277,9 @@ pub fn run(
 ) -> ExprResult<BacktestResult> {
     if strategy.is_continuous() {
         return crate::backtest::continuous::run(strategy, raw_candles, config);
+    }
+    if strategy.manifest.market.inst_type.is_option() {
+        return crate::backtest::options::run(strategy, raw_candles, config);
     }
 
     let mut candles: Vec<Candle> = raw_candles.iter().copied().filter(|c| c.is_confirmed()).collect();

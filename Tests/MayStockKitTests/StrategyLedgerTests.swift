@@ -103,12 +103,12 @@ struct StrategyPositionTests {
         #expect(state.returnPct(mark: 110, capital: 0) == nil)
     }
 
-    @Test func spotBuyFeesInBaseCurrencyConvertToQuote() {
+    @Test func spotBuyFeesInBaseCurrencyConvertToQuote() throws {
         let exchange = ExchangeFill(
             id: "t1", instId: "BTC-USDT", side: .buy, posSide: nil,
             price: 100, size: 1, fee: -0.001, feeCcy: "BTC",
             ordId: "o1", clOrdId: nil, ts: Date())
-        let fill = StrategyFill(exchange: exchange, strategyId: "s", mode: .demo, venue: .okx)
+        let fill = try #require(StrategyFill(exchange: exchange, strategyId: "s", mode: .demo, venue: .okx))
         #expect(abs(fill.feeQuote - 0.1) < 1e-9, "0.001 BTC at 100 is 0.1 USDT")
     }
 }
@@ -381,7 +381,7 @@ struct StrategyLedgerTests {
         // The exchange holds 3 BTC; only 1 came from a strategy.
         let rows = ledger.reconcile(
             spotBalances: [AccountBalance(ccy: "BTC", available: 3, total: 3)],
-            swapPositions: [])
+            derivativePositions: [])
         let row = try? #require(rows.first { $0.instId == "BTC-USDT" })
         #expect(row?.unattributed == 2)
         #expect(row?.isMaterial == true)
@@ -394,7 +394,7 @@ struct StrategyLedgerTests {
                       knownStrategyIds: ["ema-trend"], venue: .okx)
         let rows = ledger.reconcile(
             spotBalances: [AccountBalance(ccy: "BTC", available: 2, total: 2)],
-            swapPositions: [])
+            derivativePositions: [])
         #expect(rows.allSatisfy { !$0.isMaterial })
     }
 
@@ -560,13 +560,13 @@ struct PerpetualContractSizingTests {
     }
 
     /// Teaching the ledger a contract size must fix positions already on the
-    /// book — a restart loads a ledger that predates the knowledge.
+    /// book — a ledger written before the field existed loads without one.
     @Test func learningTheContractSizeCorrectsExistingPositions() {
         let ledger = StrategyLedger(mode: .demo)
-        ledger.record(StrategyFill(
-            id: "1", strategyId: "s", instId: "BTC-USDT-SWAP", side: .sell,
-            price: 64_000, quantity: 1, feeQuote: 0,
-            ts: Date(), clOrdId: nil, mode: .demo))
+        var stale = StrategyPositionState(strategyId: "s", instId: "BTC-USDT-SWAP")
+        stale.quantity = -1
+        stale.averagePrice = 64_000
+        ledger.replace(fills: [], positions: ["s": stale])
         #expect(ledger.position(for: "s")?.multiplier == 1)
 
         ledger.setContractSize(0.01, forInstId: "BTC-USDT-SWAP")
@@ -577,13 +577,55 @@ struct PerpetualContractSizingTests {
 
     @Test func aNonsenseContractSizeIsIgnored() {
         let ledger = StrategyLedger(mode: .demo)
+        ledger.setContractSize(0.01, forInstId: "BTC-USDT-SWAP")
         ledger.record(StrategyFill(
             id: "1", strategyId: "s", instId: "BTC-USDT-SWAP", side: .sell,
             price: 64_000, quantity: 1, feeQuote: 0,
             ts: Date(), clOrdId: nil, mode: .demo))
         ledger.setContractSize(0, forInstId: "BTC-USDT-SWAP")
         ledger.setContractSize(-5, forInstId: "BTC-USDT-SWAP")
-        #expect(ledger.position(for: "s")?.multiplier == 1, "never scale by zero")
+        #expect(ledger.position(for: "s")?.multiplier == 0.01, "never scale by zero")
+    }
+
+    /// The realised stamp is cumulative and taken once, so a multiplier
+    /// learned afterwards cannot repair it. A fill that cannot be scaled
+    /// waits instead of being booked at 1.
+    @Test("面值未知的衍生品成交不入账，知道之后按真面值补记")
+    func aFillIsNotBookedUntilItsContractSizeIsKnown() {
+        let ledger = StrategyLedger(mode: .demo)
+        let call = "BTC-USD-261225-100000-C"
+        let tag = OrderTag.make(strategyId: "s")
+        func fill(_ id: String, _ side: OrderSide, _ price: Double) -> ExchangeFill {
+            ExchangeFill(
+                id: id, instId: call, side: side, posSide: nil, price: price, size: 2,
+                fee: 0, feeCcy: "BTC", ordId: "o" + id, clOrdId: tag,
+                ts: Date(timeIntervalSince1970: 1_000), priceUsd: nil, indexPrice: 80_000)
+        }
+        let listing = [fill("open", .buy, 0.0375), fill("close", .sell, 0.037)]
+
+        // A fresh ledger reading the exchange's history has never held this
+        // contract, so nobody has told it one contract is 0.01 BTC.
+        #expect(ledger.ingest(listing, knownStrategyIds: ["s"], venue: .okx) == 0)
+        #expect(ledger.fills.isEmpty)
+        #expect(ledger.position(for: "s") == nil)
+
+        // The caller looked the size up; both fills book at once, correctly.
+        #expect(ledger.ingest(listing, knownStrategyIds: ["s"], venue: .okx,
+                              contractSizes: [call: 0.01]) == 2)
+        let position = try? #require(ledger.position(for: "s"))
+        #expect(position?.isFlat == true)
+        // (0.037 − 0.0375) × 80,000 × 2 contracts × 0.01 BTC = −0.80.
+        #expect(abs((position?.realisedPnL ?? 0) + 0.80) < 1e-6,
+                "realised=\(position?.realisedPnL ?? 0)")
+    }
+
+    @Test("现货不需要谁来教面值")
+    func spotNeedsNoMultiplier() {
+        let ledger = StrategyLedger(mode: .demo)
+        ledger.record(StrategyFill(
+            id: "1", strategyId: "s", instId: "BTC-USDT", side: .buy,
+            price: 64_000, quantity: 0.5, feeQuote: 0, ts: Date(), clOrdId: nil, mode: .demo))
+        #expect(ledger.position(for: "s")?.quantity == 0.5)
     }
 }
 
@@ -652,6 +694,9 @@ struct LedgerFundingTests {
 
     private func ledgerHoldingAPosition() -> StrategyLedger {
         let ledger = StrategyLedger(mode: .demo)
+        // One ETH-USDT-SWAP contract is 0.1 ETH; a ledger that has not been
+        // told refuses the fill rather than booking it at 1.
+        ledger.setContractSize(0.1, forInstId: "ETH-USDT-SWAP")
         ledger.record(StrategyFill(
             id: "f1", strategyId: "eth-short", instId: "ETH-USDT-SWAP", side: .sell,
             price: 1_919.58, quantity: 40, feeQuote: 0,
@@ -709,5 +754,132 @@ struct LedgerFundingTests {
         let store = StrategyLedgerStore(directory: directory, mode: .demo)
         try Data(#"{"fills":[],"positions":{}}"#.utf8).write(to: store.fileURL)
         #expect(store.load().fundingIds.isEmpty)
+    }
+}
+
+// MARK: - Options in the book
+
+/// An option is quoted in its settlement coin per unit of underlying, and so
+/// is its fee; the book keeps quote currency. Everything below is about that
+/// conversion being done once, at the fill, at the index the exchange stamped.
+@Suite("期权入账")
+@MainActor
+struct LedgerOptionTests {
+    private let call = "BTC-USD-260926-80000-C"
+    private let put = "BTC-USD-260926-80000-P"
+
+    private func exchangeFill(
+        id: String = "opt-1", instId: String? = nil, side: OrderSide = .buy,
+        price: Double = 0.02, size: Double = 5, fee: Double = -0.0001,
+        priceUsd: Double? = nil, indexPrice: Double? = 80_000, clOrdId: String? = nil
+    ) -> ExchangeFill {
+        ExchangeFill(
+            id: id, instId: instId ?? call, side: side, posSide: nil,
+            price: price, size: size, fee: fee, feeCcy: "BTC",
+            ordId: "o", clOrdId: clOrdId, ts: Date(timeIntervalSince1970: 1_000),
+            priceUsd: priceUsd, indexPrice: indexPrice)
+    }
+
+    @Test("权利金和手续费按成交时的指数价换算成计价币")
+    func premiumAndFeeConvertAtTheFillIndex() throws {
+        let fill = try #require(StrategyFill(exchange: exchangeFill(), strategyId: "s", mode: .demo, venue: .okx))
+        // 0.02 BTC per unit at an 80,000 index is 1,600 USD per unit.
+        #expect(abs(fill.price - 1_600) < 1e-9)
+        // A 0.0001 BTC fee is 8 USD.
+        #expect(abs(fill.feeQuote - 8) < 1e-9)
+        #expect(fill.quantity == 5)
+    }
+
+    @Test("交易所给了美元价就用美元价")
+    func theExchangesUsdPriceWins() throws {
+        let fill = try #require(StrategyFill(
+            exchange: exchangeFill(priceUsd: 1_650), strategyId: "s", mode: .demo, venue: .okx))
+        #expect(abs(fill.price - 1_650) < 1e-9)
+    }
+
+    @Test("没有指数价就不入账，而不是猜一个")
+    func noIndexMeansNoBooking() {
+        #expect(StrategyFill(
+            exchange: exchangeFill(indexPrice: nil), strategyId: "s", mode: .demo, venue: .okx) == nil)
+        // The caller's own reading fills the gap.
+        let converted = StrategyFill(
+            exchange: exchangeFill(indexPrice: nil), strategyId: "s", mode: .demo,
+            venue: .okx, indexPrice: 90_000)
+        #expect(abs((converted?.price ?? 0) - 1_800) < 1e-9)
+    }
+
+    @Test("ingest 用调用方的指数价补齐，补不齐的留到下轮")
+    func ingestUsesTheCallersIndexAndLeavesTheRest() {
+        let ledger = StrategyLedger(mode: .demo)
+        let tag = OrderTag.make(strategyId: "s")
+        let fills = [exchangeFill(id: "a", indexPrice: nil, clOrdId: tag)]
+        ledger.setContractSize(0.01, forInstId: call)
+        #expect(ledger.ingest(fills, knownStrategyIds: ["s"], venue: .okx) == 0, "nothing to convert with")
+        #expect(ledger.fills.isEmpty)
+        #expect(ledger.ingest(fills, knownStrategyIds: ["s"], venue: .okx, indexPrices: ["BTC-USD": 80_000]) == 1)
+        #expect(abs((ledger.position(for: "s")?.averagePrice ?? 0) - 1_600) < 1e-9)
+    }
+
+    @Test("空仓时可以换到新合约，持仓时不能")
+    func aFlatBookRollsToANewContractAndAnOpenOneDoesNot() {
+        let ledger = StrategyLedger(mode: .demo)
+        ledger.setContractSize(0.01, forInstId: call)
+        ledger.setContractSize(0.01, forInstId: put)
+        let tag = OrderTag.make(strategyId: "s")
+        ledger.ingest([exchangeFill(id: "open-call", clOrdId: tag)], knownStrategyIds: ["s"], venue: .okx)
+        #expect(ledger.position(for: "s")?.instId == call)
+
+        // A fill on another contract while this one is held is left out and
+        // retried later: the arithmetic of one book cannot span two contracts.
+        ledger.ingest([exchangeFill(id: "stray", instId: put, clOrdId: tag)], knownStrategyIds: ["s"], venue: .okx)
+        #expect(ledger.position(for: "s")?.instId == call)
+        #expect(ledger.position(for: "s")?.quantity == 5)
+        #expect(ledger.fills.count == 1)
+
+        // Close the call; the book is flat and the put may now be booked.
+        ledger.ingest([exchangeFill(id: "close-call", side: .sell, price: 0.03, clOrdId: tag)],
+                      knownStrategyIds: ["s"], venue: .okx)
+        #expect(ledger.position(for: "s")?.isFlat == true)
+        ledger.ingest([exchangeFill(id: "stray", instId: put, clOrdId: tag)], knownStrategyIds: ["s"], venue: .okx)
+        let rolled = ledger.position(for: "s")
+        #expect(rolled?.instId == put)
+        #expect(rolled?.quantity == 5)
+        #expect(rolled?.contractSize == 0.01, "the new contract's multiplier, not the old one's")
+    }
+
+    @Test("看跌期权的多头是看空观点")
+    func aLongPutReadsAsAShortView() {
+        var state = StrategyPositionState(strategyId: "s", instId: put)
+        state.contractSize = 0.01
+        state.apply(StrategyFill(
+            id: "1", strategyId: "s", instId: put, side: .buy, price: 1_600, quantity: 5,
+            feeQuote: 0, ts: Date(), clOrdId: nil, mode: .demo))
+        #expect(state.direction == .long, "the book is long the contract")
+        #expect(state.signalDirection == .short, "and short the market")
+        // 5 contracts × 0.01 = 0.05 units, signed by the view.
+        #expect(abs(state.kernelHeldBase + 0.05) < 1e-12)
+
+        var callState = StrategyPositionState(strategyId: "s", instId: call)
+        callState.contractSize = 0.01
+        callState.apply(StrategyFill(
+            id: "1", strategyId: "s", instId: call, side: .buy, price: 1_600, quantity: 5,
+            feeQuote: 0, ts: Date(), clOrdId: nil, mode: .demo))
+        #expect(callState.signalDirection == .long)
+        #expect(abs(callState.kernelHeldBase - 0.05) < 1e-12)
+        #expect(StrategyPositionState(strategyId: "s", instId: call).kernelHeldBase == 0)
+    }
+
+    @Test("期权盈亏按权利金差 × 张数 × 面值")
+    func optionPnLScalesByTheContractMultiplier() {
+        var state = StrategyPositionState(strategyId: "s", instId: call)
+        state.contractSize = 0.01
+        state.apply(StrategyFill(
+            id: "1", strategyId: "s", instId: call, side: .buy, price: 1_600, quantity: 5,
+            feeQuote: 8, ts: Date(), clOrdId: nil, mode: .demo))
+        // Premium up 400 per unit on 0.05 units = 20, less the 8 fee.
+        #expect(abs(state.unrealisedPnL(mark: 2_000) - 20) < 1e-9)
+        #expect(abs(state.netPnL(mark: 2_000) - 12) < 1e-9)
+        // Exposure is the premium's current value, not the notional it controls.
+        #expect(abs(state.exposure(mark: 2_000) - 100) < 1e-9)
     }
 }

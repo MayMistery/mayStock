@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::calendar::MarketCalendar;
 use crate::expr::{eval, parser, Expr, ExprError, ExprResult};
 use crate::fees::{self, FeeComponent, OrderSide};
+use crate::options::OptionsSpec;
 
 // MARK: - Venue
 
@@ -70,6 +71,9 @@ pub enum InstrumentType {
     Spot,
     Swap,
     Stock,
+    /// The signals are evaluated on the underlying's candles; the position is
+    /// a long call or put on it. See `crate::options`.
+    Option,
 }
 
 /// Everything the rest of the system may need to know about an instrument
@@ -100,27 +104,39 @@ pub struct InstrumentPolicy {
 }
 
 impl InstrumentType {
+    /// Only a perpetual borrows. An option's leverage is intrinsic to the
+    /// contract and is not a dial the manifest may turn.
     pub fn allows_leverage(self) -> bool {
         self.max_leverage() > 1.0
     }
 
+    /// A bearish view: a perpetual sells, a margined stock borrows the shares,
+    /// an option strategy buys a put.
     pub fn allows_short(self) -> bool {
-        matches!(self, Self::Swap | Self::Stock)
+        matches!(self, Self::Swap | Self::Stock | Self::Option)
+    }
+
+    pub fn is_option(self) -> bool {
+        matches!(self, Self::Option)
     }
 
     /// The most leverage a manifest may declare. Spot has none to give; a
     /// perpetual goes to fifty; a stock on Regulation T margin borrows at most
-    /// half its value, which is two times.
+    /// half its value, which is two times; an option's leverage is intrinsic
+    /// to the contract and not a dial the manifest may turn.
     pub fn max_leverage(self) -> f64 {
         match self {
             Self::Spot => 1.0,
             Self::Swap => 50.0,
             Self::Stock => 2.0,
+            Self::Option => 1.0,
         }
     }
 
+    /// Sized in contracts rather than in the base unit, so the exchange has
+    /// to be asked what one contract is worth.
     pub fn trades_in_contracts(self) -> bool {
-        matches!(self, Self::Swap)
+        matches!(self, Self::Swap | Self::Option)
     }
 
     pub fn margin_regime(self) -> MarginRegime {
@@ -128,6 +144,9 @@ impl InstrumentType {
             Self::Spot => MarginRegime::None,
             Self::Swap => MarginRegime::Isolated,
             Self::Stock => MarginRegime::RegT,
+            // A bought option is paid for in full; the premium is the whole
+            // loss and nothing is borrowed against it.
+            Self::Option => MarginRegime::None,
         }
     }
 
@@ -138,18 +157,23 @@ impl InstrumentType {
             Self::Spot => None,
             Self::Swap => Some(0.005),
             Self::Stock => Some(0.25),
+            Self::Option => None,
         }
     }
 
     /// Taker fee for a fresh OKX account, used when the manifest states no
-    /// costs and the caller supplies none. A stock has no such default: its
-    /// commission is a broker's choice and its regulatory levies change every
-    /// year, so a caller has to say rather than have the kernel assume.
+    /// costs and the caller supplies none. The option figure is what OKX
+    /// reports for a Lv1 account, charged on the underlying notional; the
+    /// option engine caps it at a share of the premium (`options::option_fee`).
+    /// A stock has no such default: its commission is a broker's choice and
+    /// its regulatory levies change every year, so a caller has to say rather
+    /// than have the kernel assume.
     pub fn default_fees(self) -> Option<Vec<FeeComponent>> {
         match self {
             Self::Spot => Some(vec![FeeComponent::flat_bps(10.0)]),
             Self::Swap => Some(vec![FeeComponent::flat_bps(5.0)]),
             Self::Stock => None,
+            Self::Option => Some(vec![FeeComponent::flat_bps(3.0)]),
         }
     }
 
@@ -166,7 +190,7 @@ impl InstrumentType {
         }
     }
 
-    pub const ALL: [InstrumentType; 3] = [Self::Spot, Self::Swap, Self::Stock];
+    pub const ALL: [InstrumentType; 4] = [Self::Spot, Self::Swap, Self::Stock, Self::Option];
 }
 
 // MARK: - Manifest
@@ -467,6 +491,11 @@ pub struct Manifest {
     #[serde(default)]
     pub risk: Risk,
     pub costs: Option<Costs>,
+    /// Which contract an `OPTION` market trades. Only meaningful there; the
+    /// compiler refuses it on any other market rather than letting a stray
+    /// block imply something the engine does not do.
+    #[serde(default)]
+    pub options: Option<OptionsSpec>,
 }
 
 // MARK: - Compiled form
@@ -547,10 +576,9 @@ impl CompiledStrategy {
         // naming rather than silently ignoring.
         let inst_type = manifest.market.inst_type;
         if !inst_type.allows_short() && (short_entry.is_some() || short_exit.is_some()) {
-            return Err(ExprError::Syntax {
-                message: format!("{inst_type:?} 不能做空，清单却声明了 shortEntry / shortExit"),
-                column: 1,
-            });
+            return Err(ExprError::Policy(format!(
+                "{inst_type:?} 不能做空，清单却声明了 shortEntry / shortExit"
+            )));
         }
 
         // Leverage beyond what the instrument's margin allows is not clamped:
@@ -558,13 +586,17 @@ impl CompiledStrategy {
         // strategy from the one that was validated.
         let leverage = manifest.risk.leverage;
         if leverage > inst_type.max_leverage() + 1e-9 || leverage < 1.0 {
-            return Err(ExprError::Syntax {
-                message: format!(
-                    "杠杆 {leverage}× 超出 {inst_type:?} 允许的范围（1~{}）",
-                    inst_type.max_leverage()
-                ),
-                column: 1,
-            });
+            return Err(ExprError::Policy(format!(
+                "杠杆 {leverage}× 超出 {inst_type:?} 允许的范围（1~{}）",
+                inst_type.max_leverage()
+            )));
+        }
+
+        // What an option strategy can and cannot express. Each refusal is a
+        // feature the option engine genuinely does not have, named at import
+        // rather than discovered as a silently ignored field.
+        if let Some(reason) = Self::option_policy_violation(&manifest, exposure.is_some()) {
+            return Err(ExprError::Policy(reason));
         }
 
         // A ceiling below the floor can never be satisfied: the position would
@@ -572,13 +604,10 @@ impl CompiledStrategy {
         // instead of letting the barrier silently win every time.
         if let Some(limit) = manifest.risk.max_hold_bars {
             if limit < manifest.risk.min_hold_bars {
-                return Err(ExprError::Syntax {
-                    message: format!(
-                        "maxHoldBars({limit}) 小于 minHoldBars({})，这两条规则无法同时满足",
-                        manifest.risk.min_hold_bars
-                    ),
-                    column: 1,
-                });
+                return Err(ExprError::Policy(format!(
+                    "maxHoldBars({limit}) 小于 minHoldBars({})，这两条规则无法同时满足",
+                    manifest.risk.min_hold_bars
+                )));
             }
         }
 
@@ -612,7 +641,11 @@ impl CompiledStrategy {
         // size anything, which is independent of what the signal expressions
         // need. Folding it in here keeps one definition of "how much history
         // does this strategy require" for both the backtester and the runner.
-        if manifest.sizing.mode == SizingMode::VolatilityTarget {
+        // The option pricing model reads the same realised-volatility window,
+        // so an option strategy needs it primed for the same reason.
+        if manifest.sizing.mode == SizingMode::VolatilityTarget
+            || manifest.market.inst_type.is_option()
+        {
             warmup = warmup.max(manifest.risk.vol_lookback_bars + 1);
         }
 
@@ -704,7 +737,9 @@ impl CompiledStrategy {
             .map(|e| eval::warmup_bars(e, &params, &known))
             .max()
             .unwrap_or(0);
-        if self.manifest.sizing.mode == SizingMode::VolatilityTarget {
+        if self.manifest.sizing.mode == SizingMode::VolatilityTarget
+            || self.manifest.market.inst_type.is_option()
+        {
             warmup = warmup.max(self.manifest.risk.vol_lookback_bars + 1);
         }
 
@@ -720,6 +755,35 @@ impl CompiledStrategy {
             free_parameter_count: self.free_parameter_count,
             known_series: self.known_series.clone(),
         })
+    }
+
+    /// Why an option manifest cannot run as written, or `None` when it can.
+    ///
+    /// One place for the whole policy, so the Swift importer and the kernel
+    /// cannot disagree about it: Swift only re-words what this returns.
+    fn option_policy_violation(manifest: &Manifest, has_exposure: bool) -> Option<String> {
+        if !manifest.market.inst_type.is_option() {
+            return manifest.options.as_ref().map(|_| {
+                "options 块仅在 market.instType = OPTION 时有意义".to_string()
+            });
+        }
+        if has_exposure {
+            return Some("期权策略不支持连续敞口（exposure），只能用进出场信号".into());
+        }
+        if manifest.risk.atr_stop.is_some() || manifest.risk.trailing_stop_pct.is_some() {
+            return Some(
+                "期权策略的止损止盈按权利金百分比计（stopLossPct / takeProfitPct），\
+                 不支持 atrStop 和 trailingStopPct"
+                    .into(),
+            );
+        }
+        if manifest.sizing.mode == SizingMode::VolatilityTarget {
+            return Some("期权策略没有可缩放的敞口，sizing.mode 不能是 volatilityTarget".into());
+        }
+        if (manifest.risk.leverage - 1.0).abs() > 1e-9 {
+            return Some("期权策略不设杠杆：权利金就是全部风险，leverage 必须为 1".into());
+        }
+        manifest.options.as_ref().and_then(OptionsSpec::validate)
     }
 
     /// A few well-formed bars used only to type-check expressions at compile
@@ -769,6 +833,12 @@ impl CompiledStrategy {
             fees,
             slippage_bps: fallback_slippage_bps.unwrap_or_else(default_slippage),
         })
+    }
+
+    /// The option block, with the manifest's defaults filled in. Only
+    /// meaningful for an `OPTION` market.
+    pub fn options_spec(&self) -> OptionsSpec {
+        self.manifest.options.clone().unwrap_or_default()
     }
 
     /// Leverage the manifest declares. `compile` already refused anything the
@@ -867,6 +937,73 @@ mod tests {
         assert_eq!(bare.slippage_bps, default_slippage());
     }
 
+    const OPTION_TREND: &str = r#"{
+      "id": "btc-option-trend",
+      "name": "BTC option trend",
+      "market": { "instId": "BTC-USDT", "instType": "OPTION", "bar": "4H" },
+      "signals": {
+        "longEntry": "close > sma(close, 20)", "longExit": "close < sma(close, 20)",
+        "shortEntry": "close < sma(close, 20)", "shortExit": "close > sma(close, 20)"
+      },
+      "sizing": { "mode": "equityPct", "value": 10 },
+      "risk": { "stopLossPct": 50, "takeProfitPct": 100, "volLookbackBars": 30 },
+      "options": { "minDaysToExpiry": 7, "moneynessPct": 2 }
+    }"#;
+
+    #[test]
+    fn an_option_manifest_compiles_and_primes_its_volatility_window() {
+        let manifest: Manifest = serde_json::from_str(OPTION_TREND).unwrap();
+        let compiled = CompiledStrategy::compile(manifest, &[]).unwrap();
+        assert!(compiled.manifest.market.inst_type.is_option());
+        assert!(compiled.short_entry.is_some(), "a put is a legitimate bearish view");
+        assert!(compiled.warmup_bars >= 31, "the pricing model needs realised vol primed");
+        assert_eq!(compiled.options_spec().moneyness_pct, 2.0);
+        assert_eq!(compiled.leverage(), 1.0);
+    }
+
+    #[test]
+    fn an_option_manifest_defaults_its_block() {
+        let json = OPTION_TREND.replace(r#""options": { "minDaysToExpiry": 7, "moneynessPct": 2 }"#, r#""options": null"#);
+        let manifest: Manifest = serde_json::from_str(&json).unwrap();
+        let compiled = CompiledStrategy::compile(manifest, &[]).unwrap();
+        assert_eq!(compiled.options_spec(), OptionsSpec::default());
+    }
+
+    #[test]
+    fn option_strategies_refuse_what_the_engine_cannot_do() {
+        for (from, to) in [
+            (r#""stopLossPct": 50"#, r#""stopLossPct": 50, "atrStop": {"period": 14, "mult": 2}"#),
+            (r#""stopLossPct": 50"#, r#""stopLossPct": 50, "trailingStopPct": 5"#),
+            (r#""stopLossPct": 50"#, r#""stopLossPct": 50, "leverage": 3"#),
+            (r#""mode": "equityPct", "value": 10"#, r#""mode": "volatilityTarget", "value": 20"#),
+            (r#""moneynessPct": 2"#, r#""moneynessPct": 80"#),
+        ] {
+            let json = OPTION_TREND.replace(from, to);
+            let manifest: Manifest = serde_json::from_str(&json).unwrap();
+            assert!(CompiledStrategy::compile(manifest, &[]).is_err(), "{to} must be refused");
+        }
+    }
+
+    #[test]
+    fn a_continuous_exposure_cannot_be_traded_with_options() {
+        let json = OPTION_TREND.replace(
+            r#""longEntry": "close > sma(close, 20)", "longExit": "close < sma(close, 20)","#,
+            r#""exposure": "sign(close - sma(close, 20))","#,
+        );
+        let manifest: Manifest = serde_json::from_str(&json).unwrap();
+        assert!(CompiledStrategy::compile(manifest, &[]).is_err());
+    }
+
+    #[test]
+    fn an_options_block_on_a_spot_market_is_a_mistake_worth_naming() {
+        let json = DONCHIAN.replace(
+            r#""sizing": { "mode": "riskPerTrade", "value": 1 },"#,
+            r#""sizing": { "mode": "riskPerTrade", "value": 1 }, "options": { "moneynessPct": 5 },"#,
+        );
+        let manifest: Manifest = serde_json::from_str(&json).unwrap();
+        assert!(CompiledStrategy::compile(manifest, &[]).is_err());
+    }
+
     #[test]
     fn an_undeclared_parameter_is_rejected_at_compile_time() {
         let json = DONCHIAN.replace("entryLen\", 1)", "nosuchparam\", 1)");
@@ -925,9 +1062,12 @@ mod tests {
         for inst_type in InstrumentType::ALL {
             let policy = inst_type.policy();
             assert_eq!(policy.allows_leverage, policy.max_leverage > 1.0);
-            // Anything sized in contracts must ask the exchange for the
-            // multiplier; anything else is one-for-one by definition.
-            assert_eq!(policy.trades_in_contracts, inst_type == InstrumentType::Swap);
+            // Regulation T is a loan against shares: only a base-unit
+            // instrument can be under it, never one sized in contracts.
+            assert!(
+                !(policy.trades_in_contracts && policy.margin_regime == MarginRegime::RegT),
+                "{inst_type:?}"
+            );
             // A margin regime exists exactly when there is something to lend.
             assert_eq!(
                 policy.margin_regime == MarginRegime::None,

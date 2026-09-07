@@ -16,12 +16,60 @@ final class FakeVenue: ExchangeVenue, @unchecked Sendable {
     var placed: [OrderRequest] = []
     /// Errors to throw from `place`, consumed in order; nil means accept.
     var placeOutcomes: [Error?] = []
+    /// The candles every instrument answers with.
+    var candlesResult: [Candle] = []
+    /// When set, an accepted order is answered with a fill of its own size at
+    /// its limit (or `price`), tagged with its client id — the exchange's side
+    /// of a fill, so the runner's ingest has something to book.
+    var autoFill = false
+    var autoFillIndexPrice: Double?
+    var equity: Double = 1_000
+    /// What `accountSnapshot` reports as held; empty is an account that holds
+    /// nothing in any coin an order might be paid in.
+    var balances: [AccountBalance] = []
+    /// When set, `accountSnapshot` throws it — an exchange that cannot be
+    /// asked what the account holds.
+    var accountSnapshotFailure: Error?
 
     func isReady() async -> Bool { true }
 
-    func candles(instId: String, bar: BarInterval, target: Int) async throws -> [Candle] { [] }
-    func historyCandles(instId: String, bar: BarInterval, target: Int) async throws -> [Candle] { [] }
-    func lastPrice(instId: String) async throws -> Double { price }
+    func candles(instId: String, bar: BarInterval, target: Int) async throws -> [Candle] { candlesResult }
+    func historyCandles(instId: String, bar: BarInterval, target: Int) async throws -> [Candle] {
+        candlesResult
+    }
+    func lastPrice(instId: String, mode: TradingMode) async throws -> Double { price }
+
+    // MARK: Options
+
+    var valuationPrices: [String: Double] = [:]
+    var optionChainResult: [OptionContract] = []
+    var optionQuotes: [String: OptionQuote] = [:]
+    var indexPrices: [String: Double] = [:]
+    var accountConfig: AccountTradingConfig?
+
+    func valuationPrice(instId: String, mode: TradingMode) async throws -> Double {
+        if let price = valuationPrices[instId] { return price }
+        return price
+    }
+    func optionChain(underlying: String, mode: TradingMode) async throws -> [OptionContract] {
+        optionChainResult.filter { $0.underlying == underlying }
+    }
+    func optionQuote(instId: String, mode: TradingMode) async throws -> OptionQuote {
+        guard let quote = optionQuotes[instId] else {
+            throw ExchangeVenueError.unsupported(venueName, "\(instId) 报价")
+        }
+        return quote
+    }
+    func indexPrice(underlying: String, mode: TradingMode) async throws -> Double {
+        guard let index = indexPrices[underlying] else {
+            throw ExchangeVenueError.unsupported(venueName, "\(underlying) 指数")
+        }
+        return index
+    }
+    func accountTradingConfig(mode: TradingMode) async throws -> AccountTradingConfig {
+        guard let accountConfig else { throw ExchangeVenueError.unsupported(venueName, "账户配置") }
+        return accountConfig
+    }
     /// Set to model an exchange we cannot reach — a laptop waking from sleep
     /// before the network is up is the realistic case.
     var metaFailure: Error?
@@ -29,7 +77,7 @@ final class FakeVenue: ExchangeVenue, @unchecked Sendable {
     /// One BTC-USDT-SWAP contract is 0.01 BTC, as OKX reports it. The runner
     /// re-reads this every tick, so a fixture that omitted it would silently
     /// have the ledger price contracts as coins.
-    func instrumentMeta(instId: String) async throws -> InstrumentMeta? {
+    func instrumentMeta(instId: String, mode: TradingMode) async throws -> InstrumentMeta? {
         if let metaFailure { throw metaFailure }
         return InstrumentMeta(
             instId: instId, tickSize: 0.1, lotSize: 1, minSize: 1, contractValue: 0.01)
@@ -40,12 +88,23 @@ final class FakeVenue: ExchangeVenue, @unchecked Sendable {
     ) async throws -> OrderResult {
         placed.append(order)
         if !placeOutcomes.isEmpty, let failure = placeOutcomes.removeFirst() { throw failure }
+        if autoFill {
+            fillsResult.append(ExchangeFill(
+                id: "fill-\(placed.count)", instId: order.instId, side: order.side,
+                posSide: order.posSide, price: order.limitPrice ?? price, size: order.size,
+                fee: 0, feeCcy: nil, ordId: "ord-\(placed.count)", clOrdId: order.clOrdId,
+                ts: Date(), priceUsd: nil, indexPrice: autoFillIndexPrice))
+        }
         return OrderResult(ordId: "ord-\(placed.count)", clOrdId: order.clOrdId, raw: "{}")
     }
 
+    /// What the exchange says became of any order asked about; `.unknown`
+    /// models a listing that has not caught up yet.
+    var orderStatusResult: VenueOrderStatus = .unknown
+
     func orderStatus(
         instId: String, instType: InstrumentType, clOrdId: String, mode: TradingMode
-    ) async throws -> VenueOrderStatus { .unknown }
+    ) async throws -> VenueOrderStatus { orderStatusResult }
 
     func fills(
         instId: String?, instType: InstrumentType, mode: TradingMode
@@ -66,7 +125,8 @@ final class FakeVenue: ExchangeVenue, @unchecked Sendable {
             wedgeNextAccountSnapshot = false
             await withCheckedContinuation { wedged = $0 }
         }
-        return AccountSnapshot(balances: [], totalEquity: 1_000)
+        if let accountSnapshotFailure { throw accountSnapshotFailure }
+        return AccountSnapshot(balances: balances, totalEquity: equity)
     }
 
     func releaseWedge() {
@@ -1225,6 +1285,17 @@ struct AppWiringTests {
             .joined(separator: "\n")
     }
 
+    /// True when some `.environment(` call passes an object rather than a key path.
+    private static func injectsObject(_ text: String) -> Bool {
+        var searchRange = text.startIndex..<text.endIndex
+        while let call = text.range(of: ".environment(", range: searchRange) {
+            let argument = text[call.upperBound...].drop(while: { $0 == " " })
+            if !argument.hasPrefix("\\.") { return true }
+            searchRange = call.upperBound..<text.endIndex
+        }
+        return false
+    }
+
     @Test("没有人注入，就没有视图可以从 environment 里读 AppState")
     func noViewReadsAppStateFromAnEnvironmentNothingPopulates() throws {
         let sources = appSources()
@@ -1234,7 +1305,11 @@ struct AppWiringTests {
         var readers: [String] = []
         for url in sources {
             let text = try code(of: url)
-            if text.contains(".environment(") || text.contains(".environmentObject(") {
+            // `.environment(\.key, value)` sets a keyed value and is not what
+            // this guards against; `.environment(object)` and
+            // `.environmentObject(object)` are the injections that would make
+            // `@Environment(AppState.self)` legitimate.
+            if text.contains(".environmentObject(") || Self.injectsObject(text) {
                 injectors.append(url.lastPathComponent)
             }
             if text.contains("@Environment(AppState.self)") {
@@ -1490,5 +1565,320 @@ struct WalkForwardCoverageTests {
                     "folds must move forward in time")
         }
         #expect(result.folds.count >= 3)
+    }
+}
+
+// MARK: - Option execution
+
+/// The runner's option path, driven end to end against fixtures: the kernel
+/// asks for a contract, the runner reads the chain and the book, sizes the
+/// premium into whole contracts, and books the fill in quote currency.
+@MainActor
+struct OptionRunnerTests {
+    private static let call = "BTC-USD-260917-80000-C"
+    private static let underlying = "BTC-USD"
+
+    /// Hourly bars ending on the most recent closed hour, so the kernel's
+    /// staleness check reads them as live.
+    private func recentCandles(_ count: Int) -> [Candle] {
+        let latest = (Date().timeIntervalSince1970 / 3_600).rounded(.down) * 3_600 - 3_600
+        return (0..<count).map { index in
+            let ts = latest - Double(count - 1 - index) * 3_600
+            let base = 80_000 + sin(Double(index) * 0.3) * 400 + Double(index) * 2
+            return Candle(ts: Date(timeIntervalSince1970: ts), open: base, high: base + 80,
+                          low: base - 80, close: base + 10, volume: 5, confirmed: true)
+        }
+    }
+
+    private func contract(_ instId: String, kind: OptionKind, strike: Double, days: Double) -> OptionContract {
+        OptionContract(
+            instId: instId, underlying: Self.underlying, kind: kind, strike: strike,
+            expiry: Date().addingTimeInterval(days * 86_400),
+            contractValue: 0.01, tickSize: 0.0001, lotSize: 1, minSize: 1, settleCurrency: "BTC")
+    }
+
+    private func strategy(signals: String) throws -> CompiledStrategy {
+        let json = """
+        {"schema":1,"id":"opt","name":"opt",
+         "market":{"instId":"BTC-USDT","instType":"OPTION","bar":"1H"},
+         "signals":\(signals),
+         "sizing":{"mode":"equityPct","value":10},
+         "risk":{"stopLossPct":50,"takeProfitPct":150,"volLookbackBars":24},
+         "options":{"minDaysToExpiry":7,"moneynessPct":0}}
+        """
+        return try JSONDecoder().decode(StrategyManifest.self, from: Data(json.utf8)).compile()
+    }
+
+    /// A host armed with one option strategy on a 10,000 budget, and a venue
+    /// listing a chain around 80,000 with a quoted at-the-money call.
+    private func armedHost(signals: String = #"{"longEntry":"close > 0"}"#) throws -> FakeHost {
+        let host = FakeHost()
+        host.runnableStrategies = [try strategy(signals: signals)]
+        host.portfolio.totalCapital = 20_000
+        host.portfolio.setCapital(10_000, for: "opt")
+        host.portfolio.setRunning(true, for: "opt")
+        host.fake.equity = 20_000
+        host.fake.candlesResult = recentCandles(200)
+        host.fake.indexPrices[Self.underlying] = 80_000
+        host.fake.accountConfig = AccountTradingConfig(positionMode: .longShort, accountLevel: 3)
+        // The premium is paid in BTC; an account that holds some can buy.
+        host.fake.balances = [AccountBalance(ccy: "BTC", available: 1, total: 1)]
+        host.fake.optionChainResult = [
+            contract("BTC-USD-260910-80000-C", kind: .call, strike: 80_000, days: 3),
+            contract("BTC-USD-260917-79000-C", kind: .call, strike: 79_000, days: 10),
+            contract(Self.call, kind: .call, strike: 80_000, days: 10),
+            contract("BTC-USD-260917-81000-C", kind: .call, strike: 81_000, days: 10),
+            contract("BTC-USD-260917-80000-P", kind: .put, strike: 80_000, days: 10),
+        ]
+        host.fake.optionQuotes[Self.call] = OptionQuote(
+            instId: Self.call, bid: 0.02, ask: 0.021, mark: 0.0205, indexPrice: 80_000, ts: Date())
+        host.fake.autoFill = true
+        host.fake.autoFillIndexPrice = 80_000
+        return host
+    }
+
+    @Test("做多信号买入最近合格到期的平值看涨，张数由权利金预算决定，IOC 限价略高于卖一")
+    func anEntryBuysTheChosenContract() async throws {
+        let host = try armedHost()
+        let runner = runner(for: host)
+        await runner.tick()
+
+        let order = try #require(host.fake.placed.first)
+        #expect(order.instId == Self.call, "the 10-day at-the-money call, not the 3-day one")
+        #expect(order.instType == .option)
+        #expect(order.side == .buy)
+        #expect(order.kind == .ioc)
+        #expect(order.tradeMode == "cross", "acctLv 3 cross-margins options")
+        #expect(order.posSide == nil)
+        #expect(!order.reduceOnly)
+        #expect(order.stopTriggerPrice == nil, "levels live on the premium, watched locally")
+        // 10% of 10,000 = 1,000 of premium; a contract costs 0.021 × 80,000 × 0.01 = 16.8.
+        #expect(order.size == 59, "floor(1000 / 16.8)")
+        // The limit is the ask plus the buffer, rounded up to the tick.
+        #expect(abs((order.limitPrice ?? 0) - 0.0215) < 1e-9)
+
+        // The fill was booked in quote currency, per unit of underlying.
+        let position = try #require(host.ledger.position(for: "opt"))
+        #expect(position.instId == Self.call)
+        #expect(position.quantity == 59)
+        #expect(position.contractSize == 0.01)
+        #expect((position.averagePrice * 1e6).rounded() / 1e6 == 1_720, "0.0215 BTC/unit × 80,000")
+        #expect(position.signalDirection == .long)
+        #expect(host.runner_stateMessage(runner, "opt")?.contains("拒绝") != true)
+    }
+
+    @Test("信号消失时以 reduceOnly 的 IOC 卖单平掉整个合约")
+    func anExitSellsTheWholeContract() async throws {
+        // Enter on tick one with an always-on long, then flip the signal off.
+        let host = try armedHost()
+        let runner = runner(for: host)
+        await runner.tick()
+        #expect(host.ledger.position(for: "opt")?.quantity == 59)
+
+        host.runnableStrategies = [try strategy(signals: #"{"longEntry":"close > 1e12","longExit":"close > 0"}"#)]
+        runner.reloadKernel()
+        host.fake.positionsResult = .success([ExchangePosition(
+            instId: Self.call, posSide: .net, quantity: 59, averagePrice: 0.021,
+            markPrice: 0.02, unrealisedPnL: 0, leverage: nil, liquidationPrice: nil)])
+        // A new closed bar, so the bar-guard lets the runner act again.
+        host.fake.candlesResult = recentCandles(201)
+        await runner.tick()
+
+        let exit = try #require(host.fake.placed.last)
+        #expect(host.fake.placed.count == 2)
+        #expect(exit.side == .sell)
+        #expect(exit.kind == .ioc)
+        #expect(exit.reduceOnly)
+        #expect(exit.size == 59)
+        // The limit is the bid less the buffer, rounded down to the tick.
+        #expect(abs((exit.limitPrice ?? 0) - 0.0196) < 1e-9)
+        #expect(host.ledger.position(for: "opt")?.isFlat == true)
+    }
+
+    @Test("权利金跌破本地止损时平仓")
+    func aPremiumStopFlattens() async throws {
+        let host = try armedHost()
+        let runner = runner(for: host)
+        await runner.tick()
+        host.fake.positionsResult = .success([ExchangePosition(
+            instId: Self.call, posSide: .net, quantity: 59, averagePrice: 0.021,
+            markPrice: 0.02, unrealisedPnL: 0, leverage: nil, liquidationPrice: nil)])
+        // The mark, in quote currency per unit, at 40% of the premium paid.
+        host.fake.valuationPrices[Self.call] = 0.0215 * 80_000 * 0.4
+        host.fake.optionQuotes[Self.call] = OptionQuote(
+            instId: Self.call, bid: 0.008, ask: 0.009, mark: 0.0086, indexPrice: 80_000, ts: Date())
+
+        await runner.tick()
+
+        let exit = try #require(host.fake.placed.last)
+        #expect(host.fake.placed.count == 2, "one entry, one stop-out")
+        #expect(exit.side == .sell && exit.reduceOnly)
+        #expect(host.ledger.position(for: "opt")?.isFlat == true)
+        #expect(runner.state(for: "opt").message?.contains("止损") == true)
+    }
+
+    @Test("没有卖盘或卖一远高于标记价时不开仓，并说明原因")
+    func anEmptyOrAbsurdBookIsRefused() async throws {
+        let host = try armedHost()
+        host.fake.optionQuotes[Self.call] = OptionQuote(
+            instId: Self.call, bid: nil, ask: nil, mark: 0.02, indexPrice: 80_000, ts: Date())
+        let first = runner(for: host)
+        await first.tick()
+        #expect(host.fake.placed.isEmpty)
+        #expect(first.state(for: "opt").message?.contains("没有卖盘") == true)
+
+        // The demo book's placeholder ask: 3000 BTC against a 0.02 mark.
+        let again = try armedHost()
+        again.fake.optionQuotes[Self.call] = OptionQuote(
+            instId: Self.call, bid: 0.02, ask: 3_000, mark: 0.0205, indexPrice: 80_000, ts: Date())
+        let second = runner(for: again)
+        await second.tick()
+        #expect(again.fake.placed.isEmpty)
+        #expect(second.state(for: "opt").message?.contains("盘口太薄") == true)
+    }
+
+    @Test("账户没有结算币又不能借时不下单，并写明缺口")
+    func anUnfundedPremiumIsRefusedBeforeTheOrder() async throws {
+        // The demo account as found: 65,000 USDT, no BTC, auto-borrow off.
+        // The exchange would answer 51008 "Insufficient BTC margin"; the
+        // runner says how much BTC and what to do about it, and sends nothing.
+        let host = try armedHost()
+        host.fake.balances = [AccountBalance(ccy: "USDT", available: 65_000, total: 65_000)]
+        host.fake.accountConfig = AccountTradingConfig(
+            positionMode: .longShort, accountLevel: 3, autoLoan: false)
+        let runner = runner(for: host)
+        await runner.tick()
+
+        #expect(host.fake.placed.isEmpty)
+        let message = try #require(runner.state(for: "opt").message)
+        #expect(message.contains("结算币不足"))
+        #expect(message.contains("BTC 可用 0"))
+        // 59 contracts × 0.01 × 0.0215 = 0.012685 BTC of premium, plus 3 bps
+        // of 0.59 BTC notional = 0.000177 in fee.
+        #expect(message.contains("需约 0.012862 BTC"), "\(message)")
+        #expect(message.contains("换入 BTC"))
+        #expect(runner.state(for: "opt").status == .running, "funding is the account's state, not a fault")
+    }
+
+    @Test("开启自动借币的跨币种账户没有结算币也下单，简单账户则不行")
+    func autoBorrowFundsThePremiumOnlyWhereTheExchangeHonoursIt() async throws {
+        let borrowing = try armedHost()
+        borrowing.fake.balances = []
+        borrowing.fake.accountConfig = AccountTradingConfig(
+            positionMode: .longShort, accountLevel: 3, autoLoan: true)
+        await runner(for: borrowing).tick()
+        #expect(borrowing.fake.placed.count == 1, "the exchange borrows the BTC")
+
+        let simple = try armedHost()
+        simple.fake.balances = []
+        simple.fake.accountConfig = AccountTradingConfig(
+            positionMode: .net, accountLevel: 1, autoLoan: true)
+        let runner = runner(for: simple)
+        await runner.tick()
+        #expect(simple.fake.placed.isEmpty, "a simple account cannot borrow, whatever the switch says")
+        #expect(runner.state(for: "opt").message?.contains("结算币不足") == true)
+    }
+
+    @Test("IOC 到达时盘口已变、被交易所撤单时，状态说未成交而不是说买入了")
+    func anUnfilledIOCIsReportedAsSuch() async throws {
+        // The demo round trip as it first ran: priced from one book, sent
+        // into another, cancelled with fillSz 0 — while the message read
+        // "买入 3" and the ledger, correctly, held nothing.
+        let host = try armedHost()
+        host.fake.autoFill = false
+        host.fake.orderStatusResult = .canceled
+        let runner = runner(for: host)
+        await runner.tick()
+
+        #expect(host.fake.placed.count == 1)
+        #expect(host.ledger.position(for: "opt")?.isFlat ?? true)
+        let message = try #require(runner.state(for: "opt").message)
+        #expect(message.contains("未成交"), "\(message)")
+        #expect(message.contains("已撤单"), "\(message)")
+        #expect(!message.hasSuffix("买入 59"), "\(message)")
+    }
+
+    @Test("成交后状态写明成交数量和均价，部分成交说明其余已撤")
+    func aFillIsReportedWithItsAverage() async throws {
+        let host = try armedHost()
+        host.fake.orderStatusResult = .filled(filledSize: 59, averagePrice: 0.0212)
+        let full = runner(for: host)
+        await full.tick()
+        #expect(full.state(for: "opt").message?.contains("买入 59 已成交 @ 0.0212") == true,
+                "\(full.state(for: "opt").message ?? "")")
+
+        let partial = try armedHost()
+        partial.fake.orderStatusResult = .filled(filledSize: 20, averagePrice: 0.0211)
+        let runner = runner(for: partial)
+        await runner.tick()
+        let message = try #require(runner.state(for: "opt").message)
+        #expect(message.contains("成交 20 @ 0.0211"), "\(message)")
+        #expect(message.contains("其余已撤"), "\(message)")
+    }
+
+    @Test("读不到余额时不猜，交给交易所裁定")
+    func anUnreadableBalanceDefersToTheExchange() async throws {
+        let host = try armedHost()
+        host.fake.balances = []
+        host.fake.accountSnapshotFailure = ExchangeVenueError.unsupported("fake", "余额")
+        let runner = runner(for: host)
+        await runner.tick()
+        #expect(host.fake.placed.count == 1, "an unknown balance is not a known shortfall")
+    }
+
+    @Test("期权链里没有合格到期时不开仓")
+    func noEligibleExpiryMeansNoOrder() async throws {
+        let host = try armedHost()
+        host.fake.optionChainResult = [
+            contract("BTC-USD-260910-80000-C", kind: .call, strike: 80_000, days: 3),
+        ]
+        let runner = runner(for: host)
+        await runner.tick()
+        #expect(host.fake.placed.isEmpty)
+        #expect(runner.state(for: "opt").message?.contains("没有到期") == true)
+    }
+
+    @Test("到期后交易所不再报告仓位，台账按标记价结算并说明是到期")
+    func expiryIsAbsorbedAsASettlement() async throws {
+        let host = try armedHost()
+        let runner = runner(for: host)
+        await runner.tick()
+        #expect(host.ledger.position(for: "opt")?.quantity == 59)
+
+        // Settled: the exchange reports nothing on the contract, and its mark
+        // is the intrinsic value the settlement paid — above the 50% stop, so
+        // the settlement is what closes the book, not a stop-out.
+        host.fake.positionsResult = .success([])
+        host.fake.valuationPrices[Self.call] = 1_500
+        await runner.tick()
+        await runner.tick()
+
+        let position = try #require(host.ledger.position(for: "opt"))
+        #expect(position.isFlat)
+        #expect(host.ledger.fills.count == 2)
+        #expect(host.fake.placed.count == 1, "settlement is booked, not traded")
+        #expect(runner.state(for: "opt").message?.contains("到期结算") == true)
+        // Paid 1,720 per unit on 0.59 units, settled at 1,500: −129.8 realised.
+        #expect((position.realisedPnL * 1e6).rounded() / 1e6 == ((1_500 - 1_720) * 0.59 * 1e6).rounded() / 1e6)
+    }
+}
+
+extension FakeHost {
+    /// The runtime message for a strategy, for assertions that a path was not
+    /// taken.
+    func runner_stateMessage(_ runner: StrategyRunner, _ id: String) -> String? {
+        runner.state(for: id).message
+    }
+}
+
+struct TickRoundingTests {
+    @Test("按 tick 取整不被浮点噪声多推一档")
+    func snappingIsNotFooledByFloatingPoint() {
+        // 0.02 × 0.98 / 0.0001 is 195.99999999999997 in floating point.
+        #expect(StrategyRunner.snapToTick(0.02 * 0.98, tick: 0.0001, roundingUp: false) == 0.0196)
+        #expect(StrategyRunner.snapToTick(0.021 * 1.02, tick: 0.0001, roundingUp: true) == 0.0215)
+        #expect(StrategyRunner.snapToTick(0.02143, tick: 0.0001, roundingUp: true) == 0.0215)
+        #expect(StrategyRunner.snapToTick(0.02143, tick: 0.0001, roundingUp: false) == 0.0214)
+        #expect(StrategyRunner.snapToTick(5, tick: 0, roundingUp: true) == 5, "no tick, no snapping")
     }
 }

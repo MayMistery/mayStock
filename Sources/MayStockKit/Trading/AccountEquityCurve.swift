@@ -224,12 +224,12 @@ public final class AccountEquityCurve {
     /// Samples closer together than this are dropped. The runner ticks every
     /// 20s; an equity curve does not need that resolution and the file would
     /// grow without bound if it kept it.
-    public static let minimumSampleInterval: TimeInterval = 60
+    nonisolated public static let minimumSampleInterval: TimeInterval = 60
     /// Full-resolution horizon. Older points are thinned to `coarseInterval`,
     /// which keeps 30 days of history in a few thousand rows.
-    public static let fineHorizon: TimeInterval = 25 * 3_600
-    public static let coarseInterval: TimeInterval = 900
-    public static let retention: TimeInterval = 30 * 86_400
+    nonisolated public static let fineHorizon: TimeInterval = 25 * 3_600
+    nonisolated public static let coarseInterval: TimeInterval = 900
+    nonisolated public static let retention: TimeInterval = 30 * 86_400
 
     public init(mode: TradingMode) {
         self.mode = mode
@@ -328,10 +328,33 @@ public final class AccountEquityCurve {
     /// `fineHorizon` the curve is thinned to `coarseInterval` on purpose, so
     /// judging that region by the fine threshold would report our own
     /// compaction as an outage.
-    public static let continuityTolerance: TimeInterval = 300
+    nonisolated public static let continuityTolerance: TimeInterval = 300
 
-    private static func continuityLimit(after ts: Date, now: Date) -> TimeInterval {
+    nonisolated private static func continuityLimit(after ts: Date, now: Date) -> TimeInterval {
         ts < now.addingTimeInterval(-fineHorizon) ? coarseInterval * 2 : continuityTolerance
+    }
+
+    /// The series split at every hole, by the same rule `coveredSeconds` uses.
+    ///
+    /// For drawing. A chart that joins the last sample before an outage to
+    /// the first one after it draws a dead engine as a quiet market — a flat
+    /// line where there was no line at all. Breaking the path where the
+    /// coverage figure counts a hole keeps the two from disagreeing.
+    public nonisolated static func continuousRuns(
+        _ points: [AccountEquityPoint], now: Date = Date()
+    ) -> [[AccountEquityPoint]] {
+        var runs: [[AccountEquityPoint]] = []
+        var current: [AccountEquityPoint] = []
+        for point in points {
+            if let last = current.last,
+               point.ts.timeIntervalSince(last.ts) > continuityLimit(after: last.ts, now: now) {
+                runs.append(current)
+                current = []
+            }
+            current.append(point)
+        }
+        if !current.isEmpty { runs.append(current) }
+        return runs
     }
 
     /// Every window at once, in display order.

@@ -8,7 +8,7 @@ import MayStockKit
 /// dead end the moment you tried to tune it.
 enum StrategyTemplates {
 
-    static let names = ["trend", "reversion", "breakout", "grid"]
+    static let names = ["trend", "reversion", "breakout", "grid", "options"]
 
     static func make(
         template: String, name: String, instId: String, bar: BarInterval, venue: Venue
@@ -90,6 +90,32 @@ enum StrategyTemplates {
                     longExit: "close crosses_above sma(close, period)"),
                 sizing: StrategySizing(mode: .equityPct, value: 100),
                 risk: StrategyRisk(stopLossPct: 5, cooldownBars: 1))
+
+        case "options":
+            // The signals read the underlying named by `instId`; the position
+            // is a call or put on it. Only long options, so the loss on any
+            // one trade is the premium and nothing else.
+            let underlying = StrategyMarket(instId: instId, instType: .option, bar: bar)
+            return StrategyManifest(
+                id: StrategyManifest.slug(from: name),
+                name: name,
+                notes: "期权趋势脚手架：做多信号买入看涨、做空信号买入看跌，只买不卖，"
+                    + "单笔最大亏损即权利金。回测按 Black–Scholes 用标的实现波动率 × 倍数定价，"
+                    + "是模型定价不是历史成交价；实盘用交易所真实盘口。",
+                market: underlying,
+                params: StrategyParameterSet([
+                    StrategyParameter(name: "fast", value: 12, minimum: 4, maximum: 60, label: "快线周期"),
+                    StrategyParameter(name: "slow", value: 26, minimum: 10, maximum: 200, label: "慢线周期"),
+                ]),
+                signals: StrategySignals(
+                    longEntry: "ema(close, fast) crosses_above ema(close, slow)",
+                    longExit: "ema(close, fast) crosses_below ema(close, slow)",
+                    shortEntry: "ema(close, fast) crosses_below ema(close, slow)",
+                    shortExit: "ema(close, fast) crosses_above ema(close, slow)"),
+                sizing: StrategySizing(mode: .equityPct, value: 10),
+                risk: StrategyRisk(stopLossPct: 50, takeProfitPct: 150, cooldownBars: 1,
+                                   volLookbackBars: 60),
+                options: StrategyOptionsSpec(minDaysToExpiry: 14, moneynessPct: 0))
 
         default:
             throw LabError.usage("未知模板：\(template)（可选 \(names.joined(separator: " ")))")

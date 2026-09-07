@@ -47,7 +47,9 @@
 
 - 多标的：任意 OKX 现货/永续 instId（BTC-USDT 为默认练手标的）。
 - 更新频率：tickers/books5 推送 ~100ms 级；菜单栏渲染合并节流至 10Hz；sparkline 1s 采样。
-- 右键菜单：设置、暂停刷新、关于、退出。
+- 右键菜单：打开终端、本标的行情、策略、交易环境（模拟盘 / 实盘，实盘未解锁时置灰）、账户与连接、关于、退出。
+- 终端窗口（2.2 起，取代分开的「设置」与「策略工作台」两个窗口）：侧栏六页——总览 / 行情 / 策略 / 告警 / 账户与连接 / 设置；
+  每页顶部一条环境栏：当前账户、连接状态、权益、急停。
 
 ## 2. 架构
 
@@ -56,7 +58,8 @@
 │ StatusItemController ── SparklineRenderer(CG)                                               │
 │ HoverPanelController(NSPanel .nonactivating) ── PanelRootView(SwiftUI)                      │
 │     Charts: CandleChart · DepthChart · LineChart · VolumeStrip   (全部 Canvas 自绘)          │
-│ SettingsScene: Watchlist · Alerts · Trading · General                                       │
+│ TerminalWindow(NavigationSplitView): Overview · Markets · Strategies · Alerts · Account · Settings │
+│ UISnapshotter: 离屏真实窗口渲染每个界面 → PNG（`make.sh snapshot`）                          │
 │ NotificationService(UNUserNotificationCenter, bundle-guarded)                               │
 └──────────────△──────────────────────────────────────────────────────────────────────────────┘
                │ @Observable (InstrumentSession / ConfigStore / AlertCenter)
@@ -76,7 +79,8 @@
 1. **Kit 与 App 分层**：MayStockKit 不依赖 AppKit，可在 Linux/CI 编译测试 —— E2E 驱动 `maystock-e2e` 直接复用同一套引擎，「测试的就是线上跑的代码」。
 2. **双 WebSocket 复用**：public 与 business 各一条连接，所有标的共享；订阅表由 MarketHub 维护，重连后自动重放。
 3. **数据正确性**：K 线以 `ts` 为主键 replace-or-append；未确认 K 线（confirm=0）实时刷新；REST 回填与 WS 增量在同一 actor 内合并，无竞态。
-4. **交易走官方 CLI 而非自持密钥**：API Key 由 OKX 官方 `okx` CLI 的 `~/.okx/config.toml` 管理，MayStock 不接触、不存储任何私钥 —— 合规且边界干净。默认 demo（模拟盘），实盘需在设置中显式解锁 + 每单确认。
+4. **交易走官方 CLI 而非自持密钥**：API Key 由 OKX 官方 `okx` CLI 的 `~/.okx/config.toml` 管理，MayStock 不接触、不存储任何私钥 —— 合规且边界干净。默认 demo（模拟盘），实盘需在「账户与连接」页显式解锁，切换前先验证目标账户并确认，每个策略在实盘启动时再单独确认。
+   模拟盘与实盘是**两个账户、两套密钥**（OKX 对另一环境的 Key 一律回 "APIKey does not match current environment"），所以配置里每个环境各有一个 profile（`trading.demoProfile` / `trading.liveProfile`），`TradeBridge` 按调用的 mode 选 profile；App 只读 `config.toml` 的 profile 名与 `demo` 标记，从不读密钥。
 5. **Swift 6 工具链 + v5 语言模式**：并发注解按 v6 纪律书写（actor/@MainActor/Sendable），语言模式暂锁 v5 保证首编通过，后续可无痛升 v6。
 
 ## 3. 数据面（OKX，已核实 2026-07）
@@ -123,7 +127,7 @@
 
 ```
 Sources/MayStockKit/{Models,OKX,Engine,Trading,Util}
-Sources/MayStock/{App,StatusBar,Panel,Charts,Settings,Support}
+Sources/MayStock/{App,StatusBar,Panel,Charts,Terminal,Design,Support}
 Sources/maystock-e2e/           # E2E 驱动 & 诊断 CLI
 Tests/{MayStockKitTests,LiveE2ETests}
 docs/{DESIGN.md,ICON_PROMPT.md}

@@ -11,6 +11,13 @@ public enum OrderSide: String, Sendable, Equatable, Codable {
 
 public enum OrderKind: String, Sendable, Equatable, Codable {
     case market, limit
+    /// A limit that fills what it can at once and cancels the rest. What an
+    /// option order is: OKX quotes options in a coin, the book is thin, and a
+    /// market order there would be a blank cheque on the ask.
+    case ioc
+
+    /// True when the order carries a price.
+    public var isPriced: Bool { self != .market }
 }
 
 /// Which leg of a hedged perpetual position an order touches.
@@ -41,6 +48,10 @@ public struct OrderRequest: Sendable, Equatable {
     public var takeProfitTriggerPrice: Double?
     /// Strategy attribution tag; see `OrderTag`.
     public var clOrdId: String?
+    /// OKX `tdMode`, which an option order must state: the account's margin
+    /// level decides it (`AccountTradingConfig.optionTradeMode`). Nil lets
+    /// the CLI default, which is right for spot and perpetuals.
+    public var tradeMode: String?
 
     public init(
         instId: String,
@@ -54,10 +65,12 @@ public struct OrderRequest: Sendable, Equatable {
         reduceOnly: Bool = false,
         stopTriggerPrice: Double? = nil,
         takeProfitTriggerPrice: Double? = nil,
-        clOrdId: String? = nil
+        clOrdId: String? = nil,
+        tradeMode: String? = nil
     ) {
         self.stopTriggerPrice = stopTriggerPrice
         self.takeProfitTriggerPrice = takeProfitTriggerPrice
+        self.tradeMode = tradeMode
         self.instId = instId
         self.instType = instType
         self.side = side
@@ -90,6 +103,99 @@ public struct CLIInfo: Sendable, Equatable {
     public init(path: String, version: String) {
         self.path = path
         self.version = version
+    }
+}
+
+/// What `okx account config` says about the account a mode reaches.
+public struct AccountConfigInfo: Sendable, Equatable {
+    /// OKX `acctLv`: 1 simple, 2 single-currency margin, 3 multi-currency
+    /// margin, 4 portfolio margin. Perpetual orders need at least 2.
+    public let accountLevel: String
+    /// `long_short_mode` or `net_mode`.
+    public let positionMode: String
+    /// Comma-separated: `read_only`, `trade`, `withdraw`.
+    public let permissions: String
+    public let label: String?
+    public let uid: String?
+
+    public init(accountLevel: String, positionMode: String, permissions: String,
+                label: String?, uid: String?) {
+        self.accountLevel = accountLevel
+        self.positionMode = positionMode
+        self.permissions = permissions
+        self.label = label
+        self.uid = uid
+    }
+
+    public var canTrade: Bool {
+        permissions.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+            .contains("trade")
+    }
+
+    public var accountLevelName: String {
+        switch accountLevel {
+        case "1": return "简单交易模式"
+        case "2": return "单币种保证金"
+        case "3": return "跨币种保证金"
+        case "4": return "组合保证金"
+        default: return "模式 \(accountLevel)"
+        }
+    }
+
+    public var positionModeName: String {
+        switch positionMode {
+        case "long_short_mode": return "开平仓（双向）"
+        case "net_mode": return "买卖（单向）"
+        default: return positionMode
+        }
+    }
+
+    /// The simple-trading level rejects every perpetual order with 51010;
+    /// worth saying before a strategy on a swap discovers it.
+    public var supportsPerpetuals: Bool { accountLevel != "1" }
+}
+
+/// Proof that a mode's credentials reached its environment, with what was
+/// found there.
+public struct VenueConnectionReport: Sendable, Equatable {
+    public let mode: TradingMode
+    /// The profile the check ran under; nil means the CLI default.
+    public let profile: String?
+    public let checkedAt: Date
+    public let totalEquity: Double?
+    public let balanceCount: Int
+    /// Nil when the balance read succeeded but the configuration read did not.
+    public let account: AccountConfigInfo?
+
+    public init(mode: TradingMode, profile: String?, checkedAt: Date,
+                totalEquity: Double?, balanceCount: Int, account: AccountConfigInfo?) {
+        self.mode = mode
+        self.profile = profile
+        self.checkedAt = checkedAt
+        self.totalEquity = totalEquity
+        self.balanceCount = balanceCount
+        self.account = account
+    }
+}
+
+/// Where a mode's connection stands, as the UI tracks it.
+public enum VenueConnectionStatus: Sendable, Equatable {
+    /// Never checked since launch.
+    case unknown
+    case checking
+    case connected(VenueConnectionReport)
+    /// The exchange, the CLI or the network said no; `hint` is what to do
+    /// about it when the cause is one this app recognises.
+    case failed(message: String, hint: String?, at: Date)
+
+    public var isConnected: Bool {
+        if case .connected = self { return true }
+        return false
+    }
+
+    public var report: VenueConnectionReport? {
+        if case .connected(let report) = self { return report }
+        return nil
     }
 }
 
@@ -219,6 +325,8 @@ public struct ExchangeFill: Sendable, Equatable, Identifiable {
     public let instId: String
     public let side: OrderSide
     public let posSide: PositionSide?
+    /// In the instrument's own quoting unit: quote currency for spot and
+    /// perpetuals, the settlement coin per unit of underlying for an option.
     public let price: Double
     public let size: Double
     /// Fee in `feeCcy`. OKX reports charges as negative numbers.
@@ -227,11 +335,18 @@ public struct ExchangeFill: Sendable, Equatable, Identifiable {
     public let ordId: String?
     public let clOrdId: String?
     public let ts: Date
+    /// Option fills only: the premium in USD per unit of underlying, as the
+    /// exchange stamped it at execution (`fillPxUsd`).
+    public let priceUsd: Double?
+    /// Option fills only: the underlying index at execution (`fillIdxPx`),
+    /// which converts a coin-denominated premium or fee into quote currency.
+    public let indexPrice: Double?
 
     public init(
         id: String, instId: String, side: OrderSide, posSide: PositionSide?,
         price: Double, size: Double, fee: Double, feeCcy: String?,
-        ordId: String?, clOrdId: String?, ts: Date
+        ordId: String?, clOrdId: String?, ts: Date,
+        priceUsd: Double? = nil, indexPrice: Double? = nil
     ) {
         self.id = id
         self.instId = instId
@@ -244,6 +359,8 @@ public struct ExchangeFill: Sendable, Equatable, Identifiable {
         self.ordId = ordId
         self.clOrdId = clOrdId
         self.ts = ts
+        self.priceUsd = priceUsd
+        self.indexPrice = indexPrice
     }
 }
 
@@ -255,6 +372,10 @@ public enum TradeError: Error, CustomStringConvertible, Sendable {
     case badOutput(String)
     case liveTradingLocked
     case notConfigured
+    /// An order reached the OKX bridge for a family OKX does not list — a
+    /// routing bug rather than a market condition. Named here so it reads as
+    /// one, instead of as an opaque CLI usage error.
+    case unsupportedInstrument(InstrumentType)
 
     public var description: String {
         switch self {
@@ -268,6 +389,8 @@ public enum TradeError: Error, CustomStringConvertible, Sendable {
             return "实盘交易未解锁（设置 → 交易）。当前仅允许 demo 模拟盘。"
         case .notConfigured:
             return "okx CLI 尚未配置 API Key。运行 `okx config` 添加模拟盘密钥后重试。"
+        case .unsupportedInstrument(let instType):
+            return "OKX 不交易\(instType.displayName)，这笔请求不该走到 okx CLI"
         }
     }
 
@@ -281,19 +404,98 @@ public enum TradeError: Error, CustomStringConvertible, Sendable {
     public var exchangeRejection: String? {
         guard case .cliFailed(let exitCode, let stderr) = self, exitCode > 0,
               let code = Self.okxCode(in: stderr) else { return nil }
-        let text = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-        return "OKX \(code)：\(text.prefix(180))"
+        let words = Self.okxMessage(in: stderr)
+            ?? stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        return "OKX \(code)：\(words.prefix(180))"
+    }
+
+    /// The exchange's own words for a refusal, when the payload carries them.
+    ///
+    /// Three places they can be, matching the three shapes `okxCode` reads:
+    /// `sMsg` on a per-order result, `msg` on the envelope, and the `Error:`
+    /// line of a failure the CLI formatted itself. Without any of them the
+    /// raw payload is all there is, and the caller shows that instead — a
+    /// message that starts with a JSON bracket is worse than one that says
+    /// "insufficient BTC margin", but better than one that says nothing.
+    static func okxMessage(in text: String) -> String? {
+        let patterns = [
+            #"\"sMsg\"\s*:\s*\"([^\"]+)\""#,
+            #"\"msg\"\s*:\s*\"([^\"]+)\""#,
+            #"(?m)^\s*Error:\s*(.+?)\s*$"#,
+        ]
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            for match in regex.matches(in: text, range: range) {
+                guard let found = Range(match.range(at: 1), in: text) else { continue }
+                let words = text[found].trimmingCharacters(in: .whitespacesAndNewlines)
+                if !words.isEmpty { return words }
+            }
+        }
+        return nil
+    }
+
+    /// What to do about it, for the failures whose cause is known.
+    ///
+    /// The exchange's message is accurate but terse — "APIKey does not match
+    /// current environment" does not say that demo and live keys are issued
+    /// separately, which is the thing the reader has to know to fix it.
+    public var hint: String? {
+        guard case .cliFailed(_, let stderr) = self else { return nil }
+        return Self.hint(forCLIOutput: stderr)
+    }
+
+    /// Advice keyed on the exchange's own code or message, whichever the CLI
+    /// passed through.
+    public static func hint(forCLIOutput text: String) -> String? {
+        let lower = text.lowercased()
+        let code = okxCode(in: text)
+        if code == "50101" || lower.contains("does not match current environment") {
+            return "这个 profile 的 API Key 属于另一个环境。OKX 的模拟盘密钥在「模拟交易」页单独创建，"
+                + "实盘密钥在主站 API 管理页创建，两者不能互用——为这个环境配置一个对应的 profile。"
+        }
+        if code == "50111" || lower.contains("invalid ok-access-key") {
+            return "API Key 无效或已被删除，请在 OKX 重新创建后运行 `okx config` 更新。"
+        }
+        if code == "50113" || lower.contains("invalid sign") {
+            return "签名校验失败：Secret Key 或 Passphrase 不正确。"
+        }
+        if code == "50105" || (lower.contains("passphrase") && lower.contains("incorrect")) {
+            return "Passphrase 不正确。"
+        }
+        if code == "50100" || lower.contains("api frozen") {
+            return "这个 API Key 已被 OKX 冻结。"
+        }
+        if lower.contains("profile") && lower.contains("not found") {
+            return "CLI 里没有这个 profile，检查 ~/.okx/config.toml。"
+        }
+        if lower.contains("未返回") || lower.contains("timed out") || lower.contains("timeout")
+            || lower.contains("enotfound") || lower.contains("econnrefused") {
+            return "网络或代理问题：CLI 没能连上 OKX。"
+        }
+        return nil
     }
 
     /// First non-zero OKX status code in a CLI error payload, if any.
+    ///
+    /// Two spellings, because the CLI uses both: a JSON `sCode`/`code` field
+    /// when it passes the exchange's response through, and a plain
+    /// `Code: 51001` line when it formats the error itself. Only OKX's own
+    /// five-digit codes count; the `Code: 400` of an HTTP failure says the
+    /// gateway refused the call, not that the exchange judged the order.
     static func okxCode(in text: String) -> String? {
-        let pattern = #"\"(?:sCode|code)\"\s*:\s*\"?(\d+)\"?"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let patterns = [
+            #"\"(?:sCode|code)\"\s*:\s*\"?(\d+)\"?"#,
+            #"(?m)^\s*Code:\s*(\d{5})\s*$"#,
+        ]
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
-        for match in regex.matches(in: text, range: range) {
-            guard let found = Range(match.range(at: 1), in: text) else { continue }
-            let code = String(text[found])
-            if code != "0" { return code }
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            for match in regex.matches(in: text, range: range) {
+                guard let found = Range(match.range(at: 1), in: text) else { continue }
+                let code = String(text[found])
+                if code != "0" { return code }
+            }
         }
         return nil
     }
@@ -310,19 +512,45 @@ public enum TradeError: Error, CustomStringConvertible, Sendable {
 /// individual strategy.
 public struct TradeBridge: Sendable {
     public var explicitCLIPath: String?
-    public var profile: String?
+    /// CLI profile for each environment. Nil means the CLI's default profile.
+    ///
+    /// Kept per mode because the two environments need different keys; see
+    /// `TradingPrefs.demoProfile`.
+    public var demoProfile: String?
+    public var liveProfile: String?
     /// Hard ceiling on one CLI invocation. Settable so a test can exercise the
     /// watchdog without waiting it out.
     public var commandTimeout: TimeInterval
 
     public init(
         explicitCLIPath: String? = nil,
-        profile: String? = nil,
+        demoProfile: String? = nil,
+        liveProfile: String? = nil,
         commandTimeout: TimeInterval = TradeBridge.defaultCommandTimeout
     ) {
         self.explicitCLIPath = explicitCLIPath
-        self.profile = profile
+        self.demoProfile = demoProfile
+        self.liveProfile = liveProfile
         self.commandTimeout = commandTimeout
+    }
+
+    /// The bridge the app's settings describe. Every process that trades on
+    /// the user's behalf — the app, the hourly review — builds its bridge
+    /// here, so none of them can drift onto a different profile mapping.
+    public init(prefs: TradingPrefs, commandTimeout: TimeInterval = TradeBridge.defaultCommandTimeout) {
+        self.init(
+            explicitCLIPath: prefs.cliPath,
+            demoProfile: prefs.demoProfile,
+            liveProfile: prefs.liveProfile,
+            commandTimeout: commandTimeout)
+    }
+
+    /// The profile a mode's calls run under.
+    public func profile(for mode: TradingMode) -> String? {
+        switch mode {
+        case .demo: return demoProfile
+        case .live: return liveProfile
+        }
     }
 
     private static let searchPaths = [
@@ -335,12 +563,26 @@ public struct TradeBridge: Sendable {
     public func detectCLI() async -> CLIInfo? {
         guard let path = resolveCLIPath() else { return nil }
         let output = (try? await run(executable: path, arguments: ["--version"])) ?? ""
-        // The CLI prepends an update banner; the version is the last real line.
-        let version = output
+        return CLIInfo(path: path, version: Self.parseVersion(output))
+    }
+
+    /// The version out of `okx --version`, whatever else the CLI prints.
+    ///
+    /// The output has grown around the number over time — an update banner
+    /// above it, then a "Pilot: installed" status line below it — so neither
+    /// the first nor the last line is reliable. The version is the first line
+    /// that starts like one.
+    static func parseVersion(_ output: String) -> String {
+        let lines = output
             .split(separator: "\n")
             .map { $0.trimmingCharacters(in: .whitespaces) }
-            .last { !$0.isEmpty } ?? "unknown"
-        return CLIInfo(path: path, version: version)
+            .filter { !$0.isEmpty }
+        let versionLike = lines.first { line in
+            let scalars = line.unicodeScalars
+            guard let first = scalars.first, CharacterSet.decimalDigits.contains(first) else { return false }
+            return line.contains(".")
+        }
+        return versionLike ?? lines.last ?? "unknown"
     }
 
     public func resolveCLIPath() -> String? {
@@ -371,29 +613,43 @@ public struct TradeBridge: Sendable {
 
     // MARK: Trading
 
+    /// The `okx` CLI module that trades this family, or a refusal naming the
+    /// family OKX does not list. Every command below starts with one, so a
+    /// stock that somehow reached this bridge is turned back here rather than
+    /// sent to a subcommand that does not exist.
+    private static func module(for instType: InstrumentType) throws -> String {
+        guard let module = instType.cliModule else {
+            throw TradeError.unsupportedInstrument(instType)
+        }
+        return module
+    }
+
     public func place(
         _ order: OrderRequest, mode: TradingMode, liveUnlocked: Bool = false
     ) async throws -> OrderResult {
         if mode == .live && !liveUnlocked { throw TradeError.liveTradingLocked }
 
-        let module = order.instType == .swap ? "swap" : "spot"
-        var args = [module, "place",
+        var args = [try Self.module(for: order.instType), "place",
                     "--instId", order.instId,
                     "--side", order.side.rawValue,
                     "--ordType", order.kind.rawValue,
                     "--sz", PriceFormatter.plain(order.size)]
-        if order.kind == .limit, let price = order.limitPrice {
+        if order.kind.isPriced, let price = order.limitPrice {
             args += ["--px", PriceFormatter.plain(price)]
+        }
+        if let tradeMode = order.tradeMode {
+            args += ["--tdMode", tradeMode]
         }
         if order.instType == .spot, order.kind == .market {
             // Market orders: spend quote ccy when buying by quote size.
             args += ["--tgtCcy", order.sizeUnit == .quote ? "quote_ccy" : "base_ccy"]
         }
-        if let posSide = order.posSide, order.instType == .swap {
+        if let posSide = order.posSide, order.instType.usesPositionSide {
             args += ["--posSide", posSide.rawValue]
         }
-        if order.reduceOnly, order.instType == .swap {
-            args += ["--reduceOnly", "true"]
+        if order.reduceOnly, order.instType.isDerivative {
+            // A bare flag, as the CLI documents it for every module.
+            args += ["--reduceOnly"]
         }
         // `-1` is OKX's "fill at market once triggered". A limit exit could sit
         // unfilled through the move it was meant to escape.
@@ -419,8 +675,31 @@ public struct TradeBridge: Sendable {
         mode: TradingMode, liveUnlocked: Bool = false
     ) async throws {
         if mode == .live && !liveUnlocked { throw TradeError.liveTradingLocked }
-        let module = instType == .swap ? "swap" : "spot"
-        _ = try await runCLI([module, "cancel", instId, "--ordId", ordId], mode: mode)
+        _ = try await runCLI(
+            [try Self.module(for: instType), "cancel", instId, "--ordId", ordId], mode: mode)
+    }
+
+    /// How the account is configured for derivatives.
+    public func accountTradingConfig(mode: TradingMode) async throws -> AccountTradingConfig {
+        let output = try await runCLI(["account", "config"], mode: mode)
+        guard let config = Self.parseAccountTradingConfig(json: output) else {
+            throw TradeError.badOutput(output)
+        }
+        return config
+    }
+
+    static func parseAccountTradingConfig(json: String) -> AccountTradingConfig? {
+        var result: AccountTradingConfig?
+        walkObjects(in: json) { dict in
+            guard result == nil,
+                  dict["posMode"] != nil || dict["acctLv"] != nil else { return }
+            result = AccountTradingConfig(
+                positionMode: (dict["posMode"] as? String)
+                    .flatMap(AccountTradingConfig.PositionMode.init(rawValue:)),
+                accountLevel: number(dict, "acctLv").map { Int($0) },
+                autoLoan: flag(dict, "autoLoan"))
+        }
+        return result
     }
 
     // MARK: Account
@@ -456,13 +735,22 @@ public struct TradeBridge: Sendable {
     /// A timeout is not a rejection: the request may have reached the exchange
     /// and filled. Absent from the listing is the *only* answer that makes a
     /// retry safe, so that is the only case reported as `.unknown`.
+    ///
+    /// Two listings, because the CLI keeps them apart: `orders` is the working
+    /// book and `orders --history` the last week of finished ones. An order
+    /// that filled is in the second and not the first, so asking only the
+    /// first — which is what this used to do, with a `--state all` flag the
+    /// CLI silently ignored — answered "never seen" for every filled order.
     public func orderStatus(
         instId: String, instType: InstrumentType, clOrdId: String, mode: TradingMode
     ) async throws -> VenueOrderStatus {
-        let module = instType == .swap ? "swap" : "spot"
-        let output = try await runCLI(
-            [module, "orders", "--instId", instId, "--state", "all"], mode: mode)
-        return Self.parseOrderStatus(json: output, clOrdId: clOrdId)
+        let module = try Self.module(for: instType)
+        let working = try await runCLI([module, "orders", "--instId", instId], mode: mode)
+        let status = Self.parseOrderStatus(json: working, clOrdId: clOrdId)
+        if status != .unknown { return status }
+        let finished = try await runCLI(
+            [module, "orders", "--instId", instId, "--history"], mode: mode)
+        return Self.parseOrderStatus(json: finished, clOrdId: clOrdId)
     }
 
     static func parseOrderStatus(json: String, clOrdId: String) -> VenueOrderStatus {
@@ -493,8 +781,7 @@ public struct TradeBridge: Sendable {
     public func fills(
         instId: String? = nil, instType: InstrumentType = .spot, mode: TradingMode
     ) async throws -> [ExchangeFill] {
-        let module = instType == .swap ? "swap" : "spot"
-        var args = [module, "fills"]
+        var args = [try Self.module(for: instType), "fills"]
         if let instId { args += ["--instId", instId] }
         let output = try await runCLI(args, mode: mode)
         return Self.parseFills(json: output)
@@ -553,19 +840,25 @@ public struct TradeBridge: Sendable {
     /// would make the comparison silently partial, which is the failure mode
     /// this whole check exists to remove.
     public func bookTotals(
-        mode: TradingMode, limit: Int = 100
+        mode: TradingMode, instTypes: [InstrumentType] = [.swap], limit: Int = 100
     ) async throws -> [String: ExchangeBookTotals] {
-        let base = ["account", "bills", "--instType", "SWAP", "--limit", String(limit)]
-        let recent = try await runCLI(base, mode: mode)
-        // The archive endpoint is genuinely slow — measured at 18.7s against
-        // the 15s default, which meant it timed out on every run and `try?`
-        // turned that into a short window. The review then reported "the bill
-        // window does not reach far enough back", which was true and had
-        // nothing to do with the actual failure. A degraded call has to fail as
-        // itself, not as whatever its empty result happens to look like.
-        let archived = try await runCLI(
-            base + ["--archive"], mode: mode, timeout: Self.archiveCommandTimeout)
-        return Self.parseBookTotals(json: [recent, archived])
+        var blobs: [String] = []
+        // Bills are filed per instrument family; a book holding both
+        // perpetuals and options needs both listings.
+        for instType in instTypes where instType.isDerivative {
+            let base = ["account", "bills", "--instType", instType.rawValue,
+                        "--limit", String(limit)]
+            blobs.append(try await runCLI(base, mode: mode))
+            // The archive endpoint is genuinely slow — measured at 18.7s against
+            // the 15s default, which meant it timed out on every run and `try?`
+            // turned that into a short window. The review then reported "the bill
+            // window does not reach far enough back", which was true and had
+            // nothing to do with the actual failure. A degraded call has to fail as
+            // itself, not as whatever its empty result happens to look like.
+            blobs.append(try await runCLI(
+                base + ["--archive"], mode: mode, timeout: Self.archiveCommandTimeout))
+        }
+        return Self.parseBookTotals(json: blobs)
     }
 
     static func parseBookTotals(json blobs: [String]) -> [String: ExchangeBookTotals] {
@@ -612,6 +905,54 @@ public struct TradeBridge: Sendable {
         return totals
     }
 
+    // MARK: Connection
+
+    /// Prove that a mode's credentials reach *its* environment.
+    ///
+    /// One authenticated read — the balance — is the whole test: it fails on
+    /// a missing profile, a key from the other environment, a wrong secret or
+    /// passphrase, and a frozen key, each with the exchange's own words. The
+    /// account configuration is read afterwards on a best-effort basis, because
+    /// the position mode decides whether perpetual orders are accepted at all
+    /// and that is worth showing next to the green tick.
+    public func verifyConnection(mode: TradingMode) async throws -> VenueConnectionReport {
+        let snapshot = try await accountSnapshot(mode: mode)
+        let config = try? await accountConfig(mode: mode)
+        return VenueConnectionReport(
+            mode: mode,
+            profile: profile(for: mode),
+            checkedAt: Date(),
+            totalEquity: snapshot.totalEquity,
+            balanceCount: snapshot.balances.count,
+            account: config)
+    }
+
+    /// `okx account config` — the account's level, position mode and the key's
+    /// permissions. Read-only.
+    public func accountConfig(mode: TradingMode) async throws -> AccountConfigInfo {
+        let output = try await runCLI(["account", "config"], mode: mode)
+        guard let info = Self.parseAccountConfig(json: output) else {
+            throw TradeError.badOutput(output)
+        }
+        return info
+    }
+
+    static func parseAccountConfig(json: String) -> AccountConfigInfo? {
+        var result: AccountConfigInfo?
+        walkObjects(in: json) { dict in
+            guard result == nil,
+                  let level = dict["acctLv"] as? String,
+                  let posMode = dict["posMode"] as? String else { return }
+            result = AccountConfigInfo(
+                accountLevel: level,
+                positionMode: posMode,
+                permissions: (dict["perm"] as? String) ?? "",
+                label: dict["label"] as? String,
+                uid: dict["uid"] as? String)
+        }
+        return result
+    }
+
     // MARK: Protective orders
 
     /// Stops and take-profits the exchange is currently holding.
@@ -622,9 +963,8 @@ public struct TradeBridge: Sendable {
     public func protectiveOrders(
         instId: String, instType: InstrumentType, mode: TradingMode
     ) async throws -> [VenueProtectiveOrder] {
-        let module = instType == .swap ? "swap" : "spot"
         let output = try await runCLI(
-            [module, "algo", "orders", "--instId", instId], mode: mode)
+            [try Self.module(for: instType), "algo", "orders", "--instId", instId], mode: mode)
         return Self.parseProtectiveOrders(json: output, instId: instId)
     }
 
@@ -652,9 +992,8 @@ public struct TradeBridge: Sendable {
         stopPrice: Double, mode: TradingMode, liveUnlocked: Bool = false
     ) async throws {
         if mode == .live && !liveUnlocked { throw TradeError.liveTradingLocked }
-        let module = instType == .swap ? "swap" : "spot"
         _ = try await runCLI(
-            [module, "algo", "amend", "--instId", instId, "--algoId", algoId,
+            [try Self.module(for: instType), "algo", "amend", "--instId", instId, "--algoId", algoId,
              "--newSlTriggerPx", PriceFormatter.plain(stopPrice), "--newSlOrdPx", "-1"],
             mode: mode)
     }
@@ -665,15 +1004,14 @@ public struct TradeBridge: Sendable {
         size: Double, stopPrice: Double, mode: TradingMode, liveUnlocked: Bool = false
     ) async throws {
         if mode == .live && !liveUnlocked { throw TradeError.liveTradingLocked }
-        let module = instType == .swap ? "swap" : "spot"
         // The order that closes a long is a sell, and vice versa.
         let side: OrderSide = posSide == .short ? .buy : .sell
-        var args = [module, "algo", "place", "--instId", instId,
+        var args = [try Self.module(for: instType), "algo", "place", "--instId", instId,
                     "--side", side.rawValue, "--sz", PriceFormatter.plain(size),
                     "--ordType", "conditional",
                     "--slTriggerPx", PriceFormatter.plain(stopPrice),
                     "--slOrdPx", "-1", "--reduceOnly"]
-        if let posSide, instType == .swap { args += ["--posSide", posSide.rawValue] }
+        if let posSide, instType.usesPositionSide { args += ["--posSide", posSide.rawValue] }
         _ = try await runCLI(args, mode: mode)
     }
 
@@ -702,7 +1040,7 @@ public struct TradeBridge: Sendable {
         var args = arguments + ["--json"]
         if needsAuth {
             args.append(mode == .demo ? "--demo" : "--live")
-            if let profile { args += ["--profile", profile] }
+            if let profile = profile(for: mode) { args += ["--profile", profile] }
         }
         return try await run(executable: cli, arguments: args, timeout: timeout)
     }
@@ -747,11 +1085,33 @@ public struct TradeBridge: Sendable {
 
         let out = outcome.stdoutText
         guard outcome.exitCode == 0 else {
-            let err = outcome.stderrText
             throw TradeError.cliFailed(
-                exitCode: outcome.exitCode, stderr: err.isEmpty ? out : err)
+                exitCode: outcome.exitCode,
+                stderr: Self.failureText(stdout: out, stderr: outcome.stderrText))
         }
         return out
+    }
+
+    /// What a failed invocation actually said.
+    ///
+    /// The CLI prints the exchange's refusal — `sCode`, `sMsg` — to stdout as
+    /// JSON, and its update nag to stderr. "stderr, else stdout" therefore
+    /// handed the runner the nag and dropped the verdict: a 51198 refusal on
+    /// the demo account was reported as an unconfirmed order, which is the
+    /// one thing a definite refusal must never be reported as. Both streams
+    /// are kept, and the nag is not.
+    static func failureText(stdout: String, stderr: String) -> String {
+        let signal = stderr
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .filter { line in
+                !line.contains("Update available for @okx_ai/okx-trade-cli")
+                    && !line.contains("npm install -g @okx_ai/okx-trade-cli")
+            }
+            .joined(separator: "\n")
+        return [stdout, signal]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
     }
 
     // MARK: Output parsing
@@ -841,7 +1201,11 @@ public struct TradeBridge: Sendable {
                 feeCcy: dict["feeCcy"] as? String,
                 ordId: ordId,
                 clOrdId: clOrdId,
-                ts: Date(timeIntervalSince1970: ms / 1000)))
+                ts: Date(timeIntervalSince1970: ms / 1000),
+                // Stamped on option fills only; empty strings elsewhere, which
+                // `number` already reads as absent.
+                priceUsd: number(dict, "fillPxUsd"),
+                indexPrice: number(dict, "fillIdxPx")))
         }
         return out.sorted { $0.ts < $1.ts }
     }
@@ -870,6 +1234,17 @@ public struct TradeBridge: Sendable {
         if let value = dict[key] as? Double { return value }
         if let value = dict[key] as? Int { return Double(value) }
         return nil
+    }
+
+    /// A switch the CLI passes through as JSON `true` or, on some envelopes,
+    /// as the string `"true"`. Anything else is "not reported".
+    static func flag(_ dict: [String: Any], _ key: String) -> Bool? {
+        if let value = dict[key] as? Bool { return value }
+        switch (dict[key] as? String)?.lowercased() {
+        case "true": return true
+        case "false": return false
+        default: return nil
+        }
     }
 
     static func findString(key: String, in json: String) -> String? {

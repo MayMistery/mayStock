@@ -525,6 +525,24 @@ public enum PortfolioReview {
         }
 
         var findings: [ReviewFinding] = []
+        // An option book is kept in quote currency, converted at each fill's
+        // own index; the exchange's option bills are in the settlement coin
+        // with no index attached, so the two cannot be compared without
+        // guessing a rate per bill. Said out loud rather than left as a
+        // silence that reads like a pass.
+        let optionBooks = s.positions.values
+            .filter { $0.venue.instrumentType(of: $0.instId) == .option && !$0.isFlat }
+            .sorted { $0.instId < $1.instId }
+        for book in optionBooks {
+            findings.append(ReviewFinding(
+                code: "ledger.uncheckable",
+                severity: .info,
+                title: "期权账本未与账单核对",
+                detail: "\(book.strategyId) \(book.instId) 以计价币记账，交易所账单以结算币计且不带指数价，"
+                    + "两边无法逐笔换算，本轮不比。",
+                remedy: "以交易所持仓页的浮动盈亏为准；到期结算后账本按标记价补记"))
+        }
+
         for (instId, total) in totals.sorted(by: { $0.key < $1.key }) {
             // Attribution has to be unambiguous, same rule as booking funding:
             // two strategies on one instrument means the exchange's per

@@ -35,7 +35,7 @@ public enum Venue: String, Codable, Sendable, CaseIterable, Identifiable, Hashab
     /// The instrument types this venue trades.
     public var instrumentTypes: [InstrumentType] {
         switch self {
-        case .okx: return [.spot, .swap]
+        case .okx: return [.spot, .swap, .option]
         case .schwab: return [.stock]
         }
     }
@@ -53,10 +53,34 @@ public enum Venue: String, Codable, Sendable, CaseIterable, Identifiable, Hashab
     public func instrumentType(of instId: String) -> InstrumentType {
         switch self {
         case .okx:
-            return instId.hasSuffix("-" + InstrumentType.swap.rawValue) ? .swap : .spot
+            if instId.hasSuffix("-" + InstrumentType.swap.rawValue) { return .swap }
+            if optionKind(of: instId) != nil { return .option }
+            return .spot
         case .schwab:
             return .stock
         }
+    }
+
+    /// The call/put leg an option id names: OKX spells a call
+    /// `BTC-USD-260908-70000-C`. Nil for any id that is not an option, and
+    /// for every id on a venue that lists none.
+    public func optionKind(of instId: String) -> OptionKind? {
+        guard self == .okx else { return nil }
+        let parts = instId.split(separator: "-")
+        guard parts.count == 5,
+              parts[2].count == 6, parts[2].allSatisfy(\.isNumber),
+              Double(parts[3]) != nil else { return nil }
+        switch parts[4] {
+        case "C": return .call
+        case "P": return .put
+        default: return nil
+        }
+    }
+
+    /// The index an option settles against: `BTC-USD-260908-70000-C` → `BTC-USD`.
+    public func optionUnderlying(of instId: String) -> String? {
+        guard optionKind(of: instId) != nil else { return nil }
+        return instId.split(separator: "-").prefix(2).joined(separator: "-")
     }
 
     /// "BTC-USDT-SWAP" → ("BTC", "USDT") on OKX; "AAPL" → ("AAPL", "USD") on

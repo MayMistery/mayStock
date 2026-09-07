@@ -9,12 +9,26 @@ import Foundation
 public struct OKXVenue: ExchangeVenue {
     public let venue = Venue.okx
 
+    /// The real market, which signals read whatever the trading mode.
     private let rest: OKXRESTClient
+    /// The demo environment's own books, marks and listings.
+    private let demoRest: OKXRESTClient
     private let bridge: TradeBridge
 
     public init(rest: OKXRESTClient = OKXRESTClient(), bridge: TradeBridge) {
         self.rest = rest
+        self.demoRest = OKXRESTClient(baseURL: rest.baseURL, simulated: true)
         self.bridge = bridge
+    }
+
+    /// Where an order's prices come from: the environment it will be filled
+    /// in. A demo option order priced from the real book was sent at 0.0215
+    /// into a demo book whose best ask was 0.0375, and the exchange cancelled
+    /// it unfilled; the demo marks the same contract at 0.052 against the
+    /// real 0.0205, so a position valued from the real mark is not what the
+    /// demo account shows either.
+    func market(_ mode: TradingMode) -> OKXRESTClient {
+        mode == .demo ? demoRest : rest
     }
 
     public func isReady() async -> Bool {
@@ -33,12 +47,42 @@ public struct OKXVenue: ExchangeVenue {
         try await rest.historyCandles(instId: instId, bar: bar, target: target)
     }
 
-    public func lastPrice(instId: String) async throws -> Double {
-        try await rest.ticker(instId: instId).last
+    public func lastPrice(instId: String, mode: TradingMode) async throws -> Double {
+        try await market(mode).ticker(instId: instId).last
     }
 
-    public func instrumentMeta(instId: String) async throws -> InstrumentMeta? {
-        try await rest.instrumentMeta(instId: instId)
+    public func instrumentMeta(instId: String, mode: TradingMode) async throws -> InstrumentMeta? {
+        try await market(mode).instrumentMeta(instId: instId)
+    }
+
+    /// Options are marked, not last-traded: a thin book's last print can be
+    /// hours old, while the mark is refreshed continuously and is the number
+    /// the exchange itself values the position at.
+    public func valuationPrice(instId: String, mode: TradingMode) async throws -> Double {
+        guard venue.instrumentType(of: instId) == .option else {
+            return try await market(mode).ticker(instId: instId).last
+        }
+        let quote = try await market(mode).optionQuote(instId: instId)
+        guard let mark = quote.markQuote, mark > 0 else {
+            throw OKXError.decoding("\(instId) 没有标记价")
+        }
+        return mark
+    }
+
+    public func optionChain(underlying: String, mode: TradingMode) async throws -> [OptionContract] {
+        try await market(mode).optionChain(underlying: underlying)
+    }
+
+    public func optionQuote(instId: String, mode: TradingMode) async throws -> OptionQuote {
+        try await market(mode).optionQuote(instId: instId)
+    }
+
+    public func indexPrice(underlying: String, mode: TradingMode) async throws -> Double {
+        try await market(mode).indexPrice(underlying: underlying)
+    }
+
+    public func accountTradingConfig(mode: TradingMode) async throws -> AccountTradingConfig {
+        try await bridge.accountTradingConfig(mode: mode)
     }
 
     public func alternativeSeries(

@@ -8,10 +8,20 @@ import FoundationNetworking
 /// (limit is 20 requests / 2 seconds).
 public struct OKXRESTClient: Sendable {
     public let baseURL: URL
+    /// Read the demo environment's market data rather than the real market's.
+    ///
+    /// OKX serves both from the same host, told apart by a request header.
+    /// The demo's spot and perpetual prices shadow the real ones, but its
+    /// option books and marks are its own — a demo order priced from the real
+    /// book can sit far outside the book it actually lands in.
+    public let simulated: Bool
     private let session: URLSession
 
-    public init(baseURL: URL = OKXEndpoints.rest, session: URLSession? = nil) {
+    public init(
+        baseURL: URL = OKXEndpoints.rest, session: URLSession? = nil, simulated: Bool = false
+    ) {
         self.baseURL = baseURL
+        self.simulated = simulated
         if let session {
             self.session = session
         } else {
@@ -30,9 +40,9 @@ public struct OKXRESTClient: Sendable {
         let data: [Row]
     }
 
-    private func get<Row: Decodable>(
-        _ type: Row.Type, path: String, query: [String: String]
-    ) async throws -> [Row] {
+    /// The request for one GET, carrying the environment header when this
+    /// client reads the demo.
+    func request(path: String, query: [String: String]) throws -> URLRequest {
         var components = URLComponents(
             url: baseURL.appendingPathComponent(path), resolvingAgainstBaseURL: false)!
         components.queryItems = query.sorted { $0.key < $1.key }
@@ -41,6 +51,16 @@ public struct OKXRESTClient: Sendable {
 
         var request = URLRequest(url: url)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if simulated {
+            request.setValue("1", forHTTPHeaderField: "x-simulated-trading")
+        }
+        return request
+    }
+
+    private func get<Row: Decodable>(
+        _ type: Row.Type, path: String, query: [String: String]
+    ) async throws -> [Row] {
+        let request = try request(path: path, query: query)
 
         let (data, response): (Data, URLResponse)
         do {
@@ -242,21 +262,135 @@ public struct OKXRESTClient: Sendable {
         let lotSz: String
         let minSz: String
         let ctVal: String?
+        let ctMult: String?
+        let uly: String?
+        let optType: String?
+        let stk: String?
+        let expTime: String?
+        let settleCcy: String?
+        let state: String?
+
+        var meta: InstrumentMeta {
+            InstrumentMeta(
+                instId: instId,
+                tickSize: Double(tickSz) ?? 0.01,
+                lotSize: Double(lotSz) ?? 0,
+                minSize: Double(minSz) ?? 0,
+                contractValue: InstrumentMeta.contractValue(
+                    ctVal: ctVal.flatMap(Double.init), ctMult: ctMult.flatMap(Double.init)))
+        }
+
+        /// The row as an option contract, or nil for any row that is not one.
+        var contract: OptionContract? {
+            guard let uly, !uly.isEmpty,
+                  let kind = optType.flatMap({ $0 == "C" ? OptionKind.call : $0 == "P" ? .put : nil }),
+                  let strike = stk.flatMap(Double.init), strike > 0,
+                  let expiryMs = expTime.flatMap(Double.init),
+                  let value = meta.contractValue else { return nil }
+            return OptionContract(
+                instId: instId, underlying: uly, kind: kind, strike: strike,
+                expiry: Date(timeIntervalSince1970: expiryMs / 1000),
+                contractValue: value,
+                tickSize: Double(tickSz) ?? 0.0001,
+                lotSize: Double(lotSz) ?? 1,
+                minSize: Double(minSz) ?? 1,
+                settleCurrency: settleCcy ?? Venue.okx.currencies(of: uly).base)
+        }
     }
 
     /// Instrument metadata (tick size → price decimals). Also serves as
     /// validation when the user adds a new instrument.
     public func instrumentMeta(instId: String) async throws -> InstrumentMeta? {
-        let instType = Venue.okx.instrumentType(of: instId).rawValue
-        let rows = try await get(InstrumentRow.self, path: "api/v5/public/instruments",
-                                 query: ["instType": instType, "instId": instId])
-        guard let row = rows.first else { return nil }
-        return InstrumentMeta(
-            instId: row.instId,
-            tickSize: Double(row.tickSz) ?? 0.01,
-            lotSize: Double(row.lotSz) ?? 0,
-            minSize: Double(row.minSz) ?? 0,
-            contractValue: row.ctVal.flatMap(Double.init))
+        let instType = Venue.okx.instrumentType(of: instId)
+        var query = ["instType": instType.rawValue, "instId": instId]
+        // The instruments endpoint refuses an option lookup without its
+        // underlying, even when the id is given in full.
+        if let underlying = Venue.okx.optionUnderlying(of: instId) {
+            query["uly"] = underlying
+        }
+        let rows = try await get(InstrumentRow.self, path: "api/v5/public/instruments", query: query)
+        return rows.first?.meta
+    }
+
+    // MARK: Options
+
+    /// Every live option on an underlying index, e.g. `BTC-USD`.
+    public func optionChain(underlying: String) async throws -> [OptionContract] {
+        let rows = try await get(
+            InstrumentRow.self, path: "api/v5/public/instruments",
+            query: ["instType": InstrumentType.option.rawValue, "uly": underlying])
+        return rows
+            .filter { ($0.state ?? "live") == "live" }
+            .compactMap(\.contract)
+    }
+
+    private struct MarkPriceRow: Decodable {
+        let instId: String
+        let markPx: String
+    }
+
+    /// The exchange's mark for a derivative, in the unit it quotes the
+    /// instrument in — the settlement coin for an option.
+    public func markPrice(instId: String) async throws -> Double {
+        let rows = try await get(
+            MarkPriceRow.self, path: "api/v5/public/mark-price",
+            query: ["instType": Venue.okx.instrumentType(of: instId).rawValue, "instId": instId])
+        guard let row = rows.first, let mark = Double(row.markPx) else {
+            throw OKXError.decoding("mark-price \(instId)")
+        }
+        return mark
+    }
+
+    private struct IndexTickerRow: Decodable {
+        let instId: String
+        let idxPx: String
+    }
+
+    /// The index an option settles against, e.g. `BTC-USD`.
+    public func indexPrice(underlying: String) async throws -> Double {
+        let rows = try await get(
+            IndexTickerRow.self, path: "api/v5/market/index-tickers", query: ["instId": underlying])
+        guard let row = rows.first, let price = Double(row.idxPx), price > 0 else {
+            throw OKXError.decoding("index-tickers \(underlying)")
+        }
+        return price
+    }
+
+    /// The top of an option's book, decoded on its own terms.
+    ///
+    /// A contract that has never traded reports an empty `last`, and the
+    /// general ticker decoder rightly refuses a ticker without one. An option
+    /// order needs the bid and the ask, and either side may be empty too —
+    /// reported as nil, not zero, because a zero would read as "free" to the
+    /// sizing arithmetic downstream.
+    struct OptionTickerRow: Decodable {
+        let instId: String
+        let bidPx: String?
+        let askPx: String?
+        let ts: String?
+
+        var bid: Double? { bidPx.flatMap(Double.init).flatMap { $0 > 0 ? $0 : nil } }
+        var ask: Double? { askPx.flatMap(Double.init).flatMap { $0 > 0 ? $0 : nil } }
+        var time: Date { Date(timeIntervalSince1970: (ts.flatMap(Double.init) ?? 0) / 1000) }
+    }
+
+    /// Book, mark and index for one option, read together.
+    public func optionQuote(instId: String) async throws -> OptionQuote {
+        guard let underlying = Venue.okx.optionUnderlying(of: instId) else {
+            throw OKXError.decoding("\(instId) 不是期权合约")
+        }
+        async let book = get(OptionTickerRow.self, path: "api/v5/market/ticker", query: ["instId": instId])
+        async let mark = self.markPrice(instId: instId)
+        async let index = self.indexPrice(underlying: underlying)
+        let (rows, markPx, indexPx) = try await (book, mark, index)
+        guard let top = rows.first else { throw OKXError.decoding("ticker \(instId)") }
+        return OptionQuote(
+            instId: instId,
+            bid: top.bid,
+            ask: top.ask,
+            mark: markPx > 0 ? markPx : nil,
+            indexPrice: indexPx,
+            ts: top.time)
     }
 }
 

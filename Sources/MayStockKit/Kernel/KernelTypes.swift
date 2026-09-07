@@ -141,6 +141,56 @@ public struct KernelDataQuality: Decodable, Sendable, Equatable {
     }
 }
 
+/// What an option strategy is asking the runner to do on this bar.
+public enum KernelOptionAction: String, Decodable, Sendable, Equatable {
+    /// Buy `kind` with `premiumBudget`.
+    case open
+    /// Sell whatever contract is held, whole.
+    case close
+    /// Sell the held contract, then buy `kind`.
+    case flip
+}
+
+/// The kernel's half of an option order: everything that does not need a live
+/// quote. The runner turns the premium budget into contracts against the
+/// exchange's ask.
+public struct KernelOptionPlan: Decodable, Sendable, Equatable {
+    public let action: KernelOptionAction
+    public let kind: OptionKind?
+    /// Premium to spend on the entry, in quote currency — the position's
+    /// maximum loss.
+    public let premiumBudget: Double
+    public let minDaysToExpiry: Double
+    public let moneynessPct: Double
+    public let strikeStep: Double?
+    /// Protective levels as a percentage of the premium paid, enforced by the
+    /// runner against the option's own mark.
+    public let stopLossPct: Double?
+    public let takeProfitPct: Double?
+}
+
+/// One contract offered to the kernel's selection rule, and what it picks.
+public struct KernelOptionCandidate: Codable, Sendable, Equatable {
+    public let instId: String
+    public let strike: Double
+    public let expiryMs: Int64
+    public let kind: OptionKind
+
+    public init(instId: String, strike: Double, expiryMs: Int64, kind: OptionKind) {
+        self.instId = instId
+        self.strike = strike
+        self.expiryMs = expiryMs
+        self.kind = kind
+    }
+
+    public init(contract: OptionContract) {
+        self.init(
+            instId: contract.instId, strike: contract.strike,
+            expiryMs: Int64((contract.expiry.timeIntervalSince1970 * 1000).rounded()),
+            kind: contract.kind)
+    }
+}
+
 public struct KernelDecision: Decodable, Sendable, Equatable {
     /// 1 long, −1 short, 0 flat.
     public let target: Int
@@ -175,6 +225,10 @@ public struct KernelDecision: Decodable, Sendable, Equatable {
     /// Set when the candle series is not fit to trade on. Distinct from warming
     /// up: there is enough data, it is just not trustworthy.
     public let dataQuality: KernelDataQuality?
+    /// Present for an option strategy: which contract to buy or sell and how
+    /// much premium to spend. `baseDelta` is then only an underlying-equivalent
+    /// for the guard, never something to submit.
+    public let optionPlan: KernelOptionPlan?
 
     public var direction: TradeDirection? { TradeDirection.fromKernelCode(Int32(target)) }
     public var barTime: Date { Date(timeIntervalSince1970: Double(barTs) / 1000) }
@@ -183,7 +237,7 @@ public struct KernelDecision: Decodable, Sendable, Equatable {
         case target, targetExposure, confirmedBars, barTs, warmingUp
         case targetBaseQuantity, baseDelta, shouldTrade, haltDailyLoss, reason
         case stopPrice, takeProfitPrice, trailingStopPrice
-        case denied, dataQuality
+        case denied, dataQuality, optionPlan
     }
 
     public init(from decoder: Decoder) throws {
@@ -205,6 +259,7 @@ public struct KernelDecision: Decodable, Sendable, Equatable {
         warmingUp = try c.decode(Bool.self, forKey: .warmingUp)
         denied = try c.decodeIfPresent(KernelOrderDenied.self, forKey: .denied)
         dataQuality = try c.decodeIfPresent(KernelDataQuality.self, forKey: .dataQuality)
+        optionPlan = try c.decodeIfPresent(KernelOptionPlan.self, forKey: .optionPlan)
     }
 }
 
@@ -276,6 +331,8 @@ public struct KernelTrade: Decodable, Sendable, Equatable {
 
 public enum KernelExitReason: String, Decodable, Sendable, Equatable {
     case signal, stopLoss, takeProfit, trailingStop, liquidation, dailyLossHalt, endOfData
+    /// An option contract reached settlement and paid its intrinsic value.
+    case expiry
 
     public var displayName: String {
         switch self {
@@ -286,6 +343,7 @@ public enum KernelExitReason: String, Decodable, Sendable, Equatable {
         case .liquidation: return "强平"
         case .dailyLossHalt: return "日内熔断"
         case .endOfData: return "回测结束"
+        case .expiry: return "到期结算"
         }
     }
 }

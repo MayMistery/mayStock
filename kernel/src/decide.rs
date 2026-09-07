@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::candle::Candle;
 use crate::expr::eval::{truthy, Evaluator};
 use crate::expr::ExprResult;
+use crate::options::{self, OptionKind};
 use crate::strategy::{CompiledStrategy, SizingMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,6 +209,63 @@ pub struct LiveDecision {
     /// warming up: there is enough data, it is just not trustworthy.
     #[serde(rename = "dataQuality")]
     pub data_quality: Option<crate::quality::DataQuality>,
+    /// For an option strategy: which contract to buy or sell and how much
+    /// premium to spend. The kernel decides everything that does not need a
+    /// live quote; turning the budget into a number of contracts needs the
+    /// exchange's ask, so the runner finishes that part.
+    #[serde(rename = "optionPlan", skip_serializing_if = "Option::is_none", default)]
+    pub option_plan: Option<OptionPlan>,
+}
+
+/// What an option strategy is asking the runner to do on this bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OptionAction {
+    /// Buy `kind` with `premium_budget`.
+    Open,
+    /// Sell whatever contract is held, whole.
+    Close,
+    /// Sell the held contract, then buy `kind`: a reversal.
+    Flip,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OptionPlan {
+    pub action: OptionAction,
+    /// The contract to buy; absent on a plain close.
+    pub kind: Option<OptionKind>,
+    /// Premium to spend on the entry, in quote currency — the position's
+    /// maximum loss, which is why sizing an option is sizing this.
+    #[serde(rename = "premiumBudget")]
+    pub premium_budget: f64,
+    #[serde(rename = "minDaysToExpiry")]
+    pub min_days_to_expiry: f64,
+    #[serde(rename = "moneynessPct")]
+    pub moneyness_pct: f64,
+    #[serde(rename = "strikeStep")]
+    pub strike_step: Option<f64>,
+    /// Protective levels as a percentage of the premium paid. Enforced by the
+    /// runner against the option's own mark, because that is what a stop on
+    /// an option is about.
+    #[serde(rename = "stopLossPct")]
+    pub stop_loss_pct: Option<f64>,
+    #[serde(rename = "takeProfitPct")]
+    pub take_profit_pct: Option<f64>,
+}
+
+impl OptionPlan {
+    fn close() -> Self {
+        Self {
+            action: OptionAction::Close,
+            kind: None,
+            premium_budget: 0.0,
+            min_days_to_expiry: 0.0,
+            moneyness_pct: 0.0,
+            strike_step: None,
+            stop_loss_pct: None,
+            take_profit_pct: None,
+        }
+    }
 }
 
 /// What the runner knows about the account when it asks for a plan.
@@ -282,6 +340,7 @@ fn idle(reason: &str, current: Option<Direction>, held: f64, bars: usize, ts: i6
         trailing_stop_price: trailing,
         denied: None,
         data_quality: None,
+        option_plan: None,
     }
 }
 
@@ -357,6 +416,7 @@ pub fn decide_live(
 
     let index = candles.len() - 1;
     let bar_ts = candles[index].ts_ms;
+    let is_option = strategy.manifest.market.inst_type.is_option();
 
     // Judged before a single indicator touches the series. Every one of them
     // will happily compute a real-looking number from a stale or holed feed,
@@ -420,6 +480,10 @@ pub fn decide_live(
                 trailing_stop_price: None,
                 denied: None,
                 data_quality: None,
+                // The halt closes an option position like any other; the
+                // runner needs to be told it is a contract sale.
+                option_plan: (is_option && account.held_base.abs() > 1e-12)
+                    .then(OptionPlan::close),
             });
         }
     }
@@ -498,6 +562,7 @@ pub fn decide_live(
             trailing_stop_price: None,
             denied,
             data_quality: None,
+            option_plan: None,
         });
     }
 
@@ -534,6 +599,14 @@ pub fn decide_live(
         short_exit.as_deref(),
         None,
     );
+
+    // An option strategy shares the signal and the cooldown with the binary
+    // path and diverges only in what an order *is*: a contract and a premium
+    // rather than a quantity of coins.
+    if is_option {
+        return Ok(option_decision(
+            strategy, current, target, price, &account, candles.len(), bar_ts));
+    }
 
     // Binary strategies switch in and out; nothing to do while the side is
     // unchanged.
@@ -600,6 +673,7 @@ pub fn decide_live(
                     trailing_stop_price: trailing,
                     denied: None,
                     data_quality: None,
+                    option_plan: None,
                 });
             }
         }
@@ -632,7 +706,105 @@ pub fn decide_live(
         // belongs to the position being *left*, so it must not leak into the
         // new one.
         trailing_stop_price: if target == current { trailing } else { None },
+        option_plan: None,
     })
+}
+
+/// The plan for an option strategy once the signal has been resolved.
+///
+/// `held_base` is signed by the *view* the held contract expresses — positive
+/// for a call, negative for a put — so the guard's notion of "does this order
+/// reduce exposure" keeps meaning what it means elsewhere.
+fn option_decision(
+    strategy: &CompiledStrategy,
+    current: Option<Direction>,
+    target: Option<Direction>,
+    price: f64,
+    account: &AccountState,
+    bars: usize,
+    bar_ts: i64,
+) -> LiveDecision {
+    let spec = strategy.options_spec();
+    let risk = &strategy.manifest.risk;
+    let held = account.held_base;
+
+    if target == current {
+        return idle("信号未变", target, held, bars, bar_ts, false, None);
+    }
+    if target.is_some()
+        && current.is_none()
+        && !can_enter(account.bars_since_exit, risk.cooldown_bars)
+    {
+        return idle("冷却中", None, held, bars, bar_ts, false, None);
+    }
+
+    let plan = |action: OptionAction, kind: Option<OptionKind>, budget: f64| OptionPlan {
+        action,
+        kind,
+        premium_budget: budget,
+        min_days_to_expiry: spec.min_days_to_expiry,
+        moneyness_pct: spec.moneyness_pct,
+        strike_step: spec.strike_step,
+        stop_loss_pct: risk.stop_loss_pct,
+        take_profit_pct: risk.take_profit_pct,
+    };
+    let base = |target: Option<Direction>| LiveDecision {
+        target: Direction::to_i32(target),
+        target_exposure: f64::NAN,
+        target_base_quantity: 0.0,
+        base_delta: 0.0,
+        should_trade: false,
+        halt_daily_loss: false,
+        reason: String::new(),
+        confirmed_bars: bars,
+        bar_ts,
+        warming_up: false,
+        stop_price: None,
+        take_profit_price: None,
+        trailing_stop_price: None,
+        denied: None,
+        data_quality: None,
+        option_plan: None,
+    };
+
+    let Some(direction) = target else {
+        return LiveDecision {
+            base_delta: -held,
+            should_trade: held.abs() > 1e-12,
+            reason: "信号平仓（卖出所持期权）".to_string(),
+            option_plan: Some(plan(OptionAction::Close, None, 0.0)),
+            ..base(None)
+        };
+    };
+
+    let kind = OptionKind::for_direction(direction);
+    let Some(budget) = options::premium_budget(strategy, account.equity) else {
+        return LiveDecision {
+            target_base_quantity: held,
+            reason: "无法定仓（资金为零）".to_string(),
+            ..base(target)
+        };
+    };
+    // The premium is the order's whole exposure: expressed to the guard as
+    // the underlying it would buy at this price, so the same notional caps
+    // apply to an option entry as to any other.
+    let equivalent = budget / price * direction.sign();
+    let denied = crate::guard::check_order(equivalent, 0.0, price, account.equity, &account.limits);
+    let action = if current.is_some() { OptionAction::Flip } else { OptionAction::Open };
+    let view = if direction == Direction::Long { "做多" } else { "做空" };
+    let contract = if kind == OptionKind::Call { "看涨" } else { "看跌" };
+    LiveDecision {
+        target_base_quantity: equivalent,
+        base_delta: equivalent - held,
+        should_trade: denied.is_none(),
+        reason: match &denied {
+            Some(refusal) => refusal.reason.clone(),
+            None => format!("信号{view}：买入{contract}期权，权利金预算 {budget:.2}"),
+        },
+        denied,
+        option_plan: Some(plan(action, Some(kind), budget)),
+        ..base(target)
+    }
 }
 
 // MARK: - Volatility targeting
