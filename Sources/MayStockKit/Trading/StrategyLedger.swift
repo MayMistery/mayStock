@@ -63,11 +63,32 @@ public struct StrategyFill: Codable, Sendable, Equatable, Identifiable {
         self.positionEffect = positionEffect
     }
 
-    /// Convert an exchange fill, normalising the fee into quote currency.
-    /// OKX charges spot buy fees in the base currency and reports them negative.
-    public init(exchange fill: ExchangeFill, strategyId: String, mode: TradingMode) {
+    /// Convert an exchange fill, normalising price and fee into quote currency.
+    ///
+    /// OKX charges spot buy fees in the base currency and reports them
+    /// negative. An option is quoted in its settlement coin per unit of
+    /// underlying, and so is its fee, so both convert at the index the exchange
+    /// stamped on the fill — or at `indexPrice`, the caller's current reading,
+    /// when the fill carries none. Without either there is no honest number to
+    /// book, so the conversion fails rather than guess; the caller leaves the
+    /// fill unrecorded and tries again next tick.
+    public init?(
+        exchange fill: ExchangeFill, strategyId: String, mode: TradingMode,
+        indexPrice: Double? = nil
+    ) {
         let (base, _) = StrategyLedger.currencies(of: fill.instId)
         let feeMagnitude = abs(fill.fee)
+        if InstrumentType.of(instId: fill.instId) == .option {
+            guard let index = fill.indexPrice ?? indexPrice, index > 0 else { return nil }
+            let premiumQuote = fill.priceUsd.map { $0 > 0 ? $0 : fill.price * index }
+                ?? fill.price * index
+            let feeQuote = fill.feeCcy == base ? feeMagnitude * index : feeMagnitude
+            self.init(
+                id: fill.id, strategyId: strategyId, instId: fill.instId, side: fill.side,
+                price: premiumQuote, quantity: abs(fill.size), feeQuote: feeQuote,
+                ts: fill.ts, clOrdId: fill.clOrdId, mode: mode)
+            return
+        }
         let inQuote = fill.feeCcy == base ? feeMagnitude * fill.price : feeMagnitude
         self.init(
             id: fill.id, strategyId: strategyId, instId: fill.instId, side: fill.side,
@@ -160,6 +181,26 @@ public struct StrategyPositionState: Codable, Sendable, Equatable, Identifiable 
     public var isFlat: Bool { abs(quantity) < 1e-12 }
     public var direction: TradeDirection? {
         isFlat ? nil : (quantity > 0 ? .long : .short)
+    }
+
+    /// The call/put leg when this position is an option, else nil.
+    public var optionKind: OptionKind? { InstrumentType.optionKind(of: instId) }
+
+    /// The market view the position expresses, which is what the kernel's
+    /// `current` direction means. A long in spot or a perpetual is long; a
+    /// long *put* is a bearish view and reads as short, a short put as long.
+    public var signalDirection: TradeDirection? {
+        guard let direction else { return nil }
+        guard let optionKind else { return direction }
+        let bullish = (optionKind == .call) == (direction == .long)
+        return bullish ? .long : .short
+    }
+
+    /// Units of underlying, signed by `signalDirection` — the quantity the
+    /// kernel reasons about. Zero when flat.
+    public var kernelHeldBase: Double {
+        guard let signalDirection else { return 0 }
+        return abs(baseQuantity) * signalDirection.sign
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -383,6 +424,22 @@ public final class StrategyLedger {
         guard !fills.contains(where: { $0.id == fill.id }) else { return }
         var state = positions[fill.strategyId] ?? StrategyPositionState(
             strategyId: fill.strategyId, instId: fill.instId)
+        if state.instId != fill.instId {
+            // A strategy holds one instrument at a time. A *flat* book may move
+            // to a new one — an option strategy rolls from one expiry to the
+            // next — and the position follows it. A book that still holds the
+            // old instrument cannot absorb a fill on another without the
+            // arithmetic becoming nonsense, so the fill is left unrecorded and
+            // said so; it is retried on the next ingest, by which time the
+            // closing fill it was ordered after has normally arrived.
+            guard state.isFlat else {
+                Log.warn("ledger: \(fill.strategyId) 仍持有 \(state.instId)，"
+                         + "收到 \(fill.instId) 的成交 \(fill.id) 暂不入账，下轮重试")
+                return
+            }
+            state.instId = fill.instId
+            state.contractSize = nil
+        }
         state.contractSize = contractSizes[fill.instId] ?? state.contractSize
         var stamped = fill
         (stamped.positionEffect, stamped.realisedQuote) = state.apply(fill)
@@ -395,16 +452,32 @@ public final class StrategyLedger {
     /// Attribute exchange fills to strategies and fold in anything new.
     /// Fills without a MayStock tag belong to somebody else and are skipped —
     /// they surface later as unattributed exposure in reconciliation.
+    ///
+    /// `indexPrices`, keyed by underlying (`BTC-USD`), converts option fills
+    /// the exchange did not stamp with an index of their own. A fill that can
+    /// be converted by neither is left for the next ingest and logged, not
+    /// booked at a guess.
     @discardableResult
-    public func ingest(_ exchangeFills: [ExchangeFill], knownStrategyIds: [String]) -> Int {
+    public func ingest(
+        _ exchangeFills: [ExchangeFill], knownStrategyIds: [String],
+        indexPrices: [String: Double] = [:]
+    ) -> Int {
         let existing = Set(fills.map(\.id))
         var added = 0
         for fill in exchangeFills.sorted(by: { $0.ts < $1.ts }) {
             guard !existing.contains(fill.id),
                   let strategyId = OrderTag.resolveStrategy(fill.clOrdId, among: knownStrategyIds)
             else { continue }
-            record(StrategyFill(exchange: fill, strategyId: strategyId, mode: mode))
-            added += 1
+            let index = InstrumentType.optionUnderlying(of: fill.instId).flatMap { indexPrices[$0] }
+            guard let booked = StrategyFill(
+                exchange: fill, strategyId: strategyId, mode: mode, indexPrice: index) else {
+                Log.warn("ledger: 期权成交 \(fill.id)（\(fill.instId)）没有可用的指数价，"
+                         + "本轮未入账，下轮重试")
+                continue
+            }
+            let before = fills.count
+            record(booked)
+            if fills.count > before { added += 1 }
         }
         return added
     }
@@ -492,8 +565,12 @@ public final class StrategyLedger {
     // MARK: Reconciliation
 
     /// Compare the book against the exchange, per instrument.
+    ///
+    /// `derivativePositions` is every per-instrument position the exchange
+    /// reports — perpetuals and options alike; spot exposure is read from the
+    /// coin balance of each traded pair.
     public func reconcile(
-        spotBalances: [AccountBalance], swapPositions: [ExchangePosition]
+        spotBalances: [AccountBalance], derivativePositions: [ExchangePosition]
     ) -> [LedgerReconciliation] {
         var ledgerByInst: [String: Double] = [:]
         for state in positions.values where !state.isFlat {
@@ -501,7 +578,7 @@ public final class StrategyLedger {
         }
 
         var exchangeByInst: [String: Double] = [:]
-        for position in swapPositions {
+        for position in derivativePositions {
             exchangeByInst[position.instId, default: 0] += position.quantity
         }
         // Spot exposure is the base-currency balance of each traded pair.

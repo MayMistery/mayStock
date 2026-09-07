@@ -43,8 +43,8 @@ make lab ARGS="fees --tier lv1"
   "notes": "写给三个月后的自己：这套规则为什么成立。",
 
   "market": {
-    "instId": "BTC-USDT",         // 任意 OKX 标的
-    "instType": "SPOT",           // SPOT | SWAP（做空与杠杆仅 SWAP）
+    "instId": "BTC-USDT",         // 任意 OKX 标的；OPTION 时是信号所读的标的，见 §1.5
+    "instType": "SPOT",           // SPOT | SWAP | OPTION（杠杆仅 SWAP；做空 SWAP 卖出、OPTION 买看跌）
     "bar": "1H"                   // 1m 5m 15m 1H 4H 1D 1W
   },
 
@@ -63,10 +63,60 @@ make lab ARGS="fees --tier lv1"
   "risk":   { "stopLossPct": 4, "cooldownBars": 1 },
   "costs":  { "feeBps": 10, "slippageBps": 5 },  // 省略则按账户费率档位
 
+  "options": { "minDaysToExpiry": 14, "moneynessPct": 0 },  // 仅 OPTION，见 §1.5
   "data":   { "funding": { "source": "fundingRate" } },   // 见 §2.5
   "engine": { "kind": "declarative" }                     // 或 script，见 §2.6
 }
 ```
+
+### 1.5 期权：信号读标的，仓位是合约
+
+`instType = "OPTION"` 时，`market.instId` 是**信号所读的标的**（如 `BTC-USDT`），
+仓位则是它的期权合约：做多信号买入看涨，做空信号买入看跌。**只买不卖**——
+卖出期权亏损无上限且靠交易所保证金约束，引擎不建模，也就不许写。
+每笔的最大亏损就是权利金，所以 `equityPct` 和 `riskPerTrade` 在这里是一个意思：
+拿资金的多少比例去买权利金。
+
+```jsonc
+"market":  { "instId": "BTC-USDT", "instType": "OPTION", "bar": "4H" },
+"signals": { "longEntry": "…", "longExit": "…", "shortEntry": "…", "shortExit": "…" },
+"sizing":  { "mode": "equityPct", "value": 10 },          // 每次动用 10% 预算买权利金
+"risk":    { "stopLossPct": 50, "takeProfitPct": 150, "volLookbackBars": 60 },
+"options": {
+  "uly": "BTC-USD",              // 结算指数；省略则由标的推导（BTC-USDT → BTC-USD）
+  "minDaysToExpiry": 14,         // 买最近一个到期 ≥ 14 天的合约（默认 7）
+  "moneynessPct": 0,             // 行权价偏离现价的百分比，正为价外；0 = 平值
+  "impliedVolMultiplier": 1.2,   // 回测定价用：隐含波动 = 实现波动 × 1.2（默认）
+  "strikeStep": 1000,            // 回测模型的行权价网格；省略 = 现价的 1%
+  "contractMultiplier": 0.01,    // 回测模型每张合约的标的数量；实盘读交易所元数据
+  "feeCapPctOfPremium": 12.5     // OKX 手续费上限：权利金的 12.5%
+}
+```
+
+| 条款 | 期权策略里的含义 |
+|------|------|
+| `stopLossPct` / `takeProfitPct` | **相对权利金**（不是标的价）：权利金亏 50% 止损、赚 150% 止盈 |
+| `atrStop` / `trailingStopPct` / `exposure` / `volatilityTarget` / `leverage > 1` | 不支持，导入即拒绝并说明原因 |
+| `volLookbackBars` | 回测定价用的实现波动率窗口；同时决定预热长度 |
+| `cooldownBars` / `minHoldBars` / `maxHoldBars` / `maxDailyLossPct` | 与其它品种相同 |
+| 到期 | 持到期即按内在价值结算；只要信号仍在，下一根重新买入下一个到期 |
+
+**回测是模型定价，不是历史成交价。** OKX 不提供已到期合约的行情，所以回测用
+Black–Scholes（无风险利率取 0）按标的收盘价与实现波动率 × `impliedVolMultiplier`
+给每根 K 线定价：入场按下根开盘价定价并加滑点，止损止盈按**收盘**判定，
+到期在含到期时刻的那根**开盘**按内在价值结算、不收手续费。手续费按 OKX 规则：
+名义额 × 费率，封顶权利金的 `feeCapPctOfPremium`%。它能诚实回答的只有一个问题：
+**方向信号赚不赚得回权利金**；某一天的权利金到底多少，是模型的猜测。
+报告和工作台都会标注这一点。
+
+**实盘用交易所真实盘口。** 运行器读期权链，用与回测**同一个**筛选函数
+（内核 `select_contract`）挑合约，再读买一/卖一/标记价/指数价，
+把权利金预算按 `卖一 × 指数 × 每张标的量` 换算成整张数，以 **IOC 限价单**
+（卖一上浮 2%）成交；平仓是 reduceOnly 的 IOC 卖单（买一下浮 2%）。
+没有卖盘、或卖一高出标记价 25% 以上（空盘口里的占位挂单），不开仓并说明。
+止损止盈按权利金标记价在本程序 tick 上执行——App 关闭期间不设防，
+但多头期权的亏损本来就以权利金为限。到期后交易所结算掉仓位，
+运行器在对账时按标记价补记为「到期结算」。
 
 ### params 的三种写法
 
@@ -119,7 +169,7 @@ make lab ARGS="fees --tier lv1"
 | `stopLossPct` / `takeProfitPct` | 相对入场价的百分比 |
 | `trailingStopPct` | 移动止损；水位按每根收盘更新，只约束**之后**的 K 线 |
 | `atrStop` | `{ "period": 14, "mult": 2.5 }`；与 `stopLossPct` 并存时**取更紧的那个** |
-| `leverage` | 仅 SWAP，1~50；现货必须为 1 |
+| `leverage` | 仅 SWAP，1~50；现货和期权必须为 1 |
 | `cooldownBars` | 平仓后需等待的根数才允许再入场（反手不受限） |
 | `minHoldBars` | 持仓至少这么多根才响应离场**信号**；止损不受限 |
 | `maxDailyLossPct` | UTC 日内亏损达标即平仓并停到次日 |

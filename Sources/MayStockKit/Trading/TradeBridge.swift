@@ -11,6 +11,13 @@ public enum OrderSide: String, Sendable, Equatable, Codable {
 
 public enum OrderKind: String, Sendable, Equatable, Codable {
     case market, limit
+    /// A limit that fills what it can at once and cancels the rest. What an
+    /// option order is: OKX quotes options in a coin, the book is thin, and a
+    /// market order there would be a blank cheque on the ask.
+    case ioc
+
+    /// True when the order carries a price.
+    public var isPriced: Bool { self != .market }
 }
 
 /// Which leg of a hedged perpetual position an order touches.
@@ -41,6 +48,10 @@ public struct OrderRequest: Sendable, Equatable {
     public var takeProfitTriggerPrice: Double?
     /// Strategy attribution tag; see `OrderTag`.
     public var clOrdId: String?
+    /// OKX `tdMode`, which an option order must state: the account's margin
+    /// level decides it (`AccountTradingConfig.optionTradeMode`). Nil lets
+    /// the CLI default, which is right for spot and perpetuals.
+    public var tradeMode: String?
 
     public init(
         instId: String,
@@ -54,10 +65,12 @@ public struct OrderRequest: Sendable, Equatable {
         reduceOnly: Bool = false,
         stopTriggerPrice: Double? = nil,
         takeProfitTriggerPrice: Double? = nil,
-        clOrdId: String? = nil
+        clOrdId: String? = nil,
+        tradeMode: String? = nil
     ) {
         self.stopTriggerPrice = stopTriggerPrice
         self.takeProfitTriggerPrice = takeProfitTriggerPrice
+        self.tradeMode = tradeMode
         self.instId = instId
         self.instType = instType
         self.side = side
@@ -219,6 +232,8 @@ public struct ExchangeFill: Sendable, Equatable, Identifiable {
     public let instId: String
     public let side: OrderSide
     public let posSide: PositionSide?
+    /// In the instrument's own quoting unit: quote currency for spot and
+    /// perpetuals, the settlement coin per unit of underlying for an option.
     public let price: Double
     public let size: Double
     /// Fee in `feeCcy`. OKX reports charges as negative numbers.
@@ -227,11 +242,18 @@ public struct ExchangeFill: Sendable, Equatable, Identifiable {
     public let ordId: String?
     public let clOrdId: String?
     public let ts: Date
+    /// Option fills only: the premium in USD per unit of underlying, as the
+    /// exchange stamped it at execution (`fillPxUsd`).
+    public let priceUsd: Double?
+    /// Option fills only: the underlying index at execution (`fillIdxPx`),
+    /// which converts a coin-denominated premium or fee into quote currency.
+    public let indexPrice: Double?
 
     public init(
         id: String, instId: String, side: OrderSide, posSide: PositionSide?,
         price: Double, size: Double, fee: Double, feeCcy: String?,
-        ordId: String?, clOrdId: String?, ts: Date
+        ordId: String?, clOrdId: String?, ts: Date,
+        priceUsd: Double? = nil, indexPrice: Double? = nil
     ) {
         self.id = id
         self.instId = instId
@@ -244,6 +266,8 @@ public struct ExchangeFill: Sendable, Equatable, Identifiable {
         self.ordId = ordId
         self.clOrdId = clOrdId
         self.ts = ts
+        self.priceUsd = priceUsd
+        self.indexPrice = indexPrice
     }
 }
 
@@ -376,24 +400,27 @@ public struct TradeBridge: Sendable {
     ) async throws -> OrderResult {
         if mode == .live && !liveUnlocked { throw TradeError.liveTradingLocked }
 
-        let module = order.instType == .swap ? "swap" : "spot"
-        var args = [module, "place",
+        var args = [order.instType.cliModule, "place",
                     "--instId", order.instId,
                     "--side", order.side.rawValue,
                     "--ordType", order.kind.rawValue,
                     "--sz", PriceFormatter.plain(order.size)]
-        if order.kind == .limit, let price = order.limitPrice {
+        if order.kind.isPriced, let price = order.limitPrice {
             args += ["--px", PriceFormatter.plain(price)]
+        }
+        if let tradeMode = order.tradeMode {
+            args += ["--tdMode", tradeMode]
         }
         if order.instType == .spot, order.kind == .market {
             // Market orders: spend quote ccy when buying by quote size.
             args += ["--tgtCcy", order.sizeUnit == .quote ? "quote_ccy" : "base_ccy"]
         }
-        if let posSide = order.posSide, order.instType == .swap {
+        if let posSide = order.posSide, order.instType.usesPositionSide {
             args += ["--posSide", posSide.rawValue]
         }
-        if order.reduceOnly, order.instType == .swap {
-            args += ["--reduceOnly", "true"]
+        if order.reduceOnly, order.instType.isDerivative {
+            // A bare flag, as the CLI documents it for every module.
+            args += ["--reduceOnly"]
         }
         // `-1` is OKX's "fill at market once triggered". A limit exit could sit
         // unfilled through the move it was meant to escape.
@@ -419,8 +446,29 @@ public struct TradeBridge: Sendable {
         mode: TradingMode, liveUnlocked: Bool = false
     ) async throws {
         if mode == .live && !liveUnlocked { throw TradeError.liveTradingLocked }
-        let module = instType == .swap ? "swap" : "spot"
-        _ = try await runCLI([module, "cancel", instId, "--ordId", ordId], mode: mode)
+        _ = try await runCLI([instType.cliModule, "cancel", instId, "--ordId", ordId], mode: mode)
+    }
+
+    /// How the account is configured for derivatives.
+    public func accountTradingConfig(mode: TradingMode) async throws -> AccountTradingConfig {
+        let output = try await runCLI(["account", "config"], mode: mode)
+        guard let config = Self.parseAccountTradingConfig(json: output) else {
+            throw TradeError.badOutput(output)
+        }
+        return config
+    }
+
+    static func parseAccountTradingConfig(json: String) -> AccountTradingConfig? {
+        var result: AccountTradingConfig?
+        walkObjects(in: json) { dict in
+            guard result == nil,
+                  dict["posMode"] != nil || dict["acctLv"] != nil else { return }
+            result = AccountTradingConfig(
+                positionMode: (dict["posMode"] as? String)
+                    .flatMap(AccountTradingConfig.PositionMode.init(rawValue:)),
+                accountLevel: number(dict, "acctLv").map { Int($0) })
+        }
+        return result
     }
 
     // MARK: Account
@@ -456,13 +504,22 @@ public struct TradeBridge: Sendable {
     /// A timeout is not a rejection: the request may have reached the exchange
     /// and filled. Absent from the listing is the *only* answer that makes a
     /// retry safe, so that is the only case reported as `.unknown`.
+    ///
+    /// Two listings, because the CLI keeps them apart: `orders` is the working
+    /// book and `orders --history` the last week of finished ones. An order
+    /// that filled is in the second and not the first, so asking only the
+    /// first — which is what this used to do, with a `--state all` flag the
+    /// CLI silently ignored — answered "never seen" for every filled order.
     public func orderStatus(
         instId: String, instType: InstrumentType, clOrdId: String, mode: TradingMode
     ) async throws -> VenueOrderStatus {
-        let module = instType == .swap ? "swap" : "spot"
-        let output = try await runCLI(
-            [module, "orders", "--instId", instId, "--state", "all"], mode: mode)
-        return Self.parseOrderStatus(json: output, clOrdId: clOrdId)
+        let module = instType.cliModule
+        let working = try await runCLI([module, "orders", "--instId", instId], mode: mode)
+        let status = Self.parseOrderStatus(json: working, clOrdId: clOrdId)
+        if status != .unknown { return status }
+        let finished = try await runCLI(
+            [module, "orders", "--instId", instId, "--history"], mode: mode)
+        return Self.parseOrderStatus(json: finished, clOrdId: clOrdId)
     }
 
     static func parseOrderStatus(json: String, clOrdId: String) -> VenueOrderStatus {
@@ -493,8 +550,7 @@ public struct TradeBridge: Sendable {
     public func fills(
         instId: String? = nil, instType: InstrumentType = .spot, mode: TradingMode
     ) async throws -> [ExchangeFill] {
-        let module = instType == .swap ? "swap" : "spot"
-        var args = [module, "fills"]
+        var args = [instType.cliModule, "fills"]
         if let instId { args += ["--instId", instId] }
         let output = try await runCLI(args, mode: mode)
         return Self.parseFills(json: output)
@@ -553,19 +609,25 @@ public struct TradeBridge: Sendable {
     /// would make the comparison silently partial, which is the failure mode
     /// this whole check exists to remove.
     public func bookTotals(
-        mode: TradingMode, limit: Int = 100
+        mode: TradingMode, instTypes: [InstrumentType] = [.swap], limit: Int = 100
     ) async throws -> [String: ExchangeBookTotals] {
-        let base = ["account", "bills", "--instType", "SWAP", "--limit", String(limit)]
-        let recent = try await runCLI(base, mode: mode)
-        // The archive endpoint is genuinely slow — measured at 18.7s against
-        // the 15s default, which meant it timed out on every run and `try?`
-        // turned that into a short window. The review then reported "the bill
-        // window does not reach far enough back", which was true and had
-        // nothing to do with the actual failure. A degraded call has to fail as
-        // itself, not as whatever its empty result happens to look like.
-        let archived = try await runCLI(
-            base + ["--archive"], mode: mode, timeout: Self.archiveCommandTimeout)
-        return Self.parseBookTotals(json: [recent, archived])
+        var blobs: [String] = []
+        // Bills are filed per instrument family; a book holding both
+        // perpetuals and options needs both listings.
+        for instType in instTypes where instType.isDerivative {
+            let base = ["account", "bills", "--instType", instType.rawValue,
+                        "--limit", String(limit)]
+            blobs.append(try await runCLI(base, mode: mode))
+            // The archive endpoint is genuinely slow — measured at 18.7s against
+            // the 15s default, which meant it timed out on every run and `try?`
+            // turned that into a short window. The review then reported "the bill
+            // window does not reach far enough back", which was true and had
+            // nothing to do with the actual failure. A degraded call has to fail as
+            // itself, not as whatever its empty result happens to look like.
+            blobs.append(try await runCLI(
+                base + ["--archive"], mode: mode, timeout: Self.archiveCommandTimeout))
+        }
+        return Self.parseBookTotals(json: blobs)
     }
 
     static func parseBookTotals(json blobs: [String]) -> [String: ExchangeBookTotals] {
@@ -622,9 +684,8 @@ public struct TradeBridge: Sendable {
     public func protectiveOrders(
         instId: String, instType: InstrumentType, mode: TradingMode
     ) async throws -> [VenueProtectiveOrder] {
-        let module = instType == .swap ? "swap" : "spot"
         let output = try await runCLI(
-            [module, "algo", "orders", "--instId", instId], mode: mode)
+            [instType.cliModule, "algo", "orders", "--instId", instId], mode: mode)
         return Self.parseProtectiveOrders(json: output, instId: instId)
     }
 
@@ -652,9 +713,8 @@ public struct TradeBridge: Sendable {
         stopPrice: Double, mode: TradingMode, liveUnlocked: Bool = false
     ) async throws {
         if mode == .live && !liveUnlocked { throw TradeError.liveTradingLocked }
-        let module = instType == .swap ? "swap" : "spot"
         _ = try await runCLI(
-            [module, "algo", "amend", "--instId", instId, "--algoId", algoId,
+            [instType.cliModule, "algo", "amend", "--instId", instId, "--algoId", algoId,
              "--newSlTriggerPx", PriceFormatter.plain(stopPrice), "--newSlOrdPx", "-1"],
             mode: mode)
     }
@@ -665,15 +725,14 @@ public struct TradeBridge: Sendable {
         size: Double, stopPrice: Double, mode: TradingMode, liveUnlocked: Bool = false
     ) async throws {
         if mode == .live && !liveUnlocked { throw TradeError.liveTradingLocked }
-        let module = instType == .swap ? "swap" : "spot"
         // The order that closes a long is a sell, and vice versa.
         let side: OrderSide = posSide == .short ? .buy : .sell
-        var args = [module, "algo", "place", "--instId", instId,
+        var args = [instType.cliModule, "algo", "place", "--instId", instId,
                     "--side", side.rawValue, "--sz", PriceFormatter.plain(size),
                     "--ordType", "conditional",
                     "--slTriggerPx", PriceFormatter.plain(stopPrice),
                     "--slOrdPx", "-1", "--reduceOnly"]
-        if let posSide, instType == .swap { args += ["--posSide", posSide.rawValue] }
+        if let posSide, instType.usesPositionSide { args += ["--posSide", posSide.rawValue] }
         _ = try await runCLI(args, mode: mode)
     }
 
@@ -841,7 +900,11 @@ public struct TradeBridge: Sendable {
                 feeCcy: dict["feeCcy"] as? String,
                 ordId: ordId,
                 clOrdId: clOrdId,
-                ts: Date(timeIntervalSince1970: ms / 1000)))
+                ts: Date(timeIntervalSince1970: ms / 1000),
+                // Stamped on option fills only; empty strings elsewhere, which
+                // `number` already reads as absent.
+                priceUsd: number(dict, "fillPxUsd"),
+                indexPrice: number(dict, "fillIdxPx")))
         }
         return out.sorted { $0.ts < $1.ts }
     }

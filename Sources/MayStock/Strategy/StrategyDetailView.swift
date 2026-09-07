@@ -242,12 +242,23 @@ struct StrategyDetailView: View {
                     .font(.system(size: 11, weight: .semibold))
                 if let position, !position.isFlat {
                     let mark = appState.mark(for: position.instId)
+                    if position.optionKind != nil {
+                        // The contract is not the market the strategy watches,
+                        // so it has to be named; the premium is booked in quote
+                        // currency per unit of underlying, which is what the
+                        // 均价 / 现价 columns below show.
+                        Text(position.instId)
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
                     HStack(spacing: 0) {
-                        positionStat("方向", position.direction?.displayName ?? "—",
-                                     tint: ChartStyle.trend(position.quantity > 0))
+                        positionStat("方向", position.signalDirection?.displayName ?? "—",
+                                     tint: ChartStyle.trend(position.signalDirection == .long))
                         positionStat("数量", PriceFormatter.plain(abs(position.quantity)))
-                        positionStat("均价", PriceFormatter.auto(position.averagePrice))
-                        positionStat("现价", mark.map(PriceFormatter.auto) ?? "—")
+                        positionStat(position.optionKind == nil ? "均价" : "权利金均价",
+                                     PriceFormatter.auto(position.averagePrice))
+                        positionStat(position.optionKind == nil ? "现价" : "权利金标记",
+                                     mark.map(PriceFormatter.auto) ?? "—")
                         positionStat("浮动盈亏",
                                      PriceFormatter.signedMoney(position.unrealisedPnL(mark: mark)),
                                      tint: ChartStyle.trend(position.unrealisedPnL(mark: mark) >= 0))
@@ -321,10 +332,13 @@ struct StrategyDetailView: View {
 
     @ViewBuilder
     private var reconciliationPanel: some View {
+        // The instrument the book actually holds — for an option strategy
+        // that is the contract, not the market its signals read.
+        let held = appState.ledger.position(for: strategy.id)?.instId ?? strategy.market.instId
         let rows = appState.ledger
             .reconcile(spotBalances: appState.accountBalances,
-                       swapPositions: appState.exchangePositions)
-            .filter { $0.instId == strategy.market.instId && $0.isMaterial }
+                       derivativePositions: appState.exchangePositions)
+            .filter { $0.instId == held && $0.isMaterial }
         if let row = rows.first {
             VStack(alignment: .leading, spacing: 3) {
                 Label("交易所持仓与台账不一致", systemImage: "arrow.triangle.branch")
@@ -391,8 +405,29 @@ struct StrategyDetailView: View {
                 }
             }
 
-            infoBox("回测按「本根收盘出信号、下根开盘成交」撮合，进出各收一次手续费并叠加滑点；"
-                    + "同一根 K 线同时触及止损与止盈时按止损先成交计算。", tint: .secondary)
+            if strategy.isOptionStrategy {
+                let spec = strategy.optionsSpec
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("期权合约").font(.system(size: 11, weight: .semibold))
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 130), spacing: 8)],
+                              alignment: .leading, spacing: 6) {
+                        definitionCell("标的指数", spec.resolvedUnderlying(for: strategy.market))
+                        definitionCell("最短到期", "≥ \(PriceFormatter.plain(spec.minDaysToExpiry)) 天")
+                        definitionCell("行权价偏移",
+                                       "\(PriceFormatter.plain(spec.moneynessPct))%（正为价外）")
+                        definitionCell("隐含波动 / 实现波动",
+                                       "×\(PriceFormatter.plain(spec.impliedVolMultiplier))")
+                        definitionCell("手续费上限", "权利金的 \(PriceFormatter.plain(spec.feeCapPctOfPremium))%")
+                    }
+                }
+                infoBox("做多信号买入看涨、做空信号买入看跌，只买不卖，最大亏损即权利金。"
+                        + "回测按 Black–Scholes 用标的实现波动率 × 上面的倍数定价 —— 是模型定价，"
+                        + "不是历史成交价；止损止盈按权利金百分比、在收盘判定；到期按内在价值结算。"
+                        + "实盘用交易所真实盘口，以 IOC 限价单成交。", tint: .orange)
+            } else {
+                infoBox("回测按「本根收盘出信号、下根开盘成交」撮合，进出各收一次手续费并叠加滑点；"
+                        + "同一根 K 线同时触及止损与止盈时按止损先成交计算。", tint: .secondary)
+            }
         }
         .padding(.top, 2)
     }

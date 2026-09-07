@@ -403,3 +403,171 @@ struct OrderStatusTests {
         #expect(TradeBridge.parseOrderStatus(json: "", clOrdId: "x") == .unknown)
     }
 }
+
+@Suite("Option orders through the bridge")
+struct TradeBridgeOptionTests {
+    private func makeStubCLI(stdout: String) throws -> (bridge: TradeBridge, argsFile: URL, dir: URL) {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("maystock-option-stub-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let cli = dir.appendingPathComponent("okx")
+        let argsFile = dir.appendingPathComponent("args.txt")
+        let script = """
+        #!/bin/sh
+        printf '%s\\n' "$@" > "\(argsFile.path)"
+        cat <<'JSON'
+        \(stdout)
+        JSON
+        """
+        try script.write(to: cli, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cli.path)
+        return (TradeBridge(explicitCLIPath: cli.path), argsFile, dir)
+    }
+
+    private func recordedArgs(_ url: URL) -> [String] {
+        (try? String(contentsOf: url, encoding: .utf8))?
+            .split(separator: "\n").map(String.init) ?? []
+    }
+
+    @Test("期权单走 option 模块，带 tdMode、IOC 限价、reduceOnly 裸标志，不带 posSide/tgtCcy")
+    func anOptionOrderIsShapedForItsModule() async throws {
+        let stub = try makeStubCLI(stdout: #"{"code":"0","data":[{"ordId":"9","sCode":"0"}]}"#)
+        defer { try? FileManager.default.removeItem(at: stub.dir) }
+
+        let order = OrderRequest(
+            instId: "BTC-USD-260926-80000-C", instType: .option, side: .sell, kind: .ioc,
+            size: 3, sizeUnit: .base, limitPrice: 0.0214, reduceOnly: true,
+            clOrdId: "ms0123abcd0000000001", tradeMode: "cross")
+        _ = try await stub.bridge.place(order, mode: .demo)
+
+        let args = recordedArgs(stub.argsFile)
+        #expect(args.prefix(2) == ["option", "place"])
+        #expect(args.contains("--tdMode") && args.contains("cross"))
+        #expect(args.contains("--ordType") && args.contains("ioc"))
+        #expect(args.contains("--px") && args.contains("0.0214"))
+        #expect(args.contains("--sz") && args.contains("3"))
+        let reduce = try #require(args.firstIndex(of: "--reduceOnly"))
+        #expect(args.indices.contains(reduce + 1) ? args[reduce + 1] != "true" : true,
+                "the CLI documents a bare flag")
+        #expect(!args.contains("--posSide"), "options have no legs")
+        #expect(!args.contains("--tgtCcy"), "tgtCcy is spot-only")
+        #expect(args.contains("--demo"))
+    }
+
+    @Test("永续 reduceOnly 也是裸标志")
+    func aSwapReduceOnlyIsABareFlag() async throws {
+        let stub = try makeStubCLI(stdout: #"{"code":"0","data":[{"ordId":"9","sCode":"0"}]}"#)
+        defer { try? FileManager.default.removeItem(at: stub.dir) }
+        let order = OrderRequest(
+            instId: "BTC-USDT-SWAP", instType: .swap, side: .sell, kind: .market,
+            size: 2, sizeUnit: .base, posSide: .long, reduceOnly: true)
+        _ = try await stub.bridge.place(order, mode: .demo)
+        let args = recordedArgs(stub.argsFile)
+        #expect(args.contains("--reduceOnly"))
+        #expect(!args.contains("true"))
+        #expect(args.contains("--posSide") && args.contains("long"))
+    }
+
+    @Test("期权成交带上美元价和指数价")
+    func optionFillStampsAreRead() {
+        let json = """
+        {"data":[{"instId":"BTC-USD-260926-80000-C","tradeId":"t9","ordId":"o9",
+                  "clOrdId":"ms0123abcd0000000001","side":"buy","fillPx":"0.02","fillSz":"5",
+                  "fee":"-0.0001","feeCcy":"BTC","ts":"1700000000000",
+                  "fillPxUsd":"1600.5","fillIdxPx":"80025","fillPxVol":"0.55"}]}
+        """
+        let fills = TradeBridge.parseFills(json: json)
+        #expect(fills.count == 1)
+        #expect(fills.first?.priceUsd == 1_600.5)
+        #expect(fills.first?.indexPrice == 80_025)
+        // A spot fill carries neither, and empty strings must not become zero.
+        let spot = TradeBridge.parseFills(json: """
+        {"data":[{"instId":"BTC-USDT","tradeId":"t1","side":"buy","fillPx":"100","fillSz":"1",
+                  "ts":"1700000000000","fillPxUsd":"","fillIdxPx":""}]}
+        """)
+        #expect(spot.first?.priceUsd == nil)
+        #expect(spot.first?.indexPrice == nil)
+    }
+
+    @Test("账户配置读出持仓模式和账户等级")
+    func accountConfigIsRead() {
+        let json = """
+        [{"acctLv":"3","posMode":"long_short_mode","uid":"1"}]
+        """
+        let config = TradeBridge.parseAccountTradingConfig(json: json)
+        #expect(config?.positionMode == .longShort)
+        #expect(config?.accountLevel == 3)
+        #expect(config?.optionTradeMode == "cross")
+        let net = TradeBridge.parseAccountTradingConfig(json: #"[{"acctLv":"1","posMode":"net_mode"}]"#)
+        #expect(net?.positionMode == .net)
+        #expect(net?.optionTradeMode == "cash")
+        #expect(TradeBridge.parseAccountTradingConfig(json: "[]") == nil)
+    }
+
+    @Test("合约面值是 ctVal × ctMult，期权的 0.01 在 ctMult 里")
+    func contractValueMultipliesBothFields() {
+        #expect(InstrumentMeta.contractValue(ctVal: 1, ctMult: 0.01) == 0.01)
+        #expect(InstrumentMeta.contractValue(ctVal: 0.01, ctMult: 1) == 0.01)
+        #expect(InstrumentMeta.contractValue(ctVal: 0.1, ctMult: nil) == 0.1)
+        #expect(InstrumentMeta.contractValue(ctVal: nil, ctMult: 0.01) == nil)
+        #expect(InstrumentMeta.contractValue(ctVal: 0, ctMult: 1) == nil)
+    }
+
+    @Test("期权费率也能同步")
+    func optionFeesSync() {
+        var schedule = OKXFeeSchedule()
+        #expect(schedule.feeBps(for: .option) == 3)
+        schedule.apply(AccountFeeRates(instType: .option, makerBps: 2, takerBps: 2.5))
+        #expect(schedule.feeBps(for: .option) == 2.5)
+        #expect(schedule.feeBps(for: .option, style: .maker) == 2)
+        #expect(schedule.summary.contains("期权"))
+        schedule.clearSync()
+        #expect(schedule.feeBps(for: .option) == 3)
+        // Every family has a fee, taker and maker, on every tier.
+        for tier in OKXFeeTier.allCases {
+            for family in InstrumentType.allCases {
+                for style in FeeExecutionStyle.allCases {
+                    let bps = OKXFeeSchedule(tier: tier).feeBps(for: family, style: style)
+                    #expect(bps.isFinite, "\(tier) \(family) \(style)")
+                }
+            }
+        }
+    }
+}
+
+@Suite("Order status asks both listings")
+struct OrderStatusListingTests {
+    /// A stub whose answer depends on whether `--history` was asked for: the
+    /// working book is empty, the finished book holds the order.
+    private func makeStub() throws -> (bridge: TradeBridge, dir: URL) {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("maystock-status-stub-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let cli = dir.appendingPathComponent("okx")
+        let script = """
+        #!/bin/sh
+        case "$*" in
+          *--history*) echo '{"data":[{"clOrdId":"msmine","state":"filled","accFillSz":"2","avgPx":"100"}]}' ;;
+          *) echo '[]' ;;
+        esac
+        """
+        try script.write(to: cli, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cli.path)
+        return (TradeBridge(explicitCLIPath: cli.path), dir)
+    }
+
+    @Test("成交了的订单在历史单里，不在挂单里；只问挂单会把它当成从未送达")
+    func aFilledOrderIsFoundInTheHistoryListing() async throws {
+        let stub = try makeStub()
+        defer { try? FileManager.default.removeItem(at: stub.dir) }
+        let status = try await stub.bridge.orderStatus(
+            instId: "BTC-USDT", instType: .spot, clOrdId: "msmine", mode: .demo)
+        #expect(status.didExecute)
+        guard case .filled(let size, _) = status else { Issue.record("expected a fill"); return }
+        #expect(size == 2)
+        // An order in neither listing is the one case that is safe to retry.
+        let absent = try await stub.bridge.orderStatus(
+            instId: "BTC-USDT", instType: .spot, clOrdId: "msother", mode: .demo)
+        #expect(absent == .unknown)
+    }
+}

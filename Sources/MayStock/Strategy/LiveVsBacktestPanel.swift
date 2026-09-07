@@ -140,6 +140,11 @@ struct LiveVsBacktestPanel: View {
     }
 
     private var slippage: KernelSlippageReport? {
+        // An option strategy's fills are premiums on a contract, and the
+        // candles the runner holds are the underlying's; scoring one against
+        // the other would report a slippage of several thousand percent and
+        // mean nothing by it.
+        guard !strategy.isOptionStrategy else { return nil }
         let fills = appState.ledger.fills(for: strategy.id, limit: 500)
         guard !fills.isEmpty else { return nil }
         // The candles the runner already holds for this strategy — the same
@@ -147,8 +152,10 @@ struct LiveVsBacktestPanel: View {
         let candles = appState.runner.cachedCandles(
             instId: strategy.market.instId, bar: strategy.market.bar)
         guard candles.count > 1 else { return nil }
+        // The assumption the backtest actually ran under, not a second
+        // default typed in here.
         return try? TradingKernel.calibrateSlippage(
             fills: fills, candles: candles,
-            assumedBps: strategy.manifest.costs?.slippageBps ?? 5)
+            assumedBps: strategy.manifest.effectiveCosts.slippageBps)
     }
 }

@@ -24,10 +24,12 @@ struct PositionStripView: View {
             .map { ($0, appState.strategy(id: $0.strategyId)?.name ?? $0.strategyId) }
     }
 
-    /// "BTC-USDT-SWAP" and "BTC-USDT" are both BTC against USDT.
+    /// "BTC-USDT-SWAP", "BTC-USDT" and "BTC-USD-260926-80000-C" are all BTC
+    /// exposure. Grouped by base currency: an option settles against the USD
+    /// index while the watchlist tracks the USDT pair, and splitting the two
+    /// would hide a BTC option on the BTC panel.
     private static func underlying(_ instId: String) -> String {
-        let (base, quote) = StrategyLedger.currencies(of: instId)
-        return "\(base)-\(quote)"
+        StrategyLedger.currencies(of: instId).base
     }
 
     /// Positions the portfolio holds on some *other* underlying, so nothing is
@@ -160,7 +162,7 @@ struct PositionStripView: View {
         let capital = appState.store.config.strategy.allocation(for: state.strategyId)?.capital ?? 0
         let markHere = mark(for: state)
         let pct = state.returnPct(mark: markHere, capital: capital)
-        let isSwap = InstrumentType.of(instId: state.instId) == .swap
+        let family = InstrumentType.of(instId: state.instId)
         return HStack(spacing: 6) {
             Circle()
                 .fill(ChartStyle.trend(state.quantity > 0))
@@ -170,7 +172,7 @@ struct PositionStripView: View {
                 .lineLimit(1)
             // The panel is scoped to an underlying, so the leg has to say
             // which market it is actually on.
-            Text(isSwap ? "永续" : "现货")
+            Text(family.displayName)
                 .font(.system(size: 7, weight: .medium))
                 .padding(.horizontal, 3).padding(.vertical, 1)
                 .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 3))

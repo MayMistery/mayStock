@@ -18,6 +18,22 @@ BUILD_DIR=".build/release"
 INFO_PLIST="Sources/MayStock/SupportingFiles/Info.plist"
 ICON_DIR="Sources/MayStock/Resources/Assets.xcassets/AppIcon.appiconset"
 DEVELOPER_DIR_PATH="$(xcode-select -p 2>/dev/null || true)"
+# The Command Line Tools ship swift-testing's framework but, under the build
+# system Swift 6.4 selects by default, not a resolvable macro plugin for it:
+# every `@Test` fails with "plugin for module 'TestingMacros' not found". A
+# full Xcode has the plugin where the build system looks. So when the selected
+# developer dir is the CLT and an Xcode is installed, tests build against the
+# Xcode toolchain — announced, so a surprising toolchain is never a silent one.
+if [[ "$DEVELOPER_DIR_PATH" == *CommandLineTools* && -z "${DEVELOPER_DIR:-}" ]]; then
+  for candidate in /Applications/Xcode.app /Applications/Xcode-beta.app; do
+    if [[ -d "$candidate/Contents/Developer" ]]; then
+      export DEVELOPER_DIR="$candidate/Contents/Developer"
+      DEVELOPER_DIR_PATH="$DEVELOPER_DIR"
+      echo "==> using $candidate for the Swift toolchain (CLT lacks the swift-testing macro plugin)"
+      break
+    fi
+  done
+fi
 TESTING_FRAMEWORKS="$DEVELOPER_DIR_PATH/Library/Developer/Frameworks"
 TESTING_LIBS="$DEVELOPER_DIR_PATH/Library/Developer/usr/lib"
 

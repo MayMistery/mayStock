@@ -28,6 +28,34 @@ public protocol ExchangeVenue: Sendable {
     /// Nil when the exchange does not publish metadata for the instrument.
     func instrumentMeta(instId: String) async throws -> InstrumentMeta?
 
+    /// The price the ledger marks `instId` at, in the quote currency it books
+    /// in. For spot and perpetuals that is the last trade. For an option it is
+    /// the exchange's mark — quoted in the settlement coin per unit of
+    /// underlying — converted at the index, so a held premium is worth what
+    /// the account would actually get for it. Defaults to `lastPrice`, which
+    /// is right for every family a venue without options trades.
+    func valuationPrice(instId: String) async throws -> Double
+
+    // MARK: Options
+
+    /// Every live contract on an underlying index. Defaults to refusing: a
+    /// venue that lists no options must say so rather than answer with an
+    /// empty chain the runner would read as "nothing qualifies today".
+    func optionChain(underlying: String) async throws -> [OptionContract]
+    /// Bid, ask, mark and index for one contract, read together so the four
+    /// numbers describe the same instant.
+    func optionQuote(instId: String) async throws -> OptionQuote
+    /// The index price of an underlying, e.g. `BTC-USD`.
+    func indexPrice(underlying: String) async throws -> Double
+
+    // MARK: Account
+
+    /// How the account is set up for derivatives: whether a perpetual order
+    /// must name its leg, and which margin mode an option order needs. Read
+    /// rather than assumed — an account switched to net mode rejects every
+    /// order that names a leg, with an error that says nothing about why.
+    func accountTradingConfig(mode: TradingMode) async throws -> AccountTradingConfig
+
     /// The alternative series a manifest declares — funding rates, open
     /// interest, long/short ratios — aligned to `candles`.
     ///
@@ -138,6 +166,71 @@ extension ExchangeVenue {
     public func fundingPayments(
         instId: String?, mode: TradingMode
     ) async throws -> [FundingPayment] { [] }
+
+    public func valuationPrice(instId: String) async throws -> Double {
+        try await lastPrice(instId: instId)
+    }
+
+    public func optionChain(underlying: String) async throws -> [OptionContract] {
+        throw ExchangeVenueError.unsupported(venueName, "期权链")
+    }
+
+    public func optionQuote(instId: String) async throws -> OptionQuote {
+        throw ExchangeVenueError.unsupported(venueName, "期权报价")
+    }
+
+    public func indexPrice(underlying: String) async throws -> Double {
+        throw ExchangeVenueError.unsupported(venueName, "指数价")
+    }
+
+    public func accountTradingConfig(mode: TradingMode) async throws -> AccountTradingConfig {
+        throw ExchangeVenueError.unsupported(venueName, "账户配置")
+    }
+}
+
+/// A capability the venue does not have. Thrown, never defaulted around: the
+/// runner reports it against the strategy that needed it.
+public enum ExchangeVenueError: Error, CustomStringConvertible, Sendable, Equatable {
+    case unsupported(String, String)
+
+    public var description: String {
+        switch self {
+        case .unsupported(let venue, let capability):
+            return "\(venue) 不提供\(capability)"
+        }
+    }
+}
+
+/// How the account handles derivative orders.
+public struct AccountTradingConfig: Sendable, Equatable {
+    public enum PositionMode: String, Sendable, Equatable {
+        /// Every perpetual order names the leg it acts on.
+        case longShort = "long_short_mode"
+        /// One net position per instrument; orders name no leg.
+        case net = "net_mode"
+    }
+
+    public let positionMode: PositionMode?
+    /// OKX's `acctLv`: 1 simple, 2 single-currency margin, 3 multi-currency
+    /// margin, 4 portfolio margin.
+    public let accountLevel: Int?
+
+    public init(positionMode: PositionMode?, accountLevel: Int?) {
+        self.positionMode = positionMode
+        self.accountLevel = accountLevel
+    }
+
+    /// The `tdMode` an option order has to carry. Options are margined by the
+    /// account, not the order: a simple account buys them for cash, a
+    /// single-currency margin account isolates them, and the multi-currency
+    /// and portfolio modes cross-margin everything.
+    public var optionTradeMode: String {
+        switch accountLevel {
+        case .some(1): return "cash"
+        case .some(2): return "isolated"
+        default: return "cross"
+        }
+    }
 }
 
 /// What the exchange says became of an order we are unsure about.

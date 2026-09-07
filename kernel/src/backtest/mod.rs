@@ -11,6 +11,7 @@
 
 pub mod continuous;
 pub mod metrics;
+pub mod options;
 
 use std::collections::HashMap;
 
@@ -94,6 +95,8 @@ pub enum ExitReason {
     Liquidation,
     DailyLossHalt,
     EndOfData,
+    /// An option contract reached its settlement and paid its intrinsic value.
+    Expiry,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,6 +243,9 @@ pub fn run(
 ) -> ExprResult<BacktestResult> {
     if strategy.is_continuous() {
         return crate::backtest::continuous::run(strategy, raw_candles, config);
+    }
+    if strategy.manifest.market.inst_type.is_option() {
+        return crate::backtest::options::run(strategy, raw_candles, config);
     }
 
     let mut candles: Vec<Candle> = raw_candles.iter().copied().filter(|c| c.is_confirmed()).collect();

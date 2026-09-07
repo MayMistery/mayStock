@@ -282,6 +282,26 @@ struct E2EMain {
             fail("永续合约面值", String(describing: error)); allOK = false
         }
 
+        // 3b. An option is sized by ctVal × ctMult — the 0.01 lives in the
+        //     multiplier, so a chain that read only ctVal would size every
+        //     order a hundredfold.
+        do {
+            let chain = try await rest.optionChain(underlying: "BTC-USD")
+            if let sample = chain.first, chain.count > 10 {
+                let ok = abs(sample.contractValue - 0.01) < 1e-12
+                (ok ? pass : fail)("期权链",
+                     "\(chain.count) 张合约，\(sample.instId) 每张 \(PriceFormatter.plain(sample.contractValue)) BTC")
+                if !ok { allOK = false }
+                let quote = try await rest.optionQuote(instId: sample.instId)
+                pass("期权报价", "标记 \(quote.mark.map(PriceFormatter.plain) ?? "—") BTC · 指数 "
+                     + PriceFormatter.plain(quote.indexPrice))
+            } else {
+                fail("期权链", "只拿到 \(chain.count) 张合约"); allOK = false
+            }
+        } catch {
+            fail("期权链", String(describing: error)); allOK = false
+        }
+
         // 4. A real five-window report.
         guard let strategy = compiled.first else { return false }
         do {

@@ -360,6 +360,7 @@ struct InstrumentTypeVocabularyTests {
     private static let sampleIds: [InstrumentType: String] = [
         .spot: "BTC-USDT",
         .swap: "BTC-USDT-SWAP",
+        .option: "BTC-USD-260926-80000-C",
     ]
 
     @Test func everyTypeIsRecognisableFromAnInstrumentId() throws {
@@ -370,11 +371,12 @@ struct InstrumentTypeVocabularyTests {
     }
 
     /// A multiplier may only be implied where it cannot be anything else.
-    /// Anything that trades in contracts has to ask the exchange, and "we could
-    /// not ask" must stay distinguishable from "the answer is 1".
-    @Test func onlyUnleveragedTypesMayImplyTheirContractSize() {
+    /// Anything that trades in contracts — every derivative, levered or not —
+    /// has to ask the exchange, and "we could not ask" must stay
+    /// distinguishable from "the answer is 1".
+    @Test func onlyCoinDenominatedTypesMayImplyTheirContractSize() {
         for type in InstrumentType.allCases {
-            if type.allowsLeverage {
+            if type.isDerivative {
                 #expect(type.impliedContractSize == nil, "\(type) 不该自带面值")
             } else {
                 #expect(type.impliedContractSize == 1, "\(type) 的面值应恒为 1")
@@ -393,5 +395,128 @@ struct InstrumentTypeVocabularyTests {
             #expect(taught.contractSizeIsKnown)
             #expect(taught.multiplier == 0.01)
         }
+    }
+}
+
+// MARK: - Option manifests
+
+@Suite("期权策略清单")
+struct OptionManifestTests {
+    private func decode(_ json: String) throws -> StrategyManifest {
+        try JSONDecoder().decode(StrategyManifest.self, from: Data(json.utf8))
+    }
+
+    private let json = """
+    {
+      "schema": 1, "id": "opt", "name": "Option trend",
+      "market": { "instId": "BTC-USDT", "instType": "OPTION", "bar": "4H" },
+      "signals": {
+        "longEntry": "close > sma(close, 20)", "longExit": "close < sma(close, 20)",
+        "shortEntry": "close < sma(close, 20)", "shortExit": "close > sma(close, 20)"
+      },
+      "sizing": { "mode": "equityPct", "value": 10 },
+      "risk": { "stopLossPct": 50, "takeProfitPct": 150, "volLookbackBars": 30 },
+      "options": { "minDaysToExpiry": 14, "moneynessPct": 2 }
+    }
+    """
+
+    @Test("期权清单能解码、编译，并推导标的指数")
+    func decodesAndCompiles() throws {
+        let manifest = try decode(json)
+        let compiled = try manifest.compile()
+        #expect(compiled.isOptionStrategy)
+        #expect(compiled.canGoShort, "a put is a legitimate bearish view")
+        #expect(compiled.optionsSpec.minDaysToExpiry == 14)
+        #expect(compiled.optionsSpec.moneynessPct == 2)
+        #expect(compiled.optionsSpec.resolvedUnderlying(for: manifest.market) == "BTC-USD")
+        #expect(compiled.warmupBars >= 31, "the pricing model needs its volatility window primed")
+        // Round-trips with the block intact.
+        let again = try JSONDecoder().decode(StrategyManifest.self, from: manifest.encoded())
+        #expect(again == manifest)
+    }
+
+    @Test("options 块省略时全部取默认")
+    func theBlockDefaults() throws {
+        let stripped = json.replacingOccurrences(
+            of: #""options": { "minDaysToExpiry": 14, "moneynessPct": 2 }"#, with: #""options": null"#)
+        let compiled = try decode(stripped).compile()
+        #expect(compiled.optionsSpec == StrategyOptionsSpec())
+        #expect(compiled.optionsSpec.minDaysToExpiry == 7)
+    }
+
+    @Test("现货清单带 options 块会被拒绝")
+    func anOptionsBlockOnSpotIsRefused() throws {
+        var manifest = StrategyLibrary.emaTrend
+        manifest.options = StrategyOptionsSpec(moneynessPct: 5)
+        #expect(throws: StrategyManifestError.self) { _ = try manifest.compile() }
+    }
+
+    @Test("期权策略拒绝引擎做不到的东西，且说出来的是策略的话不是表达式的话")
+    func unsupportedRiskRulesAreRefusedWithTheirOwnWording() throws {
+        var manifest = try decode(json)
+        manifest.risk.trailingStopPct = 5
+        do {
+            _ = try manifest.compile()
+            Issue.record("a trailing stop must be refused on an option strategy")
+        } catch let error as StrategyManifestError {
+            guard case .rejectedByKernel(let reason) = error else {
+                Issue.record("expected the kernel's own verdict, got \(error)"); return
+            }
+            #expect(reason.contains("trailingStopPct"))
+            #expect(!error.description.hasPrefix("signals"))
+        }
+    }
+
+    @Test("单笔风险模式在期权上不需要止损：权利金就是风险")
+    func riskPerTradeNeedsNoStopOnOptions() throws {
+        var manifest = try decode(json)
+        manifest.sizing = StrategySizing(mode: .riskPerTrade, value: 2)
+        manifest.risk = StrategyRisk(volLookbackBars: 30)
+        _ = try manifest.compile()
+    }
+
+    @Test("从 instId 认出期权、永续和现货")
+    func instrumentFamiliesAreReadOffTheId() {
+        #expect(InstrumentType.of(instId: "BTC-USD-260926-80000-C") == .option)
+        #expect(InstrumentType.of(instId: "ETH-USD-261225-3000-P") == .option)
+        #expect(InstrumentType.of(instId: "BTC-USDT-SWAP") == .swap)
+        #expect(InstrumentType.of(instId: "BTC-USDT") == .spot)
+        // A dated future is not an option, and neither is a typo.
+        #expect(InstrumentType.of(instId: "BTC-USD-260926") == .spot)
+        #expect(InstrumentType.of(instId: "BTC-USD-260926-80000-X") == .spot)
+        #expect(InstrumentType.optionKind(of: "BTC-USD-260926-80000-C") == .call)
+        #expect(InstrumentType.optionKind(of: "BTC-USD-260926-80000-P") == .put)
+        #expect(InstrumentType.optionUnderlying(of: "BTC-USD-260926-80000-C") == "BTC-USD")
+        #expect(InstrumentType.optionUnderlying(of: "BTC-USDT") == nil)
+    }
+
+    /// Every family declares its own behaviour; nothing may fall through to
+    /// "whatever spot does" by accident.
+    @Test("每个品种家族都声明了自己的行为")
+    func everyFamilyDeclaresItself() {
+        for family in InstrumentType.allCases {
+            #expect(!family.displayName.isEmpty)
+            #expect(!family.cliModule.isEmpty)
+            #expect(family.defaultFeeBps > 0)
+            #expect(family.isDerivative == (family.impliedContractSize == nil),
+                    "\(family): a contract multiplier is known without asking only for spot")
+            #expect(!family.usesPositionSide || family.isDerivative)
+            #expect(!family.settlesFunding || family.isDerivative)
+        }
+        #expect(InstrumentType.option.isDerivative)
+        #expect(!InstrumentType.option.usesPositionSide)
+        #expect(!InstrumentType.option.settlesFunding)
+        #expect(InstrumentType.option.allowsShorting && !InstrumentType.option.allowsLeverage)
+    }
+
+    @Test("内置示例里的期权清单能编译")
+    func theShippedOptionExampleCompiles() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let url = root.appendingPathComponent("Strategies/examples/12-btc-options-trend.json")
+        let manifest = try StrategyManifest.load(from: url)
+        let compiled = try manifest.compile()
+        #expect(compiled.isOptionStrategy)
+        #expect(compiled.optionsSpec.resolvedUnderlying(for: manifest.market) == "BTC-USD")
     }
 }

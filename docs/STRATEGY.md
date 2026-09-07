@@ -65,7 +65,7 @@
 }
 ```
 
-- `instType`：`SPOT` 或 `SWAP`。做空与 `leverage > 1` 仅 `SWAP` 允许。
+- `instType`：`SPOT`、`SWAP` 或 `OPTION`。`leverage > 1` 仅 `SWAP` 允许；做空信号在 `SWAP` 上卖出、在 `OPTION` 上买入看跌。`OPTION` 的 `instId` 是信号所读的标的，仓位是它的期权合约，细节见 [STRATEGY-DEV.md §1.5](STRATEGY-DEV.md)。
 - `sizing.mode`：`equityPct`（占本策略分配资金的百分比）/ `fixedQuote`（固定计价币金额）/ `riskPerTrade`（按止损距离反推头寸，`value` 为单笔风险百分比）。
 - `costs` 省略时按 instType 取默认：现货 taker 10 bps，永续 taker 5 bps；滑点默认 5 bps。
 

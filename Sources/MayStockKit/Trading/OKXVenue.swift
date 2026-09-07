@@ -41,6 +41,36 @@ public struct OKXVenue: ExchangeVenue {
         try await rest.instrumentMeta(instId: instId)
     }
 
+    /// Options are marked, not last-traded: a thin book's last print can be
+    /// hours old, while the mark is refreshed continuously and is the number
+    /// the exchange itself values the position at.
+    public func valuationPrice(instId: String) async throws -> Double {
+        guard InstrumentType.of(instId: instId) == .option else {
+            return try await rest.ticker(instId: instId).last
+        }
+        let quote = try await rest.optionQuote(instId: instId)
+        guard let mark = quote.markQuote, mark > 0 else {
+            throw OKXError.decoding("\(instId) 没有标记价")
+        }
+        return mark
+    }
+
+    public func optionChain(underlying: String) async throws -> [OptionContract] {
+        try await rest.optionChain(underlying: underlying)
+    }
+
+    public func optionQuote(instId: String) async throws -> OptionQuote {
+        try await rest.optionQuote(instId: instId)
+    }
+
+    public func indexPrice(underlying: String) async throws -> Double {
+        try await rest.indexPrice(underlying: underlying)
+    }
+
+    public func accountTradingConfig(mode: TradingMode) async throws -> AccountTradingConfig {
+        try await bridge.accountTradingConfig(mode: mode)
+    }
+
     public func alternativeSeries(
         specs: [String: AlternativeSeriesSpec], market: StrategyMarket,
         candles: [Candle], days: Int

@@ -62,8 +62,8 @@ struct LabMain {
           fees [--tier lv1] [--sync]
               查看费率档位表；--sync 从已配置的 okx CLI 拉取本账户真实费率。
 
-          new <名称> [--template trend|reversion|breakout|grid] [--instId BTC-USDT] [--bar 1H]
-              生成一份策略清单脚手架到 Strategies/。
+          new <名称> [--template trend|reversion|breakout|grid|options] [--instId BTC-USDT] [--bar 1H]
+              生成一份策略清单脚手架到 Strategies/。options 模板在标的上买入看涨/看跌期权。
 
           signals [--ccy BTC] [--bar 1H]
               列出可用的另类数据源，实测每个接口现在能给多少历史。
@@ -147,6 +147,14 @@ struct LabMain {
 
         if result.liquidations > 0 { Out.warn("发生 \(result.liquidations) 次强平") }
         if result.fundingUnmodelled { Out.warn("未取到资金费率历史，永续成本被低估") }
+        if strategy.isOptionStrategy {
+            let spec = strategy.optionsSpec
+            Out.warn("期权按 Black–Scholes 模型定价：标的 \(spec.resolvedUnderlying(for: strategy.market))，"
+                     + "隐含波动 = \(strategy.manifest.risk.volLookbackBars) 根实现波动 × "
+                     + "\(PriceFormatter.plain(spec.impliedVolMultiplier))，到期 ≥ "
+                     + "\(PriceFormatter.plain(spec.minDaysToExpiry)) 天。这是模型价不是历史成交价，"
+                     + "结论只对「方向信号能否赚回权利金」成立。")
+        }
         if let quality = result.dataQuality, !quality.usable {
             Out.warn("行情数据有问题：\(quality.reason)")
         } else if let quality = result.dataQuality, quality.gaps > 0 {

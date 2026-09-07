@@ -140,6 +140,12 @@ impl Expr {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExprError {
     Syntax { message: String, column: usize },
+    /// The manifest is well-formed but asks for something the engine does
+    /// not do — a short leg on spot, a barrier below its floor, an option
+    /// rule the option engine lacks. The message is the whole verdict, so it
+    /// is shown without an "expression error" prefix that would point the
+    /// reader at the wrong block.
+    Policy(String),
     UnknownIdentifier(String),
     UnknownFunction(String),
     BadArity {
@@ -165,6 +171,7 @@ impl fmt::Display for ExprError {
             Self::Syntax { message, column } => {
                 write!(f, "表达式语法错误（第 {column} 列）：{message}")
             }
+            Self::Policy(message) => write!(f, "{message}"),
             Self::UnknownIdentifier(name) => write!(f, "未知的变量或参数：{name}"),
             Self::UnknownFunction(name) => write!(f, "未知的函数：{name}()"),
             Self::BadArity {

@@ -81,18 +81,10 @@ public enum TradeDirection: String, Sendable, Equatable, Codable {
 
 public enum TradeExitReason: String, Sendable, Equatable, Codable {
     case signal, stopLoss, takeProfit, trailingStop, liquidation, dailyLossHalt, endOfData
+    /// An option contract reached settlement and paid its intrinsic value.
+    case expiry
 
-    public var displayName: String {
-        switch self {
-        case .signal: return "信号平仓"
-        case .stopLoss: return "止损"
-        case .takeProfit: return "止盈"
-        case .trailingStop: return "移动止损"
-        case .liquidation: return "强平"
-        case .dailyLossHalt: return "日内熔断"
-        case .endOfData: return "回测结束"
-        }
-    }
+    public var displayName: String { KernelExitReason(rawValue: rawValue)?.displayName ?? rawValue }
 }
 
 public struct BacktestTrade: Sendable, Equatable, Identifiable {

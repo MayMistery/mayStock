@@ -126,3 +126,30 @@ struct CandleMergeTests {
 
 // Sparkline buffer coverage lives in ChartDataTests.swift alongside the rest
 // of the charting data path.
+
+@Suite("Option ticker decoding")
+struct OptionTickerDecodingTests {
+    /// What OKX returns for a contract nobody has traded yet: an empty last,
+    /// an empty bid, a resting ask. The general ticker decoder refuses it,
+    /// correctly; the option book must not.
+    @Test("从未成交的合约也能读出盘口")
+    func anUntradedContractStillYieldsItsBook() throws {
+        let json = """
+        {"instType":"OPTION","instId":"BTC-USD-260908-74000-C","last":"","lastSz":"0",
+         "askPx":"0.0125","askSz":"3","bidPx":"","bidSz":"0","open24h":"","high24h":"",
+         "low24h":"","volCcy24h":"0","vol24h":"0","ts":"1788786839084"}
+        """
+        let row = try JSONDecoder().decode(OKXRESTClient.OptionTickerRow.self, from: Data(json.utf8))
+        #expect(row.bid == nil, "an empty side is absent, not free")
+        #expect(row.ask == 0.0125)
+        #expect(row.time == Date(timeIntervalSince1970: 1_788_786_839.084))
+    }
+
+    @Test("零价也当作没有")
+    func aZeroPriceIsAbsent() throws {
+        let json = #"{"instId":"BTC-USD-260908-74000-C","askPx":"0","bidPx":"0.01","ts":"0"}"#
+        let row = try JSONDecoder().decode(OKXRESTClient.OptionTickerRow.self, from: Data(json.utf8))
+        #expect(row.ask == nil)
+        #expect(row.bid == 0.01)
+    }
+}

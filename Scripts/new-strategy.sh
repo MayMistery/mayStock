@@ -4,7 +4,7 @@
 #
 #   ./Scripts/new-strategy.sh <名称> [模板] [标的] [周期]
 #
-#   模板：trend（默认） | reversion | breakout | grid
+#   模板：trend（默认） | reversion | breakout | grid | options
 #   例：  ./Scripts/new-strategy.sh "我的ETH趋势" trend ETH-USDT 4H
 #
 # Generates Strategies/<id>.json, backtests it, and runs the walk-forward — in
@@ -20,7 +20,7 @@ INST="${3:-BTC-USDT}"
 BAR="${4:-1H}"
 
 if [[ -z "$NAME" ]]; then
-  echo "用法：$0 <名称> [trend|reversion|breakout|grid] [标的] [周期]" >&2
+  echo "用法：$0 <名称> [trend|reversion|breakout|grid|options] [标的] [周期]" >&2
   echo "例：  $0 \"我的ETH趋势\" trend ETH-USDT 4H" >&2
   exit 2
 fi

@@ -551,3 +551,118 @@ struct LiveRiskControlTests {
         #expect(!newDay.haltDailyLoss)
     }
 }
+
+// MARK: - Options through the kernel
+
+@Suite("期权：内核桥接")
+struct KernelOptionBridgeTests {
+    static func manifest(
+        signals: String = #"{"longEntry": "close > sma(close, 20)", "longExit": "close < sma(close, 20)", "shortEntry": "close < sma(close, 20)", "shortExit": "close > sma(close, 20)"}"#,
+        options: String = #"{"minDaysToExpiry": 7, "moneynessPct": 0}"#,
+        risk: String = #"{"stopLossPct": 50, "takeProfitPct": 150, "volLookbackBars": 24}"#
+    ) -> String {
+        """
+        {
+          "schema": 1, "id": "opt", "name": "opt",
+          "market": { "instId": "BTC-USDT", "instType": "OPTION", "bar": "1H" },
+          "signals": \(signals),
+          "sizing": { "mode": "equityPct", "value": 10 },
+          "risk": \(risk),
+          "options": \(options)
+        }
+        """
+    }
+
+    @Test("合约筛选经过 FFI 往返，选最近的合格到期和最贴近目标的行权价")
+    func contractSelectionRoundTrips() throws {
+        let day: Int64 = 86_400_000
+        let now = Date(timeIntervalSince1970: 0)
+        let candidates = [
+            KernelOptionCandidate(instId: "soon", strike: 80_000, expiryMs: 3 * day, kind: .call),
+            KernelOptionCandidate(instId: "put", strike: 80_000, expiryMs: 10 * day, kind: .put),
+            KernelOptionCandidate(instId: "far", strike: 90_000, expiryMs: 10 * day, kind: .call),
+            KernelOptionCandidate(instId: "right", strike: 81_000, expiryMs: 10 * day, kind: .call),
+            KernelOptionCandidate(instId: "later", strike: 80_000, expiryMs: 20 * day, kind: .call),
+        ]
+        let chosen = try TradingKernel.selectOptionContract(
+            kind: .call, spot: 80_000, now: now, minDaysToExpiry: 7, moneynessPct: 1,
+            strikeStep: 1_000, candidates: candidates)
+        #expect(chosen?.instId == "right")
+        let none = try TradingKernel.selectOptionContract(
+            kind: .put, spot: 80_000, now: now, minDaysToExpiry: 30, moneynessPct: 0,
+            strikeStep: nil, candidates: candidates)
+        #expect(none == nil, "nothing qualifying is an answer, not an error")
+    }
+
+    @Test("从空仓出信号时，计划是买入对应方向的合约，预算是资金的份额")
+    func anEntryPlansAContractPurchase() throws {
+        let kernel = try KernelStrategy(manifestJSON: Self.manifest(
+            signals: #"{"shortEntry": "close > 0"}"#))
+        let bars = KernelGoldenTests.candles(200)
+        let decision = try kernel.decide(
+            candles: bars, current: nil,
+            account: KernelAccountState(equity: 20_000, dayStartEquity: 20_000))
+        #expect(decision.shouldTrade)
+        let plan = try #require(decision.optionPlan)
+        #expect(plan.action == .open)
+        #expect(plan.kind == .put, "a bearish view buys a put")
+        #expect(abs(plan.premiumBudget - 2_000) < 1e-9, "10% of the budget")
+        #expect(plan.minDaysToExpiry == 7)
+        #expect(plan.stopLossPct == 50 && plan.takeProfitPct == 150)
+        #expect(decision.stopPrice == nil, "levels are on the premium, not the underlying")
+        #expect(decision.direction == .short)
+    }
+
+    @Test("持仓中信号消失时，计划是卖出所持合约")
+    func anExitPlansASale() throws {
+        let kernel = try KernelStrategy(manifestJSON: Self.manifest(
+            signals: #"{"longEntry": "close > 1e12", "longExit": "close > 0"}"#))
+        let bars = KernelGoldenTests.candles(200)
+        let decision = try kernel.decide(
+            candles: bars, current: .long, barsHeld: 5,
+            account: KernelAccountState(equity: 20_000, heldBase: 0.05, dayStartEquity: 20_000))
+        #expect(decision.shouldTrade)
+        #expect(decision.optionPlan?.action == .close)
+        #expect(decision.target == 0)
+    }
+
+    @Test("反手是先卖后买")
+    func aReversalPlansAFlip() throws {
+        let kernel = try KernelStrategy(manifestJSON: Self.manifest(
+            signals: #"{"longEntry": "close > 1e12", "shortEntry": "close > 0"}"#))
+        let bars = KernelGoldenTests.candles(200)
+        let decision = try kernel.decide(
+            candles: bars, current: .long, barsHeld: 5,
+            account: KernelAccountState(equity: 20_000, heldBase: 0.05, dayStartEquity: 20_000))
+        #expect(decision.optionPlan?.action == .flip)
+        #expect(decision.optionPlan?.kind == .put)
+    }
+
+    @Test("信号未变时不出计划")
+    func noChangeNoPlan() throws {
+        let kernel = try KernelStrategy(manifestJSON: Self.manifest(
+            signals: #"{"longEntry": "close > 0", "longExit": "close < 0"}"#))
+        let decision = try kernel.decide(
+            candles: KernelGoldenTests.candles(200), current: .long, barsHeld: 5,
+            account: KernelAccountState(equity: 20_000, heldBase: 0.05, dayStartEquity: 20_000))
+        #expect(!decision.shouldTrade)
+        #expect(decision.optionPlan == nil)
+    }
+
+    @Test("期权回测跑通：到期结算是一种离场原因，没有强平也没有资金费")
+    func anOptionBacktestSettlesAtExpiry() throws {
+        let json = Self.manifest(
+            signals: #"{"longEntry": "close > 0"}"#,
+            options: #"{"minDaysToExpiry": 1}"#)
+        let manifest = try JSONDecoder().decode(StrategyManifest.self, from: Data(json.utf8))
+        let strategy = try manifest.compile()
+        let result = try BacktestEngine(strategy: strategy, config: BacktestConfig(initialCapital: 20_000))
+            .run(candles: KernelGoldenTests.candles(600, seed: 9))
+        #expect(!result.trades.isEmpty)
+        #expect(result.trades.contains { $0.exitReason == .expiry })
+        #expect(result.liquidations == 0)
+        #expect(!result.fundingUnmodelled)
+        #expect(result.trades.allSatisfy { $0.direction == .long })
+        #expect(TradeExitReason.expiry.displayName == "到期结算")
+    }
+}

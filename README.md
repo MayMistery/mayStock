@@ -40,6 +40,12 @@
   Numbers that cannot support a decision are labelled "insufficient sample"
   rather than presented as insight. Then allocate capital and start or stop
   trading. Manifests do arithmetic over candles — **no code is executed**.
+- **Spot, perpetuals and options** — a manifest names its market; an
+  `OPTION` strategy reads the underlying's candles and buys a call on a
+  long signal or a put on a short one, never selling options. Backtests
+  price contracts with Black–Scholes off realised volatility (and say so);
+  live trading reads the exchange's chain and book and fills with IOC
+  limits, with the contract chosen by the same rule the backtest used.
 - **Per-strategy attribution** — the exchange holds one balance, so every
   order carries a `clOrdId` strategy tag and is reconciled against
   `okx spot fills`. Each strategy's position, realised/unrealised P&L and

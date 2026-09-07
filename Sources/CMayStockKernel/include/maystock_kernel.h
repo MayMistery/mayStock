@@ -143,6 +143,13 @@ char *ms_diversification(const char *request_json, char **error_out);
  * it. Request JSON carries live and backtest sample arrays. Caller frees. */
 char *ms_compare_equity(const char *request_json, char **error_out);
 
+/* Which option contract a strategy buys from a listed chain, by the same rule
+ * the backtester applies to its modelled chain. Request JSON carries kind,
+ * spot, nowMs, minDaysToExpiry, moneynessPct, strikeStep and candidates;
+ * the result is the chosen candidate as JSON or the literal `null` when
+ * nothing qualifies. Caller frees. */
+char *ms_option_select(const char *request_json, char **error_out);
+
 /* Evaluate one DSL expression over the candles; returns a JSON array where
  * warm-up NaNs are null. Caller frees. */
 char *ms_evaluate_expression(const char *source,

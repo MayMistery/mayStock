@@ -381,6 +381,28 @@ extension TradingKernel {
         return try JSONDecoder().decode(KernelDiversification.self, from: Data(json.utf8))
     }
 
+    /// Which contract an option strategy buys, chosen from a listed chain by
+    /// the rule the backtester applies to its modelled one.
+    ///
+    /// Nil when nothing in the chain qualifies — every expiry too near, or no
+    /// contract of the wanted kind — which is an answer the runner reports,
+    /// not an error.
+    public static func selectOptionContract(
+        kind: OptionKind, spot: Double, now: Date,
+        minDaysToExpiry: Double, moneynessPct: Double, strikeStep: Double?,
+        candidates: [KernelOptionCandidate]
+    ) throws -> KernelOptionCandidate? {
+        let request = OptionSelectionRequest(
+            kind: kind, spot: spot,
+            nowMs: Int64((now.timeIntervalSince1970 * 1000).rounded()),
+            minDaysToExpiry: minDaysToExpiry, moneynessPct: moneynessPct,
+            strikeStep: strikeStep, candidates: candidates)
+        let json = try callReturningString { error in
+            ms_option_select(try? encodeJSON(request), error)
+        }
+        return try JSONDecoder().decode(KernelOptionCandidate?.self, from: Data(json.utf8))
+    }
+
     /// How far live equity has drifted from the backtest that justified it.
     public static func compareEquity(
         live: [(ts: Date, equity: Double)], backtest: [(ts: Date, equity: Double)]
@@ -398,6 +420,17 @@ extension TradingKernel {
         }
         return try JSONDecoder().decode(KernelEquityComparison.self, from: Data(json.utf8))
     }
+}
+
+/// Wire shape for `ms_option_select`.
+private struct OptionSelectionRequest: Encodable {
+    let kind: OptionKind
+    let spot: Double
+    let nowMs: Int64
+    let minDaysToExpiry: Double
+    let moneynessPct: Double
+    let strikeStep: Double?
+    let candidates: [KernelOptionCandidate]
 }
 
 /// Wire shape for `ms_resample_trades`.

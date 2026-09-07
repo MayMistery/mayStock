@@ -5,24 +5,54 @@ import Foundation
 public enum InstrumentType: String, Codable, Sendable, CaseIterable {
     case spot = "SPOT"
     case swap = "SWAP"
+    /// Signals are evaluated on the underlying's candles; the position is a
+    /// long call or put on it. See `StrategyOptionsSpec`.
+    case option = "OPTION"
 
     public var displayName: String {
         switch self {
         case .spot: return "现货"
         case .swap: return "永续"
+        case .option: return "期权"
         }
     }
 
     /// OKX taker fee in basis points, used when a manifest omits `costs`.
+    ///
+    /// The option figure is what a Lv1 account reports; it is charged on the
+    /// underlying notional and capped at a share of the premium, which the
+    /// kernel's fee model applies.
     public var defaultFeeBps: Double {
         switch self {
         case .spot: return 10   // 0.10%
         case .swap: return 5    // 0.05%
+        case .option: return 3  // 0.03% of notional, ≤ 12.5% of premium
         }
     }
 
-    public var allowsShorting: Bool { self == .swap }
+    /// A bearish view: a perpetual sells, an option strategy buys a put.
+    public var allowsShorting: Bool { self == .swap || self == .option }
+    /// Only a perpetual borrows. An option's leverage is intrinsic to the
+    /// contract and is not a dial the manifest may turn.
     public var allowsLeverage: Bool { self == .swap }
+
+    /// Reported by the exchange as a position per instrument rather than as a
+    /// coin balance — which is what makes it reconcilable per instrument, and
+    /// what lets the exchange close it out from under us.
+    public var isDerivative: Bool { self != .spot }
+    /// The `okx` CLI module that trades this family.
+    public var cliModule: String {
+        switch self {
+        case .spot: return "spot"
+        case .swap: return "swap"
+        case .option: return "option"
+        }
+    }
+    /// A perpetual in long/short mode must name the leg every order acts on;
+    /// options and spot have no legs.
+    public var usesPositionSide: Bool { self == .swap }
+    /// Only perpetuals settle funding.
+    public var settlesFunding: Bool { self == .swap }
 
     /// The instrument family an id names.
     ///
@@ -32,20 +62,108 @@ public enum InstrumentType: String, Codable, Sendable, CaseIterable {
     /// needs to grow a case — futures, options, a venue that spells it
     /// differently — and eleven others quietly keep the old answer.
     public static func of(instId: String) -> InstrumentType {
-        instId.hasSuffix("-" + InstrumentType.swap.rawValue) ? .swap : .spot
+        if instId.hasSuffix("-" + InstrumentType.swap.rawValue) { return .swap }
+        if optionKind(of: instId) != nil { return .option }
+        return .spot
+    }
+
+    /// The call/put leg an option id names: `BTC-USD-260908-70000-C` is a
+    /// call. Nil for any id that is not an option.
+    public static func optionKind(of instId: String) -> OptionKind? {
+        let parts = instId.split(separator: "-")
+        guard parts.count == 5,
+              parts[2].count == 6, parts[2].allSatisfy(\.isNumber),
+              Double(parts[3]) != nil else { return nil }
+        switch parts[4] {
+        case "C": return .call
+        case "P": return .put
+        default: return nil
+        }
+    }
+
+    /// The index an option settles against: `BTC-USD-260908-70000-C` → `BTC-USD`.
+    public static func optionUnderlying(of instId: String) -> String? {
+        guard optionKind(of: instId) != nil else { return nil }
+        return instId.split(separator: "-").prefix(2).joined(separator: "-")
     }
 
     /// Base units per contract when the exchange has nothing to say.
     ///
     /// Spot is one-for-one by definition, so its multiplier is *known* without
-    /// asking anyone. A swap's is not: only the exchange's `ctVal` answers it,
-    /// and "we could not reach the exchange" is not an answer. Returning nil
-    /// there is the whole point — see `StrategyPositionState.contractSize`.
+    /// asking anyone. A swap's or an option's is not: only the exchange's
+    /// contract metadata answers it, and "we could not reach the exchange" is
+    /// not an answer. Returning nil there is the whole point — see
+    /// `StrategyPositionState.contractSize`.
     public var impliedContractSize: Double? {
         switch self {
         case .spot: return 1
-        case .swap: return nil
+        case .swap, .option: return nil
         }
+    }
+}
+
+/// The `options` block of a manifest whose market is `OPTION`. Mirrors the
+/// kernel's `OptionsSpec`; every field defaults, so the block may be omitted.
+public struct StrategyOptionsSpec: Codable, Sendable, Equatable {
+    /// Underlying index the chain is keyed by, e.g. `BTC-USD`. Derived from
+    /// the market's base currency when absent.
+    public var uly: String?
+    /// Nearest listed expiry at least this far away is the one traded.
+    public var minDaysToExpiry: Double
+    /// Strike offset from spot in percent, out of the money in the traded
+    /// direction when positive. Zero is at the money.
+    public var moneynessPct: Double
+    /// Strike grid for the model; nil means one percent of spot.
+    public var strikeStep: Double?
+    /// Underlying units per contract, for the model's lot rounding. Live
+    /// trading reads the exchange's figure instead.
+    public var contractMultiplier: Double
+    /// Implied volatility as a multiple of realised, for the model's premiums.
+    public var impliedVolMultiplier: Double
+    /// Fee cap as a share of premium, as OKX applies it.
+    public var feeCapPctOfPremium: Double
+
+    public init(
+        uly: String? = nil, minDaysToExpiry: Double = 7, moneynessPct: Double = 0,
+        strikeStep: Double? = nil, contractMultiplier: Double = 0.01,
+        impliedVolMultiplier: Double = 1.2, feeCapPctOfPremium: Double = 12.5
+    ) {
+        self.uly = uly
+        self.minDaysToExpiry = minDaysToExpiry
+        self.moneynessPct = moneynessPct
+        self.strikeStep = strikeStep
+        self.contractMultiplier = contractMultiplier
+        self.impliedVolMultiplier = impliedVolMultiplier
+        self.feeCapPctOfPremium = feeCapPctOfPremium
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case uly, minDaysToExpiry, moneynessPct, strikeStep, contractMultiplier
+        case impliedVolMultiplier, feeCapPctOfPremium
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let fallback = StrategyOptionsSpec()
+        uly = try c.decodeIfPresent(String.self, forKey: .uly)
+        minDaysToExpiry = try c.decodeIfPresent(Double.self, forKey: .minDaysToExpiry)
+            ?? fallback.minDaysToExpiry
+        moneynessPct = try c.decodeIfPresent(Double.self, forKey: .moneynessPct)
+            ?? fallback.moneynessPct
+        strikeStep = try c.decodeIfPresent(Double.self, forKey: .strikeStep)
+        contractMultiplier = try c.decodeIfPresent(Double.self, forKey: .contractMultiplier)
+            ?? fallback.contractMultiplier
+        impliedVolMultiplier = try c.decodeIfPresent(Double.self, forKey: .impliedVolMultiplier)
+            ?? fallback.impliedVolMultiplier
+        feeCapPctOfPremium = try c.decodeIfPresent(Double.self, forKey: .feeCapPctOfPremium)
+            ?? fallback.feeCapPctOfPremium
+    }
+
+    /// The index the chain is keyed by: `BTC-USDT` signals trade `BTC-USD`
+    /// options unless the manifest says otherwise.
+    public func resolvedUnderlying(for market: StrategyMarket) -> String {
+        if let uly, !uly.isEmpty { return uly }
+        return StrategyLedger.currencies(of: market.instId).base + "-USD"
     }
 }
 
@@ -405,6 +523,8 @@ public struct StrategyManifest: Codable, Sendable, Equatable, Identifiable {
     public var sizing: StrategySizing
     public var risk: StrategyRisk
     public var costs: StrategyCosts?
+    /// Which contract an `OPTION` market trades. Refused on any other market.
+    public var options: StrategyOptionsSpec?
     /// Named public data series beyond OHLCV — funding rate, open interest,
     /// positioning, order flow, another instrument's price. Each name becomes
     /// a variable usable in any signal expression.
@@ -426,11 +546,13 @@ public struct StrategyManifest: Codable, Sendable, Equatable, Identifiable {
         sizing: StrategySizing = StrategySizing(),
         risk: StrategyRisk = StrategyRisk(),
         costs: StrategyCosts? = nil,
+        options: StrategyOptionsSpec? = nil,
         data: [String: AlternativeSeriesSpec] = [:],
         engine: StrategyEngineSpec = .declarative
     ) {
         self.data = data
         self.engine = engine
+        self.options = options
         self.schema = schema
         self.id = id
         self.name = name
@@ -453,7 +575,7 @@ public struct StrategyManifest: Codable, Sendable, Equatable, Identifiable {
 
     private enum CodingKeys: String, CodingKey {
         case schema, id, name, version, author, notes, market, params, signals
-        case sizing, risk, costs, data, engine
+        case sizing, risk, costs, options, data, engine
     }
 
     public init(from decoder: Decoder) throws {
@@ -470,6 +592,7 @@ public struct StrategyManifest: Codable, Sendable, Equatable, Identifiable {
         sizing = try c.decodeIfPresent(StrategySizing.self, forKey: .sizing) ?? StrategySizing()
         risk = try c.decodeIfPresent(StrategyRisk.self, forKey: .risk) ?? StrategyRisk()
         costs = try c.decodeIfPresent(StrategyCosts.self, forKey: .costs)
+        options = try c.decodeIfPresent(StrategyOptionsSpec.self, forKey: .options)
         data = try c.decodeIfPresent([String: AlternativeSeriesSpec].self, forKey: .data) ?? [:]
         engine = try c.decodeIfPresent(StrategyEngineSpec.self, forKey: .engine) ?? .declarative
     }
@@ -523,6 +646,10 @@ public enum StrategyManifestError: Error, CustomStringConvertible, Sendable, Equ
     case leverageOutOfRange(Double)
     case unknownIdentifier(signal: String, name: String)
     case badExpression(signal: String, reason: String)
+    /// The kernel refused the manifest for a reason that is not an expression:
+    /// an option policy rule, a barrier that contradicts another. Its message
+    /// is already the user's, so it is shown unprefixed.
+    case rejectedByKernel(String)
     case invalidSizing(String)
     case invalidParameter(String)
     case riskPerTradeNeedsStop
@@ -539,6 +666,7 @@ public enum StrategyManifestError: Error, CustomStringConvertible, Sendable, Equ
         case .unknownIdentifier(let signal, let name):
             return "\(signal) 引用了未声明的标识符「\(name)」—— 请在 params 中声明，或改用行情变量"
         case .badExpression(let signal, let reason): return "\(signal)：\(reason)"
+        case .rejectedByKernel(let reason): return reason
         case .invalidSizing(let reason): return "仓位设置无效：\(reason)"
         case .invalidParameter(let reason): return "参数无效：\(reason)"
         case .riskPerTradeNeedsStop: return "单笔风险模式必须配置止损（stopLossPct 或 atrStop）"
@@ -578,6 +706,12 @@ public struct CompiledStrategy: @unchecked Sendable {
         manifest.data.mapValues { $0.resolved(against: manifest.market) }
     }
     public var usesAlternativeData: Bool { !manifest.data.isEmpty }
+    /// True when the position is an option on the market rather than the
+    /// market itself.
+    public var isOptionStrategy: Bool { manifest.market.instType == .option }
+    /// The option block with defaults filled in. Meaningful only for an
+    /// option strategy.
+    public var optionsSpec: StrategyOptionsSpec { manifest.options ?? StrategyOptionsSpec() }
     public var isScriptEngine: Bool { manifest.engine.isScript }
     public var scriptSpec: ScriptEngineSpec? { manifest.engine.scriptSpec }
 
@@ -652,15 +786,24 @@ extension StrategyManifest {
 
         // Expression validation belongs to the kernel: it owns the grammar, the
         // function table and the period rules, so a second Swift validator here
-        // could only ever disagree with what actually runs.
+        // could only ever disagree with what actually runs. The same goes for
+        // what an option strategy may declare — one policy, in the kernel.
         let kernel: KernelStrategy
         do {
             kernel = try KernelStrategy(
                 manifest: try JSONEncoder().encode(self),
                 knownSeries: Array(seriesNames))
         } catch let error as KernelError {
-            throw StrategyManifestError.badExpression(
-                signal: "signals", reason: error.description)
+            // The kernel prefixes genuine expression errors itself
+            // (表达式语法错误 / 未知的变量 / 未知的函数 / f() 需要…); a policy
+            // verdict arrives as its bare message, and its wording already
+            // names the field, so a "signals：" prefix would only point the
+            // reader at the wrong block.
+            if Self.isExpressionError(error.description) {
+                throw StrategyManifestError.badExpression(
+                    signal: "signals", reason: error.description)
+            }
+            throw StrategyManifestError.rejectedByKernel(error.description)
         }
 
         // A script decides its own direction, and a continuous-exposure
@@ -696,7 +839,11 @@ extension StrategyManifest {
             guard sizing.value <= 100 else {
                 throw StrategyManifestError.invalidSizing("单笔风险不能超过 100%")
             }
-            guard risk.hasStop else { throw StrategyManifestError.riskPerTradeNeedsStop }
+            // An option's premium is its whole risk, so the stop distance the
+            // rule normally sizes from does not exist and is not required.
+            guard risk.hasStop || market.instType == .option else {
+                throw StrategyManifestError.riskPerTradeNeedsStop
+            }
         case .fixedQuote:
             break
         case .volatilityTarget:
@@ -728,5 +875,14 @@ extension StrategyManifest {
     static func isDeclared(_ source: String?) -> Bool {
         guard let source else { return false }
         return !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// True for the kernel's expression-level messages (`ExprError` other
+    /// than `Policy`), which all name the expression or the function.
+    static func isExpressionError(_ message: String) -> Bool {
+        message.hasPrefix("表达式语法错误")
+            || message.hasPrefix("未知的变量")
+            || message.hasPrefix("未知的函数")
+            || message.contains("() ")
     }
 }

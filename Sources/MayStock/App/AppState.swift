@@ -258,7 +258,15 @@ final class AppState {
         let mode = tradingMode
         do {
             accountBalances = try await bridge.balances(mode: mode)
-            exchangePositions = (try? await bridge.positions(mode: mode, instType: .swap)) ?? []
+            // Every family the exchange reports per instrument, so the
+            // reconciliation panel can judge an option leg as well as a
+            // perpetual one. A failed listing is an error on screen, not an
+            // empty list that reads as "nothing held".
+            var positions: [ExchangePosition] = []
+            for instType in InstrumentType.allCases where instType.isDerivative {
+                positions += try await bridge.positions(mode: mode, instType: instType)
+            }
+            exchangePositions = positions
             accountError = nil
         } catch {
             accountError = String(describing: error)
@@ -296,13 +304,32 @@ final class AppState {
         return manifest
     }
 
-    func deleteStrategy(id: String) {
-        Task { await runner.flatten(strategyId: id) }
+    /// Remove a strategy from the library, flattening what it holds first.
+    ///
+    /// Sequenced, not fired off: this used to start the flatten in a task and
+    /// delete the strategy at once, so by the time the task ran the strategy
+    /// was no longer runnable, `flatten` found nothing to do, and the ledger
+    /// entry had already been cleared — leaving the exchange position with no
+    /// record anywhere. A strategy whose position cannot be closed stays in
+    /// the library, and the reason is shown.
+    @discardableResult
+    func deleteStrategy(id: String) async -> Bool {
+        await runner.flatten(strategyId: id)
+        if let position = ledger.position(for: id), !position.isFlat {
+            let name = strategy(id: id)?.name ?? id
+            notifications.post(
+                title: "未能移除 · \(name)",
+                body: "仍持有 \(PriceFormatter.plain(abs(position.quantity))) 张 \(position.instId)，"
+                    + "平仓未成交：" + (runner.state(for: id).message ?? "见运行状态"),
+                sound: true)
+            return false
+        }
         try? strategyStore.delete(id: id)
         store.update { $0.strategy.remove(strategyId: id) }
         reports[id] = nil
         ledger.clearPosition(strategyId: id)
         reloadStrategies()
+        return true
     }
 
     func saveStrategy(_ manifest: StrategyManifest) {
@@ -386,6 +413,11 @@ final class AppState {
     }
 
     /// Stop every strategy and flatten open positions.
+    ///
+    /// The notification reports what actually happened, after it happened. It
+    /// used to announce "持仓已市价平掉" before a single order had been sent,
+    /// which on the one occasion a flatten fails is the exact moment a person
+    /// most needs to be told the opposite.
     func emergencyStop() {
         store.update { config in
             config.strategy.emergencyStop = true
@@ -393,8 +425,20 @@ final class AppState {
                 config.strategy.allocations[index].running = false
             }
         }
-        Task { await runner.emergencyStop() }
-        notifications.post(title: "已急停", body: "所有策略已停止，持仓已市价平掉。", sound: true)
+        Task {
+            await runner.emergencyStop()
+            let remaining = ledger.activePositions
+            if remaining.isEmpty {
+                notifications.post(title: "已急停", body: "所有策略已停止，持仓已市价平掉。", sound: true)
+            } else {
+                let held = remaining.map {
+                    "\($0.instId) \(PriceFormatter.plain(abs($0.quantity))) 张"
+                }.joined(separator: "，")
+                notifications.post(
+                    title: "已急停，但仍有持仓未平",
+                    body: "所有策略已停止；未能平掉：\(held)。请到交易所核对。", sound: true)
+            }
+        }
     }
 
     func clearEmergencyStop() {

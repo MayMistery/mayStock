@@ -101,6 +101,19 @@ public enum OKXFeeTier: String, Codable, Sendable, CaseIterable, Identifiable {
         }
     }
 
+    /// Option maker fee in basis points, charged on the underlying notional
+    /// and capped at 12.5% of the premium (`kernel::options::option_fee`).
+    ///
+    /// The figure is what a Lv1 account reports (`okx account fees --instType
+    /// OPTION`: maker and taker both 0.03%). Higher tiers are not reproduced
+    /// here because their published schedule was not verified against an
+    /// account; `--sync` reads the real rate for whatever tier the account
+    /// holds, and that is the number to trust.
+    public var optionMakerBps: Double { 3 }
+
+    /// Option taker fee in basis points; see `optionMakerBps`.
+    public var optionTakerBps: Double { 3 }
+
     /// Perpetual taker fee in basis points.
     public var swapTakerBps: Double {
         switch self {
@@ -161,6 +174,8 @@ public struct OKXFeeSchedule: Codable, Sendable, Equatable {
     public var spotTakerOverrideBps: Double?
     public var swapMakerOverrideBps: Double?
     public var swapTakerOverrideBps: Double?
+    public var optionMakerOverrideBps: Double?
+    public var optionTakerOverrideBps: Double?
     public var syncedAt: Date?
 
     public init(
@@ -171,6 +186,8 @@ public struct OKXFeeSchedule: Codable, Sendable, Equatable {
         spotTakerOverrideBps: Double? = nil,
         swapMakerOverrideBps: Double? = nil,
         swapTakerOverrideBps: Double? = nil,
+        optionMakerOverrideBps: Double? = nil,
+        optionTakerOverrideBps: Double? = nil,
         syncedAt: Date? = nil
     ) {
         self.tier = tier
@@ -180,6 +197,8 @@ public struct OKXFeeSchedule: Codable, Sendable, Equatable {
         self.spotTakerOverrideBps = spotTakerOverrideBps
         self.swapMakerOverrideBps = swapMakerOverrideBps
         self.swapTakerOverrideBps = swapTakerOverrideBps
+        self.optionMakerOverrideBps = optionMakerOverrideBps
+        self.optionTakerOverrideBps = optionTakerOverrideBps
         self.syncedAt = syncedAt
     }
 
@@ -192,6 +211,8 @@ public struct OKXFeeSchedule: Codable, Sendable, Equatable {
         case (.spot, .taker): return spotTakerOverrideBps ?? tier.spotTakerBps
         case (.swap, .maker): return swapMakerOverrideBps ?? tier.swapMakerBps
         case (.swap, .taker): return swapTakerOverrideBps ?? tier.swapTakerBps
+        case (.option, .maker): return optionMakerOverrideBps ?? tier.optionMakerBps
+        case (.option, .taker): return optionTakerOverrideBps ?? tier.optionTakerBps
         }
     }
 
@@ -209,6 +230,7 @@ public struct OKXFeeSchedule: Codable, Sendable, Equatable {
         let source = syncedFromAccount ? "账户实时费率" : tier.displayName
         return "\(source) · 现货 \(PriceFormatter.decimals(feeBps(for: .spot), 3)) bps"
             + " · 永续 \(PriceFormatter.decimals(feeBps(for: .swap), 3)) bps"
+            + " · 期权 \(PriceFormatter.decimals(feeBps(for: .option), 3)) bps（名义额，≤ 权利金 12.5%）"
             + " · 滑点 \(PriceFormatter.plain(slippageBps)) bps"
     }
 
@@ -221,6 +243,9 @@ public struct OKXFeeSchedule: Codable, Sendable, Equatable {
         case .swap:
             swapMakerOverrideBps = rates.makerBps
             swapTakerOverrideBps = rates.takerBps
+        case .option:
+            optionMakerOverrideBps = rates.makerBps
+            optionTakerOverrideBps = rates.takerBps
         }
         syncedAt = Date()
     }
@@ -231,6 +256,8 @@ public struct OKXFeeSchedule: Codable, Sendable, Equatable {
         spotTakerOverrideBps = nil
         swapMakerOverrideBps = nil
         swapTakerOverrideBps = nil
+        optionMakerOverrideBps = nil
+        optionTakerOverrideBps = nil
         syncedAt = nil
     }
 }

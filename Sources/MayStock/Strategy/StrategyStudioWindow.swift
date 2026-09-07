@@ -297,9 +297,11 @@ private struct StrategySidebar: View {
                             Button("导出清单…") { export(strategy.manifest) }
                             Divider()
                             Button("移除策略", role: .destructive) {
-                                appState.deleteStrategy(id: strategy.id)
-                                if selection.strategyId == strategy.id {
-                                    selection.strategyId = appState.strategies.first?.id
+                                Task { @MainActor in
+                                    guard await appState.deleteStrategy(id: strategy.id) else { return }
+                                    if selection.strategyId == strategy.id {
+                                        selection.strategyId = appState.strategies.first?.id
+                                    }
                                 }
                             }
                         }
