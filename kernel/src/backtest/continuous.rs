@@ -8,13 +8,14 @@
 //! which is what makes a turnover comparison meaningful.
 
 use super::{
-    bucket_funding, empty_result, liquidation_buffer, utc_day, BacktestConfig, BacktestResult,
-    EquityPoint, ExitReason, Metrics, Trade,
+    bucket_funding, empty_result, liquidation_buffer, resolve_costs, resolve_maintenance,
+    BacktestConfig, BacktestResult, EquityPoint, ExitReason, Metrics, Trade,
 };
 use crate::candle::Candle;
 use crate::decide::{realised_volatility, volatility_scale, Direction};
 use crate::expr::eval::Evaluator;
 use crate::expr::ExprResult;
+use crate::fees::OrderSide;
 use crate::strategy::{CompiledStrategy, InstrumentType, SizingMode};
 
 fn unrealised_for(quantity: f64, average_price: f64, price: f64, funding: f64) -> f64 {
@@ -37,8 +38,9 @@ pub fn run(
     candles.sort_by_key(|c| c.ts_ms);
 
     let manifest = &strategy.manifest;
-    let costs = strategy.costs(config.fee_bps, config.slippage_bps);
-    let fee_rate = costs.fee_bps / 10_000.0;
+    let costs = resolve_costs(strategy, config)?;
+    let maintenance = resolve_maintenance(strategy, config);
+    let calendar = manifest.market.calendar();
     let slippage = costs.slippage_bps / 10_000.0;
     let allows_short = manifest.market.inst_type.allows_short();
     let leverage = strategy.leverage();
@@ -56,7 +58,7 @@ pub fn run(
     // Volatility scaling, when the manifest asks for it.
     let closes: Vec<f64> = candles.iter().map(|c| c.close).collect();
     let volatility = if manifest.sizing.mode == SizingMode::VolatilityTarget {
-        realised_volatility(&closes, manifest.risk.vol_lookback_bars, &manifest.market.bar)
+        realised_volatility(&closes, manifest.risk.vol_lookback_bars, manifest.market.bars_per_year())
     } else {
         vec![f64::NAN; candles.len()]
     };
@@ -84,15 +86,15 @@ pub fn run(
     // has bled through its limit; a simulation that did not would report
     // returns from days the runner would have sat out.
     let mut halted_day: Option<i64> = None;
-    let mut day = utc_day(candles[0].ts_ms);
+    let mut day = calendar.session_key(candles[0].ts_ms);
     let mut day_start_equity = config.initial_capital;
     let mut liquidations = 0usize;
 
     for index in 0..candles.len() {
         let candle = candles[index];
 
-        if utc_day(candle.ts_ms) != day {
-            day = utc_day(candle.ts_ms);
+        if calendar.session_key(candle.ts_ms) != day {
+            day = calendar.session_key(candle.ts_ms);
             day_start_equity =
                 equity + unrealised_for(quantity, average_price, candle.close, accrued_funding);
             // Latched for the day only. Leaving it set would make the backtest
@@ -107,7 +109,11 @@ pub fn run(
                 let buying = delta > 0.0;
                 let fill = candle.open * if buying { 1.0 + slippage } else { 1.0 - slippage };
                 let traded_notional = delta.abs() * fill;
-                let fee = traded_notional * fee_rate;
+                let fee = costs.fee(
+                    if buying { OrderSide::Buy } else { OrderSide::Sell },
+                    delta.abs(),
+                    traded_notional,
+                );
                 equity -= fee;
                 accrued_fees += fee;
 
@@ -218,7 +224,8 @@ pub fn run(
         //         so the level is recomputed from what is currently held rather
         //         than fixed at entry.
         if quantity != 0.0 && leverage > 1.0 {
-            let buffer = liquidation_buffer(config.maintenance_margin_rate, leverage);
+            let buffer = liquidation_buffer(
+                manifest.market.inst_type.margin_regime(), maintenance, leverage);
             let level = if quantity > 0.0 {
                 average_price * (1.0 - buffer)
             } else {
@@ -329,7 +336,11 @@ pub fn run(
         let last = candles[candles.len() - 1];
         let buying = quantity < 0.0;
         let fill = last.close * if buying { 1.0 + slippage } else { 1.0 - slippage };
-        let fee = quantity.abs() * fill * fee_rate;
+        let fee = costs.fee(
+            if buying { OrderSide::Buy } else { OrderSide::Sell },
+            quantity.abs(),
+            quantity.abs() * fill,
+        );
         let realised =
             (fill - average_price) * quantity.abs() * if quantity > 0.0 { 1.0 } else { -1.0 };
         equity += realised - fee;
@@ -373,7 +384,7 @@ pub fn run(
         &trades,
         &equity_curve,
         config.initial_capital,
-        &manifest.market.bar,
+        manifest.market.bars_per_year(),
         strategy.free_parameter_count,
     );
 
@@ -391,7 +402,7 @@ pub fn run(
         liquidations,
         warmup_bars: strategy.warmup_bars,
         data_quality: crate::quality::inspect(
-            &candles, crate::strategy::bar_seconds(&manifest.market.bar), None),
+            &candles, calendar, manifest.market.bar_seconds(), None),
         funding_unmodelled: manifest.market.inst_type == InstrumentType::Swap
             && config.funding_rates.is_empty(),
         metrics,
@@ -453,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn the_breaker_clears_at_the_utc_day_boundary() {
+    fn the_breaker_clears_at_the_day_boundary() {
         // Latched for the day only. A permanently halted backtest would refuse
         // trades the runner takes tomorrow.
         let bars = falling(200, 0.004);

@@ -21,6 +21,10 @@ public struct StrategyFill: Codable, Sendable, Equatable, Identifiable {
     public let id: String
     public let strategyId: String
     public let instId: String
+    /// Where the fill happened. Decides how `instId` is read and what
+    /// currency `feeQuote` is in. Records written before the field existed
+    /// are OKX's, the only venue there was.
+    public let venue: Venue
     public let side: OrderSide
     public let price: Double
     /// Base units, always positive; `side` carries the direction.
@@ -47,11 +51,13 @@ public struct StrategyFill: Codable, Sendable, Equatable, Identifiable {
         id: String, strategyId: String, instId: String, side: OrderSide,
         price: Double, quantity: Double, feeQuote: Double,
         ts: Date, clOrdId: String?, mode: TradingMode,
-        realisedQuote: Double? = nil, positionEffect: PositionEffect? = nil
+        realisedQuote: Double? = nil, positionEffect: PositionEffect? = nil,
+        venue: Venue = .okx
     ) {
         self.id = id
         self.strategyId = strategyId
         self.instId = instId
+        self.venue = venue
         self.side = side
         self.price = price
         self.quantity = quantity
@@ -65,14 +71,36 @@ public struct StrategyFill: Codable, Sendable, Equatable, Identifiable {
 
     /// Convert an exchange fill, normalising the fee into quote currency.
     /// OKX charges spot buy fees in the base currency and reports them negative.
-    public init(exchange fill: ExchangeFill, strategyId: String, mode: TradingMode) {
-        let (base, _) = StrategyLedger.currencies(of: fill.instId)
+    public init(exchange fill: ExchangeFill, strategyId: String, mode: TradingMode, venue: Venue) {
+        let (base, _) = venue.currencies(of: fill.instId)
         let feeMagnitude = abs(fill.fee)
         let inQuote = fill.feeCcy == base ? feeMagnitude * fill.price : feeMagnitude
         self.init(
             id: fill.id, strategyId: strategyId, instId: fill.instId, side: fill.side,
             price: fill.price, quantity: abs(fill.size), feeQuote: inQuote,
-            ts: fill.ts, clOrdId: fill.clOrdId, mode: mode)
+            ts: fill.ts, clOrdId: fill.clOrdId, mode: mode, venue: venue)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, strategyId, instId, venue, side, price, quantity, feeQuote, ts, clOrdId, mode
+        case realisedQuote, positionEffect
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        strategyId = try c.decode(String.self, forKey: .strategyId)
+        instId = try c.decode(String.self, forKey: .instId)
+        venue = try c.decodeIfPresent(Venue.self, forKey: .venue) ?? .okx
+        side = try c.decode(OrderSide.self, forKey: .side)
+        price = try c.decode(Double.self, forKey: .price)
+        quantity = try c.decode(Double.self, forKey: .quantity)
+        feeQuote = try c.decode(Double.self, forKey: .feeQuote)
+        ts = try c.decode(Date.self, forKey: .ts)
+        clOrdId = try c.decodeIfPresent(String.self, forKey: .clOrdId)
+        mode = try c.decode(TradingMode.self, forKey: .mode)
+        realisedQuote = try c.decodeIfPresent(Double.self, forKey: .realisedQuote)
+        positionEffect = try c.decodeIfPresent(PositionEffect.self, forKey: .positionEffect)
     }
 
     /// Signed base quantity: positive for buys, negative for sells.
@@ -105,6 +133,9 @@ public struct StrategyFill: Codable, Sendable, Equatable, Identifiable {
 public struct StrategyPositionState: Codable, Sendable, Equatable, Identifiable {
     public var strategyId: String
     public var instId: String
+    /// Where the position is held. Records written before the field existed
+    /// are OKX's, the only venue there was.
+    public var venue: Venue
     /// Signed: positive long, negative short, zero flat.
     public var quantity: Double
     public var averagePrice: Double
@@ -139,7 +170,7 @@ public struct StrategyPositionState: Codable, Sendable, Equatable, Identifiable 
     /// Nothing may book P&L off a guess — see `StrategyRunner.contractSize`.
     public var contractSizeIsKnown: Bool {
         if let contractSize, contractSize > 0 { return true }
-        return InstrumentType.of(instId: instId).impliedContractSize != nil
+        return venue.instrumentType(of: instId).impliedContractSize != nil
     }
 
     /// Contracts → coins. 1 for spot and for any position whose size the
@@ -150,7 +181,7 @@ public struct StrategyPositionState: Codable, Sendable, Equatable, Identifiable 
     /// why the writers refuse to persist a fabricated one.
     public var multiplier: Double {
         if let contractSize, contractSize > 0 { return contractSize }
-        return InstrumentType.of(instId: instId).impliedContractSize ?? 1
+        return venue.instrumentType(of: instId).impliedContractSize ?? 1
     }
 
     /// Position size in coins rather than contracts, for display.
@@ -163,21 +194,38 @@ public struct StrategyPositionState: Codable, Sendable, Equatable, Identifiable 
     }
 
     private enum CodingKeys: String, CodingKey {
-        case strategyId, instId, quantity, averagePrice, realisedPnL, feesPaid
+        case strategyId, instId, venue, quantity, averagePrice, realisedPnL, feesPaid
         case fillCount, lastFillAt, contractSize, fundingPaid
         // Written under the old name before it was scoped to the current
         // position, so ledgers already on disk keep decoding.
         case openedAt = "firstFillAt"
     }
 
-    public init(strategyId: String, instId: String) {
+    public init(strategyId: String, instId: String, venue: Venue = .okx) {
         self.strategyId = strategyId
         self.instId = instId
+        self.venue = venue
         self.quantity = 0
         self.averagePrice = 0
         self.realisedPnL = 0
         self.feesPaid = 0
         self.fillCount = 0
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        strategyId = try c.decode(String.self, forKey: .strategyId)
+        instId = try c.decode(String.self, forKey: .instId)
+        venue = try c.decodeIfPresent(Venue.self, forKey: .venue) ?? .okx
+        quantity = try c.decode(Double.self, forKey: .quantity)
+        averagePrice = try c.decode(Double.self, forKey: .averagePrice)
+        realisedPnL = try c.decode(Double.self, forKey: .realisedPnL)
+        feesPaid = try c.decode(Double.self, forKey: .feesPaid)
+        fillCount = try c.decode(Int.self, forKey: .fillCount)
+        openedAt = try c.decodeIfPresent(Date.self, forKey: .openedAt)
+        lastFillAt = try c.decodeIfPresent(Date.self, forKey: .lastFillAt)
+        contractSize = try c.decodeIfPresent(Double.self, forKey: .contractSize)
+        fundingPaid = try c.decodeIfPresent(Double.self, forKey: .fundingPaid)
     }
 
     public func unrealisedPnL(mark: Double?) -> Double {
@@ -382,7 +430,7 @@ public final class StrategyLedger {
     public func record(_ fill: StrategyFill) {
         guard !fills.contains(where: { $0.id == fill.id }) else { return }
         var state = positions[fill.strategyId] ?? StrategyPositionState(
-            strategyId: fill.strategyId, instId: fill.instId)
+            strategyId: fill.strategyId, instId: fill.instId, venue: fill.venue)
         state.contractSize = contractSizes[fill.instId] ?? state.contractSize
         var stamped = fill
         (stamped.positionEffect, stamped.realisedQuote) = state.apply(fill)
@@ -396,14 +444,16 @@ public final class StrategyLedger {
     /// Fills without a MayStock tag belong to somebody else and are skipped —
     /// they surface later as unattributed exposure in reconciliation.
     @discardableResult
-    public func ingest(_ exchangeFills: [ExchangeFill], knownStrategyIds: [String]) -> Int {
+    public func ingest(
+        _ exchangeFills: [ExchangeFill], knownStrategyIds: [String], venue: Venue
+    ) -> Int {
         let existing = Set(fills.map(\.id))
         var added = 0
         for fill in exchangeFills.sorted(by: { $0.ts < $1.ts }) {
             guard !existing.contains(fill.id),
                   let strategyId = OrderTag.resolveStrategy(fill.clOrdId, among: knownStrategyIds)
             else { continue }
-            record(StrategyFill(exchange: fill, strategyId: strategyId, mode: mode))
+            record(StrategyFill(exchange: fill, strategyId: strategyId, mode: mode, venue: venue))
             added += 1
         }
         return added
@@ -451,7 +501,7 @@ public final class StrategyLedger {
         var stampsById: [String: (effect: PositionEffect, realisedQuote: Double?)] = [:]
         for fill in fills.sorted(by: { $0.ts < $1.ts }) {
             var state = rebuilt[fill.strategyId] ?? StrategyPositionState(
-                strategyId: fill.strategyId, instId: fill.instId)
+                strategyId: fill.strategyId, instId: fill.instId, venue: fill.venue)
             state.contractSize = contractSizes[fill.instId] ?? state.contractSize
             stampsById[fill.id] = state.apply(fill)
             rebuilt[fill.strategyId] = state
@@ -496,8 +546,10 @@ public final class StrategyLedger {
         spotBalances: [AccountBalance], swapPositions: [ExchangePosition]
     ) -> [LedgerReconciliation] {
         var ledgerByInst: [String: Double] = [:]
+        var venueByInst: [String: Venue] = [:]
         for state in positions.values where !state.isFlat {
             ledgerByInst[state.instId, default: 0] += state.quantity
+            venueByInst[state.instId] = state.venue
         }
 
         var exchangeByInst: [String: Double] = [:]
@@ -505,8 +557,8 @@ public final class StrategyLedger {
             exchangeByInst[position.instId, default: 0] += position.quantity
         }
         // Spot exposure is the base-currency balance of each traded pair.
-        for instId in ledgerByInst.keys where InstrumentType.of(instId: instId) == .spot {
-            let (base, _) = Self.currencies(of: instId)
+        for (instId, venue) in venueByInst where venue.instrumentType(of: instId) == .spot {
+            let (base, _) = venue.currencies(of: instId)
             if let balance = spotBalances.first(where: { $0.ccy == base }) {
                 exchangeByInst[instId] = balance.total
             }
@@ -521,11 +573,6 @@ public final class StrategyLedger {
         }
     }
 
-    /// "BTC-USDT-SWAP" → ("BTC", "USDT")
-    public nonisolated static func currencies(of instId: String) -> (base: String, quote: String) {
-        let parts = instId.split(separator: "-").map(String.init)
-        return (parts.first ?? instId, parts.count > 1 ? parts[1] : "USDT")
-    }
 }
 
 // MARK: - Persistence

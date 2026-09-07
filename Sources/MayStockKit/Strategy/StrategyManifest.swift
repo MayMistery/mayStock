@@ -5,47 +5,37 @@ import Foundation
 public enum InstrumentType: String, Codable, Sendable, CaseIterable {
     case spot = "SPOT"
     case swap = "SWAP"
+    case stock = "STOCK"
 
     public var displayName: String {
         switch self {
         case .spot: return "现货"
         case .swap: return "永续"
+        case .stock: return "股票"
         }
     }
 
-    /// OKX taker fee in basis points, used when a manifest omits `costs`.
-    public var defaultFeeBps: Double {
-        switch self {
-        case .spot: return 10   // 0.10%
-        case .swap: return 5    // 0.05%
-        }
-    }
+    /// What this type allows, as the kernel defines it. The kernel compiles
+    /// manifests and sizes positions, so it is the side whose answer counts;
+    /// Swift asks rather than keeping a table that could disagree.
+    public var policy: KernelInstrumentPolicy { KernelInstrumentPolicy.policy(for: self) }
 
-    public var allowsShorting: Bool { self == .swap }
-    public var allowsLeverage: Bool { self == .swap }
-
-    /// The instrument family an id names.
-    ///
-    /// OKX encodes it in the id itself, and this is the only place allowed to
-    /// know how. The test spelling `instId.hasSuffix("-SWAP")` used to be
-    /// copied into a dozen call sites, which is fine right up until one of them
-    /// needs to grow a case — futures, options, a venue that spells it
-    /// differently — and eleven others quietly keep the old answer.
-    public static func of(instId: String) -> InstrumentType {
-        instId.hasSuffix("-" + InstrumentType.swap.rawValue) ? .swap : .spot
-    }
+    public var allowsShorting: Bool { policy.allowsShort }
+    public var allowsLeverage: Bool { policy.allowsLeverage }
+    /// The most leverage a manifest may declare on this type.
+    public var maxLeverage: Double { policy.maxLeverage }
+    /// Sized in contracts rather than in the base unit.
+    public var tradesInContracts: Bool { policy.tradesInContracts }
 
     /// Base units per contract when the exchange has nothing to say.
     ///
-    /// Spot is one-for-one by definition, so its multiplier is *known* without
-    /// asking anyone. A swap's is not: only the exchange's `ctVal` answers it,
-    /// and "we could not reach the exchange" is not an answer. Returning nil
-    /// there is the whole point — see `StrategyPositionState.contractSize`.
+    /// Anything sized in its own base unit — a coin, a share — is one-for-one
+    /// by definition, so its multiplier is *known* without asking anyone. A
+    /// perpetual's is not: only the exchange's `ctVal` answers it, and "we
+    /// could not reach the exchange" is not an answer. Returning nil there is
+    /// the whole point — see `StrategyPositionState.contractSize`.
     public var impliedContractSize: Double? {
-        switch self {
-        case .spot: return 1
-        case .swap: return nil
-        }
+        tradesInContracts ? nil : 1
     }
 }
 
@@ -53,11 +43,33 @@ public struct StrategyMarket: Codable, Sendable, Equatable {
     public var instId: String
     public var instType: InstrumentType
     public var bar: BarInterval
+    /// Where the instrument trades. Schema-1 manifests carry no venue and
+    /// only ever meant OKX.
+    public var venue: Venue
 
-    public init(instId: String, instType: InstrumentType = .spot, bar: BarInterval = .h1) {
+    public init(
+        instId: String, instType: InstrumentType = .spot, bar: BarInterval = .h1,
+        venue: Venue = .okx
+    ) {
         self.instId = instId
         self.instType = instType
         self.bar = bar
+        self.venue = venue
+    }
+
+    /// The calendar this market's bars follow, as the kernel keeps it.
+    public var calendar: KernelCalendar { KernelCalendar(market: self) }
+
+    private enum CodingKeys: String, CodingKey {
+        case instId, instType, bar, venue
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        instId = try c.decode(String.self, forKey: .instId)
+        instType = try c.decodeIfPresent(InstrumentType.self, forKey: .instType) ?? .spot
+        bar = try c.decodeIfPresent(BarInterval.self, forKey: .bar) ?? .h1
+        venue = try c.decodeIfPresent(Venue.self, forKey: .venue) ?? .okx
     }
 }
 
@@ -308,7 +320,8 @@ public struct StrategyRisk: Codable, Sendable, Equatable {
     /// A stop and a take-profit bound the price a position may reach but say
     /// nothing about how long it may sit there. Nil means no limit.
     public var maxHoldBars: Int?
-    /// Halt the strategy for the rest of the UTC day after this much loss.
+    /// Halt the strategy for the rest of the trading day — the market's own
+    /// day, by its calendar — after this much loss.
     public var maxDailyLossPct: Double?
 
     public init(
@@ -358,9 +371,15 @@ public struct StrategyRisk: Codable, Sendable, Equatable {
     }
 }
 
+/// What a fill costs beyond its price.
+///
+/// Written as `{"feeBps": 10, "slippageBps": 1}` when the model is the plain
+/// both-sides percentage — the only shape there used to be — and as
+/// `{"fees": [...], "slippageBps": 1}` otherwise. The kernel reads the same two
+/// shapes; see `FeeModel`.
 public struct StrategyCosts: Codable, Sendable, Equatable {
-    /// Taker fee charged on notional, once on entry and once on exit.
-    public var feeBps: Double
+    /// Fees charged on each fill, by component.
+    public var fees: FeeModel
     /// Adverse price move assumed on every fill.
     ///
     /// 1, not the 5 this defaulted to for a long time. The measured top-of-book
@@ -373,13 +392,49 @@ public struct StrategyCosts: Codable, Sendable, Equatable {
 
     public static let defaultSlippageBps: Double = 1
 
-    public init(feeBps: Double, slippageBps: Double = StrategyCosts.defaultSlippageBps) {
-        self.feeBps = feeBps
+    public init(fees: FeeModel, slippageBps: Double = StrategyCosts.defaultSlippageBps) {
+        self.fees = fees
         self.slippageBps = slippageBps
     }
 
-    public static func `default`(for instType: InstrumentType) -> StrategyCosts {
-        StrategyCosts(feeBps: instType.defaultFeeBps)
+    /// The shorthand: a percentage of notional charged on both sides.
+    public init(feeBps: Double, slippageBps: Double = StrategyCosts.defaultSlippageBps) {
+        self.init(fees: .flatBps(feeBps), slippageBps: slippageBps)
+    }
+
+    /// The fee as a single both-sides percentage, when it is one.
+    public var feeBps: Double? { fees.flatBps }
+
+    private enum CodingKeys: String, CodingKey {
+        case feeBps, fees, slippageBps
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let bps = try c.decodeIfPresent(Double.self, forKey: .feeBps)
+        let list = try c.decodeIfPresent(FeeModel.self, forKey: .fees)
+        switch (bps, list) {
+        case (.some, .some):
+            throw DecodingError.dataCorruptedError(
+                forKey: .fees, in: c, debugDescription: "costs 里 feeBps 和 fees 只能写一个：前者是后者的简写")
+        case (.some(let bps), .none): fees = .flatBps(bps)
+        case (.none, .some(let list)): fees = list
+        case (.none, .none):
+            throw DecodingError.dataCorruptedError(
+                forKey: .feeBps, in: c, debugDescription: "costs 必须写 feeBps 或 fees")
+        }
+        slippageBps = try c.decodeIfPresent(Double.self, forKey: .slippageBps)
+            ?? StrategyCosts.defaultSlippageBps
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        if let bps = feeBps {
+            try c.encode(bps, forKey: .feeBps)
+        } else {
+            try c.encode(fees, forKey: .fees)
+        }
+        try c.encode(slippageBps, forKey: .slippageBps)
     }
 }
 
@@ -391,7 +446,10 @@ public struct StrategyCosts: Codable, Sendable, Equatable {
 /// candles and nothing else. `compile()` is the only gate into execution and it
 /// rejects anything malformed before a single order can be contemplated.
 public struct StrategyManifest: Codable, Sendable, Equatable, Identifiable {
-    public static let currentSchema = 1
+    /// Schema 2 adds `market.venue` and the `costs.fees` list. A schema-1 file
+    /// still loads: it has no venue and only ever meant OKX.
+    public static let currentSchema = 2
+    public static let supportedSchemas = 1...currentSchema
 
     public var schema: Int
     public var id: String
@@ -445,8 +503,12 @@ public struct StrategyManifest: Codable, Sendable, Equatable, Identifiable {
         self.costs = costs
     }
 
-    public var effectiveCosts: StrategyCosts {
-        costs ?? .default(for: market.instType)
+    /// The costs a backtest of this manifest charges: its own when it states
+    /// them, otherwise the venue's schedule for its instrument. Nil when the
+    /// venue does not trade the instrument at all — there is then no cost
+    /// model, and a simulation must refuse rather than run for free.
+    public func effectiveCosts(under schedules: FeeSchedules) -> StrategyCosts? {
+        costs ?? schedules.schedule(for: market.venue).costs(for: market.instType)
     }
 
     // MARK: Codable with tolerant defaults
@@ -518,9 +580,11 @@ public enum StrategyManifestError: Error, CustomStringConvertible, Sendable, Equ
     case unsupportedSchema(Int)
     case emptyName
     case noEntrySignal
-    case shortingRequiresSwap
-    case leverageRequiresSwap(Double)
-    case leverageOutOfRange(Double)
+    case shortingNotAllowed(InstrumentType)
+    case leverageNotAllowed(InstrumentType, Double)
+    case leverageOutOfRange(Double, max: Double)
+    case instrumentNotOnVenue(InstrumentType, Venue)
+    case dataSourceNotOnVenue(name: String, source: AlternativeSeriesSource, venue: Venue)
     case unknownIdentifier(signal: String, name: String)
     case badExpression(signal: String, reason: String)
     case invalidSizing(String)
@@ -530,12 +594,19 @@ public enum StrategyManifestError: Error, CustomStringConvertible, Sendable, Equ
     public var description: String {
         switch self {
         case .malformed(let detail): return "策略文件格式错误：\(detail)"
-        case .unsupportedSchema(let v): return "不支持的 schema 版本 \(v)（当前支持 \(StrategyManifest.currentSchema)）"
+        case .unsupportedSchema(let v):
+            return "不支持的 schema 版本 \(v)（当前支持 \(StrategyManifest.supportedSchemas.lowerBound)~\(StrategyManifest.currentSchema)）"
         case .emptyName: return "策略必须有名称"
         case .noEntrySignal: return "策略至少需要一个入场信号（longEntry 或 shortEntry）"
-        case .shortingRequiresSwap: return "做空信号仅永续（instType = SWAP）可用"
-        case .leverageRequiresSwap(let x): return "杠杆 \(PriceFormatter.plain(x))× 仅永续可用，现货必须为 1"
-        case .leverageOutOfRange(let x): return "杠杆 \(PriceFormatter.plain(x))× 超出允许范围（1~50）"
+        case .shortingNotAllowed(let type): return "\(type.displayName)不能做空，清单却声明了做空信号"
+        case .leverageNotAllowed(let type, let x):
+            return "\(type.displayName)没有杠杆可用，清单却声明了 \(PriceFormatter.plain(x))×"
+        case .leverageOutOfRange(let x, let max):
+            return "杠杆 \(PriceFormatter.plain(x))× 超出允许范围（1~\(PriceFormatter.plain(max))）"
+        case .instrumentNotOnVenue(let type, let venue):
+            return "\(venue.displayName)不交易\(type.displayName)（可选：\(venue.instrumentTypes.map(\.displayName).joined(separator: "、"))）"
+        case .dataSourceNotOnVenue(let name, let source, let venue):
+            return "data 中的「\(name)」（\(source.displayName)）是 \(Venue.okx.displayName) 专有的数据源，\(venue.displayName)上没有"
         case .unknownIdentifier(let signal, let name):
             return "\(signal) 引用了未声明的标识符「\(name)」—— 请在 params 中声明，或改用行情变量"
         case .badExpression(let signal, let reason): return "\(signal)：\(reason)"
@@ -548,8 +619,6 @@ public enum StrategyManifestError: Error, CustomStringConvertible, Sendable, Equ
 
 // MARK: - Compilation
 
-/// A manifest that has passed every check and is ready to backtest or run.
-/// Holding one is proof the strategy is executable.
 /// A manifest the kernel has accepted.
 ///
 /// The rules themselves live in the kernel, not here: this type carries the
@@ -615,7 +684,9 @@ extension StrategyManifest {
     /// Parse and validate every rule. Throws on the first real problem, with a
     /// message aimed at whoever wrote the file.
     public func compile() throws -> CompiledStrategy {
-        guard schema == Self.currentSchema else { throw StrategyManifestError.unsupportedSchema(schema) }
+        guard Self.supportedSchemas.contains(schema) else {
+            throw StrategyManifestError.unsupportedSchema(schema)
+        }
         guard !name.trimmingCharacters(in: .whitespaces).isEmpty else { throw StrategyManifestError.emptyName }
 
         for parameter in params.items {
@@ -644,10 +715,27 @@ extension StrategyManifest {
         let hasShortEntry = Self.isDeclared(signals.shortEntry)
 
         // Market-policy checks run *before* the kernel compiles the rules, so a
-        // spot manifest declaring a short leg reports the precise reason rather
-        // than the kernel's generic refusal.
+        // manifest declaring something its instrument cannot do reports the
+        // precise reason rather than the kernel's generic refusal.
+        guard market.venue.trades(market.instType) else {
+            throw StrategyManifestError.instrumentNotOnVenue(market.instType, market.venue)
+        }
         if hasShortEntry, !market.instType.allowsShorting {
-            throw StrategyManifestError.shortingRequiresSwap
+            throw StrategyManifestError.shortingNotAllowed(market.instType)
+        }
+        for (name, spec) in data.sorted(by: { $0.key < $1.key })
+        where !spec.source.isAvailable(on: market.venue) {
+            throw StrategyManifestError.dataSourceNotOnVenue(
+                name: name, source: spec.source, venue: market.venue)
+        }
+        if risk.leverage != 1 {
+            guard market.instType.allowsLeverage else {
+                throw StrategyManifestError.leverageNotAllowed(market.instType, risk.leverage)
+            }
+            guard risk.leverage >= 1, risk.leverage <= market.instType.maxLeverage else {
+                throw StrategyManifestError.leverageOutOfRange(
+                    risk.leverage, max: market.instType.maxLeverage)
+            }
         }
 
         // Expression validation belongs to the kernel: it owns the grammar, the
@@ -669,20 +757,6 @@ extension StrategyManifest {
         if !engine.isScript, !hasExposure {
             guard hasLongEntry || hasShortEntry else {
                 throw StrategyManifestError.noEntrySignal
-            }
-        }
-        // Continuous exposure can go short by construction, so the same
-        // spot-market restriction has to apply to it.
-        if hasExposure, !market.instType.allowsShorting {
-            // Long-only spot is still fine — the engine clamps exposure at 0.
-            // Nothing to reject here, but the clamp is what makes it safe.
-        }
-        if risk.leverage != 1 {
-            guard market.instType.allowsLeverage else {
-                throw StrategyManifestError.leverageRequiresSwap(risk.leverage)
-            }
-            guard risk.leverage >= 1, risk.leverage <= 50 else {
-                throw StrategyManifestError.leverageOutOfRange(risk.leverage)
             }
         }
 

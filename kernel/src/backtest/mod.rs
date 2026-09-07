@@ -16,12 +16,14 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::calendar::MarketCalendar;
 use crate::candle::Candle;
 use crate::decide::{desired_direction, Direction};
 use crate::expr::eval::Evaluator;
-use crate::expr::ExprResult;
+use crate::expr::{ExprError, ExprResult};
+use crate::fees::{FeeComponent, OrderSide};
 use crate::series;
-use crate::strategy::{bar_seconds, CompiledStrategy};
+use crate::strategy::{bar_seconds, CompiledStrategy, Costs, MarginRegime};
 
 pub use metrics::Metrics;
 
@@ -39,16 +41,18 @@ pub struct FundingRate {
 pub struct BacktestConfig {
     #[serde(rename = "initialCapital", default = "default_capital")]
     pub initial_capital: f64,
-    /// Maintenance margin rate used for the swap liquidation check.
-    #[serde(rename = "maintenanceMarginRate", default = "default_mmr")]
-    pub maintenance_margin_rate: f64,
+    /// Maintenance margin rate for the liquidation check. `None` takes the
+    /// instrument's documented default (`InstrumentType::default_maintenance_margin_rate`).
+    #[serde(rename = "maintenanceMarginRate", default)]
+    pub maintenance_margin_rate: Option<f64>,
     /// Real funding history; empty means funding is not modelled (flagged in
     /// the report rather than silently assumed to be zero).
     #[serde(rename = "fundingRates", default)]
     pub funding_rates: Vec<FundingRate>,
-    /// Account-tier fallbacks used when the manifest states no costs.
-    #[serde(rename = "feeBps")]
-    pub fee_bps: Option<f64>,
+    /// Fee model from the caller's schedule, used when the manifest states no
+    /// costs. See `crate::fees`.
+    #[serde(default)]
+    pub fees: Option<Vec<FeeComponent>>,
     #[serde(rename = "slippageBps")]
     pub slippage_bps: Option<f64>,
     /// Named non-OHLCV series from the manifest's `data` block, **already
@@ -64,17 +68,14 @@ pub struct BacktestConfig {
 fn default_capital() -> f64 {
     10_000.0
 }
-fn default_mmr() -> f64 {
-    0.005
-}
 
 impl Default for BacktestConfig {
     fn default() -> Self {
         Self {
             initial_capital: 10_000.0,
-            maintenance_margin_rate: 0.005,
+            maintenance_margin_rate: None,
             funding_rates: Vec::new(),
-            fee_bps: None,
+            fees: None,
             slippage_bps: None,
             external_series: HashMap::new(),
             script_targets: None,
@@ -202,16 +203,49 @@ struct PendingExit {
     reason: ExitReason,
 }
 
-/// Fractional adverse move that wipes the margin backing a position.
+/// Fractional adverse move that gets a position closed out by its lender.
 ///
 /// Shared with the continuous engine so "when does this get liquidated" has
-/// one definition rather than two that must be kept in step.
-pub(crate) fn liquidation_buffer(maintenance_margin_rate: f64, leverage: f64) -> f64 {
-    (1.0 - maintenance_margin_rate) / leverage
+/// one definition rather than two that must be kept in step. The arithmetic
+/// differs by margin regime because the collateral does:
+///
+/// - isolated margin backs the position with `notional / leverage` and closes
+///   it when the loss has eaten that down to the maintenance rate;
+/// - Regulation T lends against the shares and calls the loan when equity
+///   falls below the maintenance share of the position's *current* value,
+///   so at 2× and 25% the buffer is a third, not the 37.5% the isolated
+///   formula would give.
+pub(crate) fn liquidation_buffer(regime: MarginRegime, maintenance_margin_rate: f64, leverage: f64) -> f64 {
+    match regime {
+        // Fully paid: only a price of zero takes it away.
+        MarginRegime::None => 1.0,
+        MarginRegime::Isolated => (1.0 - maintenance_margin_rate) / leverage,
+        MarginRegime::RegT => {
+            if leverage <= 1.0 {
+                1.0
+            } else {
+                1.0 - (1.0 - 1.0 / leverage) / (1.0 - maintenance_margin_rate)
+            }
+        }
+    }
 }
 
-pub(crate) fn utc_day(ts_ms: i64) -> i64 {
-    (ts_ms as f64 / 86_400_000.0).floor() as i64
+/// Costs the simulation charges: the manifest's own, else the caller's fee
+/// schedule, else the instrument's documented default. A manifest with no
+/// costs on an instrument with no default is refused rather than simulated
+/// for free.
+fn resolve_costs(strategy: &CompiledStrategy, config: &BacktestConfig) -> ExprResult<Costs> {
+    strategy
+        .costs(config.fees.as_deref(), config.slippage_bps)
+        .map_err(|message| ExprError::Syntax { message, column: 1 })
+}
+
+/// Maintenance margin the simulation liquidates against.
+fn resolve_maintenance(strategy: &CompiledStrategy, config: &BacktestConfig) -> f64 {
+    config
+        .maintenance_margin_rate
+        .or_else(|| strategy.manifest.market.inst_type.default_maintenance_margin_rate())
+        .unwrap_or(0.0)
 }
 
 fn unrealised(position: Option<&OpenPosition>, price: f64) -> f64 {
@@ -246,8 +280,9 @@ pub fn run(
     candles.sort_by_key(|c| c.ts_ms);
 
     let manifest = &strategy.manifest;
-    let costs = strategy.costs(config.fee_bps, config.slippage_bps);
-    let fee_rate = costs.fee_bps / 10_000.0;
+    let costs = resolve_costs(strategy, config)?;
+    let maintenance = resolve_maintenance(strategy, config);
+    let calendar: MarketCalendar = manifest.market.calendar();
     let slippage = costs.slippage_bps / 10_000.0;
     let leverage = strategy.leverage();
     // The absolute pre-trade limits, so a sizing bug is capped here exactly as
@@ -300,7 +335,7 @@ pub fn run(
     let mut last_exit_index: Option<usize> = None;
     let mut halted_day: Option<i64> = None;
     let mut day_start_equity = config.initial_capital;
-    let mut current_day = utc_day(candles[0].ts_ms);
+    let mut current_day = calendar.session_key(candles[0].ts_ms);
 
     let funding_by_bar = bucket_funding(&candles, &manifest.market.bar, &config.funding_rates);
     let first_tradable = strategy.warmup_bars.min(candles.len() - 1);
@@ -308,8 +343,9 @@ pub fn run(
     for index in 0..candles.len() {
         let candle = candles[index];
 
-        // --- New UTC day: reset the daily-loss circuit breaker.
-        let day = utc_day(candle.ts_ms);
+        // --- New trading day (by the market's calendar): reset the
+        //     daily-loss circuit breaker.
+        let day = calendar.session_key(candle.ts_ms);
         if day != current_day {
             current_day = day;
             day_start_equity = equity + unrealised(position.as_ref(), candle.open);
@@ -330,7 +366,7 @@ pub fn run(
                         candle.ts_ms,
                         index,
                         ExitReason::Signal,
-                        fee_rate,
+                        &costs,
                         &mut equity,
                         &mut trades,
                     );
@@ -352,7 +388,7 @@ pub fn run(
                         });
                         open_position(
                             strategy,
-                            config,
+                            maintenance,
                             &mut position,
                             direction,
                             fill,
@@ -361,7 +397,7 @@ pub fn run(
                             &mut equity,
                             leverage,
                             &limits,
-                            fee_rate,
+                            &costs,
                             atr,
                         );
                     }
@@ -381,7 +417,7 @@ pub fn run(
                     candle.ts_ms,
                     index,
                     exit.reason,
-                    fee_rate,
+                    &costs,
                     &mut equity,
                     &mut trades,
                 );
@@ -438,7 +474,7 @@ pub fn run(
                         candle.ts_ms,
                         index,
                         ExitReason::DailyLossHalt,
-                        fee_rate,
+                        &costs,
                         &mut equity,
                         &mut trades,
                     );
@@ -492,7 +528,7 @@ pub fn run(
             last.ts_ms,
             candles.len() - 1,
             ExitReason::EndOfData,
-            fee_rate,
+            &costs,
             &mut equity,
             &mut trades,
         );
@@ -509,7 +545,7 @@ pub fn run(
         &trades,
         &equity_curve,
         config.initial_capital,
-        &manifest.market.bar,
+        manifest.market.bars_per_year(),
         strategy.free_parameter_count,
     );
 
@@ -527,7 +563,7 @@ pub fn run(
         liquidations,
         warmup_bars: strategy.warmup_bars,
         data_quality: crate::quality::inspect(
-            &candles, bar_seconds(&manifest.market.bar), None),
+            &candles, calendar, manifest.market.bar_seconds(), None),
         funding_unmodelled: manifest.market.inst_type == crate::strategy::InstrumentType::Swap
             && config.funding_rates.is_empty(),
         metrics,
@@ -538,7 +574,7 @@ pub fn run(
 #[allow(clippy::too_many_arguments)]
 fn open_position(
     strategy: &CompiledStrategy,
-    config: &BacktestConfig,
+    maintenance_margin_rate: f64,
     position: &mut Option<OpenPosition>,
     direction: Direction,
     price: f64,
@@ -547,7 +583,7 @@ fn open_position(
     equity: &mut f64,
     leverage: f64,
     limits: &crate::guard::OrderLimits,
-    fee_rate: f64,
+    costs: &Costs,
     atr: Option<f64>,
 ) {
     if !(price > 0.0) || !(*equity > 0.0) {
@@ -574,7 +610,10 @@ fn open_position(
     {
         return;
     }
-    let fee = notional * fee_rate;
+    // Opening a long buys; opening a short sells — and a short sale pays the
+    // levies a sale pays.
+    let side = if direction == Direction::Long { OrderSide::Buy } else { OrderSide::Sell };
+    let fee = costs.fee(side, quantity, notional);
     *equity -= fee;
 
     let mut new = OpenPosition {
@@ -607,7 +646,8 @@ fn open_position(
         });
     }
     if leverage > 1.0 {
-        let buffer = liquidation_buffer(config.maintenance_margin_rate, leverage);
+        let buffer = liquidation_buffer(
+            manifest.market.inst_type.margin_regime(), maintenance_margin_rate, leverage);
         new.liquidation_price = Some(if direction == Direction::Long {
             price * (1.0 - buffer)
         } else {
@@ -624,7 +664,7 @@ fn close_position(
     ts: i64,
     index: usize,
     reason: ExitReason,
-    fee_rate: f64,
+    costs: &Costs,
     equity: &mut f64,
     trades: &mut Vec<Trade>,
 ) {
@@ -633,7 +673,8 @@ fn close_position(
     };
 
     let exit_notional = existing.quantity * price;
-    let exit_fee = exit_notional * fee_rate;
+    let side = if existing.direction == Direction::Long { OrderSide::Sell } else { OrderSide::Buy };
+    let exit_fee = costs.fee(side, existing.quantity, exit_notional);
     let gross = existing.direction.sign() * (price - existing.entry_price) * existing.quantity;
     let net = gross - exit_fee - existing.funding;
     *equity += net;
@@ -768,14 +809,14 @@ fn empty_result(
         liquidations: 0,
         warmup_bars: strategy.warmup_bars,
         data_quality: crate::quality::inspect(
-            &candles, bar_seconds(&manifest.market.bar), None),
+            &candles, manifest.market.calendar(), manifest.market.bar_seconds(), None),
         funding_unmodelled: manifest.market.inst_type == crate::strategy::InstrumentType::Swap
             && config.funding_rates.is_empty(),
         metrics: Metrics::compute(
             &[],
             &[],
             config.initial_capital,
-            &manifest.market.bar,
+            manifest.market.bars_per_year(),
             strategy.free_parameter_count,
         ),
     }

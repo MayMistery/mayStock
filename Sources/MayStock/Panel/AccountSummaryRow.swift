@@ -20,6 +20,8 @@ struct AccountSummaryRow: View {
     var openPnLPct: Double? = nil
     /// Shown in place of the equity when there is none.
     let placeholder: String
+    /// What the equity is denominated in — the venue's currency.
+    var quoteCurrency: String = ""
     let change: (EquityWindow) -> EquityChange?
     /// Why the portfolio is refusing new exposure, when it is.
     var protection: String? = nil
@@ -96,7 +98,7 @@ struct AccountSummaryRow: View {
                     .monospacedDigit()
                     .contentTransition(.numericText())
                     .animation(.snappy(duration: 0.2), value: equity)
-                Text(StrategyRunner.quoteCurrency)
+                Text(quoteCurrency)
                     .font(.system(size: 9)).foregroundStyle(.tertiary)
                     .baselineOffset(-1)
                 if let nonStablePct {
@@ -209,7 +211,7 @@ struct AccountSummaryRow: View {
             return "\(window.longLabel)：还没有任何权益采样"
         }
         let range = "\(PriceFormatter.money(change.startEquity)) → "
-            + "\(PriceFormatter.money(change.endEquity)) \(StrategyRunner.quoteCurrency)"
+            + "\(PriceFormatter.money(change.endEquity)) \(quoteCurrency)"
         let head = "\(window.longLabel)\n\(range)"
         return change.coverageNote.isEmpty ? head : "\(head)\n\(change.coverageNote)"
     }

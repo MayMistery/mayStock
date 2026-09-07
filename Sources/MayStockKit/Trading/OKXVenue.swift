@@ -7,7 +7,7 @@ import Foundation
 /// runner sees one object instead of two. Adding a second exchange means
 /// writing a sibling of this file and nothing else.
 public struct OKXVenue: ExchangeVenue {
-    public let venueName = "OKX"
+    public let venue = Venue.okx
 
     private let rest: OKXRESTClient
     private let bridge: TradeBridge

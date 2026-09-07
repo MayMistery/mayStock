@@ -1,11 +1,12 @@
 {
-  "schema": 1,
+  "schema": 2,
   "id": "btc-4h-breakout",
   "name": "BTC 4H 通道突破",
   "version": "1.0.0",
   "author": "MayStock lab",
   "notes": "研究候选，未通过验证：走向前样本外虽为正，但效率比 -0.80（样本内亏、样本外碰巧赚），属于运气而非边际。固定参数跑满一年时 72 组参数全部亏损。保留作对照，不建议投入资金。",
   "market": {
+    "venue": "okx",
     "instId": "BTC-USDT",
     "instType": "SPOT",
     "bar": "4H"

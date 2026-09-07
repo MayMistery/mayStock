@@ -15,16 +15,21 @@ public struct KernelStrategyInfo: Decodable, Sendable, Equatable {
     public let instId: String
     public let instType: String
     public let bar: String
+    public let venue: Venue
+    /// The calendar the kernel follows for this market: `continuous` or
+    /// `usEquities`.
+    public let calendar: String
+    public let barsPerYear: Double
     public let warmupBars: Int
     public let freeParameterCount: Int
     public let isContinuous: Bool
     public let leverage: Double
-    public let feeBps: Double
-    public let slippageBps: Double
+    /// The costs the kernel would charge with no fee schedule supplied — the
+    /// manifest's own, else the instrument's default. Nil when there is
+    /// neither and the caller's schedule has to decide.
+    public let fees: FeeModel?
+    public let slippageBps: Double?
     public let params: [String: Double]
-
-    /// Round-trip cost in percent — entry fee + exit fee + slippage both ways.
-    public var roundTripCostPct: Double { (feeBps + slippageBps) * 2 / 100 }
 }
 
 // MARK: - Live decision
@@ -35,7 +40,8 @@ public struct KernelAccountState: Encodable, Sendable {
     public var equity: Double
     /// Coins currently held (signed).
     public var heldBase: Double
-    /// Strategy equity at the start of the current UTC day.
+    /// Strategy equity at the start of the current trading day — the
+    /// market's own day, by its calendar (`KernelCalendar.sessionKey`).
     public var dayStartEquity: Double
     /// Portfolio-level cap, when tighter than the manifest's leverage.
     public var leverageCap: Double?
@@ -110,10 +116,29 @@ public struct KernelOrderDenied: Decodable, Sendable, Equatable {
 public struct KernelDataQuality: Decodable, Sendable, Equatable {
     public let usable: Bool
     public let reason: String
+    /// Bars the market's calendar expected that are not there.
     public let gaps: Int
     public let duplicates: Int
     public let malformed: Int
+    /// Bars present where the calendar expects none — a feed serving extended
+    /// hours, typically. Reported, never a refusal.
+    public let offGrid: Int
     public let barsBehind: Double?
+
+    private enum CodingKeys: String, CodingKey {
+        case usable, reason, gaps, duplicates, malformed, offGrid, barsBehind
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        usable = try c.decode(Bool.self, forKey: .usable)
+        reason = try c.decode(String.self, forKey: .reason)
+        gaps = try c.decode(Int.self, forKey: .gaps)
+        duplicates = try c.decode(Int.self, forKey: .duplicates)
+        malformed = try c.decode(Int.self, forKey: .malformed)
+        offGrid = try c.decodeIfPresent(Int.self, forKey: .offGrid) ?? 0
+        barsBehind = try c.decodeIfPresent(Double.self, forKey: .barsBehind)
+    }
 }
 
 public struct KernelDecision: Decodable, Sendable, Equatable {
@@ -187,10 +212,12 @@ public struct KernelDecision: Decodable, Sendable, Equatable {
 
 public struct KernelBacktestConfig: Encodable, Sendable {
     public var initialCapital: Double
-    public var maintenanceMarginRate: Double
+    /// Nil takes the instrument's documented default: OKX's tier-one rate on a
+    /// perpetual, FINRA's 25% minimum on a margined stock.
+    public var maintenanceMarginRate: Double?
     public var fundingRates: [KernelFundingRate]
-    /// Account-tier fallbacks, used only when the manifest states no costs.
-    public var feeBps: Double?
+    /// The fee schedule's model, used only when the manifest states no costs.
+    public var fees: FeeModel?
     public var slippageBps: Double?
     public var externalSeries: [String: [Double]]
     /// Per-bar targets from a script engine: 1 long, −1 short, 0 flat.
@@ -198,9 +225,9 @@ public struct KernelBacktestConfig: Encodable, Sendable {
 
     public init(
         initialCapital: Double = 10_000,
-        maintenanceMarginRate: Double = 0.005,
+        maintenanceMarginRate: Double? = nil,
         fundingRates: [KernelFundingRate] = [],
-        feeBps: Double? = nil,
+        fees: FeeModel? = nil,
         slippageBps: Double? = nil,
         externalSeries: [String: [Double]] = [:],
         scriptTargets: [Int]? = nil
@@ -208,7 +235,7 @@ public struct KernelBacktestConfig: Encodable, Sendable {
         self.initialCapital = initialCapital
         self.maintenanceMarginRate = maintenanceMarginRate
         self.fundingRates = fundingRates
-        self.feeBps = feeBps
+        self.fees = fees
         self.slippageBps = slippageBps
         self.externalSeries = externalSeries
         self.scriptTargets = scriptTargets

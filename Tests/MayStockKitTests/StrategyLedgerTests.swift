@@ -108,7 +108,7 @@ struct StrategyPositionTests {
             id: "t1", instId: "BTC-USDT", side: .buy, posSide: nil,
             price: 100, size: 1, fee: -0.001, feeCcy: "BTC",
             ordId: "o1", clOrdId: nil, ts: Date())
-        let fill = StrategyFill(exchange: exchange, strategyId: "s", mode: .demo)
+        let fill = StrategyFill(exchange: exchange, strategyId: "s", mode: .demo, venue: .okx)
         #expect(abs(fill.feeQuote - 0.1) < 1e-9, "0.001 BTC at 100 is 0.1 USDT")
     }
 }
@@ -322,7 +322,7 @@ struct StrategyLedgerTests {
             exchangeFill(id: "1", side: .buy, price: 100, size: 1, clOrdId: mine),
             exchangeFill(id: "2", side: .buy, price: 100, size: 5, clOrdId: "someoneElse"),
             exchangeFill(id: "3", side: .buy, price: 100, size: 2, clOrdId: nil),
-        ], knownStrategyIds: ["ema-trend"])
+        ], knownStrategyIds: ["ema-trend"], venue: .okx)
 
         #expect(added == 1)
         #expect(ledger.position(for: "ema-trend")?.quantity == 1,
@@ -333,8 +333,8 @@ struct StrategyLedgerTests {
         let ledger = StrategyLedger(mode: .demo)
         let tag = OrderTag.make(strategyId: "ema-trend")
         let fills = [exchangeFill(id: "1", side: .buy, price: 100, size: 1, clOrdId: tag)]
-        ledger.ingest(fills, knownStrategyIds: ["ema-trend"])
-        ledger.ingest(fills, knownStrategyIds: ["ema-trend"])
+        ledger.ingest(fills, knownStrategyIds: ["ema-trend"], venue: .okx)
+        ledger.ingest(fills, knownStrategyIds: ["ema-trend"], venue: .okx)
         #expect(ledger.fills.count == 1)
         #expect(ledger.position(for: "ema-trend")?.quantity == 1)
     }
@@ -345,7 +345,7 @@ struct StrategyLedgerTests {
         ledger.ingest([
             exchangeFill(id: "1", side: .buy, price: 100, size: 2, clOrdId: tag),
             exchangeFill(id: "2", side: .sell, price: 120, size: 1, clOrdId: tag),
-        ], knownStrategyIds: ["ema-trend"])
+        ], knownStrategyIds: ["ema-trend"], venue: .okx)
         let before = ledger.position(for: "ema-trend")
 
         ledger.rebuildPositions()
@@ -360,7 +360,7 @@ struct StrategyLedgerTests {
         let ledger = StrategyLedger(mode: .demo)
         let tag = OrderTag.make(strategyId: "ema-trend")
         ledger.ingest([exchangeFill(id: "1", side: .buy, price: 100, size: 2, clOrdId: tag)],
-                      knownStrategyIds: ["ema-trend"])
+                      knownStrategyIds: ["ema-trend"], venue: .okx)
         ledger.recordFunding(
             FundingPayment(id: "bill-1", instId: "BTC-USDT", amount: -31.19,
                            ccy: "USDT", ts: Date(timeIntervalSince1970: 1_000)),
@@ -376,7 +376,7 @@ struct StrategyLedgerTests {
         let ledger = StrategyLedger(mode: .demo)
         let tag = OrderTag.make(strategyId: "ema-trend")
         ledger.ingest([exchangeFill(id: "1", side: .buy, price: 100, size: 1, clOrdId: tag)],
-                      knownStrategyIds: ["ema-trend"])
+                      knownStrategyIds: ["ema-trend"], venue: .okx)
 
         // The exchange holds 3 BTC; only 1 came from a strategy.
         let rows = ledger.reconcile(
@@ -391,7 +391,7 @@ struct StrategyLedgerTests {
         let ledger = StrategyLedger(mode: .demo)
         let tag = OrderTag.make(strategyId: "ema-trend")
         ledger.ingest([exchangeFill(id: "1", side: .buy, price: 100, size: 2, clOrdId: tag)],
-                      knownStrategyIds: ["ema-trend"])
+                      knownStrategyIds: ["ema-trend"], venue: .okx)
         let rows = ledger.reconcile(
             spotBalances: [AccountBalance(ccy: "BTC", available: 2, total: 2)],
             swapPositions: [])
@@ -407,7 +407,7 @@ struct StrategyLedgerTests {
         let ledger = StrategyLedger(mode: .demo)
         let tag = OrderTag.make(strategyId: "ema-trend")
         ledger.ingest([exchangeFill(id: "1", side: .buy, price: 100, size: 1, clOrdId: tag)],
-                      knownStrategyIds: ["ema-trend"])
+                      knownStrategyIds: ["ema-trend"], venue: .okx)
 
         let store = StrategyLedgerStore(directory: dir, mode: .demo)
         try store.save(fills: ledger.fills, positions: ledger.positions)
@@ -470,30 +470,31 @@ struct PortfolioAllocationTests {
 @Suite("Instrument underlying")
 struct InstrumentUnderlyingTests {
     /// The panel groups positions by underlying so a perpetual leg shows up on
-    /// its spot symbol's panel. That grouping is built on `currencies(of:)`, so
-    /// a swap and its spot pair must report the same base and quote.
+    /// its spot symbol's panel. That grouping is built on the venue's
+    /// `currencies(of:)`, so a swap and its spot pair must report the same
+    /// base and quote.
     ///
     /// This was a real defect: the hybrid portfolio's `BTC-USDT-SWAP` shorts
     /// were invisible on the `BTC-USDT` panel, which read "当前空仓" while the
     /// account was short 11.65 contracts.
     @Test func aSwapAndItsSpotPairShareAnUnderlying() {
-        let spot = StrategyLedger.currencies(of: "BTC-USDT")
-        let swap = StrategyLedger.currencies(of: "BTC-USDT-SWAP")
+        let spot = Venue.okx.currencies(of: "BTC-USDT")
+        let swap = Venue.okx.currencies(of: "BTC-USDT-SWAP")
         #expect(spot.base == swap.base)
         #expect(spot.quote == swap.quote)
         #expect(spot.base == "BTC" && spot.quote == "USDT")
     }
 
     @Test func differentAssetsDoNotCollide() {
-        let btc = StrategyLedger.currencies(of: "BTC-USDT-SWAP")
-        let eth = StrategyLedger.currencies(of: "ETH-USDT-SWAP")
+        let btc = Venue.okx.currencies(of: "BTC-USDT-SWAP")
+        let eth = Venue.okx.currencies(of: "ETH-USDT-SWAP")
         #expect(btc.base != eth.base)
     }
 
     @Test func degenerateInstrumentIdsAreSafe() {
-        #expect(StrategyLedger.currencies(of: "BTC").base == "BTC")
-        #expect(StrategyLedger.currencies(of: "BTC").quote == "USDT")
-        #expect(StrategyLedger.currencies(of: "").base == "")
+        #expect(Venue.okx.currencies(of: "BTC").base == "BTC")
+        #expect(Venue.okx.currencies(of: "BTC").quote == "USDT")
+        #expect(Venue.okx.currencies(of: "").base == "")
     }
 }
 

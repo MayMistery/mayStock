@@ -74,26 +74,27 @@ struct StrategyManifestTests {
 
     // MARK: Validation
 
-    @Test func shortingRequiresASwapMarket() throws {
-        var manifest = StrategyLibrary.emaTrend
+    @Test func shortingIsRefusedWhereTheTypeCannotShort() throws {
+        var manifest = StrategyLibrary.emaTrend   // spot
         manifest.signals.shortEntry = "close < sma(close, 20)"
-        #expect(throws: StrategyManifestError.shortingRequiresSwap) {
+        #expect(throws: StrategyManifestError.shortingNotAllowed(.spot)) {
             _ = try manifest.compile()
         }
     }
 
-    @Test func leverageRequiresASwapMarket() throws {
-        var manifest = StrategyLibrary.emaTrend
+    @Test func leverageIsRefusedWhereTheTypeCannotBorrow() throws {
+        var manifest = StrategyLibrary.emaTrend   // spot
         manifest.risk.leverage = 3
-        #expect(throws: StrategyManifestError.leverageRequiresSwap(3)) {
+        #expect(throws: StrategyManifestError.leverageNotAllowed(.spot, 3)) {
             _ = try manifest.compile()
         }
     }
 
     @Test func absurdLeverageIsRefused() throws {
-        var manifest = StrategyLibrary.donchianBreakout
+        var manifest = StrategyLibrary.donchianBreakout   // swap
         manifest.risk.leverage = 500
-        #expect(throws: StrategyManifestError.leverageOutOfRange(500)) {
+        #expect(throws: StrategyManifestError.leverageOutOfRange(
+            500, max: InstrumentType.swap.maxLeverage)) {
             _ = try manifest.compile()
         }
     }
@@ -160,8 +161,9 @@ struct StrategyManifestTests {
     // MARK: Costs & defaults
 
     @Test func costDefaultsFollowTheInstrumentType() {
-        #expect(StrategyLibrary.emaTrend.effectiveCosts.feeBps == 10)          // spot taker
-        #expect(StrategyLibrary.donchianBreakout.effectiveCosts.feeBps == 5)   // swap taker
+        let schedules = FeeSchedules()
+        #expect(StrategyLibrary.emaTrend.effectiveCosts(under: schedules)?.feeBps == 10)          // spot taker
+        #expect(StrategyLibrary.donchianBreakout.effectiveCosts(under: schedules)?.feeBps == 5)   // swap taker
     }
 
     @Test func parameterClampingHonoursDeclaredBounds() {
@@ -355,26 +357,39 @@ struct StrategyConfigTests {
 @Suite("Instrument type vocabulary")
 struct InstrumentTypeVocabularyTests {
 
-    /// One sample id per case. A new case with no sample fails the require
-    /// below, which is the point — the table is the checklist.
-    private static let sampleIds: [InstrumentType: String] = [
-        .spot: "BTC-USDT",
-        .swap: "BTC-USDT-SWAP",
+    /// One sample id per (venue, type) the venue trades. A new venue or a new
+    /// type with no sample fails the require below, which is the point — the
+    /// table is the checklist.
+    private static let sampleIds: [Venue: [InstrumentType: String]] = [
+        .okx: [.spot: "BTC-USDT", .swap: "BTC-USDT-SWAP"],
+        .schwab: [.stock: "AAPL"],
     ]
 
-    @Test func everyTypeIsRecognisableFromAnInstrumentId() throws {
+    @Test func everyVenueRecognisesEachOfItsTypesFromAnId() throws {
+        for venue in Venue.allCases {
+            let samples = try #require(Self.sampleIds[venue], "\(venue) 缺少样本表")
+            for type in venue.instrumentTypes {
+                let id = try #require(samples[type], "\(venue) 的 \(type) 缺少样本 instId")
+                #expect(venue.instrumentType(of: id) == type)
+                #expect(venue.currencies(of: id).quote == venue.quoteCurrency)
+            }
+        }
+    }
+
+    /// A type nobody trades is a declaration with no venue behind it — a
+    /// manifest could name it and no account could ever fill it.
+    @Test func everyTypeTradesSomewhere() {
         for type in InstrumentType.allCases {
-            let id = try #require(Self.sampleIds[type], "\(type) 缺少样本 instId")
-            #expect(InstrumentType.of(instId: id) == type)
+            #expect(Venue.allCases.contains { $0.trades(type) }, "\(type) 没有任何交易所交易它")
         }
     }
 
     /// A multiplier may only be implied where it cannot be anything else.
     /// Anything that trades in contracts has to ask the exchange, and "we could
     /// not ask" must stay distinguishable from "the answer is 1".
-    @Test func onlyUnleveragedTypesMayImplyTheirContractSize() {
+    @Test func onlyContractTradedTypesWithholdTheirContractSize() {
         for type in InstrumentType.allCases {
-            if type.allowsLeverage {
+            if type.tradesInContracts {
                 #expect(type.impliedContractSize == nil, "\(type) 不该自带面值")
             } else {
                 #expect(type.impliedContractSize == 1, "\(type) 的面值应恒为 1")
@@ -383,15 +398,17 @@ struct InstrumentTypeVocabularyTests {
     }
 
     @Test func aPositionAdmitsWhenItsMultiplierIsNotAFact() throws {
-        for type in InstrumentType.allCases {
-            let id = try #require(Self.sampleIds[type])
-            let untaught = StrategyPositionState(strategyId: "s", instId: id)
-            #expect(untaught.contractSizeIsKnown == (type.impliedContractSize != nil))
+        for venue in Venue.allCases {
+            for type in venue.instrumentTypes {
+                let id = try #require(Self.sampleIds[venue]?[type])
+                let untaught = StrategyPositionState(strategyId: "s", instId: id, venue: venue)
+                #expect(untaught.contractSizeIsKnown == (type.impliedContractSize != nil))
 
-            var taught = untaught
-            taught.contractSize = 0.01
-            #expect(taught.contractSizeIsKnown)
-            #expect(taught.multiplier == 0.01)
+                var taught = untaught
+                taught.contractSize = 0.01
+                #expect(taught.contractSizeIsKnown)
+                #expect(taught.multiplier == 0.01)
+            }
         }
     }
 }

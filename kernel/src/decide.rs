@@ -156,7 +156,8 @@ pub struct LiveDecision {
     #[serde(rename = "shouldTrade")]
     pub should_trade: bool,
     /// The daily-loss circuit breaker has tripped: close out and stand down
-    /// for the rest of the UTC day.
+    /// for the rest of the trading day (the market's own day, see
+    /// `MarketCalendar::session_key`).
     #[serde(rename = "haltDailyLoss")]
     pub halt_daily_loss: bool,
     /// Human-readable justification, for the runtime status line.
@@ -216,7 +217,8 @@ pub struct AccountState {
     pub equity: f64,
     /// Coins currently held (signed).
     pub held_base: f64,
-    /// Strategy equity at the start of the current UTC day, for the breaker.
+    /// Strategy equity at the start of the current trading day, for the
+    /// breaker. Which day that is belongs to the market's calendar.
     pub day_start_equity: f64,
     /// Cap from the portfolio, if tighter than the manifest's.
     pub leverage_cap: Option<f64>,
@@ -360,9 +362,11 @@ pub fn decide_live(
     // will happily compute a real-looking number from a stale or holed feed,
     // and standing aside on bad data is the correct behaviour rather than a
     // failure — so this is a refusal to decide, not a flat target.
+    let market = &strategy.manifest.market;
     let quality = crate::quality::inspect(
         &candles,
-        crate::strategy::bar_seconds(&strategy.manifest.market.bar),
+        market.calendar(),
+        market.bar_seconds(),
         account.now_ms,
     );
     if !quality.usable {
@@ -386,11 +390,8 @@ pub fn decide_live(
         strategy, &candles, index, current, bars_held, account.entry_price);
 
     let price = candles[index].close;
-    let manifest_leverage = if strategy.manifest.market.inst_type.allows_leverage() {
-        strategy.manifest.risk.leverage.max(1.0)
-    } else {
-        1.0
-    };
+    // `compile` already refused any leverage the instrument cannot provide.
+    let manifest_leverage = strategy.leverage();
     let leverage = account
         .leverage_cap
         .map_or(manifest_leverage, |cap| manifest_leverage.min(cap));
@@ -440,7 +441,7 @@ pub fn decide_live(
                 let vol = realised_volatility(
                     &closes,
                     strategy.manifest.risk.vol_lookback_bars,
-                    &strategy.manifest.market.bar,
+                    market.bars_per_year(),
                 );
                 volatility_scale(
                     strategy.manifest.sizing.value,
@@ -639,15 +640,16 @@ pub fn decide_live(
 /// Annualised realised volatility, in percent, from a trailing window of
 /// close-to-close returns.
 ///
-/// Bar-aware: the same 60-bar window means 60 hours on 1H and 60 days on 1D,
-/// and the annualisation factor differs accordingly.
-pub fn realised_volatility(closes: &[f64], lookback: usize, bar: &str) -> Vec<f64> {
+/// Bar-aware through `bars_per_year`: the same 60-bar window means 60 hours on
+/// 1H and 60 days on 1D, and the factor that annualises it is the market's own
+/// — 8,766 hourly bars a year on a crypto exchange, 1,764 on the New York
+/// session. Passed in rather than derived here so one place decides.
+pub fn realised_volatility(closes: &[f64], lookback: usize, bars_per_year: f64) -> Vec<f64> {
     let mut out = vec![f64::NAN; closes.len()];
-    if lookback <= 1 || closes.len() <= lookback {
+    if lookback <= 1 || closes.len() <= lookback || !(bars_per_year > 0.0) {
         return out;
     }
 
-    let bars_per_year = 365.25 * 86_400.0 / crate::strategy::bar_seconds(bar);
     let mut returns = vec![f64::NAN; closes.len()];
     for index in 1..closes.len() {
         if closes[index - 1] > 0.0 && closes[index] > 0.0 {
@@ -938,8 +940,8 @@ mod tests {
         let closes: Vec<f64> = (0..200)
             .map(|i| 100.0 * (1.0 + 0.01 * ((i as f64) * 0.7).sin()))
             .collect();
-        let hourly = realised_volatility(&closes, 60, "1H");
-        let daily = realised_volatility(&closes, 60, "1D");
+        let hourly = realised_volatility(&closes, 60, 8_766.0);
+        let daily = realised_volatility(&closes, 60, 365.25);
         let h = hourly[199];
         let d = daily[199];
         assert!(h.is_finite() && d.is_finite());
@@ -949,6 +951,6 @@ mod tests {
     #[test]
     fn realised_volatility_needs_a_full_window() {
         let closes: Vec<f64> = (0..10).map(|i| 100.0 + i as f64).collect();
-        assert!(realised_volatility(&closes, 60, "1D").iter().all(|v| v.is_nan()));
+        assert!(realised_volatility(&closes, 60, 365.25).iter().all(|v| v.is_nan()));
     }
 }

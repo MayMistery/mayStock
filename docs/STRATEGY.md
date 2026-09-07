@@ -27,14 +27,14 @@
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
   "id": "ema-trend-btc",
   "name": "EMA 双均线趋势",
   "version": "1.0.0",
   "author": "may",
   "notes": "经典趋势跟随；200 日均线之上才做多。",
 
-  "market": { "instId": "BTC-USDT", "instType": "SPOT", "bar": "1H" },
+  "market": { "venue": "okx", "instId": "BTC-USDT", "instType": "SPOT", "bar": "1H" },
 
   "params": {
     "fast": { "default": 12, "min": 2,  "max": 100, "label": "快线周期" },
@@ -65,9 +65,9 @@
 }
 ```
 
-- `instType`：`SPOT` 或 `SWAP`。做空与 `leverage > 1` 仅 `SWAP` 允许。
+- `market.venue`：`okx`（默认）或 `schwab`。`instType`：OKX 为 `SPOT` / `SWAP`，嘉信为 `STOCK`。做空与杠杆上限由品种决定：现货不能做空、杠杆 1；永续可做空、杠杆 ≤ 50；美股（保证金账户）可做空、杠杆 ≤ 2。规则只在内核里写一份，清单编译时照它拒绝。
 - `sizing.mode`：`equityPct`（占本策略分配资金的百分比）/ `fixedQuote`（固定计价币金额）/ `riskPerTrade`（按止损距离反推头寸，`value` 为单笔风险百分比）。
-- `costs` 省略时按 instType 取默认：现货 taker 10 bps，永续 taker 5 bps；滑点默认 5 bps。
+- `costs` 省略时按交易所费率表取：OKX 现货 taker 10 bps、永续 taker 5 bps、滑点 5 bps；嘉信美股买入 0、卖出 SEC §31 + FINRA TAF、滑点 2 bps。也可写成费用组件列表 `fees`（按名义额 / 按股数 / 按单，分买卖方向，可封顶），细节见 [STRATEGY-DEV.md](STRATEGY-DEV.md) §3。
 
 ### 表达式文法
 
@@ -104,12 +104,13 @@ K 线以 JSON 从 stdin 喂入，signals 从 stdout 读回。**这等于在本�
 | 信号时点 | 第 i 根**已确认** K 线收盘后求值 |
 | 成交时点 | 第 i+1 根 K 线**开盘价**，叠加滑点（买入上滑、卖出下滑） |
 | 未来函数 | 结构上不可能：求值窗口止于 i，撮合始于 i+1 |
-| 手续费 | 进出各按名义额收一次 |
+| 手续费 | 按费用组件逐笔计：名义额比例、按股数、按单，各自分买卖方向；美股买入 0、卖出收监管费 |
 | 盘中止损/止盈 | 用第 i+1 根起的 high/low 判定；**同根同时触及则判为止损先成交**（最坏假设） |
 | 移动止损 | 按每根收盘价更新水位，下一根内触发即平 |
 | 资金费（永续） | 取 OKX `funding-rate-history` 真实费率，在结算时刻对持仓名义额计提；多头在费率为正时付出 |
 | 强平（永续） | 未实现亏损吃穿 `保证金 × (1 − 维持保证金率)` 即判强平，记为强平事件 |
 | 净值 | 每根收盘按市价盯市 |
+| 交易日历 | 由 `market.venue` 决定：OKX 7×24；美股按纽交所交易日，缺的周末与节假日不算缺口，年化按 252 个交易日，日内亏损闸按纽约交易日复位 |
 | 基准 | 同窗口买入持有收益率，用于计算超额 |
 
 ## 3. 多窗口与稳健性徽章

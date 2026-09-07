@@ -59,8 +59,7 @@ public struct BacktestMetrics: Sendable, Equatable {
     /// the CAGR figure should not drive any decision.
     public var annualisationReliable: Bool { spanDays >= 30 }
 
-    public static let empty = BacktestMetrics(
-        trades: [], equityCurve: [], initialCapital: 0, bar: .h1, freeParameterCount: 1)
+    public static let empty = BacktestMetrics(kernel: KernelMetrics.zeroed(freeParameterCount: 1))
 
     // MARK: Construction
 
@@ -101,18 +100,19 @@ public struct BacktestMetrics: Sendable, Equatable {
     /// curves together and then need exactly these numbers.
     ///
     /// Computation happens in the kernel so there is one Sharpe, one drawdown
-    /// and one expectancy in the codebase rather than two that drift.
+    /// and one expectancy in the codebase rather than two that drift. The
+    /// market, not just the bar, because annualisation is the market's.
     public init(
         trades: [BacktestTrade],
         equityCurve: [EquityPoint],
         initialCapital: Double,
-        bar: BarInterval,
+        market: StrategyMarket,
         freeParameterCount: Int
     ) {
         do {
             self.init(kernel: try TradingKernel.metrics(
                 trades: trades, equityCurve: equityCurve,
-                initialCapital: initialCapital, bar: bar,
+                initialCapital: initialCapital, market: market,
                 freeParameterCount: freeParameterCount))
         } catch {
             // The kernel only fails here on malformed input, which would mean a

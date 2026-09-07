@@ -55,7 +55,8 @@ struct StrategyDetailView: View {
                         RobustnessBadge(assessment: report.robustness)
                     }
                 }
-                Text("\(strategy.market.instId) · \(strategy.market.instType.displayName) · "
+                Text("\(strategy.market.venue.displayName) · \(strategy.market.instId) · "
+                     + "\(strategy.market.instType.displayName) · "
                      + "\(strategy.market.bar.rawValue) · v\(strategy.manifest.version)")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
                 if let notes = strategy.manifest.notes, !notes.isEmpty {
@@ -371,7 +372,11 @@ struct StrategyDetailView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("仓位与风控").font(.system(size: 11, weight: .semibold))
                 let risk = strategy.manifest.risk
-                let costs = strategy.manifest.effectiveCosts
+                // The costs a backtest of this manifest charges: its own, else
+                // the venue schedule's. Nil means the venue has no model for
+                // this instrument and a backtest would refuse.
+                let costs = strategy.manifest.effectiveCosts(
+                    under: appState.store.config.strategy.feeSchedules)
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 130), spacing: 8)],
                           alignment: .leading, spacing: 6) {
                     definitionCell("仓位模式", "\(strategy.manifest.sizing.mode.displayName) "
@@ -385,8 +390,8 @@ struct StrategyDetailView: View {
                     definitionCell("冷却", "\(risk.cooldownBars) 根")
                     definitionCell("最短持仓", "\(risk.minHoldBars) 根")
                     definitionCell("日内熔断", risk.maxDailyLossPct.map { PriceFormatter.percent($0, decimals: 1) } ?? "—")
-                    definitionCell("手续费假设", "\(PriceFormatter.plain(costs.feeBps)) bps")
-                    definitionCell("滑点假设", "\(PriceFormatter.plain(costs.slippageBps)) bps")
+                    definitionCell("手续费假设", costs?.fees.summary ?? "无费率模型，无法回测")
+                    definitionCell("滑点假设", costs.map { "\(PriceFormatter.plain($0.slippageBps)) bps" } ?? "—")
                     definitionCell("指标预热", "\(strategy.warmupBars) 根")
                 }
             }

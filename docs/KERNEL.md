@@ -60,6 +60,15 @@ char       *ms_strategy_decide (const MSStrategy *, const MSCandle *, size_t, in
 char       *ms_backtest_run    (const MSStrategy *, const MSCandle *, size_t, const char *config_json, char **err);
 void        ms_strategy_free(MSStrategy *);
 void        ms_string_free(char *);
+
+/* 市场日历与品种政策：Swift 侧所有「bar ↔ 时间」换算都问这里，不自己算 */
+double      ms_calendar_bars_per_year(const char *market_json, char **err);
+int64_t     ms_calendar_session_key  (const char *market_json, int64_t ts_ms, char **err);
+int64_t     ms_calendar_bar_close    (const char *market_json, int64_t open_ms, char **err);
+int64_t     ms_calendar_next_open    (const char *market_json, int64_t open_ms, char **err);
+int64_t     ms_calendar_opens_between(const char *market_json, int64_t from_ms, int64_t to_ms, char **err);
+int32_t     ms_calendar_is_open      (const char *market_json, int64_t ts_ms, char **err);
+char       *ms_instrument_policy     (const char *inst_type, char **err);
 ```
 
 - **K 线走裸 `#[repr(C)]` 数组**：6000 根约 330 KB，每个 tick 序列化成 JSON 的开销比它喂的计算还大。
@@ -223,6 +232,10 @@ bar *i+1* 开盘成交 + 滑点），所以算出来的数可以直接和清单�
 阈值都不是零：容忍 2% 以内的缺口（稀薄市场里交易所确实会偶尔丢 bar，为一个洞停一整天
 是另一种失败），落后 2.5 根才算陈旧（bar 要等下一根开出来才确认，健康的行情源本来就落后
 一整根）。回测传 `now_ms = None`：历史数据按定义就是陈旧的，这条性质在那里没有意义。
+
+「缺口」和「落后」都按市场日历数（§3.19）：美股序列周五 15:30 到周一 09:30 之间没有 bar
+不是洞，周六早上落后 18 根也不是断线。盘前盘后的 bar 不在日历网格上，只报 `offGrid` 计数，
+不拒绝——那多半是行情源在给延长时段的数据，值得知道，不值得为它停机。
 
 **下单前风控（`kernel/src/guard.rs`）。** 学 NautilusTrader 的 RiskEngine。定仓本来就有预算和
 杠杆两道上限，所以正常情况下这里永远不触发——**这正是重点**。它拦的是不正常的情况：
@@ -519,6 +532,41 @@ coveredSeconds: endTs.timeIntervalSince(start.ts)   // ← 两端距离
 `isAnchored`（参考采样 ≤ 锚点）和 `coverage`（密度）是两个独立的问题，
 UI 需要这个区别：一个是「我们还没记那么久」，另一个是「那段时间没人在跑」。
 
+## 3.19 去「7×24」化：日历、费用组件、品种政策
+
+接美股之前，内核有三处把「加密货币交易所」当成了「市场」本身：一年 365 天连续交易、
+手续费是双边按名义额收的百分比、做空与杠杆是永续合约的专属。三处各自散在
+`metrics.rs`、`decide.rs`、`ffi.rs`、`quality.rs` 和 Swift 的 `BacktestReport` 里，
+每处都对，加起来就是一个只认识 OKX 的内核。
+
+**市场日历（`kernel/src/calendar.rs`）。** `MarketCalendar { Continuous, UsEquities }`，
+由清单的 `market.venue` 决定。它是唯一一份「bar ↔ 时间」的换算：一年多少根
+（连续市场 365.25 天；美股 252 个交易日，日内按每日交易时段向上取整的 bar 数）、
+一根什么时候收（15:30 那根一小时 bar 16:00 就收）、两个时刻之间该有几根开盘
+（持仓多少根、冷却过了几根）、一个时刻属于哪个交易日（日内亏损闸复位的边界，
+美股按纽约本地日期，跨 UTC 午夜的一个交易时段仍是同一天）。纽交所的节假日规则、
+提前收盘、临时休市、夏令时都在这里，靠 `chrono-tz` 的 `America/New_York`。
+连续市场的网格锚点由交易所定（OKX 日线锚在 UTC+8，不在纪元），所以「两个时刻之间几根」
+从调用方给的那根 bar 往回数，而不是除以间隔取整——10:05 进场、15:00 那根判断，
+是五根不是 4.9 取整的四根。这条以前在 Swift 里修过一次，现在只在内核里有一份。
+
+**费用组件（`kernel/src/fees.rs`）。** 手续费从一个 bps 数变成 `FeeComponent` 列表：
+按名义额（bps）、按数量（每股）、按单（每笔），各自分买 / 卖 / 双边，可带单笔上下限。
+嘉信美股买入零佣金、卖出收 SEC §31（按成交额）与 FINRA TAF（按股数、封顶），
+用百分比根本写不出来。清单的 `costs.feeBps` 仍可写，是「双边名义额比例」的简写，
+和 `costs.fees` 二选一。品种没有默认成本（美股佣金是券商的选择、监管费年年改）时，
+内核不会当成零，`BacktestConfig` 必须给，Swift 侧从 `FeeSchedules` 按 venue 解析。
+
+**品种政策（`kernel/src/strategy.rs` 的 `InstrumentPolicy`）。** 能否做空、杠杆上限、
+是否按张计价、保证金制度（永续逐仓 / 美股 Reg T）、默认维持保证金率、默认费用，
+全部只在内核里声明一次，`ms_instrument_policy` 吐 JSON 给 Swift。
+`InstrumentType` 多了 `STOCK`：可做空（保证金账户）、杠杆 ≤ 2、按股计价。
+强平缓冲按制度算：逐仓是 `(1 − 维持率) / 杠杆`，Reg T 是 `1 − (1 − 1/杠杆) / (1 − 维持率)`。
+
+**金标没有变。** 指纹（交易数 / 终值 / 收益率 / 回撤 / 胜率 / 手续费）不含年化数字，
+而 OKX 策略的费用与日历行为逐 bit 未动，所以 `KernelGoldenTests` 不需重算——
+这本身是一条验证：通用化没有在原有路径上改变任何一笔成交。
+
 ## 3.18 菜单栏空转烧掉五分之一个核
 
 macOS 两次把 app 标记为持续高 CPU。实测空闲稳态 **20.5% 单核**，只挂了两个监控项。
@@ -590,6 +638,10 @@ make kernel        # 只编 Rust
 make build         # 内核 + Swift（build/test 都会先编内核）
 cd kernel && cargo test
 ```
+
+本机拉不到 crates.io 时用 `cargo test --offline`：`chrono` / `chrono-tz` 已在本地缓存里。
+macOS 27 只装 CommandLineTools 的机器上，App 目标里的 SwiftUI 宏找不到宏插件，
+要用 `DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer swift build`。
 
 `Scripts/build-kernel.sh` 在静态库变化时会 `touch Sources/CMayStockKernel/shim.c`。
 **这一步是必须的**：SwiftPM 不跟踪通过 `unsafeFlags` 找到的库，

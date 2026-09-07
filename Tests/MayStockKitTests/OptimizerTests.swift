@@ -14,10 +14,19 @@ struct FeeScheduleTests {
         #expect(schedule.executionStyle == .taker)
     }
 
-    @Test func roundTripCostIsBothLegsPlusSlippage() {
+    @Test func roundTripCostIsBothLegsPlusSlippage() throws {
         let schedule = OKXFeeSchedule(tier: .lv1, slippageBps: 5)
         // (10 + 5) × 2 = 30 bps = 0.30%
-        #expect(abs(schedule.roundTripCostPct(for: .spot) - 0.30) < 1e-9)
+        let roundTrip = try #require(schedule.roundTripCostPct(for: .spot))
+        #expect(abs(roundTrip - 0.30) < 1e-9)
+    }
+
+    @Test func anOKXScheduleHasNoAnswerForAStock() {
+        let schedule = OKXFeeSchedule()
+        #expect(schedule.feeBps(for: .stock) == nil)
+        #expect(schedule.feeModel(for: .stock) == nil)
+        #expect(schedule.roundTripCostPct(for: .stock) == nil,
+                "a missing cost model must not quietly read as free")
     }
 
     @Test func feesFallAsTiersRise() {
@@ -69,7 +78,7 @@ struct FeeScheduleTests {
         let candles = CandleFixture.flat(Array(repeating: 100.0, count: 6))
         let config = BacktestConfig(
             initialCapital: 1_000,
-            feeSchedule: OKXFeeSchedule(tier: .lv1))   // would charge 10 bps
+            feeSchedules: FeeSchedules(okx: OKXFeeSchedule(tier: .lv1)))   // would charge 10 bps
         let result = try BacktestEngine(strategy: strategy, config: config).run(candles: candles)
         #expect(result.metrics.feesPaid == 0, "an explicit manifest cost must not be overridden")
     }
@@ -84,7 +93,7 @@ struct FeeScheduleTests {
         func fees(_ tier: OKXFeeTier) throws -> Double {
             let config = BacktestConfig(
                 initialCapital: 1_000,
-                feeSchedule: OKXFeeSchedule(tier: tier, slippageBps: 0))
+                feeSchedules: FeeSchedules(okx: OKXFeeSchedule(tier: tier, slippageBps: 0)))
             return try BacktestEngine(strategy: strategy, config: config)
                 .run(candles: candles).metrics.feesPaid
         }
@@ -217,7 +226,7 @@ struct StrategyOptimizerTests {
             trades: [], equityCurve: (0..<50).map {
                 EquityPoint(ts: Date(timeIntervalSince1970: Double($0) * 3_600),
                             equity: 100 + Double($0), price: 100)
-            }, initialCapital: 100, bar: .h1, freeParameterCount: 1)
+            }, initialCapital: 100, market: .hourlySpot, freeParameterCount: 1)
         #expect(OptimizationObjective.Kind.totalReturn.score(steady) > 0)
         #expect(OptimizationObjective.Kind.dailyReturn.score(steady) > 0)
         // returnOverDrawdown floors the denominator, so a zero-drawdown run
@@ -235,7 +244,7 @@ struct StrategyOptimizerTests {
             trades: [win],
             equityCurve: [EquityPoint(ts: Date(), equity: 100, price: 1),
                           EquityPoint(ts: Date().addingTimeInterval(3_600), equity: 101, price: 1)],
-            initialCapital: 100, bar: .h1, freeParameterCount: 1)
+            initialCapital: 100, market: .hourlySpot, freeParameterCount: 1)
         #expect(metrics.profitFactor.isInfinite)
         #expect(OptimizationObjective.Kind.profitFactor.score(metrics).isFinite,
                 "an infinite metric must not become an unbeatable score")
@@ -341,9 +350,9 @@ struct WalkForwardTests {
                 outOfSampleStart: Date(), outOfSampleEnd: Date(),
                 parameters: ["fast": 8],
                 inSample: BacktestMetrics(trades: [], equityCurve: [], initialCapital: 1_000,
-                                          bar: .h1, freeParameterCount: 1),
+                                          market: .hourlySpot, freeParameterCount: 1),
                 outOfSample: BacktestMetrics(trades: [], equityCurve: losing, initialCapital: 1_000,
-                                             bar: .h1, freeParameterCount: 1),
+                                             market: .hourlySpot, freeParameterCount: 1),
                 outOfSampleTrades: [BacktestTrade(
                     id: 1, direction: .long, entryTime: .distantPast, exitTime: .distantPast,
                     entryPrice: 1, exitPrice: 0.9, quantity: 1, notional: 1,
@@ -357,7 +366,7 @@ struct WalkForwardTests {
                     entryPrice: 1, exitPrice: 0.9, quantity: 1, notional: 1,
                     grossPnL: -0.1, fees: 0, funding: 0, netPnL: -0.1, returnPct: -10,
                     bars: 1, exitReason: .signal)],
-                equityCurve: losing, initialCapital: 1_000, bar: .h1, freeParameterCount: 1),
+                equityCurve: losing, initialCapital: 1_000, market: .hourlySpot, freeParameterCount: 1),
             objective: OptimizationObjective(), totalTrials: 100, warnings: [])
         #expect(result.verdict.contains("不要投入真金"))
         #expect(result.profitableFolds == 0)
@@ -374,14 +383,14 @@ struct PortfolioBacktestTests {
                         equity: pair.0, price: pair.1)
         }
         return BacktestResult(
-            strategyId: "s", instId: "X-USDT", bar: .h1,
+            strategyId: "s", market: StrategyMarket(instId: "X-USDT", instType: .spot, bar: .h1),
             start: curve.first?.ts ?? Date(), end: curve.last?.ts ?? Date(),
             barCount: curve.count, initialCapital: equities.first ?? 0,
             finalEquity: equities.last ?? 0, trades: [], equityCurve: curve,
             liquidations: 0, warmupBars: 0, fundingUnmodelled: false,
             metrics: BacktestMetrics(trades: [], equityCurve: curve,
                                      initialCapital: equities.first ?? 0,
-                                     bar: .h1, freeParameterCount: 1))
+                                     market: .hourlySpot, freeParameterCount: 1))
     }
 
     private func leg(_ id: String, weight: Double, equities: [Double], prices: [Double]) -> PortfolioLeg {

@@ -324,7 +324,7 @@ public struct WalkForwardAnalysis: Sendable {
             trades: allTrades,
             equityCurve: stitched,
             initialCapital: config.initialCapital,
-            bar: strategy.market.bar,
+            market: strategy.market,
             freeParameterCount: strategy.freeParameterCount)
 
         if searchGrid.size > 1 {

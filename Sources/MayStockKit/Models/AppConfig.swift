@@ -54,12 +54,15 @@ public struct WatchItem: Codable, Identifiable, Sendable, Equatable {
         self.defaultBar = defaultBar
     }
 
+    /// The watchlist is fed by `MarketHub`, which speaks OKX and nothing else
+    /// until a market-data port exists; an item here is an OKX instrument.
+    public static let venue = Venue.okx
+
     /// "BTC-USDT" → "BTC", "BTC-USDT-SWAP" → "BTC⚡︎"
     public var displayLabel: String {
         if let label, !label.isEmpty { return label }
-        let parts = instId.split(separator: "-")
-        let base = parts.first.map(String.init) ?? instId
-        return InstrumentType.of(instId: instId) == .swap ? base + "⚡︎" : base
+        let base = Self.venue.currencies(of: instId).base
+        return Self.venue.instrumentType(of: instId) == .swap ? base + "⚡︎" : base
     }
 
     /// Currency glyph shown before the price in `.full` style.
@@ -136,9 +139,11 @@ public struct AppConfig: Codable, Sendable, Equatable {
     /// Strategy portfolio: mode, capital and per-strategy allocations.
     public var strategy: StrategyPortfolioPrefs
 
-    /// v3 adds `strategy` and drops the manual order ticket's default size.
+    /// v4 replaces `strategy.feeSchedule` (OKX only) with `strategy.feeSchedules`,
+    /// one per venue; a v3 file's schedule is read into the OKX slot.
+    /// v3 added `strategy` and dropped the manual order ticket's default size.
     /// v2 files still load — every field decodes with a default.
-    public static let currentSchemaVersion = 3
+    public static let currentSchemaVersion = 4
     public static let minimumSupportedSchemaVersion = 2
 
     public init(

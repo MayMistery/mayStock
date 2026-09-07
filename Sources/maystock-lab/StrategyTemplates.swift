@@ -11,10 +11,10 @@ enum StrategyTemplates {
     static let names = ["trend", "reversion", "breakout", "grid"]
 
     static func make(
-        template: String, name: String, instId: String, bar: BarInterval
+        template: String, name: String, instId: String, bar: BarInterval, venue: Venue
     ) throws -> StrategyManifest {
-        let instType = InstrumentType.of(instId: instId)
-        let market = StrategyMarket(instId: instId, instType: instType, bar: bar)
+        let instType = venue.instrumentType(of: instId)
+        let market = StrategyMarket(instId: instId, instType: instType, bar: bar, venue: venue)
 
         switch template {
         case "trend":

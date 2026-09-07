@@ -24,23 +24,42 @@ public enum BacktestPhase: Sendable, Equatable {
 /// One download serves all five windows: the longest window's candles are
 /// sliced for the shorter ones, so a five-window report costs the same network
 /// as a single 365-day run.
+/// Why a report could not be produced.
+public enum BacktestRunnerError: Error, CustomStringConvertible, Sendable, Equatable {
+    /// The strategy's venue has no market-data source wired up yet. The
+    /// manifest compiles; it cannot be backtested until the venue's data path
+    /// exists, and fetching its instrument from another exchange would be a
+    /// wrong answer with a real-looking number on it.
+    case noMarketData(Venue)
+
+    public var description: String {
+        switch self {
+        case .noMarketData(let venue):
+            return "\(venue.displayName)的行情源尚未接入，这份清单只能编译，还不能回测"
+        }
+    }
+}
+
 public struct BacktestRunner: Sendable {
     /// Ceiling on candles per report. A year of 1H bars (~8,760) fits; a year
     /// of 5m bars does not, and the report says so rather than lying about coverage.
     public static let maxBars = 12_000
 
+    /// The one market-data source there is. `run` refuses any other venue
+    /// rather than asking OKX for a stock.
     public let rest: OKXRESTClient
-    public let maintenanceMarginRate: Double
-    public let feeSchedule: OKXFeeSchedule
+    /// Nil takes the instrument's documented default.
+    public let maintenanceMarginRate: Double?
+    public let feeSchedules: FeeSchedules
 
     public init(
         rest: OKXRESTClient = OKXRESTClient(),
-        maintenanceMarginRate: Double = 0.005,
-        feeSchedule: OKXFeeSchedule = OKXFeeSchedule()
+        maintenanceMarginRate: Double? = nil,
+        feeSchedules: FeeSchedules = FeeSchedules()
     ) {
         self.rest = rest
         self.maintenanceMarginRate = maintenanceMarginRate
-        self.feeSchedule = feeSchedule
+        self.feeSchedules = feeSchedules
     }
 
     public func run(
@@ -55,16 +74,21 @@ public struct BacktestRunner: Sendable {
         onPhase: (@Sendable (BacktestPhase) -> Void)? = nil
     ) async throws -> StrategyBacktestReport {
         let market = strategy.market
-        let barSeconds = market.bar.seconds
+        guard market.venue == .okx else { throw BacktestRunnerError.noMarketData(market.venue) }
+        let calendar = market.calendar
+        // Bars per calendar day on this market — 24 for hourly crypto, 7 for
+        // hourly stocks — so a window of days is sized by what the venue
+        // actually trades rather than by the clock.
+        let barsPerCalendarDay = Swift.max(calendar.barsPerYear / 365.25, 1e-9)
         // `.full` means "everything the caller asked for", which is the bar
         // cap when they asked for no limit.
-        let capDays = Int(Double(Self.maxBars) * barSeconds / 86_400) + 1
+        let capDays = Int(Double(Self.maxBars) / barsPerCalendarDay) + 1
         let longestDays = windows.contains(where: \.coversEverything)
             ? Swift.min(maxDays ?? capDays, capDays)
             : (windows.map(\.days).max() ?? 30)
         let warmup = strategy.warmupBars
 
-        let wantedBars = Int((Double(longestDays) * 86_400 / barSeconds).rounded(.up)) + warmup
+        let wantedBars = calendar.barCount(days: longestDays) + warmup
         let targetBars = Swift.min(wantedBars, Self.maxBars)
 
         onPhase?(.fetchingCandles(loaded: 0, target: targetBars))
@@ -101,7 +125,7 @@ public struct BacktestRunner: Sendable {
             initialCapital: capital,
             maintenanceMarginRate: maintenanceMarginRate,
             fundingRates: fundingRates,
-            feeSchedule: feeSchedule,
+            feeSchedules: feeSchedules,
             externalSeries: externalSeries)
 
         var results: [BacktestWindow: BacktestResult] = [:]
@@ -140,7 +164,7 @@ public struct BacktestRunner: Sendable {
         }
 
         let robustness = RobustnessAssessment.evaluate(
-            results: results, bar: market.bar, freeParameterCount: strategy.freeParameterCount)
+            results: results, market: market, freeParameterCount: strategy.freeParameterCount)
 
         return StrategyBacktestReport(
             strategyId: strategy.id,

@@ -131,10 +131,14 @@ public enum PortfolioBacktest {
                 bars: trade.bars, exitReason: trade.exitReason)
         }
 
-        let bar = active.map(\.result.bar).min { $0.seconds < $1.seconds } ?? .h1
+        // The combined curve is sampled on the union of the legs' timestamps,
+        // which is as fine as the finest leg; that leg's market is what the
+        // curve annualises by.
+        let finest = active.map(\.result.market).min { $0.bar.seconds < $1.bar.seconds }
+            ?? active[0].result.market
         let metrics = BacktestMetrics(
             trades: renumbered, equityCurve: equityCurve,
-            initialCapital: initialCapital, bar: bar,
+            initialCapital: initialCapital, market: finest,
             freeParameterCount: active.count)
 
         return PortfolioBacktestResult(

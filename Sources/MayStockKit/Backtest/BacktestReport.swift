@@ -129,7 +129,7 @@ public struct RobustnessAssessment: Sendable, Equatable {
     /// ≥30 independent trades per free parameter, Sharpe > 3 as a red flag,
     /// and out-of-sample efficiency ≥ 0.5.
     public static func evaluate(
-        results: [BacktestWindow: BacktestResult], bar: BarInterval, freeParameterCount: Int
+        results: [BacktestWindow: BacktestResult], market: StrategyMarket, freeParameterCount: Int
     ) -> RobustnessAssessment {
         let ranked = BacktestWindow.allCases.sorted { $0.days > $1.days }
         guard let primaryWindow = ranked.first(where: { results[$0] != nil }),
@@ -144,8 +144,8 @@ public struct RobustnessAssessment: Sendable, Equatable {
         let splitIndex = Int(Double(curve.count) * 0.7)
         let inSample = Array(curve.prefix(splitIndex))
         let outOfSample = Array(curve.suffix(from: Swift.min(splitIndex, curve.count)))
-        let isSharpe = Self.sharpe(of: inSample, bar: bar)
-        let oosSharpe = Self.sharpe(of: outOfSample, bar: bar)
+        let isSharpe = Self.sharpe(of: inSample, market: market)
+        let oosSharpe = Self.sharpe(of: outOfSample, market: market)
         let efficiency: Double
         if isSharpe > 0.01 {
             efficiency = oosSharpe / isSharpe
@@ -232,17 +232,14 @@ public struct RobustnessAssessment: Sendable, Equatable {
             outOfSampleEfficiency: efficiency, windowAgreement: agreement, notes: notes)
     }
 
-    private static func sharpe(of curve: [EquityPoint], bar: BarInterval) -> Double {
-        guard curve.count > 2 else { return 0 }
-        var returns: [Double] = []
-        returns.reserveCapacity(curve.count - 1)
-        for index in 1..<curve.count where curve[index - 1].equity > 0 {
-            returns.append(curve[index].equity / curve[index - 1].equity - 1)
-        }
-        let mean = Statistics.mean(returns)
-        let deviation = Statistics.standardDeviation(returns, mean: mean)
-        guard deviation > 0 else { return 0 }
-        return mean / deviation * (365.25 * 86_400 / bar.seconds).squareRoot()
+    /// The kernel's Sharpe over a slice of the curve. Not a Swift formula:
+    /// annualisation is the market's, and `365.25 × 86 400 / bar` here was the
+    /// second copy of it that overstated every stock Sharpe by √(365/252).
+    private static func sharpe(of curve: [EquityPoint], market: StrategyMarket) -> Double {
+        guard curve.count > 2, let first = curve.first, first.equity > 0 else { return 0 }
+        return BacktestMetrics(
+            trades: [], equityCurve: curve, initialCapital: first.equity,
+            market: market, freeParameterCount: 1).sharpe
     }
 }
 

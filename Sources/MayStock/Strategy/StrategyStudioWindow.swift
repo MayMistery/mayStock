@@ -441,7 +441,8 @@ private struct StrategyRow: View {
                 Text(strategy.name)
                     .font(.system(size: 12, weight: .medium))
                     .lineLimit(1)
-                Text("\(strategy.market.instId) · \(strategy.market.instType.displayName) · \(strategy.market.bar.rawValue)")
+                Text("\(strategy.market.venue.displayName) · \(strategy.market.instId) · "
+                     + "\(strategy.market.instType.displayName) · \(strategy.market.bar.rawValue)")
                     .font(.system(size: 9)).foregroundStyle(.secondary)
                 HStack(spacing: 6) {
                     Text(allocation.map {

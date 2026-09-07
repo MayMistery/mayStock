@@ -9,34 +9,167 @@ use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
+use crate::calendar::MarketCalendar;
 use crate::expr::{eval, parser, Expr, ExprError, ExprResult};
+use crate::fees::{self, FeeComponent, OrderSide};
 
-// MARK: - Manifest
+// MARK: - Venue
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Where an instrument trades. The venue decides the calendar bars follow,
+/// what the quote currency is, and how an instrument id is spelled — none of
+/// which the kernel may guess from the id itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Venue {
+    /// OKX: crypto spot and perpetual swaps, trading every hour of every day.
+    #[default]
+    Okx,
+    /// Charles Schwab: US equities on the New York session.
+    Schwab,
+}
+
+impl Venue {
+    pub fn calendar(self) -> MarketCalendar {
+        match self {
+            Self::Okx => MarketCalendar::Continuous,
+            Self::Schwab => MarketCalendar::UsEquities,
+        }
+    }
+
+    pub fn quote_currency(self) -> &'static str {
+        match self {
+            Self::Okx => "USDT",
+            Self::Schwab => "USD",
+        }
+    }
+}
+
+// MARK: - Instrument
+
+/// How margin is lent against a position, which decides where it is
+/// liquidated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MarginRegime {
+    /// No borrowing: the position is fully paid for and cannot be liquidated.
+    None,
+    /// Isolated margin on a derivative: the position is backed by
+    /// `notional / leverage`, and is closed out when the loss eats that
+    /// collateral down to the maintenance rate.
+    Isolated,
+    /// Regulation T margin on a stock: the broker lends against the shares and
+    /// calls the loan when equity falls below the maintenance share of the
+    /// position's *current* value.
+    RegT,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum InstrumentType {
     #[default]
     Spot,
     Swap,
+    Stock,
+}
+
+/// Everything the rest of the system may need to know about an instrument
+/// type, in one place, so Swift can ask rather than keep a copy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstrumentPolicy {
+    #[serde(rename = "instType")]
+    pub inst_type: InstrumentType,
+    #[serde(rename = "allowsShort")]
+    pub allows_short: bool,
+    #[serde(rename = "allowsLeverage")]
+    pub allows_leverage: bool,
+    #[serde(rename = "maxLeverage")]
+    pub max_leverage: f64,
+    /// Sized in contracts rather than in the base unit, so the exchange has to
+    /// be asked what one contract is worth.
+    #[serde(rename = "tradesInContracts")]
+    pub trades_in_contracts: bool,
+    #[serde(rename = "marginRegime")]
+    pub margin_regime: MarginRegime,
+    /// Maintenance margin assumed when a backtest states none.
+    #[serde(rename = "defaultMaintenanceMarginRate")]
+    pub default_maintenance_margin_rate: Option<f64>,
+    /// Cost model assumed when neither the manifest nor the caller states one.
+    /// `None` means the type has no defensible default and a caller must say.
+    #[serde(rename = "defaultFees")]
+    pub default_fees: Option<Vec<FeeComponent>>,
 }
 
 impl InstrumentType {
     pub fn allows_leverage(self) -> bool {
-        matches!(self, Self::Swap)
+        self.max_leverage() > 1.0
     }
+
     pub fn allows_short(self) -> bool {
-        matches!(self, Self::Swap)
+        matches!(self, Self::Swap | Self::Stock)
     }
-    /// Taker fee in basis points for a fresh account, used when the manifest
-    /// states no costs of its own.
-    pub fn default_fee_bps(self) -> f64 {
+
+    /// The most leverage a manifest may declare. Spot has none to give; a
+    /// perpetual goes to fifty; a stock on Regulation T margin borrows at most
+    /// half its value, which is two times.
+    pub fn max_leverage(self) -> f64 {
         match self {
-            Self::Spot => 10.0,
-            Self::Swap => 5.0,
+            Self::Spot => 1.0,
+            Self::Swap => 50.0,
+            Self::Stock => 2.0,
         }
     }
+
+    pub fn trades_in_contracts(self) -> bool {
+        matches!(self, Self::Swap)
+    }
+
+    pub fn margin_regime(self) -> MarginRegime {
+        match self {
+            Self::Spot => MarginRegime::None,
+            Self::Swap => MarginRegime::Isolated,
+            Self::Stock => MarginRegime::RegT,
+        }
+    }
+
+    /// Maintenance margin when a backtest states none: OKX's tier-one rate on
+    /// a perpetual, and FINRA's 25% minimum on a margined stock.
+    pub fn default_maintenance_margin_rate(self) -> Option<f64> {
+        match self {
+            Self::Spot => None,
+            Self::Swap => Some(0.005),
+            Self::Stock => Some(0.25),
+        }
+    }
+
+    /// Taker fee for a fresh OKX account, used when the manifest states no
+    /// costs and the caller supplies none. A stock has no such default: its
+    /// commission is a broker's choice and its regulatory levies change every
+    /// year, so a caller has to say rather than have the kernel assume.
+    pub fn default_fees(self) -> Option<Vec<FeeComponent>> {
+        match self {
+            Self::Spot => Some(vec![FeeComponent::flat_bps(10.0)]),
+            Self::Swap => Some(vec![FeeComponent::flat_bps(5.0)]),
+            Self::Stock => None,
+        }
+    }
+
+    pub fn policy(self) -> InstrumentPolicy {
+        InstrumentPolicy {
+            inst_type: self,
+            allows_short: self.allows_short(),
+            allows_leverage: self.allows_leverage(),
+            max_leverage: self.max_leverage(),
+            trades_in_contracts: self.trades_in_contracts(),
+            margin_regime: self.margin_regime(),
+            default_maintenance_margin_rate: self.default_maintenance_margin_rate(),
+            default_fees: self.default_fees(),
+        }
+    }
+
+    pub const ALL: [InstrumentType; 3] = [Self::Spot, Self::Swap, Self::Stock];
 }
+
+// MARK: - Manifest
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Market {
@@ -46,6 +179,24 @@ pub struct Market {
     pub inst_type: InstrumentType,
     #[serde(default = "default_bar")]
     pub bar: String,
+    /// Absent in schema-1 manifests, which only ever meant OKX.
+    #[serde(default)]
+    pub venue: Venue,
+}
+
+impl Market {
+    pub fn calendar(&self) -> MarketCalendar {
+        self.venue.calendar()
+    }
+
+    pub fn bar_seconds(&self) -> f64 {
+        bar_seconds(&self.bar)
+    }
+
+    /// Bars in a year on this market, for annualising anything.
+    pub fn bars_per_year(&self) -> f64 {
+        self.calendar().bars_per_year(self.bar_seconds())
+    }
 }
 
 fn default_bar() -> String {
@@ -70,11 +221,6 @@ pub fn bar_seconds(bar: &str) -> f64 {
         "1W" => 604_800.0,
         _ => 3_600.0,
     }
-}
-
-/// Bars in a year, for annualising Sharpe and returns.
-pub fn bars_per_year(bar: &str) -> f64 {
-    365.0 * 86_400.0 / bar_seconds(bar)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,13 +354,75 @@ impl Default for Risk {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+/// What a fill costs beyond its price.
+///
+/// Written as `{"feeBps": 10, "slippageBps": 1}` when the model is the plain
+/// both-sides percentage — the only shape there used to be — and as
+/// `{"fees": [...], "slippageBps": 1}` otherwise. See [`crate::fees`].
+#[derive(Debug, Clone, PartialEq)]
 pub struct Costs {
-    #[serde(rename = "feeBps")]
-    pub fee_bps: f64,
-    #[serde(rename = "slippageBps", default = "default_slippage")]
+    pub fees: Vec<FeeComponent>,
     pub slippage_bps: f64,
 }
+
+impl Costs {
+    pub fn flat(fee_bps: f64, slippage_bps: f64) -> Self {
+        Self {
+            fees: vec![FeeComponent::flat_bps(fee_bps)],
+            slippage_bps,
+        }
+    }
+
+    /// What one fill pays in fees. `units` and `notional` are magnitudes.
+    pub fn fee(&self, side: OrderSide, units: f64, notional: f64) -> f64 {
+        fees::total_fee(&self.fees, side, units, notional)
+    }
+
+    /// The model as a single both-sides percentage, when it is one.
+    pub fn flat_bps(&self) -> Option<f64> {
+        fees::as_flat_bps(&self.fees)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct CostsWire {
+    #[serde(rename = "feeBps", default, skip_serializing_if = "Option::is_none")]
+    fee_bps: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fees: Option<Vec<FeeComponent>>,
+    #[serde(rename = "slippageBps", default = "default_slippage")]
+    slippage_bps: f64,
+}
+
+impl Serialize for Costs {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let wire = match self.flat_bps() {
+            Some(bps) => CostsWire { fee_bps: Some(bps), fees: None, slippage_bps: self.slippage_bps },
+            None => CostsWire { fee_bps: None, fees: Some(self.fees.clone()), slippage_bps: self.slippage_bps },
+        };
+        wire.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Costs {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = CostsWire::deserialize(deserializer)?;
+        let fees = match (wire.fee_bps, wire.fees) {
+            (Some(_), Some(_)) => {
+                return Err(serde::de::Error::custom(
+                    "costs 里 feeBps 和 fees 只能写一个：前者是后者的简写",
+                ))
+            }
+            (Some(bps), None) => vec![FeeComponent::flat_bps(bps)],
+            (None, Some(list)) => list,
+            (None, None) => {
+                return Err(serde::de::Error::custom("costs 必须写 feeBps 或 fees"))
+            }
+        };
+        Ok(Self { fees, slippage_bps: wire.slippage_bps })
+    }
+}
+
 /// Adverse price move assumed on a market fill, per side, in basis points.
 ///
 /// One, not five. Five was a number somebody typed, and it was wrong by more
@@ -240,7 +448,7 @@ pub struct Costs {
 /// trip, so five versus one is eight basis points of hurdle on every trade a
 /// strategy makes. A sweep judged against the wrong hurdle discards good
 /// strategies silently, and that is the expensive direction of this error.
-fn default_slippage() -> f64 {
+pub fn default_slippage() -> f64 {
     1.0
 }
 
@@ -334,13 +542,27 @@ impl CompiledStrategy {
             }
         }
 
-        // Shorting is a swap-only capability; a spot manifest that declares a
-        // short leg is a mistake worth naming rather than silently ignoring.
-        if !manifest.market.inst_type.allows_short()
-            && (short_entry.is_some() || short_exit.is_some())
-        {
+        // Shorting needs something to borrow; a manifest that declares a short
+        // leg on an instrument that cannot be shorted is a mistake worth
+        // naming rather than silently ignoring.
+        let inst_type = manifest.market.inst_type;
+        if !inst_type.allows_short() && (short_entry.is_some() || short_exit.is_some()) {
             return Err(ExprError::Syntax {
-                message: "现货策略不能声明做空信号（shortEntry / shortExit）".into(),
+                message: format!("{inst_type:?} 不能做空，清单却声明了 shortEntry / shortExit"),
+                column: 1,
+            });
+        }
+
+        // Leverage beyond what the instrument's margin allows is not clamped:
+        // a manifest tested at 3× and quietly run at 2× is a different
+        // strategy from the one that was validated.
+        let leverage = manifest.risk.leverage;
+        if leverage > inst_type.max_leverage() + 1e-9 || leverage < 1.0 {
+            return Err(ExprError::Syntax {
+                message: format!(
+                    "杠杆 {leverage}× 超出 {inst_type:?} 允许的范围（1~{}）",
+                    inst_type.max_leverage()
+                ),
                 column: 1,
             });
         }
@@ -524,22 +746,35 @@ impl CompiledStrategy {
         self.exposure.is_some()
     }
 
-    /// Effective costs: a manifest may state its own, otherwise the instrument
-    /// default. Never a hard-coded guess buried in the engine.
-    pub fn costs(&self, fallback_fee_bps: Option<f64>, fallback_slippage_bps: Option<f64>) -> Costs {
-        self.manifest.costs.unwrap_or(Costs {
-            fee_bps: fallback_fee_bps
-                .unwrap_or_else(|| self.manifest.market.inst_type.default_fee_bps()),
-            slippage_bps: fallback_slippage_bps.unwrap_or(5.0),
+    /// Effective costs: the manifest's own when it states them, otherwise what
+    /// the caller supplies from its fee schedule, otherwise the instrument's
+    /// documented default. Never a hard-coded guess buried in the engine —
+    /// and for an instrument with no defensible default, a refusal.
+    pub fn costs(
+        &self,
+        fallback_fees: Option<&[FeeComponent]>,
+        fallback_slippage_bps: Option<f64>,
+    ) -> Result<Costs, String> {
+        if let Some(costs) = &self.manifest.costs {
+            return Ok(costs.clone());
+        }
+        let inst_type = self.manifest.market.inst_type;
+        let fees = match fallback_fees {
+            Some(list) => list.to_vec(),
+            None => inst_type.default_fees().ok_or_else(|| {
+                format!("{inst_type:?} 没有默认费率：清单未声明 costs，调用方也没有提供费率模型")
+            })?,
+        };
+        Ok(Costs {
+            fees,
+            slippage_bps: fallback_slippage_bps.unwrap_or_else(default_slippage),
         })
     }
 
+    /// Leverage the manifest declares. `compile` already refused anything the
+    /// instrument cannot provide, so this is the declared figure, floored at 1.
     pub fn leverage(&self) -> f64 {
-        if self.manifest.market.inst_type.allows_leverage() {
-            self.manifest.risk.leverage.max(1.0)
-        } else {
-            1.0
-        }
+        self.manifest.risk.leverage.max(1.0)
     }
 }
 
@@ -576,12 +811,60 @@ mod tests {
     }
 
     #[test]
+    fn a_schema_one_manifest_is_an_okx_manifest() {
+        let manifest: Manifest = serde_json::from_str(DONCHIAN).unwrap();
+        assert_eq!(manifest.market.venue, Venue::Okx);
+        assert_eq!(manifest.market.calendar(), MarketCalendar::Continuous);
+    }
+
+    #[test]
     fn spot_defaults_to_ten_basis_points() {
         let manifest: Manifest = serde_json::from_str(DONCHIAN).unwrap();
         let compiled = CompiledStrategy::compile(manifest, &[]).unwrap();
-        let costs = compiled.costs(None, None);
-        assert_eq!(costs.fee_bps, 10.0);
-        assert_eq!(costs.slippage_bps, 5.0);
+        let costs = compiled.costs(None, None).unwrap();
+        assert_eq!(costs.flat_bps(), Some(10.0));
+        // One definition of the default slippage, shared with the manifest
+        // loader; it used to be 5 here and 1 there.
+        assert_eq!(costs.slippage_bps, default_slippage());
+    }
+
+    #[test]
+    fn a_stock_has_no_default_costs_and_says_so() {
+        let json = DONCHIAN.replace(
+            r#""market": { "instId": "BTC-USDT", "instType": "SPOT", "bar": "4H" }"#,
+            r#""market": { "instId": "AAPL", "instType": "STOCK", "bar": "1D", "venue": "schwab" }"#,
+        );
+        let manifest: Manifest = serde_json::from_str(&json).unwrap();
+        let compiled = CompiledStrategy::compile(manifest, &[]).unwrap();
+        assert!(compiled.costs(None, None).is_err(), "a guess would be optimistic");
+        let supplied = compiled
+            .costs(Some(&[FeeComponent::flat_bps(0.0)]), Some(2.0))
+            .unwrap();
+        assert_eq!(supplied.slippage_bps, 2.0);
+        assert_eq!(compiled.manifest.market.calendar(), MarketCalendar::UsEquities);
+        assert_eq!(compiled.manifest.market.bars_per_year(), 252.0);
+    }
+
+    #[test]
+    fn costs_read_the_shorthand_and_the_list_but_not_both() {
+        let flat: Costs = serde_json::from_str(r#"{"feeBps": 10, "slippageBps": 5}"#).unwrap();
+        assert_eq!(flat.flat_bps(), Some(10.0));
+        assert_eq!(flat.slippage_bps, 5.0);
+        // Written back as the shorthand it came from.
+        assert_eq!(serde_json::to_string(&flat).unwrap(), r#"{"feeBps":10.0,"slippageBps":5.0}"#);
+
+        let list: Costs = serde_json::from_str(
+            r#"{"fees":[{"basis":"notional","bps":0.278,"side":"sell"}],"slippageBps":2}"#,
+        )
+        .unwrap();
+        assert_eq!(list.flat_bps(), None);
+        assert!(serde_json::to_string(&list).unwrap().contains("\"fees\":["));
+
+        assert!(serde_json::from_str::<Costs>(r#"{"feeBps": 1, "fees": []}"#).is_err());
+        assert!(serde_json::from_str::<Costs>(r#"{"slippageBps": 1}"#).is_err());
+        // Omitted slippage takes the documented default.
+        let bare: Costs = serde_json::from_str(r#"{"feeBps": 4}"#).unwrap();
+        assert_eq!(bare.slippage_bps, default_slippage());
     }
 
     #[test]
@@ -604,11 +887,63 @@ mod tests {
     }
 
     #[test]
-    fn leverage_is_clamped_to_one_on_spot() {
-        let json = DONCHIAN.replace(r#""leverage": 1"#, r#""leverage": 10"#);
+    fn a_stock_may_declare_shorts_within_its_margin() {
+        let json = DONCHIAN
+            .replace(
+                r#""market": { "instId": "BTC-USDT", "instType": "SPOT", "bar": "4H" }"#,
+                r#""market": { "instId": "AAPL", "instType": "STOCK", "bar": "1D", "venue": "schwab" }"#,
+            )
+            .replace(
+                r#""longExit": "close < ref(lowest(low, exitLen), 1)""#,
+                r#""longExit": "close < ref(lowest(low, exitLen), 1)", "shortEntry": "close < 0""#,
+            )
+            .replace(r#""leverage": 1"#, r#""leverage": 2"#);
         let manifest: Manifest = serde_json::from_str(&json).unwrap();
         let compiled = CompiledStrategy::compile(manifest, &[]).unwrap();
-        assert_eq!(compiled.leverage(), 1.0, "spot has no leverage to give");
+        assert_eq!(compiled.leverage(), 2.0);
+    }
+
+    #[test]
+    fn leverage_beyond_the_instrument_is_refused_not_clamped() {
+        // Spot has no margin at all.
+        let json = DONCHIAN.replace(r#""leverage": 1"#, r#""leverage": 10"#);
+        let manifest: Manifest = serde_json::from_str(&json).unwrap();
+        assert!(CompiledStrategy::compile(manifest, &[]).is_err(), "spot has no leverage to give");
+        // A stock on Regulation T stops at two.
+        let json = DONCHIAN
+            .replace(
+                r#""market": { "instId": "BTC-USDT", "instType": "SPOT", "bar": "4H" }"#,
+                r#""market": { "instId": "AAPL", "instType": "STOCK", "bar": "1D", "venue": "schwab" }"#,
+            )
+            .replace(r#""leverage": 1"#, r#""leverage": 3"#);
+        let manifest: Manifest = serde_json::from_str(&json).unwrap();
+        assert!(CompiledStrategy::compile(manifest, &[]).is_err());
+    }
+
+    #[test]
+    fn every_instrument_type_has_a_coherent_policy() {
+        for inst_type in InstrumentType::ALL {
+            let policy = inst_type.policy();
+            assert_eq!(policy.allows_leverage, policy.max_leverage > 1.0);
+            // Anything sized in contracts must ask the exchange for the
+            // multiplier; anything else is one-for-one by definition.
+            assert_eq!(policy.trades_in_contracts, inst_type == InstrumentType::Swap);
+            // A margin regime exists exactly when there is something to lend.
+            assert_eq!(
+                policy.margin_regime == MarginRegime::None,
+                !policy.allows_leverage,
+                "{inst_type:?}"
+            );
+            assert_eq!(
+                policy.default_maintenance_margin_rate.is_some(),
+                policy.allows_leverage,
+                "{inst_type:?}"
+            );
+            // The policy survives the wire, since Swift reads it from JSON.
+            let json = serde_json::to_string(&policy).unwrap();
+            let back: InstrumentPolicy = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.max_leverage, policy.max_leverage);
+        }
     }
 
     #[test]
@@ -616,6 +951,16 @@ mod tests {
         assert_eq!(bar_seconds("4H"), 14_400.0);
         assert_eq!(bar_seconds("1D"), 86_400.0);
         assert_eq!(bar_seconds("nonsense"), 3_600.0);
-        assert!((bars_per_year("1D") - 365.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_market_annualises_by_its_own_calendar() {
+        let okx = Market { inst_id: "BTC-USDT".into(), inst_type: InstrumentType::Spot,
+                           bar: "1D".into(), venue: Venue::Okx };
+        assert!((okx.bars_per_year() - 365.25).abs() < 1e-9);
+        let schwab = Market { inst_id: "AAPL".into(), inst_type: InstrumentType::Stock,
+                              bar: "1H".into(), venue: Venue::Schwab };
+        assert_eq!(schwab.bars_per_year(), 252.0 * 7.0);
+        assert_eq!(Venue::Schwab.quote_currency(), "USD");
     }
 }

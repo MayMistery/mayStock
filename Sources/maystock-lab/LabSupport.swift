@@ -151,23 +151,41 @@ enum Lab {
         throw LabError.notFound(path)
     }
 
-    static func feeSchedule(from arguments: Arguments) -> OKXFeeSchedule {
-        var schedule = OKXFeeSchedule()
+    /// One schedule per venue, with the flags applied where they mean
+    /// something: `--tier` and `--style` are OKX's, `--slippage` is whatever
+    /// is being backtested.
+    static func feeSchedules(from arguments: Arguments) -> FeeSchedules {
+        var schedules = FeeSchedules()
         if let raw = arguments.string("tier"), let tier = OKXFeeTier(rawValue: raw.lowercased()) {
-            schedule.tier = tier
+            schedules.okx.tier = tier
         }
         if let raw = arguments.string("style"), let style = FeeExecutionStyle(rawValue: raw) {
-            schedule.executionStyle = style
+            schedules.okx.executionStyle = style
         }
-        schedule.slippageBps = arguments.double("slippage", default: schedule.slippageBps)
-        return schedule
+        if arguments.has("slippage") {
+            schedules.setSlippageBps(arguments.double("slippage", default: schedules.okx.slippageBps))
+        }
+        return schedules
     }
 
-    /// Enough candles for `days` of the strategy's interval, plus warm-up.
+    /// The bench reads OKX and nothing else until a venue's data path exists.
+    /// A strategy on another venue compiles and stops here, by name, rather
+    /// than having its ticker looked up on the wrong exchange.
+    static func requireMarketData(for strategy: CompiledStrategy) throws {
+        guard strategy.market.venue == .okx else {
+            throw LabError.usage(
+                "\(strategy.market.venue.displayName)的行情源尚未接入（方案第 2 阶段），"
+                + "\(strategy.market.instId) 只能编译、还不能回测")
+        }
+    }
+
+    /// Enough candles for `days` of the strategy's interval, plus warm-up —
+    /// counted on the market's calendar, not by dividing the clock.
     static func fetchCandles(
         strategy: CompiledStrategy, days: Int, rest: OKXRESTClient = OKXRESTClient()
     ) async throws -> [Candle] {
-        let bars = Int((Double(days) * 86_400 / strategy.market.bar.seconds).rounded(.up))
+        try requireMarketData(for: strategy)
+        let bars = strategy.market.calendar.barCount(days: days)
         let target = Swift.min(bars + strategy.warmupBars, BacktestRunner.maxBars)
         if let cached = CandleCache.load(
             instId: strategy.market.instId, bar: strategy.market.bar, atLeast: target) {
@@ -201,12 +219,12 @@ enum Lab {
     /// external series, funding, fees. The one place these are assembled, so a
     /// command cannot quietly omit one.
     static func config(
-        strategy: CompiledStrategy, capital: Double, schedule: OKXFeeSchedule,
+        strategy: CompiledStrategy, capital: Double, schedules: FeeSchedules,
         data: (candles: [Candle], series: [String: [Double]], coverage: [SeriesCoverage]),
         days: Int
     ) async -> BacktestConfig {
         var config = BacktestConfig(
-            initialCapital: capital, feeSchedule: schedule, externalSeries: data.series)
+            initialCapital: capital, feeSchedules: schedules, externalSeries: data.series)
         config.fundingRates = await fundingRates(
             strategy: strategy, candles: data.candles, days: days)
         return config
@@ -305,6 +323,26 @@ enum Lab {
         }
     }
 
+    /// Round-trip cost of one trade under `schedule`, or a usage error naming
+    /// the instrument the schedule cannot price. Never zero by default: a
+    /// missing cost model priced as free is the optimistic reading.
+    static func roundTrip(_ schedule: any FeeSchedule, _ instType: InstrumentType) throws -> Double {
+        guard let cost = schedule.roundTripCostPct(for: instType) else {
+            throw LabError.usage("\(schedule.venue.displayName)的费率表没有\(instType.displayName)")
+        }
+        return cost
+    }
+
+    /// One line describing what a simulation charges per side and per round
+    /// trip. Per-unit and per-order fees depend on the trade, so the round
+    /// trip is stated for a reference one.
+    static func describeCosts(_ costs: StrategyCosts) -> String {
+        let roundTripPct = costs.fees.roundTripPct(units: 100, price: 100) + costs.slippageBps * 2 / 100
+        let reference = costs.fees.flatBps == nil ? "（按 100 单位 × 100 计价的参考成交）" : ""
+        return "\(costs.fees.summary) + 滑点 \(PriceFormatter.plain(costs.slippageBps)) bps"
+            + " → 往返 \(PriceFormatter.percent(roundTripPct, decimals: 3))\(reference)"
+    }
+
     static func objective(from arguments: Arguments) -> OptimizationObjective {
         var objective = OptimizationObjective()
         if let raw = arguments.string("objective"),
@@ -320,8 +358,9 @@ enum Lab {
         return objective
     }
 
-    /// The metric block printed under every backtest.
-    static func printMetrics(_ metrics: BacktestMetrics, capital: Double, quote: String = "USDT") {
+    /// The metric block printed under every backtest. `quote` is the venue's
+    /// currency — what the money figures are in.
+    static func printMetrics(_ metrics: BacktestMetrics, capital: Double, quote: String) {
         let daily = metrics.dailyReturnPct
         Out.kv("日均收益", Out.tinted(daily, Out.signed(daily, decimals: 3))
                + "   (目标 0.5% 是 \(PriceFormatter.percent(0.5, decimals: 1)))")

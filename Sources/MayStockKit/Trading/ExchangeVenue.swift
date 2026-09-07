@@ -12,9 +12,10 @@ import Foundation
 /// stays on the concrete adapter, so a new venue is not obliged to implement
 /// surface it will never be asked for.
 public protocol ExchangeVenue: Sendable {
-    /// Shown in diagnostics and written into the ledger, so a book assembled
-    /// from two venues can still say where each fill came from.
-    var venueName: String { get }
+    /// Which venue this is. Decides the book's currency, the instrument-id
+    /// spelling and the calendar; written into every fill so a book assembled
+    /// from two venues can still say where each one came from.
+    var venue: Venue { get }
 
     /// True once the venue is reachable *and* authenticated. Without both,
     /// nothing below works, not even in a simulated environment.
@@ -128,6 +129,9 @@ public struct VenueProtectiveOrder: Sendable, Equatable, Identifiable {
 }
 
 extension ExchangeVenue {
+    /// Shown in diagnostics.
+    public var venueName: String { venue.displayName }
+
     public func alternativeSeries(
         specs: [String: AlternativeSeriesSpec], market: StrategyMarket,
         candles: [Candle], days: Int

@@ -35,7 +35,7 @@ make lab ARGS="fees --tier lv1"
 
 ```jsonc
 {
-  "schema": 1,                    // 必填，当前只支持 1
+  "schema": 2,                    // 必填；schema 1 仍可读（缺 venue 视为 okx），保存时升为 2
   "id": "my-strategy",            // 省略则从 name 推导
   "name": "我的策略",              // 必填
   "version": "1.0.0",
@@ -43,8 +43,9 @@ make lab ARGS="fees --tier lv1"
   "notes": "写给三个月后的自己：这套规则为什么成立。",
 
   "market": {
-    "instId": "BTC-USDT",         // 任意 OKX 标的
-    "instType": "SPOT",           // SPOT | SWAP（做空与杠杆仅 SWAP）
+    "venue": "okx",               // okx | schwab；省略视为 okx
+    "instId": "BTC-USDT",         // okx：任意 OKX 标的；schwab：美股代码，如 SPY
+    "instType": "SPOT",           // okx：SPOT | SWAP；schwab：STOCK（见 §1.1）
     "bar": "1H"                   // 1m 5m 15m 1H 4H 1D 1W
   },
 
@@ -55,18 +56,31 @@ make lab ARGS="fees --tier lv1"
   "signals": {
     "longEntry":  "…",            // 至少要有 longEntry 或 shortEntry
     "longExit":   "…",
-    "shortEntry": null,           // 仅 SWAP
+    "shortEntry": null,           // 仅允许做空的品种：SWAP、STOCK
     "shortExit":  null
   },
 
   "sizing": { "mode": "equityPct", "value": 100 },
   "risk":   { "stopLossPct": 4, "cooldownBars": 1 },
-  "costs":  { "feeBps": 10, "slippageBps": 5 },  // 省略则按账户费率档位
+  "costs":  { "feeBps": 10, "slippageBps": 5 },  // 或 "fees": [组件…]，见 §3；省略则按该交易所的费率表
 
   "data":   { "funding": { "source": "fundingRate" } },   // 见 §2.5
   "engine": { "kind": "declarative" }                     // 或 script，见 §2.6
 }
 ```
+
+### 1.1 `market.venue` 与 `instType`
+
+| venue | instType | 计价币 | 日历 | 做空 | 杠杆 |
+|-------|----------|--------|------|------|------|
+| `okx` | `SPOT` | USDT | 7×24 | 否 | 1 |
+| `okx` | `SWAP` | USDT | 7×24 | 是 | 1~50，逐仓 |
+| `schwab` | `STOCK` | USD | 纽交所交易日：节假日、提前收盘、夏令时都由内核日历处理 | 是（保证金账户） | 1~2（Reg T） |
+
+这张表不是文档说了算：规则在内核 `kernel/src/strategy.rs` 的 `InstrumentPolicy` 里，
+Swift 通过 `ms_instrument_policy` 读取同一份，清单编译时按它拒绝越界的做空与杠杆。
+时间换算（一年多少根、持仓多少根、「一天」从哪里到哪里）同样只有内核的
+`MarketCalendar` 一份，Swift 侧经 `KernelCalendar` 询问，不自己做 `天数 × 86400 / bar` 的算术。
 
 ### params 的三种写法
 
@@ -99,7 +113,7 @@ make lab ARGS="fees --tier lv1"
 二元仓位根本表达不了。实测 TSMOM 是四轮调研里唯一站得住的东西，
 见 [RESEARCH-TREND.md](RESEARCH-TREND.md)。
 
-- 现货的负敞口会被钳到 0（不能做空），永续才能真正持有负敞口
+- 不允许做空的品种（现货）负敞口会被钳到 0；永续与保证金账户里的股票才能真正持有负敞口
 - 敞口为 NaN（预热期）一律视为 0，绝不猜
 - `rebalanceThreshold` 是必需的：连续信号不设阈值会每根都换手，手续费吃光一切
 
@@ -119,10 +133,10 @@ make lab ARGS="fees --tier lv1"
 | `stopLossPct` / `takeProfitPct` | 相对入场价的百分比 |
 | `trailingStopPct` | 移动止损；水位按每根收盘更新，只约束**之后**的 K 线 |
 | `atrStop` | `{ "period": 14, "mult": 2.5 }`；与 `stopLossPct` 并存时**取更紧的那个** |
-| `leverage` | 仅 SWAP，1~50；现货必须为 1 |
+| `leverage` | 上限由品种决定（§1.1）：现货 1、永续 50、美股 2；越界在导入时被拒 |
 | `cooldownBars` | 平仓后需等待的根数才允许再入场（反手不受限） |
 | `minHoldBars` | 持仓至少这么多根才响应离场**信号**；止损不受限 |
-| `maxDailyLossPct` | UTC 日内亏损达标即平仓并停到次日 |
+| `maxDailyLossPct` | 交易日内亏损达标即平仓并停到次日；「一天」按该市场的日历算（OKX 为 UTC 日，美股为纽约交易日） |
 | `volLookbackBars` | 波动率估计窗口（默认 60 根），仅 `volatilityTarget` 用 |
 | `maxExposure` | 波动率缩放后的敞口上限（默认 1） |
 | `rebalanceThreshold` | 目标敞口与现有敞口差异小于此值就不动手（默认 0.1） |
@@ -297,20 +311,31 @@ maystock-lab backtest 08-script-momentum --days 90 --allow-scripts
 | 信号时点 | 第 i 根**已确认** K 线收盘后求值 |
 | 成交时点 | 第 i+1 根 K 线**开盘价** + 滑点 |
 | 手续费 | 进出各按名义额收一次 |
+| 交易日历 | 由 `market.venue` 决定：OKX 7×24；美股按纽交所交易日，缺的周末与节假日不算缺口，年化按 252 个交易日 |
 | 同根触及止损与止盈 | **按止损先成交**（最坏假设） |
 | 跳空穿过止损 | 按**开盘价**成交，不是止损价 |
 | 资金费（永续） | OKX 真实历史费率，在结算时刻计提 |
 | 强平（永续） | 亏损吃穿 `保证金 ×(1−维持保证金率)` 即判强平 |
 
-费率默认取账户档位，**默认普通 Lv1**（新账户，最贵的现实情形）：
+费率按 `market.venue` 取该交易所的费率表：OKX **默认普通 Lv1**（新账户，最贵的现实情形）；
+嘉信美股买入零佣金，卖出收 SEC §31（按成交额）与 FINRA TAF（按股数，单笔封顶），
+两个费率每年重定，数字带着核对日期放在 `feeSchedules.schwab` 里，过期改字段不改代码。
 
 ```bash
-maystock-lab fees                 # 看完整档位表
-maystock-lab fees --tier vip1     # 换个档位试算
-maystock-lab fees --sync          # 从已配置的 okx CLI 拉本账户真实费率
+maystock-lab fees                 # 两家的费率模型
+maystock-lab fees --tier vip1     # 换个 OKX 档位试算
+maystock-lab fees --sync          # 从已配置的 okx CLI 拉本账户真实费率（仅 OKX）
 ```
 
-清单里写了 `costs` 就以清单为准；没写就跟随档位。
+清单里写了 `costs` 就以清单为准；没写就跟随费率表。`costs` 有两种写法：
+
+- `{ "feeBps": 10, "slippageBps": 5 }`：双边按名义额收的百分比，交易所手续费的经典形状；
+- `{ "fees": [ … ], "slippageBps": 2 }`：费用组件列表。每项 `basis` 为 `notional`（配 `bps`）/
+  `unit`（配 `perUnit`，按股数）/ `order`（配 `perOrder`，按单），`side` 为 `buy` / `sell` / `both`，
+  可带 `minPerOrder` / `maxPerOrder` 与 `label`。美股的监管费只在卖出时收且有封顶，只能这样写。
+
+两种写法不能同时出现。费率表里查不到该品种、清单又没写 `costs` 的策略不会被按零成本回测，
+而是直接报错——没有成本模型时把成本当零，是最乐观的读法。
 
 ---
 

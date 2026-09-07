@@ -1,11 +1,12 @@
 {
-  "schema": 1,
+  "schema": 2,
   "id": "eth-4h-breakout",
   "name": "ETH 4H 通道突破",
   "version": "1.0.0",
   "author": "MayStock lab",
   "notes": "研究候选，走向前 4 折中 3 折盈利、效率比 0.95，是全空间里唯一接近站得住的配置；但样本外仅 10 笔交易，远低于 30 笔/参数 的统计下限，日均仅 0.050%。详见 docs/RESEARCH-BTC-ETH.md。",
   "market": {
+    "venue": "okx",
     "instId": "ETH-USDT",
     "instType": "SPOT",
     "bar": "4H"

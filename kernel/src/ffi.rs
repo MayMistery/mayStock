@@ -23,7 +23,7 @@ use std::ptr;
 use crate::backtest::{self, BacktestConfig};
 use crate::candle::Candle;
 use crate::decide::{self, Direction};
-use crate::strategy::{CompiledStrategy, Manifest};
+use crate::strategy::{CompiledStrategy, InstrumentType, Manifest, Market};
 
 /// Opaque handle to a compiled strategy.
 pub struct MSStrategy {
@@ -175,19 +175,27 @@ pub unsafe extern "C" fn ms_strategy_describe(
 ) -> *mut c_char {
     guarded(error_out, ptr::null_mut(), || {
         let strategy = &handle.as_ref().ok_or("strategy handle was null")?.inner;
-        let costs = strategy.costs(None, None);
+        let market = &strategy.manifest.market;
+        // Null when the manifest states no costs and the instrument has no
+        // default: the caller's fee schedule decides, and there is nothing
+        // here to describe.
+        let costs = strategy.costs(None, None).ok();
         let value = serde_json::json!({
             "id": strategy.manifest.id,
             "name": strategy.manifest.name,
-            "instId": strategy.manifest.market.inst_id,
-            "instType": strategy.manifest.market.inst_type,
-            "bar": strategy.manifest.market.bar,
+            "instId": market.inst_id,
+            "instType": market.inst_type,
+            "bar": market.bar,
+            "venue": market.venue,
+            "calendar": market.calendar(),
+            "barsPerYear": market.bars_per_year(),
             "warmupBars": strategy.warmup_bars,
             "freeParameterCount": strategy.free_parameter_count,
             "isContinuous": strategy.is_continuous(),
             "leverage": strategy.leverage(),
-            "feeBps": costs.fee_bps,
-            "slippageBps": costs.slippage_bps,
+            "fees": costs.as_ref().map(|c| c.fees.clone()),
+            "feeBps": costs.as_ref().and_then(|c| c.flat_bps()),
+            "slippageBps": costs.as_ref().map(|c| c.slippage_bps),
             "params": strategy.params,
         });
         Ok(to_c_string(value.to_string()))
@@ -726,8 +734,12 @@ pub unsafe extern "C" fn ms_compare_equity(
 /// duplication this refactor exists to remove.
 ///
 /// Input JSON: `{"equityCurve":[{"ts":…,"equity":…,"price":…}],
-///               "trades":[…], "initialCapital":…, "bar":"1H",
+///               "trades":[…], "initialCapital":…,
+///               "market":{"instId":…,"instType":…,"bar":"1H","venue":"okx"},
 ///               "freeParameterCount":1}`
+///
+/// The market, not just the bar: annualisation depends on how many of those
+/// bars the venue trades in a year, and only the market knows.
 #[no_mangle]
 pub unsafe extern "C" fn ms_metrics_compute(
     request_json: *const c_char,
@@ -741,13 +753,9 @@ pub unsafe extern "C" fn ms_metrics_compute(
         trades: Vec<crate::backtest::Trade>,
         #[serde(rename = "initialCapital")]
         initial_capital: f64,
-        #[serde(default = "default_bar_name")]
-        bar: String,
+        market: Market,
         #[serde(rename = "freeParameterCount", default = "one_usize")]
         free_parameter_count: usize,
-    }
-    fn default_bar_name() -> String {
-        "1H".to_string()
     }
     fn one_usize() -> usize {
         1
@@ -761,11 +769,204 @@ pub unsafe extern "C" fn ms_metrics_compute(
             &request.trades,
             &request.equity_curve,
             request.initial_capital,
-            &request.bar,
+            request.market.bars_per_year(),
             request.free_parameter_count,
         );
         serde_json::to_string(&metrics)
             .map(to_c_string)
             .map_err(|e| e.to_string())
     })
+}
+
+// MARK: - Market calendar
+
+/// Parse the `market` block of a manifest:
+/// `{"instId":…,"instType":…,"bar":…,"venue":…}`.
+unsafe fn parse_market(json: *const c_char) -> Result<Market, String> {
+    let text = borrow_str(json).ok_or("market JSON was null or not UTF-8")?;
+    serde_json::from_str(text).map_err(|e| format!("市场描述解析失败：{e}"))
+}
+
+/// Bars in a year on this market. NaN with `error_out` set on a bad market.
+///
+/// Swift asks rather than keeping its own `365.25 * 86_400 / bar`: that
+/// formula is the one that overstated every stock Sharpe by √(365/252), and a
+/// second copy of the right answer would only drift from the first.
+#[no_mangle]
+pub unsafe extern "C" fn ms_calendar_bars_per_year(
+    market_json: *const c_char,
+    error_out: *mut *mut c_char,
+) -> f64 {
+    guarded(error_out, f64::NAN, || Ok(parse_market(market_json)?.bars_per_year()))
+}
+
+/// The trading day `ts_ms` belongs to, as a day index. `i64::MIN` on error.
+#[no_mangle]
+pub unsafe extern "C" fn ms_calendar_session_key(
+    market_json: *const c_char,
+    ts_ms: i64,
+    error_out: *mut *mut c_char,
+) -> i64 {
+    guarded(error_out, i64::MIN, || {
+        let market = parse_market(market_json)?;
+        Ok(market.calendar().session_key(ts_ms))
+    })
+}
+
+/// Close of the bar opening at `ts_ms`. `i64::MIN` on error.
+#[no_mangle]
+pub unsafe extern "C" fn ms_calendar_bar_close(
+    market_json: *const c_char,
+    ts_ms: i64,
+    error_out: *mut *mut c_char,
+) -> i64 {
+    guarded(error_out, i64::MIN, || {
+        let market = parse_market(market_json)?;
+        Ok(market.calendar().bar_close(ts_ms, market.bar_seconds()))
+    })
+}
+
+/// Open of the bar after the one opening at `ts_ms`. `i64::MIN` on error.
+#[no_mangle]
+pub unsafe extern "C" fn ms_calendar_next_open(
+    market_json: *const c_char,
+    ts_ms: i64,
+    error_out: *mut *mut c_char,
+) -> i64 {
+    guarded(error_out, i64::MIN, || {
+        let market = parse_market(market_json)?;
+        Ok(market.calendar().next_open(ts_ms, market.bar_seconds()))
+    })
+}
+
+/// Bar opens the calendar expects strictly after `from_ms` and up to `to_ms`.
+/// −1 on error.
+#[no_mangle]
+pub unsafe extern "C" fn ms_calendar_opens_between(
+    market_json: *const c_char,
+    from_ms: i64,
+    to_ms: i64,
+    error_out: *mut *mut c_char,
+) -> i64 {
+    guarded(error_out, -1, || {
+        let market = parse_market(market_json)?;
+        Ok(market.calendar().opens_between(from_ms, to_ms, market.bar_seconds()) as i64)
+    })
+}
+
+/// 1 when the market is trading at `ts_ms`, 0 when not, −1 on error.
+#[no_mangle]
+pub unsafe extern "C" fn ms_calendar_is_open(
+    market_json: *const c_char,
+    ts_ms: i64,
+    error_out: *mut *mut c_char,
+) -> i32 {
+    guarded(error_out, -1, || {
+        let market = parse_market(market_json)?;
+        Ok(i32::from(market.calendar().is_open(ts_ms)))
+    })
+}
+
+// MARK: - Instrument policy
+
+/// What an instrument type allows — shorting, leverage, contract sizing,
+/// margin regime, default costs — as JSON. Swift reads this rather than
+/// keeping a table of its own, so the two sides cannot disagree about what a
+/// stock may do. `inst_type` is the manifest spelling: `SPOT`, `SWAP`, `STOCK`.
+#[no_mangle]
+pub unsafe extern "C" fn ms_instrument_policy(
+    inst_type: *const c_char,
+    error_out: *mut *mut c_char,
+) -> *mut c_char {
+    guarded(error_out, ptr::null_mut(), || {
+        let text = borrow_str(inst_type).ok_or("instrument type was null or not UTF-8")?;
+        let parsed: InstrumentType =
+            serde_json::from_value(serde_json::Value::String(text.to_string()))
+                .map_err(|_| format!("未知的品种类型：{text}"))?;
+        serde_json::to_string(&parsed.policy())
+            .map(to_c_string)
+            .map_err(|e| e.to_string())
+    })
+}
+
+#[cfg(test)]
+mod market_ffi_tests {
+    use super::*;
+    use std::ffi::{CStr, CString};
+
+    const OKX_DAILY: &str = r#"{"instId":"BTC-USDT","instType":"SPOT","bar":"1D","venue":"okx"}"#;
+    const SCHWAB_HOURLY: &str = r#"{"instId":"AAPL","instType":"STOCK","bar":"1H","venue":"schwab"}"#;
+    /// Friday 2024-07-05 15:30 New York, and the following Monday's open.
+    const FRIDAY_LAST_BAR: i64 = 1_720_207_800_000;
+    const MONDAY_OPEN: i64 = 1_720_445_400_000;
+
+    #[test]
+    fn bars_per_year_follows_the_venue() {
+        let mut error: *mut c_char = ptr::null_mut();
+        let okx = CString::new(OKX_DAILY).unwrap();
+        let schwab = CString::new(SCHWAB_HOURLY).unwrap();
+        let a = unsafe { ms_calendar_bars_per_year(okx.as_ptr(), &mut error) };
+        let b = unsafe { ms_calendar_bars_per_year(schwab.as_ptr(), &mut error) };
+        assert!(error.is_null());
+        assert!((a - 365.25).abs() < 1e-9);
+        assert_eq!(b, 252.0 * 7.0);
+    }
+
+    #[test]
+    fn a_broken_market_is_an_error_not_a_number() {
+        let mut error: *mut c_char = ptr::null_mut();
+        let broken = CString::new(r#"{"instId":"AAPL","venue":"nasdaq"}"#).unwrap();
+        let value = unsafe { ms_calendar_bars_per_year(broken.as_ptr(), &mut error) };
+        assert!(value.is_nan());
+        assert!(!error.is_null());
+        let message = unsafe { CStr::from_ptr(error).to_string_lossy().into_owned() };
+        unsafe { ms_string_free(error) };
+        assert!(message.contains("市场描述"), "{message}");
+
+        let mut error: *mut c_char = ptr::null_mut();
+        assert_eq!(unsafe { ms_calendar_opens_between(ptr::null(), 0, 1, &mut error) }, -1);
+        assert!(!error.is_null());
+        unsafe { ms_string_free(error) };
+    }
+
+    #[test]
+    fn the_session_arithmetic_reaches_the_caller() {
+        let mut error: *mut c_char = ptr::null_mut();
+        let market = CString::new(SCHWAB_HOURLY).unwrap();
+        let next = unsafe { ms_calendar_next_open(market.as_ptr(), FRIDAY_LAST_BAR, &mut error) };
+        assert_eq!(next, MONDAY_OPEN, "the weekend is not a hole");
+        let close = unsafe { ms_calendar_bar_close(market.as_ptr(), FRIDAY_LAST_BAR, &mut error) };
+        assert_eq!(close, FRIDAY_LAST_BAR + 1_800_000, "the last hourly bar closes at 16:00");
+        let opens = unsafe {
+            ms_calendar_opens_between(market.as_ptr(), FRIDAY_LAST_BAR, MONDAY_OPEN + 60_000, &mut error)
+        };
+        assert_eq!(opens, 1);
+        let friday = unsafe { ms_calendar_session_key(market.as_ptr(), FRIDAY_LAST_BAR, &mut error) };
+        let monday = unsafe { ms_calendar_session_key(market.as_ptr(), MONDAY_OPEN, &mut error) };
+        assert_eq!(monday - friday, 3);
+        assert_eq!(unsafe { ms_calendar_is_open(market.as_ptr(), FRIDAY_LAST_BAR, &mut error) }, 1);
+        assert_eq!(unsafe { ms_calendar_is_open(market.as_ptr(), FRIDAY_LAST_BAR + 7_200_000, &mut error) }, 0);
+        assert!(error.is_null());
+    }
+
+    #[test]
+    fn instrument_policy_is_readable_by_its_manifest_name() {
+        let mut error: *mut c_char = ptr::null_mut();
+        let stock = CString::new("STOCK").unwrap();
+        let json = unsafe { ms_instrument_policy(stock.as_ptr(), &mut error) };
+        assert!(error.is_null());
+        let text = unsafe { CStr::from_ptr(json).to_string_lossy().into_owned() };
+        unsafe { ms_string_free(json) };
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["allowsShort"], true);
+        assert_eq!(value["maxLeverage"], 2.0);
+        assert_eq!(value["marginRegime"], "regT");
+        assert!(value["defaultFees"].is_null(), "a stock has no default cost model");
+
+        let bond = CString::new("BOND").unwrap();
+        let json = unsafe { ms_instrument_policy(bond.as_ptr(), &mut error) };
+        assert!(json.is_null());
+        assert!(!error.is_null());
+        unsafe { ms_string_free(error) };
+    }
 }

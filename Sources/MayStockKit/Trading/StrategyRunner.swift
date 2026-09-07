@@ -109,9 +109,10 @@ public final class StrategyRunner {
         return nonStableExposure / equity * 100
     }
 
-    /// Everything the workbench trades settles in USDT, and per-strategy P&L is
-    /// denominated in it, so equity is reported in it too.
-    public static let quoteCurrency = "USDT"
+    /// What the book settles in — the venue's currency. Per-strategy P&L is
+    /// denominated in it, so equity is reported in it too. Empty before the
+    /// runner has a host, which is also before it has any equity to label.
+    public var quoteCurrency: String { host?.venue.venue.quoteCurrency ?? "" }
     /// Equity is polled far less often than the tick: a curve read at 1-minute
     /// resolution is plenty, and each sample costs an authenticated CLI call.
     public static let equitySampleInterval: TimeInterval = 60
@@ -152,7 +153,9 @@ public final class StrategyRunner {
     private var lastActedBar: [String: Date] = [:]
 
     private struct CacheKey: Hashable { let instId: String; let bar: BarInterval }
-    private struct DayAnchor { var day: Date; var equity: Double; var halted: Bool }
+    /// `day` is the market's own trading day (`KernelCalendar.sessionKey`),
+    /// not a calendar date: the breaker resets when the market's day turns.
+    private struct DayAnchor { var day: Int; var equity: Double; var halted: Bool }
     /// Confirmed bar on which each strategy last went flat, for the cooldown.
     private var lastExitBar: [String: Date] = [:]
     /// Orders whose submission outcome the exchange never confirmed.
@@ -453,7 +456,7 @@ public final class StrategyRunner {
            now.timeIntervalSince(last) < Self.fundingPollInterval { return }
 
         let held = host.ledger.positions.values.filter {
-            !$0.isFlat && InstrumentType.of(instId: $0.instId) == .swap
+            !$0.isFlat && $0.venue.instrumentType(of: $0.instId) == .swap
         }
         guard !held.isEmpty else { return }
         guard let payments = try? await host.venue.fundingPayments(
@@ -500,7 +503,7 @@ public final class StrategyRunner {
     /// that gets stopped out, liquidated or auto-deleveraged.
     private func reconcileExternal(for host: StrategyRunnerHost) async {
         var held = host.ledger.positions.values.filter {
-            !$0.isFlat && InstrumentType.of(instId: $0.instId) == .swap
+            !$0.isFlat && $0.venue.instrumentType(of: $0.instId) == .swap
         }
         guard !held.isEmpty else {
             pendingExternal.removeAll()
@@ -514,7 +517,7 @@ public final class StrategyRunner {
         await ingestFills(for: Set(held.map { InstrumentKey(instId: $0.instId, instType: .swap) }),
                           host: host)
         held = host.ledger.positions.values.filter {
-            !$0.isFlat && InstrumentType.of(instId: $0.instId) == .swap
+            !$0.isFlat && $0.venue.instrumentType(of: $0.instId) == .swap
         }
         guard !held.isEmpty else {
             pendingExternal.removeAll()
@@ -610,7 +613,8 @@ public final class StrategyRunner {
                 id: "external-\(instId)-\(Int(Date().timeIntervalSince1970 * 1000))",
                 strategyId: owner.strategyId, instId: instId,
                 side: booked > 0 ? .buy : .sell, price: price, quantity: remaining,
-                feeQuote: 0, ts: Date(), clOrdId: nil, mode: host.portfolio.mode))
+                feeQuote: 0, ts: Date(), clOrdId: nil, mode: host.portfolio.mode,
+                venue: host.venue.venue))
         }
 
         pendingExternal[instId] = nil
@@ -657,7 +661,8 @@ public final class StrategyRunner {
             && fill.side.sign * wanted > 0 {
             guard adopted < limit else { break }
             host.ledger.record(StrategyFill(
-                exchange: fill, strategyId: owner.strategyId, mode: host.portfolio.mode))
+                exchange: fill, strategyId: owner.strategyId, mode: host.portfolio.mode,
+                venue: host.venue.venue))
             adopted += abs(fill.size)
         }
         return adopted
@@ -709,7 +714,7 @@ public final class StrategyRunner {
     ///
     /// Only two answers are honest here: what the exchange said, and "unknown".
     private func contractSize(for instId: String, venue: any ExchangeVenue) async -> Double? {
-        let implied = InstrumentType.of(instId: instId).impliedContractSize
+        let implied = venue.venue.instrumentType(of: instId).impliedContractSize
         if let implied { return implied }
         if let cached = metaCache[instId] { return cached.contractValue }
         guard let meta = (try? await venue.instrumentMeta(instId: instId)) ?? nil else {
@@ -743,12 +748,13 @@ public final class StrategyRunner {
 
         var total = 0.0
         var pricedEverything = true
+        let venue = host.venue.venue
         for balance in snapshot.balances where balance.total > 0 {
-            if balance.ccy == Self.quoteCurrency {
+            if balance.ccy == venue.quoteCurrency {
                 total += balance.total
                 continue
             }
-            let instId = "\(balance.ccy)-\(Self.quoteCurrency)"
+            let instId = venue.spotInstId(base: balance.ccy)
             // Always re-read: a mark cached from an earlier tick would freeze
             // this holding's contribution and flatten the curve.
             if let quoted = try? await host.venue.lastPrice(instId: instId), quoted > 0 {
@@ -804,7 +810,7 @@ public final class StrategyRunner {
         // Spot coin balances.
         for balance in snapshot.balances where balance.total > 0 {
             guard !Self.stableCurrencies.contains(balance.ccy.uppercased()) else { continue }
-            let instId = "\(balance.ccy)-\(Self.quoteCurrency)"
+            let instId = host.venue.venue.spotInstId(base: balance.ccy)
             var price = marks[instId]
             if price == nil { price = try? await host.venue.lastPrice(instId: instId) }
             guard let price, price > 0 else { continue }
@@ -814,7 +820,7 @@ public final class StrategyRunner {
 
         // Derivative positions, at their own mark and contract size.
         for state in host.ledger.positions.values where !state.isFlat {
-            guard InstrumentType.of(instId: state.instId) == .swap else { continue }
+            guard state.venue.instrumentType(of: state.instId) == .swap else { continue }
             let price = marks[state.instId] ?? state.averagePrice
             exposure += abs(state.baseQuantity) * price
         }
@@ -827,6 +833,18 @@ public final class StrategyRunner {
         strategy: CompiledStrategy, allocation: StrategyAllocation, host: StrategyRunnerHost
     ) async {
         let market = strategy.market
+        // A manifest names its venue and this runner trades one. A strategy
+        // on another venue must not be evaluated against this venue's data
+        // or sent to its account — and it has to say so, rather than sit
+        // there reading as "running".
+        guard market.venue == host.venue.venue else {
+            update(strategy.id) {
+                $0.status = .failed
+                $0.message = "策略属于\(market.venue.displayName)，当前账户是"
+                    + "\(host.venue.venue.displayName)，不会评估也不会下单"
+            }
+            return
+        }
         let key = CacheKey(instId: market.instId, bar: market.bar)
 
         // --- Candles: keep a rolling window big enough for the longest indicator
@@ -902,12 +920,14 @@ public final class StrategyRunner {
         // an ATR-stopped `riskPerTrade` manifest risked 1% per trade in
         // simulation and committed the whole budget live.
         let equity = workingCapital(strategy: strategy, allocation: allocation, host: host)
-        let today = Self.utcDay(of: Date())
+        // The market's own trading day, by its calendar: midnight UTC on a
+        // crypto exchange, the New York session's date on a stock exchange.
+        let today = market.calendar.sessionKey(Date())
         var anchor = dayAnchors[strategy.id]
             ?? DayAnchor(day: today, equity: equity, halted: false)
-        // A new UTC day clears the breaker, exactly as the backtester does.
-        // Leaving it latched would mean the backtest counted tomorrow's trades
-        // and live never took them.
+        // A new trading day clears the breaker, exactly as the backtester
+        // does. Leaving it latched would mean the backtest counted tomorrow's
+        // trades and live never took them.
         if anchor.day != today {
             anchor = DayAnchor(day: today, equity: equity, halted: false)
         }
@@ -984,7 +1004,7 @@ public final class StrategyRunner {
             await syncTrailingStop(to: level, strategy: strategy, host: host)
         }
         if decision.haltDailyLoss {
-            // Latched for the rest of the UTC day only — the anchor above
+            // Latched for the rest of the trading day only — the anchor above
             // clears it at the day boundary.
             dayAnchors[strategy.id]?.halted = true
         }
@@ -995,35 +1015,27 @@ public final class StrategyRunner {
         _ since: Date?, latestBar: Candle, market: StrategyMarket
     ) -> Int? {
         guard let since else { return nil }
-        return Self.barsBetween(since, and: latestBar.ts, bar: market.bar)
+        return market.calendar.expectedBars(from: since, to: latestBar.ts)
     }
 
     /// Bars the current position has been held for, counted from the bar its
     /// opening fill landed in.
+    ///
+    /// Counted as bars the market's calendar expected between the two
+    /// instants, not as elapsed time over the bar length. A fill lands
+    /// part-way through a bar, and dividing the raw interval loses that
+    /// fraction — an entry at 10:05 measured against the 15:00 bar gave 4.9 →
+    /// 4 when the position had been open across 5 bars. Worse, elapsed time
+    /// counts the night and the weekend: a stock position opened at the
+    /// 15:30 bar was "eighteen bars old" at the next morning's open. The
+    /// backtester counts index arithmetic, so every bar-counted rule — the
+    /// minimum hold, the cooldown, the time barrier, the trailing anchor's
+    /// window — has to count the same bars it does.
     private func barsHeldCount(
         position: StrategyPositionState?, latestBar: Candle, market: StrategyMarket
     ) -> Int {
         guard let opened = position?.openedAt else { return 0 }
-        return Self.barsBetween(opened, and: latestBar.ts, bar: market.bar) ?? 0
-    }
-
-    /// Bars between two instants, counting *bars* rather than elapsed time.
-    ///
-    /// Both ends are floored to their bar's opening time first. A fill lands
-    /// part-way through a bar, and dividing the raw interval loses that
-    /// fraction: an entry at 10:05 measured against the 15:00 bar gives 4.9 →
-    /// 4, when the position has in fact been open across 5 bars. The
-    /// backtester counts index arithmetic and has no such rounding, so
-    /// without this every bar-counted rule — the minimum hold, the cooldown,
-    /// and above all the time barrier and the trailing anchor's window — was
-    /// one bar out from the simulation that justified it.
-    nonisolated static func barsBetween(_ from: Date, and to: Date, bar: BarInterval) -> Int? {
-        let seconds = bar.seconds
-        guard seconds > 0 else { return nil }
-        func barStart(_ date: Date) -> Double {
-            (date.timeIntervalSince1970 / seconds).rounded(.down) * seconds
-        }
-        return Swift.max(Int(((barStart(to) - barStart(from)) / seconds).rounded()), 0)
+        return market.calendar.expectedBars(from: opened, to: latestBar.ts)
     }
 
     /// Target direction for this bar, decided by the Rust kernel.
@@ -1246,8 +1258,7 @@ public final class StrategyRunner {
         // ETH was meant — a 10× order, in real size, on a network hiccup. Spot
         // needs no lookup (`impliedContractSize` answers it), so this only ever
         // blocks a derivative order we genuinely cannot size.
-        guard let contractSize = meta?.contractValue
-                ?? InstrumentType.of(instId: market.instId).impliedContractSize else {
+        guard let contractSize = meta?.contractValue ?? market.instType.impliedContractSize else {
             update(strategy.id) { $0.message = "取不到合约面值，未能下单（不拿 1 兜底）" }
             Log.warn("runner: \(market.instId) 合约面值未知，跳过下单")
             return
@@ -1538,7 +1549,7 @@ public final class StrategyRunner {
         let knownIds = host.runnableStrategies.map(\.id)
         for instrument in instruments {
             guard let listing = await fills(for: instrument, host: host) else { continue }
-            host.ledger.ingest(listing, knownStrategyIds: knownIds)
+            host.ledger.ingest(listing, knownStrategyIds: knownIds, venue: host.venue.venue)
         }
     }
 
@@ -1574,9 +1585,5 @@ public final class StrategyRunner {
         var state = states[strategyId] ?? StrategyRuntimeState()
         mutate(&state)
         states[strategyId] = state
-    }
-
-    private static func utcDay(of date: Date) -> Date {
-        Date(timeIntervalSince1970: (date.timeIntervalSince1970 / 86_400).rounded(.down) * 86_400)
     }
 }

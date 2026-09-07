@@ -659,7 +659,9 @@ public enum PortfolioReview {
                 remedy: "确认这是有意为之"))
         }
 
-        let configured = s.config.strategy.feeSchedule.slippageBps
+        // The measured figure comes from OKX fills, so it is the OKX schedule
+        // it is compared against.
+        let configured = s.config.strategy.feeSchedules.okx.slippageBps
         if abs(configured - policy.measuredSlippageBps) > policy.slippageDriftBps {
             findings.append(ReviewFinding(
                 code: "config.slippage",
@@ -669,7 +671,7 @@ public enum PortfolioReview {
                     format: "配置里 %.1f bps，实测 %.1f bps。回测和实盘会按不同的经济学被判定，"
                         + "同一个策略的两边结论就没法比。",
                     configured, policy.measuredSlippageBps),
-                remedy: "改配置里的 feeSchedule.slippageBps，或重新校准后更新 review-policy.json"))
+                remedy: "改配置里的 feeSchedules.okx.slippageBps，或重新校准后更新 review-policy.json"))
         }
 
         if policy.mandates.isEmpty {

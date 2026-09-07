@@ -86,7 +86,9 @@ extension UniverseBuilder {
         }
         let mean = Statistics.mean(returns)
         let deviation = Statistics.standardDeviation(returns, mean: mean)
-        return deviation * 365.0.squareRoot() * 100
+        // The universe is OKX daily bars; the market's calendar says what a
+        // year of them is.
+        return deviation * Venue.okx.barsPerYear(bar: .d1).squareRoot() * 100
     }
 }
 

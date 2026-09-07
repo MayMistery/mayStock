@@ -1,59 +1,63 @@
 //! Is this candle series fit to trade on?
 //!
-//! A backtest is handed a clean, contiguous array. Live trading is handed
-//! whatever the exchange returned, which on a bad day means a stale bar, a
-//! hole where a bar should be, or the same bar twice. Every indicator downstream
-//! will happily compute a number from that, and the number will look exactly
-//! like a real one.
+//! Every indicator downstream will compute a plausible-looking number from a
+//! series with a hole in it, a duplicate bar, or a bar whose high is below its
+//! low. None of them can tell. So the series is judged *before* any of them
+//! see it, and a series that fails is a refusal to decide — not a flat target,
+//! which would liquidate a position because the feed hiccupped.
 //!
-//! The research on production trading systems is blunt about this: the gap
-//! check is the part most people skip, and without it a quiet feed is
-//! indistinguishable from a dead one. So the series is inspected *before* the
-//! signal is, and a strategy standing aside on bad data is the correct
-//! behaviour rather than a failure.
+//! "A hole" is judged against the market's calendar, not against the clock.
+//! An hourly stock series is missing nothing between Friday's 15:30 bar and
+//! Monday's 09:30 one; an hourly crypto series missing the same stretch has
+//! lost sixty-five bars. The calendar is the only thing that can tell those
+//! apart, which is why it is an input here rather than something inferred
+//! from the data.
 
 use serde::{Deserialize, Serialize};
 
+use crate::calendar::MarketCalendar;
 use crate::candle::Candle;
 
-/// What is wrong with the series, if anything.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DataQuality {
-    /// Safe to compute signals from.
+    /// False when the series must not be traded on. `reason` says why.
     pub usable: bool,
-    /// Human-readable summary, empty when usable.
     pub reason: String,
-    /// Bars missing from the middle of the series.
+    /// Bars the calendar expected that are not there.
     pub gaps: usize,
-    /// Repeated timestamps.
     pub duplicates: usize,
-    /// Bars failing the OHLC sanity check.
+    /// Bars whose OHLC does not bracket itself.
     pub malformed: usize,
-    /// How far behind the latest confirmed bar is, in bar intervals. `None`
-    /// when the caller supplied no wall clock.
+    /// Bars that are present but not where the calendar expects one — a feed
+    /// serving extended hours, or a venue on a grid this calendar does not
+    /// describe. Reported, never a refusal: nothing is missing, something is
+    /// merely extra, and the reader should know which.
+    #[serde(rename = "offGrid", default)]
+    pub off_grid: usize,
+    /// How far the newest confirmed bar trails `now`, in bars the calendar
+    /// expected. `None` when no clock was supplied.
     #[serde(rename = "barsBehind")]
     pub bars_behind: Option<f64>,
 }
 
 impl DataQuality {
-    fn good() -> Self {
+    pub fn good() -> Self {
         Self {
             usable: true,
             reason: String::new(),
             gaps: 0,
             duplicates: 0,
             malformed: 0,
+            off_grid: 0,
             bars_behind: None,
         }
     }
 }
 
-/// How stale the newest confirmed bar may be before the feed is presumed
-/// broken, in bar intervals.
-///
-/// Two rather than one: a bar is only confirmed once the *next* one opens, so
-/// a healthy feed is routinely a whole interval behind. Anything past two means
-/// a bar that should exist does not.
+/// Bars the newest confirmed bar may trail the clock before the feed is judged
+/// dead rather than quiet. Not one: a bar is only confirmed once the next one
+/// opens, so a healthy feed is routinely a whole interval behind. Anything past
+/// two means a bar that should exist does not.
 pub const MAX_BARS_BEHIND: f64 = 2.5;
 
 /// How many bars may be missing before the series is refused outright.
@@ -64,13 +68,18 @@ pub const MAX_BARS_BEHIND: f64 = 2.5;
 /// lookback window no longer means what it says.
 pub const MAX_GAP_RATIO: f64 = 0.02;
 
-/// Inspect the confirmed portion of a candle series.
+/// Judge a candle series.
 ///
 /// `now_ms` is the caller's wall clock. The kernel has none by design — it is
 /// pure computation — so staleness is only checked when the caller supplies
 /// one. Passing `None` from a backtest is correct: historical data is stale
 /// by definition and the property is meaningless there.
-pub fn inspect(candles: &[Candle], bar_seconds: f64, now_ms: Option<i64>) -> DataQuality {
+pub fn inspect(
+    candles: &[Candle],
+    calendar: MarketCalendar,
+    bar_seconds: f64,
+    now_ms: Option<i64>,
+) -> DataQuality {
     let confirmed: Vec<Candle> = candles.iter().copied().filter(|c| c.is_confirmed()).collect();
     if confirmed.len() < 2 || bar_seconds <= 0.0 {
         return DataQuality::good();
@@ -80,23 +89,30 @@ pub fn inspect(candles: &[Candle], bar_seconds: f64, now_ms: Option<i64>) -> Dat
     sorted.sort_by_key(|c| c.ts_ms);
 
     let malformed = sorted.iter().filter(|c| !c.is_sane()).count();
-    let interval_ms = (bar_seconds * 1000.0) as i64;
 
     let mut duplicates = 0usize;
     let mut gaps = 0usize;
     for pair in sorted.windows(2) {
-        let step = pair[1].ts_ms - pair[0].ts_ms;
-        if step == 0 {
+        if pair[1].ts_ms == pair[0].ts_ms {
             duplicates += 1;
-        } else if step > interval_ms {
-            // Every whole interval beyond the first is a bar that is not there.
-            gaps += ((step / interval_ms) - 1).max(0) as usize;
+            continue;
         }
+        gaps += calendar.opens_strictly_between(pair[0].ts_ms, pair[1].ts_ms, bar_seconds);
     }
+    // Every bar is judged, the first included: a pre-market bar at the head of
+    // the series is exactly the kind of extra the reader should hear about.
+    let off_grid = sorted
+        .iter()
+        .enumerate()
+        .filter(|(index, candle)| {
+            let previous = index.checked_sub(1).map(|i| sorted[i].ts_ms);
+            !calendar.on_grid(previous, candle.ts_ms, bar_seconds)
+        })
+        .count();
 
     let bars_behind = now_ms.map(|now| {
         let newest = sorted[sorted.len() - 1].ts_ms;
-        (now - newest) as f64 / (bar_seconds * 1000.0)
+        calendar.bars_behind(newest, now, bar_seconds)
     });
 
     let expected = sorted.len() + gaps;
@@ -127,6 +143,7 @@ pub fn inspect(candles: &[Candle], bar_seconds: f64, now_ms: Option<i64>) -> Dat
         gaps,
         duplicates,
         malformed,
+        off_grid,
         bars_behind,
     }
 }
@@ -137,6 +154,8 @@ mod tests {
 
     const HOUR: f64 = 3_600.0;
     const HOUR_MS: i64 = 3_600_000;
+    const CRYPTO: MarketCalendar = MarketCalendar::Continuous;
+    const STOCKS: MarketCalendar = MarketCalendar::UsEquities;
 
     fn bar(ts_ms: i64) -> Candle {
         Candle {
@@ -154,11 +173,28 @@ mod tests {
         (0..count).map(|i| bar(i * HOUR_MS)).collect()
     }
 
+    /// Hourly New York session bars for `sessions` consecutive trading days
+    /// starting Monday 2024-07-08, exactly as the calendar expects them.
+    fn stock_hours(sessions: usize) -> Vec<Candle> {
+        // 2024-07-08 09:30 New York is 13:30 UTC (daylight time).
+        let mut ts = 1_720_445_400_000;
+        let mut out = Vec::new();
+        for _ in 0..sessions {
+            let open = ts;
+            for k in 0..7 {
+                out.push(bar(open + k * HOUR_MS));
+            }
+            ts = STOCKS.next_open(open + 6 * HOUR_MS, HOUR);
+        }
+        out
+    }
+
     #[test]
     fn a_clean_series_is_usable() {
-        let result = inspect(&contiguous(100), HOUR, None);
+        let result = inspect(&contiguous(100), CRYPTO, HOUR, None);
         assert!(result.usable, "{}", result.reason);
         assert_eq!(result.gaps, 0);
+        assert_eq!(result.off_grid, 0);
     }
 
     #[test]
@@ -167,7 +203,7 @@ mod tests {
         // for the rest of the day over one hole is its own kind of failure.
         let mut candles = contiguous(100);
         candles.remove(50);
-        let result = inspect(&candles, HOUR, None);
+        let result = inspect(&candles, CRYPTO, HOUR, None);
         assert_eq!(result.gaps, 1);
         assert!(result.usable);
     }
@@ -175,9 +211,48 @@ mod tests {
     #[test]
     fn a_series_full_of_holes_is_refused() {
         let candles: Vec<Candle> = (0..50).map(|i| bar(i * HOUR_MS * 3)).collect();
-        let result = inspect(&candles, HOUR, None);
+        let result = inspect(&candles, CRYPTO, HOUR, None);
         assert!(!result.usable);
         assert!(result.reason.contains("缺失"));
+    }
+
+    #[test]
+    fn a_stock_series_with_nights_and_weekends_has_no_holes() {
+        // Two weeks of hourly bars, Independence Day-free, clean.
+        let candles = stock_hours(10);
+        assert_eq!(candles.len(), 70);
+        let result = inspect(&candles, STOCKS, HOUR, None);
+        assert!(result.usable, "{}", result.reason);
+        assert_eq!(result.gaps, 0, "nights and weekends are not gaps on a stock calendar");
+        assert_eq!(result.off_grid, 0);
+
+        // The same bars judged as if the market never closed: refused. This is
+        // what every stock series looked like before the calendar existed.
+        let as_crypto = inspect(&candles, CRYPTO, HOUR, None);
+        assert!(!as_crypto.usable);
+        assert!(as_crypto.gaps > 100);
+    }
+
+    #[test]
+    fn a_missing_session_is_a_gap_on_a_stock_calendar_too() {
+        let mut candles = stock_hours(10);
+        // Drop Wednesday of the first week entirely: seven bars.
+        candles.drain(14..21);
+        let result = inspect(&candles, STOCKS, HOUR, None);
+        assert_eq!(result.gaps, 7);
+        assert!(!result.usable, "7 of 70 is far past the tolerance");
+    }
+
+    #[test]
+    fn extended_hours_bars_are_reported_not_refused() {
+        let mut candles = stock_hours(5);
+        // A 08:30 pre-market bar on the first day, an hour before the open.
+        let premarket = bar(candles[0].ts_ms - HOUR_MS);
+        candles.insert(0, premarket);
+        let result = inspect(&candles, STOCKS, HOUR, None);
+        assert!(result.usable, "{}", result.reason);
+        assert_eq!(result.gaps, 0);
+        assert_eq!(result.off_grid, 1);
     }
 
     #[test]
@@ -186,7 +261,7 @@ mod tests {
         // not quiet, it is dead.
         let candles = contiguous(100);
         let now = 99 * HOUR_MS + 10 * HOUR_MS;
-        let result = inspect(&candles, HOUR, Some(now));
+        let result = inspect(&candles, CRYPTO, HOUR, Some(now));
         assert!(!result.usable);
         assert!(result.reason.contains("落后"));
     }
@@ -197,14 +272,31 @@ mod tests {
         // routinely a whole interval behind. Refusing that would refuse always.
         let candles = contiguous(100);
         let now = 99 * HOUR_MS + HOUR_MS + 60_000;
-        assert!(inspect(&candles, HOUR, Some(now)).usable);
+        assert!(inspect(&candles, CRYPTO, HOUR, Some(now)).usable);
+    }
+
+    #[test]
+    fn a_stock_feed_is_not_stale_over_the_weekend() {
+        let candles = stock_hours(5); // Monday to Friday, last bar Friday 15:30
+        let friday_close = candles[candles.len() - 1].ts_ms + HOUR_MS / 2;
+        // Saturday noon: no bar was due, so nothing is behind.
+        let saturday = friday_close + 20 * HOUR_MS;
+        let result = inspect(&candles, STOCKS, HOUR, Some(saturday));
+        assert!(result.usable, "{}", result.reason);
+        assert_eq!(result.bars_behind, Some(0.0));
+        // Monday 12:00: three bars were due and none came.
+        let monday_open = STOCKS.next_open(candles[candles.len() - 1].ts_ms, HOUR);
+        let monday_noon = monday_open + 2 * HOUR_MS + HOUR_MS / 2;
+        let dead = inspect(&candles, STOCKS, HOUR, Some(monday_noon));
+        assert!(!dead.usable);
+        assert!(dead.reason.contains("落后"));
     }
 
     #[test]
     fn a_duplicate_timestamp_is_refused() {
         let mut candles = contiguous(20);
         candles.push(bar(10 * HOUR_MS));
-        let result = inspect(&candles, HOUR, None);
+        let result = inspect(&candles, CRYPTO, HOUR, None);
         assert!(!result.usable);
         assert!(result.reason.contains("重复"));
     }
@@ -216,7 +308,7 @@ mod tests {
         // from it.
         let mut candles = contiguous(20);
         candles[5].low = 500.0;
-        let result = inspect(&candles, HOUR, None);
+        let result = inspect(&candles, CRYPTO, HOUR, None);
         assert!(!result.usable);
         assert!(result.reason.contains("不自洽"));
     }
@@ -226,7 +318,7 @@ mod tests {
         // Historical data is stale by definition; the property is meaningless
         // there and must not block a backtest.
         let candles = contiguous(100);
-        let result = inspect(&candles, HOUR, None);
+        let result = inspect(&candles, CRYPTO, HOUR, None);
         assert!(result.usable);
         assert!(result.bars_behind.is_none());
     }
@@ -235,8 +327,8 @@ mod tests {
     fn too_short_a_series_is_not_judged() {
         // Warm-up handles "not enough data"; this module only judges data it
         // actually has.
-        assert!(inspect(&contiguous(1), HOUR, None).usable);
-        assert!(inspect(&[], HOUR, None).usable);
+        assert!(inspect(&contiguous(1), CRYPTO, HOUR, None).usable);
+        assert!(inspect(&[], CRYPTO, HOUR, None).usable);
     }
 
     #[test]
@@ -245,6 +337,16 @@ mod tests {
         // here the newest data would always look like a hole.
         let mut candles = contiguous(20);
         candles.push(Candle { confirmed: 0, ..bar(50 * HOUR_MS) });
-        assert!(inspect(&candles, HOUR, None).usable);
+        assert!(inspect(&candles, CRYPTO, HOUR, None).usable);
+    }
+
+    #[test]
+    fn the_report_carries_the_off_grid_count_on_the_wire() {
+        let json = serde_json::to_string(&DataQuality::good()).unwrap();
+        assert!(json.contains("\"offGrid\":0"), "{json}");
+        // And a report written before the field existed still reads.
+        let legacy = r#"{"usable":true,"reason":"","gaps":0,"duplicates":0,"malformed":0,"barsBehind":null}"#;
+        let parsed: DataQuality = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.off_grid, 0);
     }
 }

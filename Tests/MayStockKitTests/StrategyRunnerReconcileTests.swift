@@ -8,7 +8,7 @@ import Testing
 /// An exchange that answers from fixtures, so the runner's reconciliation can
 /// be driven through states a real venue only reaches by being liquidated.
 final class FakeVenue: ExchangeVenue, @unchecked Sendable {
-    let venueName = "Fake"
+    let venue = Venue.okx
 
     var positionsResult: Result<[ExchangePosition], Error> = .success([])
     var fillsResult: [ExchangeFill] = []
@@ -748,13 +748,15 @@ struct PortfolioProtectionDefaultTests {
     func barsAreCountedAsBarsNotAsElapsedTime() {
         // An entry at 10:05 against the 15:00 bar has been open across 5 bars.
         // Dividing the raw interval gives 4.9 → 4, and every bar-counted rule
-        // would then be one bar out from the backtest.
+        // would then be one bar out from the backtest. The runner asks the
+        // market's calendar, which counts bar opens rather than seconds.
+        let calendar = StrategyMarket.hourlySpot.calendar
         let entry = Date(timeIntervalSince1970: 10 * 3_600 + 5 * 60)
         let latest = Date(timeIntervalSince1970: 15 * 3_600)
-        #expect(StrategyRunner.barsBetween(entry, and: latest, bar: .h1) == 5)
+        #expect(calendar.expectedBars(from: entry, to: latest) == 5)
         // Same bar is zero, and time running backwards never goes negative.
-        #expect(StrategyRunner.barsBetween(latest, and: latest, bar: .h1) == 0)
-        #expect(StrategyRunner.barsBetween(latest, and: entry, bar: .h1) == 0)
+        #expect(calendar.expectedBars(from: latest, to: latest) == 0)
+        #expect(calendar.expectedBars(from: latest, to: entry) == 0)
     }
 }
 
@@ -983,7 +985,7 @@ struct SeriesAlignmentTests {
         }
         let aligned = SeriesAligner.align(
             observations, to: hourly(5),
-            timing: .bar(seconds: 3_600), candleSeconds: 3_600)
+            timing: .bar(.h1), market: .hourlySpot)
         #expect(aligned == [0, 1, 2, 3, 4])
     }
 
@@ -998,7 +1000,7 @@ struct SeriesAlignmentTests {
         ]
         let aligned = SeriesAligner.align(
             daily, to: hourly(30),
-            timing: .bar(seconds: 86_400), candleSeconds: 3_600)
+            timing: .bar(.d1), market: .hourlySpot)
 
         // Nothing is known until the first daily bar has closed.
         #expect(aligned[0].isNaN)
@@ -1020,7 +1022,7 @@ struct SeriesAlignmentTests {
             SeriesObservation(ts: Date(timeIntervalSince1970: 3_600), value: 0.0001),
         ]
         let aligned = SeriesAligner.align(
-            settlement, to: hourly(4), timing: .instant, candleSeconds: 3_600)
+            settlement, to: hourly(4), timing: .instant, market: .hourlySpot)
         #expect(aligned[0].isNaN)
         #expect(aligned[1] == 0.0001)
     }
@@ -1034,7 +1036,7 @@ struct SeriesAlignmentTests {
         ]
         let aligned = SeriesAligner.align(
             observations, to: hourly(2),
-            timing: .bar(seconds: 3_600), candleSeconds: 3_600)
+            timing: .bar(.h1), market: .hourlySpot)
         #expect(aligned[0] == 42)
     }
 
@@ -1047,7 +1049,7 @@ struct SeriesAlignmentTests {
                               value: Double($0))
         }
         #expect(SeriesAligner.align(
-            observations, to: hourly(3), candleSeconds: 3_600) == [0, 1, 2])
+            observations, to: hourly(3), market: .hourlySpot) == [0, 1, 2])
     }
 }
 
@@ -1267,7 +1269,7 @@ struct WalkForwardEfficiencyTests {
                     EquityPoint(ts: from.addingTimeInterval(days * 86_400),
                                 equity: 10_000 * (1 + pct / 100), price: 1),
                 ],
-                initialCapital: 10_000, bar: .h1, freeParameterCount: 1)
+                initialCapital: 10_000, market: .hourlySpot, freeParameterCount: 1)
         }
         let inMetrics = metrics(inPct, days: inDays, from: start)
         let outMetrics = metrics(
@@ -1418,14 +1420,14 @@ struct ValidationHonestyTests {
         // nothing, and a validation run seeing no warning concludes it passed.
         let sparse = BacktestMetrics.empty
         let result = BacktestResult(
-            strategyId: "x", instId: "BTC-USDT", bar: .d1,
+            strategyId: "x", market: .dailySpot,
             start: Date(timeIntervalSince1970: 0),
             end: Date(timeIntervalSince1970: 86_400 * 100),
             barCount: 100, initialCapital: 10_000, finalEquity: 10_500,
             trades: [], equityCurve: [], liquidations: 0, warmupBars: 10,
             fundingUnmodelled: false, metrics: sparse)
         let assessment = RobustnessAssessment.evaluate(
-            results: [.full: result], bar: .d1, freeParameterCount: 1)
+            results: [.full: result], market: .dailySpot, freeParameterCount: 1)
         #expect(assessment.notes.contains { $0.contains("这不是通过") })
     }
 }

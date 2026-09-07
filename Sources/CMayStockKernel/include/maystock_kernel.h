@@ -101,8 +101,45 @@ char *ms_backtest_run(const MSStrategy *handle,
 /* Performance metrics over an equity curve the kernel did not produce (the
  * portfolio backtester and factor tools combine several strategies' curves and
  * need the same statistics). Request JSON carries equityCurve, trades,
- * initialCapital, bar and freeParameterCount. Caller frees. */
+ * initialCapital, market ({instId, instType, bar, venue}) and
+ * freeParameterCount. Caller frees. */
 char *ms_metrics_compute(const char *request_json, char **error_out);
+
+/* --- market calendar ------------------------------------------------- */
+
+/* Every conversion between bars and time goes through the market's calendar:
+ * a crypto venue trades every hour of every day, a stock exchange does not.
+ * `market_json` is the manifest's market block: {instId, instType, bar,
+ * venue}. On a bad market each function sets error_out and returns its
+ * sentinel (NaN, INT64_MIN, -1). */
+
+/* Bars in a year on this market, for annualising. NaN on error. */
+double ms_calendar_bars_per_year(const char *market_json, char **error_out);
+
+/* The trading day `ts_ms` belongs to, as a day index. INT64_MIN on error. */
+int64_t ms_calendar_session_key(const char *market_json, int64_t ts_ms, char **error_out);
+
+/* Close of the bar opening at `ts_ms` — when a decision on it is taken. */
+int64_t ms_calendar_bar_close(const char *market_json, int64_t ts_ms, char **error_out);
+
+/* Open of the bar after the one opening at `ts_ms`. INT64_MIN on error. */
+int64_t ms_calendar_next_open(const char *market_json, int64_t ts_ms, char **error_out);
+
+/* Bar opens the calendar expects strictly after `from_ms` and up to `to_ms`
+ * inclusive. -1 on error. */
+int64_t ms_calendar_opens_between(const char *market_json, int64_t from_ms,
+                                  int64_t to_ms, char **error_out);
+
+/* 1 when the market is trading at `ts_ms`, 0 when not, -1 on error. */
+int32_t ms_calendar_is_open(const char *market_json, int64_t ts_ms, char **error_out);
+
+/* --- instrument policy ----------------------------------------------- */
+
+/* What an instrument type allows (shorting, leverage, contract sizing, margin
+ * regime, default costs) as JSON, keyed by the manifest spelling: SPOT, SWAP,
+ * STOCK. Swift reads this rather than keeping a table of its own. Caller
+ * frees; NULL with error_out set on an unknown type. */
+char *ms_instrument_policy(const char *inst_type, char **error_out);
 
 /* Run a whole parameter sweep inside the kernel: every grid point evaluated in
  * parallel, only metrics returned, plus the deflated-Sharpe and overfitting

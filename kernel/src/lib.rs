@@ -12,9 +12,11 @@
 //! implementation these were two functions kept in step by a comment.
 
 pub mod backtest;
+pub mod calendar;
 pub mod candle;
 pub mod decide;
 pub mod expr;
+pub mod fees;
 pub mod ffi;
 pub mod guard;
 pub mod optimize;
@@ -26,9 +28,10 @@ pub mod series;
 pub mod sizing;
 pub mod strategy;
 
+pub use calendar::MarketCalendar;
 pub use candle::Candle;
 pub use decide::Direction;
-pub use strategy::{CompiledStrategy, Manifest};
+pub use strategy::{CompiledStrategy, InstrumentType, Manifest, Venue};
 
 /// Semantic version of the kernel ABI, surfaced through `ms_kernel_version`
 /// so a stale dylib next to a fresh app is a loud mismatch, not a silent one.

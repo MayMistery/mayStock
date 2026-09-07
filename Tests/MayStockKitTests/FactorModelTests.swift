@@ -96,7 +96,7 @@ struct FactorModelTests {
     @Test func sizeScoreFavoursSmallCaps() {
         let small = asset("SMALL", closes: Array(repeating: 1.0, count: 100), supply: 1_000)
         let large = asset("LARGE", closes: Array(repeating: 1.0, count: 100), supply: 1_000_000_000)
-        let model = FactorModel(universe: universe([small, large], bars: 100))
+        let model = FactorModel(universe: universe([small, large], bars: 100), roundTripCostPct: 0.3)
         let series = Array(repeating: 1.0, count: 100)
 
         let smallScore = model.score(factor: .size, asset: small, series: series, at: 50)
@@ -112,7 +112,7 @@ struct FactorModelTests {
         let subject = asset("X", closes: closes)
         let model = FactorModel(
             universe: universe([subject], bars: closes.count),
-            lookbackBars: 28, skipBars: 7)
+            lookbackBars: 28, skipBars: 7, roundTripCostPct: 0.3)
 
         let withSkip = model.score(factor: .momentum, asset: subject,
                                    series: closes, at: closes.count - 1)
@@ -126,7 +126,7 @@ struct FactorModelTests {
         let assets = (0..<12).map { index in
             asset("A\(index)", closes: (0..<200).map { 100 * pow(1.001, Double($0)) })
         }
-        let model = FactorModel(universe: universe(assets, bars: 200), rebalanceBars: 7)
+        let model = FactorModel(universe: universe(assets, bars: 200), rebalanceBars: 7, roundTripCostPct: 0.3)
         let result = model.run(factor: .market)
         #expect(!result.periods.isEmpty)
         #expect(result.marketMetrics.totalReturnPct > 0)
@@ -140,7 +140,7 @@ struct FactorModelTests {
                 100 * pow(1 + Double(index) / 10_000, Double(bar))
             })
         }
-        let model = FactorModel(universe: universe(assets, bars: 200), rebalanceBars: 7)
+        let model = FactorModel(universe: universe(assets, bars: 200), rebalanceBars: 7, roundTripCostPct: 0.3)
         let result = model.run(factor: .momentum)
         #expect(result.turnover < 0.2, "a stable ranking must not be charged repeatedly")
     }
@@ -152,7 +152,7 @@ struct FactorModelTests {
             asset("A\(index)", closes: (0..<300).map { 100 + Double($0 % 50) + Double(index) })
         }
         let model = FactorModel(universe: universe(assets, bars: 300),
-                                rebalanceBars: 7, lookbackBars: 28, skipBars: 7)
+                                rebalanceBars: 7, lookbackBars: 28, skipBars: 7, roundTripCostPct: 0.3)
         let result = model.run(factor: .momentum)
         for period in result.periods {
             #expect(period.assetsRanked > 0)
@@ -166,7 +166,7 @@ struct FactorModelTests {
                 100 + Double((bar * (index + 1)) % 37)      // deterministic churn
             })
         }
-        let model = FactorModel(universe: universe(assets, bars: 300), rebalanceBars: 7)
+        let model = FactorModel(universe: universe(assets, bars: 300), rebalanceBars: 7, roundTripCostPct: 0.3)
         let result = model.run(factor: .momentum)
         if abs(result.longShortTStatistic) <= 2 {
             #expect(result.verdict.contains("不显著"))
@@ -177,7 +177,7 @@ struct FactorModelTests {
         let assets = (0..<12).map { index in
             asset("A\(index)", closes: (0..<200).map { 100 + Double($0) + Double(index) })
         }
-        let result = FactorModel(universe: universe(assets, bars: 200)).run(factor: .size)
+        let result = FactorModel(universe: universe(assets, bars: 200), roundTripCostPct: 0.3).run(factor: .size)
         #expect(result.biases.survivorship, "a factor result must carry its caveats")
         #expect(!result.biases.notes.isEmpty)
     }
@@ -188,7 +188,7 @@ struct FactorModelTests {
             biases: UniverseBiases(survivorship: true, supplyLookAhead: true,
                                    universeSize: 0, requestedSize: 10, droppedForHistory: 0),
             calendar: [])
-        let result = FactorModel(universe: empty).run(factor: .momentum)
+        let result = FactorModel(universe: empty, roundTripCostPct: 0.3).run(factor: .momentum)
         #expect(result.periods.isEmpty)
         #expect(result.verdict.contains("太少"))
     }

@@ -14,16 +14,35 @@ public struct FundingRate: Sendable, Equatable {
     }
 }
 
+/// Why a backtest could not be set up at all.
+public enum BacktestError: Error, CustomStringConvertible, Sendable, Equatable {
+    /// The manifest states no costs and its venue has no cost model for its
+    /// instrument, so there is nothing to charge. Simulating for free would
+    /// be the optimistic reading, and optimistic readings are what make a
+    /// backtest lie.
+    case noCostModel(Venue, InstrumentType)
+
+    public var description: String {
+        switch self {
+        case .noCostModel(let venue, let type):
+            return "\(venue.displayName)没有\(type.displayName)的费率模型，清单也没有声明 costs，无法回测"
+        }
+    }
+}
+
 public struct BacktestConfig: Sendable {
     public var initialCapital: Double
-    /// Maintenance margin rate used for the swap liquidation check.
-    public var maintenanceMarginRate: Double
+    /// Maintenance margin rate for the liquidation check. Nil takes the
+    /// instrument's documented default — OKX's tier-one rate on a perpetual,
+    /// FINRA's 25% minimum on a margined stock.
+    public var maintenanceMarginRate: Double?
     /// Real funding history; empty means funding is not modelled (flagged in the report).
     public var fundingRates: [FundingRate]
-    /// Fees and slippage to charge when a manifest does not state its own.
-    /// Defaults to a fresh OKX account (Lv1, taker) — the most expensive
-    /// realistic case, so results never flatter a beginner's account.
-    public var feeSchedule: OKXFeeSchedule
+    /// Fees and slippage to charge when a manifest does not state its own,
+    /// per venue. Defaults to a fresh OKX account (Lv1, taker) and Schwab's
+    /// published equity levies — the most expensive realistic case for each,
+    /// so results never flatter a beginner's account.
+    public var feeSchedules: FeeSchedules
     /// Named non-OHLCV series from the manifest's `data` block, **already
     /// aligned to the candle array passed to `run`**. Slicing candles without
     /// slicing these identically would silently shift every signal.
@@ -34,18 +53,49 @@ public struct BacktestConfig: Sendable {
 
     public init(
         initialCapital: Double = 10_000,
-        maintenanceMarginRate: Double = 0.005,
+        maintenanceMarginRate: Double? = nil,
         fundingRates: [FundingRate] = [],
-        feeSchedule: OKXFeeSchedule = OKXFeeSchedule(),
+        feeSchedules: FeeSchedules = FeeSchedules(),
         externalSeries: [String: [Double]] = [:],
         scriptTargets: [TradeDirection?]? = nil
     ) {
         self.initialCapital = initialCapital
         self.maintenanceMarginRate = maintenanceMarginRate
         self.fundingRates = fundingRates
-        self.feeSchedule = feeSchedule
+        self.feeSchedules = feeSchedules
         self.externalSeries = externalSeries
         self.scriptTargets = scriptTargets
+    }
+
+    /// This configuration in the kernel's shape, with the cost model resolved
+    /// for `manifest`.
+    ///
+    /// The one place the fee schedule meets the manifest: the kernel prefers
+    /// the manifest's own `costs`, and is handed the venue schedule's model
+    /// for the instrument as the fallback. A manifest with neither is refused
+    /// here, before any bar is simulated.
+    public func kernelConfig(for manifest: StrategyManifest) throws -> KernelBacktestConfig {
+        let market = manifest.market
+        let fallback = feeSchedules.schedule(for: market.venue).costs(for: market.instType)
+        guard manifest.costs != nil || fallback != nil else {
+            throw BacktestError.noCostModel(market.venue, market.instType)
+        }
+        return KernelBacktestConfig(
+            initialCapital: initialCapital,
+            maintenanceMarginRate: maintenanceMarginRate,
+            fundingRates: fundingRates.map { KernelFundingRate(ts: $0.ts, rate: $0.rate) },
+            fees: fallback?.fees,
+            slippageBps: fallback?.slippageBps,
+            externalSeries: externalSeries,
+            scriptTargets: scriptTargets.map { targets in
+                targets.map { direction in
+                    switch direction {
+                    case .some(.long): return 1
+                    case .some(.short): return -1
+                    case .none: return 0
+                    }
+                }
+            })
     }
 
     /// Same configuration against a sub-range of the candles, keeping every
@@ -157,8 +207,11 @@ public struct EquityPoint: Sendable, Equatable {
 
 public struct BacktestResult: Sendable {
     public let strategyId: String
-    public let instId: String
-    public let bar: BarInterval
+    /// The market the run was on — instrument, bar and venue. The venue is
+    /// what decides how the curve annualises, so it travels with the result.
+    public let market: StrategyMarket
+    public var instId: String { market.instId }
+    public var bar: BarInterval { market.bar }
     public let start: Date
     public let end: Date
     public let barCount: Int
@@ -193,15 +246,14 @@ public struct BacktestResult: Sendable {
     }
 
     public init(
-        strategyId: String, instId: String, bar: BarInterval, start: Date, end: Date,
+        strategyId: String, market: StrategyMarket, start: Date, end: Date,
         barCount: Int, initialCapital: Double, finalEquity: Double,
         trades: [BacktestTrade], equityCurve: [EquityPoint], liquidations: Int,
         warmupBars: Int, fundingUnmodelled: Bool,
         dataQuality: KernelDataQuality? = nil, metrics: BacktestMetrics
     ) {
         self.strategyId = strategyId
-        self.instId = instId
-        self.bar = bar
+        self.market = market
         self.start = start
         self.end = end
         self.barCount = barCount
@@ -242,29 +294,10 @@ public struct BacktestEngine: Sendable {
     }
 
     public func run(candles: [Candle]) throws -> BacktestResult {
-        let costs = strategy.manifest.costs
-            ?? config.feeSchedule.costs(for: strategy.manifest.market.instType)
-        let kernelConfig = KernelBacktestConfig(
-            initialCapital: config.initialCapital,
-            maintenanceMarginRate: config.maintenanceMarginRate,
-            fundingRates: config.fundingRates.map {
-                KernelFundingRate(ts: $0.ts, rate: $0.rate)
-            },
-            feeBps: costs.feeBps,
-            slippageBps: costs.slippageBps,
-            externalSeries: config.externalSeries,
-            scriptTargets: config.scriptTargets.map { targets in
-                targets.map { direction in
-                    switch direction {
-                    case .some(.long): return 1
-                    case .some(.short): return -1
-                    case .none: return 0
-                    }
-                }
-            })
+        let kernelConfig = try config.kernelConfig(for: strategy.manifest)
         return BacktestResult(
             kernel: try strategy.kernel.backtest(candles: candles, config: kernelConfig),
-            bar: strategy.manifest.market.bar)
+            market: strategy.manifest.market)
     }
 }
 
@@ -272,12 +305,12 @@ public struct BacktestEngine: Sendable {
 
 extension BacktestResult {
     /// Adopt a kernel result. Timestamps come back as epoch milliseconds, and
-    /// `bar` is passed separately because the kernel reports it as a string.
-    init(kernel: KernelBacktestResult, bar: BarInterval) {
+    /// the market is passed separately because the kernel reports the bar as
+    /// a string and the venue not at all.
+    init(kernel: KernelBacktestResult, market: StrategyMarket) {
         self.init(
             strategyId: kernel.strategyId,
-            instId: kernel.instId,
-            bar: bar,
+            market: market,
             start: kernel.startTime,
             end: kernel.endTime,
             barCount: kernel.barCount,

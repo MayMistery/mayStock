@@ -115,7 +115,10 @@ public struct FactorModel: Sendable {
     public let skipBars: Int
     /// Fraction of the universe in each leg (0.2 = quintiles).
     public let legFraction: Double
-    public let feeSchedule: OKXFeeSchedule
+    /// Cost of one round trip on a spot name, in percent — the caller resolves
+    /// it from its fee schedule, so a schedule that does not cover the
+    /// universe's instruments fails there, loudly, rather than here quietly.
+    public let roundTripCostPct: Double
 
     public init(
         universe: CrossSectionalUniverse,
@@ -123,14 +126,14 @@ public struct FactorModel: Sendable {
         lookbackBars: Int = 28,
         skipBars: Int = 7,
         legFraction: Double = 0.2,
-        feeSchedule: OKXFeeSchedule = OKXFeeSchedule()
+        roundTripCostPct: Double
     ) {
         self.universe = universe
         self.rebalanceBars = Swift.max(rebalanceBars, 1)
         self.lookbackBars = Swift.max(lookbackBars, 1)
         self.skipBars = Swift.max(skipBars, 0)
         self.legFraction = Swift.min(Swift.max(legFraction, 0.05), 0.5)
-        self.feeSchedule = feeSchedule
+        self.roundTripCostPct = roundTripCostPct
     }
 
     public func run(factor: CrossSectionalFactor, initialCapital: Double = 30_000) -> FactorBacktestResult {
@@ -148,7 +151,7 @@ public struct FactorModel: Sendable {
         var turnoverCount = 0
 
         // One round trip per name that changes: sell the old, buy the new.
-        let roundTrip = feeSchedule.roundTripCostPct(for: .spot)
+        let roundTrip = roundTripCostPct
 
         var index = warmup
         while index + rebalanceBars < calendar.count {
@@ -226,12 +229,14 @@ public struct FactorModel: Sendable {
         let marketEquity = compound(periods.map(\.marketReturn), dates: dates)
 
         // Rebalance periods are the natural bar here, so annualisation uses the
-        // rebalance interval rather than the underlying candle interval.
-        let periodBar: BarInterval = rebalanceBars >= 7 ? .w1 : .d1
+        // rebalance interval rather than the underlying candle interval — on
+        // the universe's own (OKX) calendar.
+        let periodMarket = StrategyMarket(
+            instId: "", instType: .spot, bar: rebalanceBars >= 7 ? .w1 : .d1, venue: .okx)
 
         func metrics(_ curve: [EquityPoint]) -> BacktestMetrics {
             BacktestMetrics(trades: [], equityCurve: curve, initialCapital: initialCapital,
-                            bar: periodBar, freeParameterCount: 2)
+                            market: periodMarket, freeParameterCount: 2)
         }
 
         return FactorBacktestResult(

@@ -84,7 +84,10 @@ impl Metrics {
         trades: &[Trade],
         equity_curve: &[EquityPoint],
         initial_capital: f64,
-        bar: &str,
+        // Bars in a year *on this market* — the calendar's number, not
+        // `365 days / bar`. Passed in rather than derived here so one place
+        // decides what a year is.
+        bars_per_year: f64,
         free_parameter_count: usize,
     ) -> Self {
         let final_equity = equity_curve
@@ -137,7 +140,6 @@ impl Metrics {
                 bar_returns.push(equity_curve[index].equity / previous - 1.0);
             }
         }
-        let bars_per_year = 365.25 * 86_400.0 / crate::strategy::bar_seconds(bar);
         let mean = mean(&bar_returns);
         let deviation = standard_deviation(&bar_returns, mean);
         let downside = downside_deviation(&bar_returns);
@@ -344,7 +346,7 @@ mod tests {
 
     #[test]
     fn an_empty_run_is_all_zeroes_not_infinities() {
-        let m = Metrics::compute(&[], &[], 10_000.0, "1H", 1);
+        let m = Metrics::compute(&[], &[], 10_000.0, 8_766.0, 1);
         assert_eq!(m.total_return_pct, 0.0);
         assert_eq!(m.trade_count, 0);
         assert_eq!(m.largest_win_pct, 0.0);
@@ -356,7 +358,7 @@ mod tests {
     #[test]
     fn drawdown_measures_peak_to_trough() {
         // 100 → 120 → 90 → 110: worst drawdown is 120 → 90 = 25%.
-        let m = Metrics::compute(&[], &curve(&[100.0, 120.0, 90.0, 110.0]), 100.0, "1D", 1);
+        let m = Metrics::compute(&[], &curve(&[100.0, 120.0, 90.0, 110.0]), 100.0, 365.25, 1);
         assert!((m.max_drawdown_pct - 25.0).abs() < 1e-9);
         assert!((m.max_drawdown_absolute - 30.0).abs() < 1e-9);
         assert_eq!(m.max_drawdown_bars, 1);
@@ -364,13 +366,13 @@ mod tests {
 
     #[test]
     fn a_monotonic_curve_has_no_drawdown() {
-        let m = Metrics::compute(&[], &curve(&[100.0, 110.0, 120.0]), 100.0, "1D", 1);
+        let m = Metrics::compute(&[], &curve(&[100.0, 110.0, 120.0]), 100.0, 365.25, 1);
         assert_eq!(m.max_drawdown_pct, 0.0);
     }
 
     #[test]
     fn profit_factor_is_infinite_without_losses_and_serialises_as_null() {
-        let m = Metrics::compute(&[trade(10.0, 1.0, 3)], &curve(&[100.0, 110.0]), 100.0, "1D", 1);
+        let m = Metrics::compute(&[trade(10.0, 1.0, 3)], &curve(&[100.0, 110.0]), 100.0, 365.25, 1);
         assert!(m.profit_factor.is_infinite());
         let json = serde_json::to_string(&m).unwrap();
         assert!(json.contains("\"profitFactor\":null"), "{json}");
@@ -385,7 +387,7 @@ mod tests {
             trade(20.0, 2.0, 1),
             trade(-1.0, -0.1, 1),
         ];
-        let m = Metrics::compute(&trades, &curve(&[100.0, 119.0]), 100.0, "1D", 1);
+        let m = Metrics::compute(&trades, &curve(&[100.0, 119.0]), 100.0, 365.25, 1);
         assert_eq!(m.trade_count, 5);
         assert!((m.win_rate - 40.0).abs() < 1e-9);
         assert_eq!(m.max_consecutive_losses, 2);
@@ -406,7 +408,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>(),
             100.0,
-            "1D",
+            365.25,
             1,
         );
         assert!((m.daily_return_pct() - 0.5).abs() < 1e-6, "{}", m.daily_return_pct());
@@ -415,14 +417,14 @@ mod tests {
     #[test]
     fn the_benchmark_is_buy_and_hold_over_the_same_window() {
         // curve() prices run 100, 101, 102 → +2%.
-        let m = Metrics::compute(&[], &curve(&[100.0, 100.0, 100.0]), 100.0, "1D", 1);
+        let m = Metrics::compute(&[], &curve(&[100.0, 100.0, 100.0]), 100.0, 365.25, 1);
         assert!((m.buy_hold_return_pct - 2.0).abs() < 1e-9);
         assert!((m.excess_return_pct() - (-2.0)).abs() < 1e-9);
     }
 
     #[test]
     fn short_windows_are_flagged_as_unreliable_to_annualise() {
-        let short = Metrics::compute(&[], &curve(&[100.0, 101.0]), 100.0, "1D", 1);
+        let short = Metrics::compute(&[], &curve(&[100.0, 101.0]), 100.0, 365.25, 1);
         assert!(!short.annualisation_reliable());
         let long: Vec<EquityPoint> = (0..40)
             .map(|i| EquityPoint {
@@ -431,12 +433,12 @@ mod tests {
                 price: 100.0,
             })
             .collect();
-        assert!(Metrics::compute(&[], &long, 100.0, "1D", 1).annualisation_reliable());
+        assert!(Metrics::compute(&[], &long, 100.0, 365.25, 1).annualisation_reliable());
     }
 
     #[test]
     fn a_flat_curve_has_zero_sharpe_not_a_nan() {
-        let m = Metrics::compute(&[], &curve(&[100.0; 20]), 100.0, "1D", 1);
+        let m = Metrics::compute(&[], &curve(&[100.0; 20]), 100.0, 365.25, 1);
         assert_eq!(m.sharpe, 0.0);
         assert_eq!(m.sortino, 0.0);
         assert_eq!(m.calmar, 0.0);

@@ -19,28 +19,33 @@ struct PositionStripView: View {
     /// what made the hybrid portfolio's perpetual legs invisible here.
     private var holdings: [(state: StrategyPositionState, name: String)] {
         appState.ledger.positions.values
-            .filter { Self.underlying($0.instId) == Self.underlying(instId) && !$0.isFlat }
+            .filter { Self.underlying($0.instId, on: $0.venue) == panelUnderlying && !$0.isFlat }
             .sorted { abs($0.quantity) > abs($1.quantity) }
             .map { ($0, appState.strategy(id: $0.strategyId)?.name ?? $0.strategyId) }
     }
 
-    /// "BTC-USDT-SWAP" and "BTC-USDT" are both BTC against USDT.
-    private static func underlying(_ instId: String) -> String {
-        let (base, quote) = StrategyLedger.currencies(of: instId)
-        return "\(base)-\(quote)"
+    /// "BTC-USDT-SWAP" and "BTC-USDT" are both BTC against USDT. The venue
+    /// says how to read the id; the venue is part of the key so the same
+    /// ticker on two exchanges never merges.
+    private static func underlying(_ instId: String, on venue: Venue) -> String {
+        let (base, quote) = venue.currencies(of: instId)
+        return "\(venue.rawValue):\(base)-\(quote)"
     }
+
+    /// The panel is scoped to a watchlist item, and the watchlist is OKX's.
+    private var panelUnderlying: String { Self.underlying(instId, on: WatchItem.venue) }
 
     /// Positions the portfolio holds on some *other* underlying, so nothing is
     /// ever silently invisible just because the panel is scoped to one symbol.
     private var elsewhere: [StrategyPositionState] {
         appState.ledger.positions.values
-            .filter { Self.underlying($0.instId) != Self.underlying(instId) && !$0.isFlat }
+            .filter { Self.underlying($0.instId, on: $0.venue) != panelUnderlying && !$0.isFlat }
             .sorted { $0.instId < $1.instId }
     }
 
     private var runningHere: Int {
         appState.strategies
-            .filter { Self.underlying($0.market.instId) == Self.underlying(instId) }
+            .filter { Self.underlying($0.market.instId, on: $0.market.venue) == panelUnderlying }
             .filter { appState.store.config.strategy.allocation(for: $0.id)?.running == true }
             .count
     }
@@ -76,6 +81,7 @@ struct PositionStripView: View {
                 openPnL: appState.openPnL,
                 openPnLPct: appState.openPnLPct,
                 placeholder: appState.accountError ?? "读取账户余额…",
+                quoteCurrency: appState.runner.quoteCurrency,
                 change: { appState.equityChange($0) },
                 // Over-commitment outranks the drawdown breaker: one is a
                 // policy the user chose, the other is a book bigger than the
@@ -146,7 +152,7 @@ struct PositionStripView: View {
                 Image(systemName: "arrow.triangle.branch")
                     .font(.system(size: 7)).foregroundStyle(.tertiary)
                 Text(others.map { state in
-                    let (base, _) = StrategyLedger.currencies(of: state.instId)
+                    let (base, _) = state.venue.currencies(of: state.instId)
                     return "\(base) \(state.quantity > 0 ? "多" : "空")"
                 }.joined(separator: " · "))
                     .font(.system(size: 8)).foregroundStyle(.tertiary)
@@ -160,7 +166,7 @@ struct PositionStripView: View {
         let capital = appState.store.config.strategy.allocation(for: state.strategyId)?.capital ?? 0
         let markHere = mark(for: state)
         let pct = state.returnPct(mark: markHere, capital: capital)
-        let isSwap = InstrumentType.of(instId: state.instId) == .swap
+        let instType = state.venue.instrumentType(of: state.instId)
         return HStack(spacing: 6) {
             Circle()
                 .fill(ChartStyle.trend(state.quantity > 0))
@@ -170,7 +176,7 @@ struct PositionStripView: View {
                 .lineLimit(1)
             // The panel is scoped to an underlying, so the leg has to say
             // which market it is actually on.
-            Text(isSwap ? "永续" : "现货")
+            Text(instType.displayName)
                 .font(.system(size: 7, weight: .medium))
                 .padding(.horizontal, 3).padding(.vertical, 1)
                 .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 3))

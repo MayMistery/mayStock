@@ -108,8 +108,9 @@ public struct StrategyPortfolioPrefs: Codable, Sendable, Equatable {
     public var allowScriptEngines: Bool
     /// Capital used when backtesting, independent of what is actually allocated.
     public var backtestCapital: Double
-    /// Fee model for backtests and cost estimates. Defaults to a fresh account.
-    public var feeSchedule: OKXFeeSchedule
+    /// Fee models for backtests and cost estimates, one per venue. Each
+    /// defaults to a fresh account on its venue.
+    public var feeSchedules: FeeSchedules
     /// Stop opening new positions once the account has drawn down this far from
     /// its high-water mark. Portfolio-wide on purpose: a per-strategy daily
     /// breaker cannot see four strategies losing 4% each, which is exactly the
@@ -132,7 +133,7 @@ public struct StrategyPortfolioPrefs: Codable, Sendable, Equatable {
         emergencyStop: Bool = false,
         allowScriptEngines: Bool = false,
         backtestCapital: Double = 10_000,
-        feeSchedule: OKXFeeSchedule = OKXFeeSchedule(),
+        feeSchedules: FeeSchedules = FeeSchedules(),
         maxDrawdownPct: Double? = 25,
         maxOrderNotional: Double? = nil,
         stoplossGuard: StoplossGuard? = StoplossGuard()
@@ -144,7 +145,7 @@ public struct StrategyPortfolioPrefs: Codable, Sendable, Equatable {
         self.emergencyStop = emergencyStop
         self.allowScriptEngines = allowScriptEngines
         self.backtestCapital = backtestCapital
-        self.feeSchedule = feeSchedule
+        self.feeSchedules = feeSchedules
         self.maxDrawdownPct = maxDrawdownPct
         self.maxOrderNotional = maxOrderNotional
         self.stoplossGuard = stoplossGuard
@@ -152,8 +153,10 @@ public struct StrategyPortfolioPrefs: Codable, Sendable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case mode, totalCapital, quoteCurrency, allocations
-        case emergencyStop, allowScriptEngines, backtestCapital, feeSchedule
+        case emergencyStop, allowScriptEngines, backtestCapital, feeSchedules
         case maxDrawdownPct, maxOrderNotional, stoplossGuard
+        /// The v3 name: one OKX schedule. Read, never written.
+        case legacyFeeSchedule = "feeSchedule"
     }
 
     public init(from decoder: Decoder) throws {
@@ -165,7 +168,15 @@ public struct StrategyPortfolioPrefs: Codable, Sendable, Equatable {
         emergencyStop = try c.decodeIfPresent(Bool.self, forKey: .emergencyStop) ?? false
         allowScriptEngines = try c.decodeIfPresent(Bool.self, forKey: .allowScriptEngines) ?? false
         backtestCapital = try c.decodeIfPresent(Double.self, forKey: .backtestCapital) ?? 10_000
-        feeSchedule = try c.decodeIfPresent(OKXFeeSchedule.self, forKey: .feeSchedule) ?? OKXFeeSchedule()
+        if let schedules = try c.decodeIfPresent(FeeSchedules.self, forKey: .feeSchedules) {
+            feeSchedules = schedules
+        } else {
+            // A v3 config carried one OKX schedule; it keeps its tier and
+            // slippage, and the other venues start from their defaults.
+            feeSchedules = FeeSchedules(
+                okx: try c.decodeIfPresent(OKXFeeSchedule.self, forKey: .legacyFeeSchedule)
+                    ?? OKXFeeSchedule())
+        }
         // Absent means "never configured", which for a protective limit has to
         // mean the default rather than "off" — a config written before these
         // existed should gain the protection, not opt out of it.
@@ -173,6 +184,23 @@ public struct StrategyPortfolioPrefs: Codable, Sendable, Equatable {
         maxOrderNotional = try c.decodeIfPresent(Double.self, forKey: .maxOrderNotional)
         stoplossGuard = try c.decodeIfPresent(StoplossGuard.self, forKey: .stoplossGuard)
             ?? StoplossGuard()
+    }
+
+    /// Written by hand because `CodingKeys` carries the legacy read-only key,
+    /// which has no property behind it for the compiler to synthesise from.
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(mode, forKey: .mode)
+        try c.encode(totalCapital, forKey: .totalCapital)
+        try c.encode(quoteCurrency, forKey: .quoteCurrency)
+        try c.encode(allocations, forKey: .allocations)
+        try c.encode(emergencyStop, forKey: .emergencyStop)
+        try c.encode(allowScriptEngines, forKey: .allowScriptEngines)
+        try c.encode(backtestCapital, forKey: .backtestCapital)
+        try c.encode(feeSchedules, forKey: .feeSchedules)
+        try c.encodeIfPresent(maxDrawdownPct, forKey: .maxDrawdownPct)
+        try c.encodeIfPresent(maxOrderNotional, forKey: .maxOrderNotional)
+        try c.encodeIfPresent(stoplossGuard, forKey: .stoplossGuard)
     }
 
     public var allocatedCapital: Double {

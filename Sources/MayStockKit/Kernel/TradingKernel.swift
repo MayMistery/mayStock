@@ -275,11 +275,14 @@ extension TradingKernel {
     /// strategies' curves and then need the same numbers a single-strategy run
     /// reports. Routing them here keeps one Sharpe, one drawdown and one
     /// expectancy in the codebase.
+    ///
+    /// The market rather than just the bar: annualisation depends on how many
+    /// of those bars the venue trades in a year, and only the market knows.
     public static func metrics(
         trades: [BacktestTrade],
         equityCurve: [EquityPoint],
         initialCapital: Double,
-        bar: BarInterval,
+        market: StrategyMarket,
         freeParameterCount: Int
     ) throws -> KernelMetrics {
         let request = MetricsRequest(
@@ -290,7 +293,7 @@ extension TradingKernel {
             },
             trades: trades.map(MetricsRequest.Trade.init(swift:)),
             initialCapital: initialCapital,
-            bar: bar.rawValue,
+            market: market,
             freeParameterCount: freeParameterCount)
         let json = try callReturningString { error in
             ms_metrics_compute(try? encodeJSON(request), error)
@@ -530,7 +533,7 @@ private struct MetricsRequest: Encodable {
     let equityCurve: [Point]
     let trades: [Trade]
     let initialCapital: Double
-    let bar: String
+    let market: StrategyMarket
     let freeParameterCount: Int
 }
 

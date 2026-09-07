@@ -60,9 +60,11 @@ struct LabMain {
               多策略组合回测：合并净值、组合回撤、腿间相关性、分散化收益。
 
           fees [--tier lv1] [--sync]
-              查看费率档位表；--sync 从已配置的 okx CLI 拉取本账户真实费率。
+              查看各交易所的费率模型：OKX 档位表（--sync 从已配置的 okx CLI 拉取本账户真实费率）
+              与嘉信美股的佣金 + 监管费。
 
           new <名称> [--template trend|reversion|breakout|grid] [--instId BTC-USDT] [--bar 1H]
+                     [--venue okx|schwab]
               生成一份策略清单脚手架到 Strategies/。
 
           signals [--ccy BTC] [--bar 1H]
@@ -112,29 +114,31 @@ struct LabMain {
         let strategy = try manifest.compile()
         let capital = arguments.double("capital", default: 30_000)
         let days = arguments.int("days", default: 365)
-        let schedule = Lab.feeSchedule(from: arguments)
+        let schedules = Lab.feeSchedules(from: arguments)
+        let quote = strategy.market.venue.quoteCurrency
 
         Out.heading("回测 · \(strategy.name)")
-        Out.kv("标的", "\(strategy.market.instId) · \(strategy.market.instType.displayName)"
-               + " · \(strategy.market.bar.rawValue)")
-        Out.kv("费率", schedule.summary)
-        // The manifest's own costs win over the account tier, so those are the
-        // numbers the simulation actually charged. Printing the tier here while
-        // charging something else is how a result comes to be trusted for the
-        // wrong reason.
-        let effective = strategy.manifest.costs
-            ?? schedule.costs(for: strategy.market.instType)
+        Out.kv("标的", "\(strategy.market.venue.displayName) · \(strategy.market.instId)"
+               + " · \(strategy.market.instType.displayName) · \(strategy.market.bar.rawValue)")
+        Out.kv("费率", schedules.schedule(for: strategy.market.venue).summary)
+        // The manifest's own costs win over the account schedule, so those are
+        // the numbers the simulation actually charged. Printing the schedule
+        // here while charging something else is how a result comes to be
+        // trusted for the wrong reason.
+        guard let effective = strategy.manifest.effectiveCosts(under: schedules) else {
+            throw LabError.usage(
+                "\(strategy.market.venue.displayName)没有\(strategy.market.instType.displayName)的费率模型，"
+                + "清单也没有声明 costs，无法回测")
+        }
         let overridden = strategy.manifest.costs != nil
-        Out.kv("单边成本", "\(PriceFormatter.decimals(effective.feeBps, 2)) bps"
-               + " + 滑点 \(PriceFormatter.plain(effective.slippageBps)) bps"
-               + " → 往返 \(PriceFormatter.percent((effective.feeBps + effective.slippageBps) / 10_000 * 2 * 100, decimals: 3))"
-               + (overridden ? "（清单自带成本，已覆盖账户档位）" : ""))
+        Out.kv("单边成本", Lab.describeCosts(effective)
+               + (overridden ? "（清单自带成本，已覆盖账户费率表）" : ""))
 
         let data = try await Lab.fetchMarketData(strategy: strategy, days: days)
         let candles = data.candles
         Lab.reportCoverage(data.coverage, bar: strategy.market.bar, days: days)
         var config = await Lab.config(
-            strategy: strategy, capital: capital, schedule: schedule, data: data, days: days)
+            strategy: strategy, capital: capital, schedules: schedules, data: data, days: days)
         config.scriptTargets = try await Lab.scriptTargets(
             strategy: strategy, candles: candles, series: data.series, arguments: arguments)
 
@@ -143,7 +147,7 @@ struct LabMain {
                + " → \(result.end.formatted(date: .numeric, time: .shortened))"
                + "  (\(result.barCount) 根，预热 \(result.warmupBars) 根)")
         Out.rule()
-        Lab.printMetrics(result.metrics, capital: capital)
+        Lab.printMetrics(result.metrics, capital: capital, quote: quote)
 
         if result.liquidations > 0 { Out.warn("发生 \(result.liquidations) 次强平") }
         if result.fundingUnmodelled { Out.warn("未取到资金费率历史，永续成本被低估") }
@@ -152,10 +156,13 @@ struct LabMain {
         } else if let quality = result.dataQuality, quality.gaps > 0 {
             Out.note("历史中缺失 \(quality.gaps) 根 K 线，跨越缺口的指标窗口比标称的长")
         }
+        if let quality = result.dataQuality, quality.offGrid > 0 {
+            Out.note("\(quality.offGrid) 根 K 线不在该市场的常规时段网格上（多半是盘前盘后数据）")
+        }
 
         // The multi-window view the app shows, for the same strategy.
         Out.heading("分窗口")
-        let report = try await BacktestRunner(feeSchedule: schedule).run(
+        let report = try await BacktestRunner(feeSchedules: schedules).run(
             strategy: strategy, capital: capital, maxDays: days)
         Out.row([("窗口", 8), ("日均", -10), ("总收益", -10), ("回撤", -9),
                  ("交易", -6), ("夏普", -7), ("买入持有", -10)])
@@ -194,7 +201,7 @@ struct LabMain {
         let top = arguments.int("top", default: 10)
         let limit = arguments.int("limit", default: 20_000)
         let objective = Lab.objective(from: arguments)
-        let schedule = Lab.feeSchedule(from: arguments)
+        let schedules = Lab.feeSchedules(from: arguments)
         let grid = ParameterGrid(manifest: manifest,
                                  pointsPerAxis: arguments.int("points", default: 8))
 
@@ -202,13 +209,13 @@ struct LabMain {
         Out.kv("目标", objective.kind.displayName)
         Out.kv("约束", constraintSummary(objective))
         Out.kv("搜索空间", grid.isEmpty ? "（无可调参数）" : "\(grid.description) = \(grid.size) 组")
-        Out.kv("费率", schedule.summary)
+        Out.kv("费率", schedules.schedule(for: strategy.market.venue).summary)
 
         let data = try await Lab.fetchMarketData(strategy: strategy, days: days)
         let candles = data.candles
         Lab.reportCoverage(data.coverage, bar: strategy.market.bar, days: days)
         let config = await Lab.config(
-            strategy: strategy, capital: capital, schedule: schedule, data: data, days: days)
+            strategy: strategy, capital: capital, schedules: schedules, data: data, days: days)
         if strategy.market.instType == .swap, config.fundingRates.isEmpty {
             Out.warn("未取到资金费率历史，永续成本被低估 —— 寻优结果会偏乐观")
         }
@@ -272,7 +279,7 @@ struct LabMain {
         let folds = arguments.int("folds", default: 4)
         let inSample = arguments.double("in-sample", default: 0.7)
         let objective = Lab.objective(from: arguments)
-        let schedule = Lab.feeSchedule(from: arguments)
+        let schedules = Lab.feeSchedules(from: arguments)
 
         Out.heading("走向前验证 · \(strategy.name)")
         Out.kv("方案", "\(folds) 折 · 每折前 \(PriceFormatter.percent(inSample * 100))"
@@ -283,7 +290,7 @@ struct LabMain {
         let candles = data.candles
         Lab.reportCoverage(data.coverage, bar: strategy.market.bar, days: days)
         let config = await Lab.config(
-            strategy: strategy, capital: capital, schedule: schedule, data: data, days: days)
+            strategy: strategy, capital: capital, schedules: schedules, data: data, days: days)
         if strategy.market.instType == .swap, config.fundingRates.isEmpty {
             Out.warn("未取到资金费率历史，永续成本被低估 —— 验证结果会偏乐观")
         }
@@ -315,7 +322,8 @@ struct LabMain {
 
         Out.rule()
         Out.heading("样本外拼接（这才是你能实际拿到的结果）")
-        Lab.printMetrics(result.stitchedMetrics, capital: capital)
+        Lab.printMetrics(result.stitchedMetrics, capital: capital,
+                         quote: strategy.market.venue.quoteCurrency)
         Out.rule()
         Out.kv("效率比", (result.efficiency.map { PriceFormatter.ratio($0) }
                           ?? "—（样本内无收益，无从计算）")
@@ -341,7 +349,7 @@ struct LabMain {
         }
         let capital = arguments.double("capital", default: 30_000)
         let days = arguments.int("days", default: 365)
-        let schedule = Lab.feeSchedule(from: arguments)
+        let schedules = Lab.feeSchedules(from: arguments)
 
         let strategies = try arguments.positionals.map { try Lab.loadManifest($0).compile() }
         var weights = arguments.string("weights")?
@@ -349,10 +357,19 @@ struct LabMain {
         if weights.count != strategies.count {
             weights = Array(repeating: 1.0 / Double(strategies.count), count: strategies.count)
         }
+        // One pot of capital is one currency. Legs on venues that settle in
+        // different currencies cannot share it without a rate nobody stated.
+        let venues = Set(strategies.map(\.market.venue))
+        guard let venue = venues.first, venues.count == 1 else {
+            throw LabError.usage("组合里的策略分属不同交易所（"
+                + venues.map(\.displayName).sorted().joined(separator: "、")
+                + "），本金币种不同，不能合并回测")
+        }
+        let quote = venue.quoteCurrency
 
         Out.heading("组合回测")
-        Out.kv("本金", "\(PriceFormatter.money(capital, decimals: 0)) USDT")
-        Out.kv("费率", schedule.summary)
+        Out.kv("本金", "\(PriceFormatter.money(capital, decimals: 0)) \(quote)")
+        Out.kv("费率", schedules.schedule(for: venue).summary)
 
         var legs: [PortfolioLeg] = []
         for (index, strategy) in strategies.enumerated() {
@@ -360,7 +377,7 @@ struct LabMain {
             let candles = data.candles
             let config = await Lab.config(
                 strategy: strategy, capital: capital * weights[index],
-                schedule: schedule, data: data, days: days)
+                schedules: schedules, data: data, days: days)
             let result = try BacktestEngine(strategy: strategy, config: config).run(candles: candles)
             legs.append(PortfolioLeg(
                 strategyId: strategy.id, strategyName: strategy.name,
@@ -386,7 +403,7 @@ struct LabMain {
         let combined = PortfolioBacktest.combine(legs: legs, initialCapital: capital)
         Out.rule()
         Out.heading("组合合计")
-        Lab.printMetrics(combined.metrics, capital: capital)
+        Lab.printMetrics(combined.metrics, capital: capital, quote: quote)
         Out.rule()
         Out.kv("分散化", "各腿加权回撤 \(PriceFormatter.percent(combined.undiversifiedDrawdownPct, decimals: 2))"
                + " → 组合 \(PriceFormatter.percent(combined.metrics.maxDrawdownPct, decimals: 2))"
@@ -396,20 +413,24 @@ struct LabMain {
                    + PriceFormatter.ratio(correlation)
                    + (correlation > 0.8 ? "   （过高，几乎没有分散效果）" : ""))
         }
-        Out.kv("终值", "\(PriceFormatter.money(combined.finalEquity)) USDT")
+        Out.kv("终值", "\(PriceFormatter.money(combined.finalEquity)) \(quote)")
     }
 
     // MARK: fees
 
     static func fees(_ arguments: Arguments) async throws {
-        var schedule = Lab.feeSchedule(from: arguments)
+        var schedules = Lab.feeSchedules(from: arguments)
+        var schedule: OKXFeeSchedule {
+            get { schedules.okx }
+            set { schedules.okx = newValue }
+        }
 
         if arguments.has("sync") {
             let bridge = TradeBridge()
             guard bridge.resolveCLIPath() != nil else { throw TradeError.cliNotFound }
             guard bridge.hasCredentials() else { throw TradeError.notConfigured }
             let mode: TradingMode = arguments.has("live") ? .live : .demo
-            for instType in InstrumentType.allCases {
+            for instType in Venue.okx.instrumentTypes {
                 if let rates = try? await bridge.feeRates(instType: instType, mode: mode) {
                     schedule.apply(rates)
                     Out.good("同步 \(instType.displayName)：maker "
@@ -438,12 +459,25 @@ struct LabMain {
         }
         Out.rule()
         Out.kv("当前生效", schedule.summary)
-        Out.kv("往返成本", "现货 \(PriceFormatter.percent(schedule.roundTripCostPct(for: .spot), decimals: 3))"
-               + " · 永续 \(PriceFormatter.percent(schedule.roundTripCostPct(for: .swap), decimals: 3))")
+        let spotRoundTrip = try Lab.roundTrip(schedule, .spot)
+        let swapRoundTrip = try Lab.roundTrip(schedule, .swap)
+        Out.kv("往返成本", "现货 \(PriceFormatter.percent(spotRoundTrip, decimals: 3))"
+               + " · 永续 \(PriceFormatter.percent(swapRoundTrip, decimals: 3))")
         Out.note("档位表为公开资料整理，可能滞后于官方调整；--sync 会用本账户的真实费率覆盖它。")
         Out.note("每天来回一次现货，光成本就吃掉约 "
-                 + PriceFormatter.percent(schedule.roundTripCostPct(for: .spot) * 30, decimals: 1)
+                 + PriceFormatter.percent(spotRoundTrip * 30, decimals: 1)
                  + " 的月收益。")
+
+        let schwab = schedules.schwab
+        Out.heading("嘉信美股费率模型（费率核对于 \(schwab.ratesAsOf)）")
+        Out.kv("买入", "0（无佣金）")
+        Out.kv("卖出", schwab.feeModel(for: .stock)?.summary ?? "—")
+        Out.kv("滑点", "\(PriceFormatter.plain(schwab.slippageBps)) bps")
+        let stockRoundTrip = try Lab.roundTrip(schwab, .stock)
+        Out.kv("往返成本", "\(PriceFormatter.percent(stockRoundTrip, decimals: 4))"
+               + "（按 100 股 × 100 美元的参考成交计）")
+        Out.note("SEC §31 费率每个财年重定，FINRA TAF 偶尔调整；数字过期就改 feeSchedules.schwab，"
+                 + "别改代码。")
     }
 
     // MARK: scaffolding
@@ -453,14 +487,18 @@ struct LabMain {
             throw LabError.usage("用法：maystock-lab new <名称> [--template trend]")
         }
         let template = arguments.string("template", default: "trend") ?? "trend"
-        let instId = arguments.string("instId", default: "BTC-USDT")!
+        let venueRaw = arguments.string("venue", default: Venue.okx.rawValue)!
+        guard let venue = Venue(rawValue: venueRaw.lowercased()) else {
+            throw LabError.usage("无效的交易所：\(venueRaw)（可选 \(Venue.allCases.map(\.rawValue).joined(separator: " ")))")
+        }
+        let instId = arguments.string("instId", default: venue == .okx ? "BTC-USDT" : "SPY")!
         let barRaw = arguments.string("bar", default: "1H")!
         guard let bar = BarInterval(rawValue: barRaw) else {
             throw LabError.usage("无效的 K 线周期：\(barRaw)（可选 \(BarInterval.allCases.map(\.rawValue).joined(separator: " ")))")
         }
 
         var manifest = try StrategyTemplates.make(template: template, name: name,
-                                                  instId: instId, bar: bar)
+                                                  instId: instId, bar: bar, venue: venue)
         manifest.id = StrategyManifest.slug(from: name)
         _ = try manifest.compile()   // never scaffold something that won't run
 
@@ -557,8 +595,8 @@ struct LabMain {
             .fetch(spec, bar: bar, days: days)
         let rawSeries = SeriesAligner.align(
             observations, to: candles,
-            timing: spec.isBarBased ? .bar(seconds: bar.seconds) : .instant,
-            candleSeconds: bar.seconds)
+            timing: spec.isBarBased ? .bar(bar) : .instant,
+            market: market)
         let transform = arguments.string("transform", default: "raw")!
         let aligned = try Lab.applyTransform(transform, to: rawSeries)
         let coverage = SeriesAligner.coverage(
@@ -615,7 +653,7 @@ struct LabMain {
         Out.note("重叠修正：h 根前瞻的相邻观测共享 h−1 根，有效样本约 n/h，裸 t 要除以 √h。"
                  + "跳过这一步是加密「信号研究」制造显著性的最常见方式。")
         Out.note("显著 ≠ 可交易：还要扣掉往返成本 "
-                 + PriceFormatter.percent(OKXFeeSchedule().roundTripCostPct(for: .spot), decimals: 3)
+                 + PriceFormatter.percent(try Lab.roundTrip(OKXFeeSchedule(), .spot), decimals: 3)
                  + "，且需通过 walkforward 验证。")
     }
 
@@ -631,7 +669,7 @@ struct LabMain {
         let size = arguments.int("size", default: 40)
         let days = arguments.int("days", default: 365)
         let capital = arguments.double("capital", default: 30_000)
-        let schedule = Lab.feeSchedule(from: arguments)
+        let schedule = Lab.feeSchedules(from: arguments).okx
 
         Out.heading("横截面因子研究")
         Out.kv("宇宙", "OKX USDT 现货，按市值取前 \(size)")
@@ -668,7 +706,7 @@ struct LabMain {
             lookbackBars: arguments.int("lookback", default: 28),
             skipBars: arguments.int("skip", default: 7),
             legFraction: arguments.double("leg", default: 0.2),
-            feeSchedule: schedule)
+            roundTripCostPct: try Lab.roundTrip(schedule, .spot))
 
         Out.rule()
         Out.row([("因子", 20), ("多空均值", -11), ("t 值", -8), ("多空累计", -11),
@@ -727,8 +765,7 @@ struct LabMain {
             throw LabError.usage("无效周期：\(barRaw)")
         }
         let days = arguments.int("days", default: 1_400)
-        let schedule = Lab.feeSchedule(from: arguments)
-        let roundTrip = schedule.roundTripCostPct(for: .spot)
+        let roundTrip = try Lab.roundTrip(Lab.feeSchedules(from: arguments).okx, .spot)
         let thresholds = (arguments.string("swings") ?? "3,5,10,20")
             .split(separator: ",").compactMap { Double($0) }.filter { $0 > 0 }
 

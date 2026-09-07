@@ -25,7 +25,7 @@ private func config(
     config.strategy.totalCapital = totalCapital
     config.strategy.allocations = allocations
     config.strategy.emergencyStop = emergencyStop
-    config.strategy.feeSchedule.slippageBps = 1
+    config.strategy.feeSchedules.okx.slippageBps = 1
     return config
 }
 

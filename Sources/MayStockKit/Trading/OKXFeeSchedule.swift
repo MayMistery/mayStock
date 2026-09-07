@@ -141,7 +141,8 @@ public enum FeeExecutionStyle: String, Codable, Sendable, CaseIterable {
 /// and sub-account arrangements all move the real number. `syncedFromAccount`
 /// records that these rates came back from `okx account fees` for this specific
 /// account, which is the only fully authoritative source.
-public struct OKXFeeSchedule: Codable, Sendable, Equatable {
+public struct OKXFeeSchedule: FeeSchedule {
+    public let venue = Venue.okx
     public var tier: OKXFeeTier
     public var executionStyle: FeeExecutionStyle
     /// Assumed adverse fill offset, in basis points, on top of the fee.
@@ -185,34 +186,41 @@ public struct OKXFeeSchedule: Codable, Sendable, Equatable {
 
     public var syncedFromAccount: Bool { syncedAt != nil }
 
-    public func feeBps(for instType: InstrumentType, style: FeeExecutionStyle? = nil) -> Double {
+    /// The venue is a constant of the type, not a stored field: it is neither
+    /// written nor read.
+    private enum CodingKeys: String, CodingKey {
+        case tier, executionStyle, slippageBps
+        case spotMakerOverrideBps, spotTakerOverrideBps, swapMakerOverrideBps, swapTakerOverrideBps
+        case syncedAt
+    }
+
+    /// Nil for anything OKX does not trade: there is no fee for a stock here.
+    public func feeBps(for instType: InstrumentType, style: FeeExecutionStyle? = nil) -> Double? {
         let resolved = style ?? executionStyle
         switch (instType, resolved) {
         case (.spot, .maker): return spotMakerOverrideBps ?? tier.spotMakerBps
         case (.spot, .taker): return spotTakerOverrideBps ?? tier.spotTakerBps
         case (.swap, .maker): return swapMakerOverrideBps ?? tier.swapMakerBps
         case (.swap, .taker): return swapTakerOverrideBps ?? tier.swapTakerBps
+        case (.stock, _): return nil
         }
     }
 
-    public func costs(for instType: InstrumentType, style: FeeExecutionStyle? = nil) -> StrategyCosts {
-        StrategyCosts(feeBps: feeBps(for: instType, style: style), slippageBps: slippageBps)
-    }
-
-    /// Round-trip cost of one trade, in percent — the hurdle every signal must
-    /// clear before it has made a cent.
-    public func roundTripCostPct(for instType: InstrumentType) -> Double {
-        (feeBps(for: instType) + slippageBps) * 2 / 100
+    /// OKX charges one percentage of notional on both sides; the model is
+    /// that single component.
+    public func feeModel(for instType: InstrumentType) -> FeeModel? {
+        feeBps(for: instType).map(FeeModel.flatBps)
     }
 
     public var summary: String {
         let source = syncedFromAccount ? "账户实时费率" : tier.displayName
-        return "\(source) · 现货 \(PriceFormatter.decimals(feeBps(for: .spot), 3)) bps"
-            + " · 永续 \(PriceFormatter.decimals(feeBps(for: .swap), 3)) bps"
+        return "\(source) · 现货 \(PriceFormatter.decimals(feeBps(for: .spot) ?? 0, 3)) bps"
+            + " · 永续 \(PriceFormatter.decimals(feeBps(for: .swap) ?? 0, 3)) bps"
             + " · 滑点 \(PriceFormatter.plain(slippageBps)) bps"
     }
 
-    /// Apply rates returned by `okx account fees`.
+    /// Apply rates returned by `okx account fees`. Rates for an instrument
+    /// OKX does not trade cannot come back from it, and are ignored.
     public mutating func apply(_ rates: AccountFeeRates) {
         switch rates.instType {
         case .spot:
@@ -221,6 +229,8 @@ public struct OKXFeeSchedule: Codable, Sendable, Equatable {
         case .swap:
             swapMakerOverrideBps = rates.makerBps
             swapTakerOverrideBps = rates.takerBps
+        case .stock:
+            return
         }
         syncedAt = Date()
     }

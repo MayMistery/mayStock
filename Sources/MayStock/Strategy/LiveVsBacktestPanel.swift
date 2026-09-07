@@ -147,8 +147,12 @@ struct LiveVsBacktestPanel: View {
         let candles = appState.runner.cachedCandles(
             instId: strategy.market.instId, bar: strategy.market.bar)
         guard candles.count > 1 else { return nil }
+        // Compared against what the backtest actually assumed: the
+        // manifest's own slippage, else the venue schedule's.
+        let assumed = strategy.manifest.effectiveCosts(
+            under: appState.store.config.strategy.feeSchedules)?.slippageBps
+            ?? StrategyCosts.defaultSlippageBps
         return try? TradingKernel.calibrateSlippage(
-            fills: fills, candles: candles,
-            assumedBps: strategy.manifest.costs?.slippageBps ?? 5)
+            fills: fills, candles: candles, assumedBps: assumed)
     }
 }

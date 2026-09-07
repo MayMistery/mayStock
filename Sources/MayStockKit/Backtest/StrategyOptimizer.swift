@@ -260,23 +260,14 @@ public struct StrategyOptimizer: Sendable {
         // parsed expression, so the kernel clones the compiled strategy and
         // swaps the map instead, evaluates the grid across every core, and
         // returns metrics only.
-        let costs = strategy.manifest.costs
-            ?? config.feeSchedule.costs(for: strategy.manifest.market.instType)
         let outcome: KernelSweepOutcome
         do {
+            var kernelConfig = try config.kernelConfig(for: strategy.manifest)
+            // A sweep re-evaluates the expressions; a script's targets belong
+            // to one parameter set and cannot be swept.
+            kernelConfig.scriptTargets = nil
             outcome = try strategy.kernel.optimize(
-                candles: candles,
-                grid: combinations,
-                config: KernelBacktestConfig(
-                    initialCapital: config.initialCapital,
-                    maintenanceMarginRate: config.maintenanceMarginRate,
-                    fundingRates: config.fundingRates.map {
-                        KernelFundingRate(ts: $0.ts, rate: $0.rate)
-                    },
-                    feeBps: costs.feeBps,
-                    slippageBps: costs.slippageBps,
-                    externalSeries: config.externalSeries,
-                    scriptTargets: nil))
+                candles: candles, grid: combinations, config: kernelConfig)
         } catch {
             return OptimizationResult(
                 objective: objective, gridSize: searchGrid.size, evaluated: 0,

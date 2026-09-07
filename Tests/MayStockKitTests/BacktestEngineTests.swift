@@ -290,7 +290,7 @@ struct BacktestMetricsTests {
     @Test func drawdownMeasuresPeakToTrough() {
         let metrics = BacktestMetrics(
             trades: [], equityCurve: curve([100, 120, 90, 110]),
-            initialCapital: 100, bar: .h1, freeParameterCount: 1)
+            initialCapital: 100, market: .hourlySpot, freeParameterCount: 1)
         #expect(abs(metrics.maxDrawdownPct - 25) < 1e-9)   // 120 → 90
         #expect(abs(metrics.maxDrawdownAbsolute - 30) < 1e-9)
     }
@@ -298,7 +298,7 @@ struct BacktestMetricsTests {
     @Test func benchmarkComesFromThePriceSeries() {
         let metrics = BacktestMetrics(
             trades: [], equityCurve: curve([100, 100, 100], startPrice: 100),
-            initialCapital: 100, bar: .h1, freeParameterCount: 1)
+            initialCapital: 100, market: .hourlySpot, freeParameterCount: 1)
         #expect(abs(metrics.buyHoldReturnPct - 2) < 1e-9)   // 100 → 102
         #expect(metrics.excessReturnPct < 0, "flat equity underperforms a rising market")
         #expect(!metrics.beatsBuyHold)
@@ -312,7 +312,7 @@ struct BacktestMetricsTests {
             bars: 1, exitReason: .signal)
         let metrics = BacktestMetrics(
             trades: [win], equityCurve: curve([100, 101]),
-            initialCapital: 100, bar: .h1, freeParameterCount: 1)
+            initialCapital: 100, market: .hourlySpot, freeParameterCount: 1)
         #expect(metrics.profitFactor.isInfinite)
         #expect(PriceFormatter.ratio(metrics.profitFactor) == "∞")
         #expect(metrics.winRate == 100)
@@ -321,7 +321,7 @@ struct BacktestMetricsTests {
     @Test func annualisationIsMarkedUnreliableOnShortWindows() {
         let short = BacktestMetrics(
             trades: [], equityCurve: curve([100, 102]),
-            initialCapital: 100, bar: .h1, freeParameterCount: 1)
+            initialCapital: 100, market: .hourlySpot, freeParameterCount: 1)
         #expect(!short.annualisationReliable)
     }
 }
@@ -346,26 +346,26 @@ struct RobustnessTests {
                 bars: 2, exitReason: .signal)
         }
         return BacktestResult(
-            strategyId: "s", instId: "BTC-USDT", bar: .h1,
+            strategyId: "s", market: .hourlySpot,
             start: equity.first?.ts ?? Date(), end: equity.last?.ts ?? Date(),
             barCount: bars, initialCapital: 1_000,
             finalEquity: equity.last?.equity ?? 1_000,
             trades: sample, equityCurve: equity, liquidations: 0, warmupBars: 0,
             fundingUnmodelled: false,
             metrics: BacktestMetrics(trades: sample, equityCurve: equity,
-                                     initialCapital: 1_000, bar: .h1, freeParameterCount: 2))
+                                     initialCapital: 1_000, market: .hourlySpot, freeParameterCount: 2))
     }
 
     @Test func tooFewTradesGradesAsInsufficient() {
         let assessment = RobustnessAssessment.evaluate(
-            results: [.d30: result(returnPct: 40, trades: 3)], bar: .h1, freeParameterCount: 2)
+            results: [.d30: result(returnPct: 40, trades: 3)], market: .hourlySpot, freeParameterCount: 2)
         #expect(assessment.grade == .insufficientData)
         #expect(assessment.requiredTrades == 60, "2 parameters × 30 trades")
     }
 
     @Test func noTradesIsAlsoInsufficient() {
         let assessment = RobustnessAssessment.evaluate(
-            results: [.d1: result(returnPct: 0, trades: 0)], bar: .h1, freeParameterCount: 1)
+            results: [.d1: result(returnPct: 0, trades: 0)], market: .hourlySpot, freeParameterCount: 1)
         #expect(assessment.grade == .insufficientData)
         #expect(assessment.observedTrades == 0)
     }
@@ -374,13 +374,13 @@ struct RobustnessTests {
         let assessment = RobustnessAssessment.evaluate(
             results: [.d1: result(returnPct: 5, trades: 1),
                       .d365: result(returnPct: 20, trades: 100)],
-            bar: .h1, freeParameterCount: 1)
+            market: .hourlySpot, freeParameterCount: 1)
         #expect(assessment.observedTrades == 100)
     }
 
     @Test func emptyResultsAreUnavailableNotOptimistic() {
         let assessment = RobustnessAssessment.evaluate(
-            results: [:], bar: .h1, freeParameterCount: 1)
+            results: [:], market: .hourlySpot, freeParameterCount: 1)
         #expect(assessment.grade == .insufficientData)
     }
 }

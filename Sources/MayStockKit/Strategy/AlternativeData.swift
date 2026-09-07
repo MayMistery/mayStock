@@ -116,6 +116,18 @@ public enum AlternativeSeriesSource: String, Codable, Sendable, CaseIterable {
     /// Sources that describe the whole market rather than one instrument.
     public var isGlobal: Bool { isIndustryFeed && self != .coinbasePremium }
 
+    /// The OKX statistics — funding, open interest, positioning, order flow —
+    /// and the Coinbase premium measured against OKX describe OKX and exist
+    /// nowhere else. The industry feeds describe the world, and
+    /// `instrumentClose` names an instrument on the strategy's own venue.
+    public var isOKXOnly: Bool {
+        self == .coinbasePremium || (!isIndustryFeed && self != .instrumentClose)
+    }
+
+    public func isAvailable(on venue: Venue) -> Bool {
+        !isOKXOnly || venue == .okx
+    }
+
     /// Longest history the endpoint will return, in days, at the given bar.
     /// Nil means "as deep as candles" (paginates without a server-side cap).
     ///
@@ -151,27 +163,20 @@ public enum AlternativeSeriesSource: String, Codable, Sendable, CaseIterable {
     }
 }
 
-/// One named external series a manifest wants alongside its candles.
 /// When an observation becomes usable.
 public enum ObservationTiming: Sendable, Equatable {
-    /// Measured over a bar of this length, and therefore known at that bar's
-    /// close. A decision is also taken at a close, so an observation whose bar
-    /// closes at the same instant *is* available — that is the execution model,
-    /// not an assumption.
-    case bar(seconds: Double)
+    /// Measured over a bar of this interval, and therefore known at that bar's
+    /// close — on the market's own calendar, so a daily bar on a stock closes
+    /// at 16:00 New York and not 24 hours after it opened. A decision is also
+    /// taken at a close, so an observation whose bar closes at the same
+    /// instant *is* available — that is the execution model, not an
+    /// assumption.
+    case bar(BarInterval)
     /// Published at an instant. One landing exactly on the decision is treated
     /// as **not yet** available: assuming you held data at the same instant you
     /// acted on it is the optimistic reading, and optimistic readings are what
     /// make a backtest lie.
     case instant
-
-    func isKnown(at decidedAt: TimeInterval, observedAt: Date) -> Bool {
-        let ts = observedAt.timeIntervalSince1970
-        switch self {
-        case .bar(let seconds): return ts + seconds <= decidedAt
-        case .instant: return ts < decidedAt
-        }
-    }
 }
 
 public struct AlternativeSeriesSpec: Codable, Sendable, Equatable {
@@ -214,20 +219,15 @@ public struct AlternativeSeriesSpec: Codable, Sendable, Equatable {
     public func resolved(against market: StrategyMarket) -> AlternativeSeriesSpec {
         var copy = self
         if copy.ccy == nil {
-            copy.ccy = StrategyLedger.currencies(of: instId ?? market.instId).base
+            copy.ccy = market.venue.currencies(of: instId ?? market.instId).base
         }
         if copy.instId == nil, source.needsInstrument {
             copy.instId = source == .fundingRate
-                ? Self.perpetual(for: market.instId)
+                ? market.venue.perpetual(for: market.instId)
                 : market.instId
         }
         if copy.instType == nil { copy.instType = market.instType }
         return copy
-    }
-
-    /// "BTC-USDT" → "BTC-USDT-SWAP"; already-perpetual ids pass through.
-    static func perpetual(for instId: String) -> String {
-        InstrumentType.of(instId: instId) == .swap ? instId : instId + "-SWAP"
     }
 
     public var description: String {
@@ -296,26 +296,42 @@ public enum SeriesAligner {
     ///   That is look-ahead, and it is the exact failure the higher-timeframe
     ///   literature warns about under the name repainting.
     ///
-    /// `candleSeconds` is the strategy's own bar length and has no default:
-    /// the answer depends on it, and a caller that has not thought about when
-    /// its decision is taken cannot get a correct alignment by accident.
+    /// `market` is the strategy's own and has no default: when its bar closes
+    /// is the market's calendar's to say, and a caller that has not thought
+    /// about when its decision is taken cannot get a correct alignment by
+    /// accident.
     ///
     /// The two kinds of observation differ at the boundary, and the difference
     /// is real.
     public static func align(
         _ observations: [SeriesObservation], to candles: [Candle],
-        timing: ObservationTiming = .instant, candleSeconds: Double
+        timing: ObservationTiming = .instant, market: StrategyMarket
     ) -> [Double] {
         var out = [Double](repeating: .nan, count: candles.count)
         guard !observations.isEmpty, !candles.isEmpty else { return out }
         let sorted = observations.sorted { $0.ts < $1.ts }
 
+        let decision = market.calendar
+        // A bar-based observation lives on the same venue as the strategy, at
+        // its own interval.
+        let observed: KernelCalendar? = {
+            guard case .bar(let interval) = timing else { return nil }
+            var observationMarket = market
+            observationMarket.bar = interval
+            return observationMarket.calendar
+        }()
+        func isKnown(_ observation: SeriesObservation, by decidedAt: Date) -> Bool {
+            if let observed {
+                return observed.barClose(observation.ts) <= decidedAt
+            }
+            return observation.ts < decidedAt
+        }
+
         var cursor = 0
         var current = Double.nan
         for (index, candle) in candles.enumerated() {
-            let decidedAt = candle.ts.timeIntervalSince1970 + candleSeconds
-            while cursor < sorted.count,
-                  timing.isKnown(at: decidedAt, observedAt: sorted[cursor].ts) {
+            let decidedAt = decision.barClose(candle.ts)
+            while cursor < sorted.count, isKnown(sorted[cursor], by: decidedAt) {
                 current = sorted[cursor].value
                 cursor += 1
             }
@@ -358,7 +374,7 @@ public struct AlternativeDataProvider: Sendable {
         let period = AlternativeSeriesSource.rubikPeriod(for: bar)
         switch spec.source {
         case .fundingRate:
-            let instId = spec.instId ?? AlternativeSeriesSpec.perpetual(for: "BTC-USDT")
+            let instId = spec.instId ?? Venue.okx.perpetual(for: "BTC-USDT")
             let since = Date().addingTimeInterval(-Double(days) * 86_400)
             let rates = try await rest.fundingRateHistory(
                 instId: instId, since: since, limit: days * 3 + 20)
@@ -441,8 +457,8 @@ public struct AlternativeDataProvider: Sendable {
             // matching on open time alone would be look-ahead.
             let aligned = SeriesAligner.align(
                 observations, to: candles,
-                timing: spec.isBarBased ? .bar(seconds: interval.seconds) : .instant,
-                candleSeconds: market.bar.seconds)
+                timing: spec.isBarBased ? .bar(interval) : .instant,
+                market: market)
             series[name] = aligned
             coverage.append(SeriesAligner.coverage(
                 name: name, spec: spec, observations: observations, aligned: aligned))
