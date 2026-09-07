@@ -95,7 +95,7 @@ call        := identifier "(" ( expr ( "," expr )* )? ")"
 ### 外部脚本适配器（需显式解锁）
 
 `"engine": { "kind": "script", "command": "/path/to/strategy.py", "args": [] }`
-K 线以 JSON 从 stdin 喂入，signals 从 stdout 读回。**这等于在本机执行导入文件携带的任意代码**，因此默认禁用，需在设置里逐条授权，且每次运行前提示。
+K 线以 JSON 从 stdin 喂入，signals 从 stdout 读回。**这等于在本机执行导入文件携带的任意代码**，因此默认禁用，需在「账户与连接」页显式开启，且每次运行前提示。
 
 ## 2. 回测执行模型
 
@@ -147,7 +147,22 @@ K 线以 JSON 从 stdin 喂入，signals 从 stdout 读回。**这等于在本�
   另有 tick 级看门狗：单次 tick 超过 5 分钟即强制恢复。
   没有这三层，一个挂起的子进程会让运行器**静默停止交易**而界面上毫无迹象 ——
   这是无人值守交易循环最危险的失败模式。
-- 安全阶梯沿用现有纪律：默认 `--demo`；实盘需在设置中解锁，且每个策略切实盘要单独确认。
+- 安全阶梯沿用现有纪律：默认 `--demo`；实盘需在「账户与连接」页解锁，切换环境前先验证目标账户并确认，每个策略在实盘启动时单独确认。
+
+## 5.0 模拟盘与实盘：两个账户，一次切换
+
+OKX 的模拟交易环境是独立账户、独立 API Key，拿实盘 Key 连模拟盘（或反过来）交易所直接拒绝。
+因此：
+
+- 配置里每个环境各有一个 CLI profile（`trading.demoProfile` / `trading.liveProfile`，
+  旧配置里的单个 `profile` 迁移时同时填给两边），`TradeBridge` 按每次调用的 `TradingMode` 选 profile。
+- App 只读 `~/.okx/config.toml` 的 profile **名字**与 `demo` 标记，密钥本身从不经手；
+  profile 标记与目标环境不符时先在界面上警告，不等交易所报错。
+- 切换流程：验证目标账户（`okx account balance` + `account config`，只读）→ 说明会停掉几个策略、
+  另一边台账有几个持仓 → 确认 → 停止所有策略、重启交易循环、切换。
+  重启不是装饰：一次 tick 里每个调用都现读 `portfolio.mode`，不打断它，
+  一个按模拟盘账本定量的决定就可能发到实盘上去。`StrategyRunner.place` 在发单前最后检查一次取消。
+- 界面上模拟盘一律琥珀色、实盘一律红色，环境栏、面板、菜单三处一致。
 
 ## 5.1 菜单栏面板：权益与 1h/1d/7d 收益率
 
@@ -176,6 +191,7 @@ K 线以 JSON 从 stdin 喂入，signals 从 stdout 读回。**这等于在本�
 Sources/MayStockKit/Strategy/   Indicators · Expression(Lexer/Parser/Eval) · StrategyManifest · StrategyLibrary
 Sources/MayStockKit/Backtest/   BacktestEngine · BacktestMetrics · BacktestReport
 Sources/MayStockKit/Trading/    TradeBridge · OrderTag · StrategyLedger · StrategyRunner
-Sources/MayStock/Strategy/      StrategyStudioWindow · 列表 / 详情 / 回测卡片 / 净值曲线 / 分配编辑
-Sources/MayStock/Panel/         PositionStripView（取代 TradeTicketView）
+Sources/MayStock/Terminal/      TerminalWindow（侧栏六页）· StrategiesPage / StrategyDetailView · AccountPage（环境、profile、连接验证、风控与成本）
+Sources/MayStock/Panel/         PanelAccountStrip（权益、收益窗口、本标的持仓；只读）
+Sources/MayStock/Design/        Theme · Components · ModeSwitch（模拟盘/实盘开关与连接状态芯片）
 ```

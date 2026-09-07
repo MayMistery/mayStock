@@ -1283,6 +1283,17 @@ struct AppWiringTests {
             .joined(separator: "\n")
     }
 
+    /// True when some `.environment(` call passes an object rather than a key path.
+    private static func injectsObject(_ text: String) -> Bool {
+        var searchRange = text.startIndex..<text.endIndex
+        while let call = text.range(of: ".environment(", range: searchRange) {
+            let argument = text[call.upperBound...].drop(while: { $0 == " " })
+            if !argument.hasPrefix("\\.") { return true }
+            searchRange = call.upperBound..<text.endIndex
+        }
+        return false
+    }
+
     @Test("没有人注入，就没有视图可以从 environment 里读 AppState")
     func noViewReadsAppStateFromAnEnvironmentNothingPopulates() throws {
         let sources = appSources()
@@ -1292,7 +1303,11 @@ struct AppWiringTests {
         var readers: [String] = []
         for url in sources {
             let text = try code(of: url)
-            if text.contains(".environment(") || text.contains(".environmentObject(") {
+            // `.environment(\.key, value)` sets a keyed value and is not what
+            // this guards against; `.environment(object)` and
+            // `.environmentObject(object)` are the injections that would make
+            // `@Environment(AppState.self)` legitimate.
+            if text.contains(".environmentObject(") || Self.injectsObject(text) {
                 injectors.append(url.lastPathComponent)
             }
             if text.contains("@Environment(AppState.self)") {

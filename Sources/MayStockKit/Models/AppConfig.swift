@@ -83,23 +83,54 @@ public struct TradingPrefs: Codable, Sendable, Equatable {
     public var cliPath: String?
     /// Orders go to OKX demo trading unless this is explicitly unlocked.
     public var liveTradingUnlocked: Bool
-    /// `okx --profile <name>`; `nil` = CLI default profile.
-    public var profile: String?
+    /// `okx --profile <name>` used for the demo account; `nil` = the CLI's
+    /// default profile.
+    ///
+    /// One profile per environment, not one for both: OKX issues separate API
+    /// keys for demo trading and for the live account, and either is refused
+    /// by the other environment ("APIKey does not match current environment").
+    /// A single profile field could therefore only ever reach one of the two
+    /// accounts, which is what made switching a setting that did nothing.
+    public var demoProfile: String?
+    /// `okx --profile <name>` used for the live account; `nil` = CLI default.
+    public var liveProfile: String?
 
     public init(
         enabled: Bool = true,
         cliPath: String? = nil,
         liveTradingUnlocked: Bool = false,
-        profile: String? = nil
+        demoProfile: String? = nil,
+        liveProfile: String? = nil
     ) {
         self.enabled = enabled
         self.cliPath = cliPath
         self.liveTradingUnlocked = liveTradingUnlocked
-        self.profile = profile
+        self.demoProfile = demoProfile
+        self.liveProfile = liveProfile
+    }
+
+    /// The profile a mode's CLI calls run under. The one place this mapping
+    /// lives; everything that shells out asks here.
+    public func profile(for mode: TradingMode) -> String? {
+        switch mode {
+        case .demo: return demoProfile
+        case .live: return liveProfile
+        }
+    }
+
+    public mutating func setProfile(_ name: String?, for mode: TradingMode) {
+        let cleaned = name?.trimmingCharacters(in: .whitespaces)
+        let value = (cleaned?.isEmpty ?? true) ? nil : cleaned
+        switch mode {
+        case .demo: demoProfile = value
+        case .live: liveProfile = value
+        }
     }
 
     private enum CodingKeys: String, CodingKey {
-        case enabled, cliPath, liveTradingUnlocked, profile
+        case enabled, cliPath, liveTradingUnlocked, demoProfile, liveProfile
+        /// Pre-2.2 files carried one profile for both environments.
+        case legacyProfile = "profile"
     }
 
     public init(from decoder: Decoder) throws {
@@ -107,7 +138,21 @@ public struct TradingPrefs: Codable, Sendable, Equatable {
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
         cliPath = try c.decodeIfPresent(String.self, forKey: .cliPath)
         liveTradingUnlocked = try c.decodeIfPresent(Bool.self, forKey: .liveTradingUnlocked) ?? false
-        profile = try c.decodeIfPresent(String.self, forKey: .profile)
+        // A file written before the split named one profile for both. Keeping
+        // it for both preserves exactly what that file did; the connection
+        // check in the UI is what reveals whether the live half ever worked.
+        let legacy = try c.decodeIfPresent(String.self, forKey: .legacyProfile)
+        demoProfile = try c.decodeIfPresent(String.self, forKey: .demoProfile) ?? legacy
+        liveProfile = try c.decodeIfPresent(String.self, forKey: .liveProfile) ?? legacy
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(enabled, forKey: .enabled)
+        try c.encodeIfPresent(cliPath, forKey: .cliPath)
+        try c.encode(liveTradingUnlocked, forKey: .liveTradingUnlocked)
+        try c.encodeIfPresent(demoProfile, forKey: .demoProfile)
+        try c.encodeIfPresent(liveProfile, forKey: .liveProfile)
     }
 }
 

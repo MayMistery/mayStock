@@ -20,3 +20,11 @@ opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
+# Never strip. The release profile's default (`strip = "debuginfo"`) runs the
+# system `strip` over every artifact — including the proc-macro dylibs
+# (serde_derive) that rustc itself must dlopen to compile the next crate — and
+# on macOS 27 the stripped dylib is refused by dyld with "mis-aligned LINKEDIT
+# string pool", which fails the whole build inside `serde`. Nothing here is
+# shipped as a dylib: Swift links the static library, so there is nothing to
+# gain from stripping and a toolchain that cannot compile to lose.
+strip = "none"

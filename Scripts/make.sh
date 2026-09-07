@@ -9,6 +9,7 @@
 #   ./Scripts/make.sh install    assemble /Applications/MayStock.app
 #   ./Scripts/make.sh run        install + launch
 #   ./Scripts/make.sh uninstall
+#   ./Scripts/make.sh snapshot   render the panel and every terminal page to PNG
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -37,10 +38,39 @@ fi
 TESTING_FRAMEWORKS="$DEVELOPER_DIR_PATH/Library/Developer/Frameworks"
 TESTING_LIBS="$DEVELOPER_DIR_PATH/Library/Developer/usr/lib"
 
+# Compiler macro plugins the SDK needs but the selected toolchain may not
+# ship. The macOS 27 SDK turned SwiftUI's property wrappers into macros
+# (`SwiftUIMacros`), and the Command Line Tools carry no copy of that plugin;
+# only an Xcode's MacOSX platform does. Likewise swift-testing's macros live in
+# a `testing/` subdirectory the driver does not search on its own. Every
+# directory found is passed explicitly, so `swift build` behaves the same
+# whichever toolchain is selected.
+swift_plugin_flags() {
+  local candidates=(
+    "$DEVELOPER_DIR_PATH/usr/lib/swift/host/plugins/testing"
+    "$DEVELOPER_DIR_PATH/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/host/plugins/testing"
+    "$DEVELOPER_DIR_PATH/Platforms/MacOSX.platform/Developer/usr/lib/swift/host/plugins"
+    /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib/swift/host/plugins
+    /Applications/Xcode-beta.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib/swift/host/plugins
+  )
+  local dir seen=""
+  for dir in "${candidates[@]}"; do
+    [[ -d "$dir" ]] || continue
+    case "$seen" in *"|$dir|"*) continue ;; esac
+    seen="$seen|$dir|"
+    printf -- '-Xswiftc\n-plugin-path\n-Xswiftc\n%s\n' "$dir"
+  done
+}
+
 # The Rust kernel must exist before Swift links against it.
 cmd_kernel() { ./Scripts/build-kernel.sh "${1:-release}"; }
 
-cmd_build() { cmd_kernel release; swift build -c release; }
+cmd_build() {
+  cmd_kernel release
+  local plugin_flags=()
+  while IFS= read -r line; do plugin_flags+=("$line"); done < <(swift_plugin_flags)
+  swift build -c release ${plugin_flags[@]+"${plugin_flags[@]}"}
+}
 
 cmd_test() {
   cmd_kernel release
@@ -53,9 +83,12 @@ cmd_test() {
       -Xlinker -rpath -Xlinker "$TESTING_LIBS"
     )
   fi
+  local plugin_flags=()
+  while IFS= read -r line; do plugin_flags+=("$line"); done < <(swift_plugin_flags)
   # bash 3.2 (the macOS default) treats an empty array as unset under `set -u`,
   # so expand it through the `+` form.
-  swift test ${swift_testing_flags[@]+"${swift_testing_flags[@]}"}
+  swift test ${swift_testing_flags[@]+"${swift_testing_flags[@]}"} \
+    ${plugin_flags[@]+"${plugin_flags[@]}"}
 }
 
 cmd_e2e() {
@@ -100,7 +133,26 @@ cmd_run() { cmd_install; open "$APP_BUNDLE"; }
 
 cmd_uninstall() { rm -rf "$APP_BUNDLE"; echo "Uninstalled $APP_NAME"; }
 
+# Draw every surface to PNG so a layout change can be looked at. Runs against a
+# *copy* of the state directory and without the trading loop, so the app that
+# is already running is neither disturbed nor duplicated in the menu bar.
+#   ./Scripts/make.sh snapshot [out-dir]
+cmd_snapshot() {
+  cmd_build
+  local out="${2:-dist/snapshots}"
+  local state="$HOME/Library/Application Support/$APP_NAME"
+  local copy
+  copy="$(mktemp -d "${TMPDIR:-/tmp}/maystock-snapshot-state.XXXXXX")"
+  if [ -d "$state" ]; then cp -R "$state/." "$copy/"; fi
+  rm -rf "$out" && mkdir -p "$out"
+  "$BUILD_DIR/$APP_NAME" --data-dir "$copy" --snapshot "$out"
+  rm -rf "$copy"
+  echo "Snapshots in $out:"
+  ls "$out"
+}
+
 case "${1:-verify}" in
   build|test|e2e|verify|install|run|uninstall) "cmd_$1" ;;
-  *) echo "usage: $0 {build|test|e2e|verify|install|run|uninstall}"; exit 2 ;;
+  snapshot) cmd_snapshot "$@" ;;
+  *) echo "usage: $0 {build|test|e2e|verify|install|run|uninstall|snapshot}"; exit 2 ;;
 esac

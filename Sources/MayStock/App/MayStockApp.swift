@@ -9,6 +9,7 @@ import AppKit
 @main
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var appState: AppState?
+    private var snapshotter: UISnapshotter?
 
     static func main() {
         let app = NSApplication.shared
@@ -20,7 +21,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        appState = AppState()
+        let options = LaunchOptions.parse(CommandLine.arguments)
+        let state = AppState(options: options)
+        appState = state
+        if let directory = options.snapshotDirectory {
+            let snapshotter = UISnapshotter(appState: state, directory: directory)
+            self.snapshotter = snapshotter
+            snapshotter.run()
+        }
     }
 
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
