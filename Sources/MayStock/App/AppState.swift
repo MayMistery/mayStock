@@ -11,7 +11,7 @@ final class ConfigStore {
     private let io: ConfigIO
     private var saveScheduled = false
 
-    init(directory: URL = ConfigIO.defaultDirectory()) {
+    init(directory: URL) {
         self.io = ConfigIO(directory: directory)
         self.config = io.load()
         // The app owns this directory, so it is the one process allowed to
@@ -40,33 +40,80 @@ final class ConfigStore {
     }
 }
 
-/// Composition root: config ⇄ market hub ⇄ alerts ⇄ strategies ⇄ status items ⇄ panel.
+/// How the process was started.
+///
+/// The one non-default way to run is the snapshot renderer: it draws every
+/// surface to PNG and exits, against a *copy* of the state directory so the
+/// running app's files are never touched, and without the trading loop so a
+/// render can never place an order.
+struct LaunchOptions: Sendable {
+    var dataDirectory: URL = ConfigIO.defaultDirectory()
+    var snapshotDirectory: URL? = nil
+
+    var isSnapshot: Bool { snapshotDirectory != nil }
+
+    /// `MayStock [--data-dir <dir>] [--snapshot <out-dir>]`
+    static func parse(_ arguments: [String]) -> LaunchOptions {
+        var options = LaunchOptions()
+        var iterator = arguments.dropFirst().makeIterator()
+        while let argument = iterator.next() {
+            switch argument {
+            case "--data-dir":
+                if let value = iterator.next() { options.dataDirectory = URL(fileURLWithPath: value) }
+            case "--snapshot":
+                if let value = iterator.next() { options.snapshotDirectory = URL(fileURLWithPath: value) }
+            default:
+                break
+            }
+        }
+        return options
+    }
+}
+
+/// Composition root: config ⇄ market hub ⇄ alerts ⇄ strategies ⇄ status items ⇄ panel ⇄ terminal.
 @Observable
 @MainActor
 final class AppState {
+    let options: LaunchOptions
+    /// Where config, ledgers, equity curves and the heartbeat live.
+    let dataDirectory: URL
     let store: ConfigStore
     let hub: MarketHub
     let alerts: AlertEngine
     let notifications: NotificationService
-    /// Chart mode / window selections, shared by every panel presentation.
+    /// Chart mode / window selections for the hover panel.
     let charts = ChartPreferences()
+    /// The terminal's markets page keeps its own, so flipping the big chart to
+    /// depth does not also flip the panel the next time it opens.
+    let terminalCharts = ChartPreferences()
 
     // MARK: Strategy layer
 
     let strategyStore: StrategyStore
     private(set) var strategies: [CompiledStrategy] = []
-    /// Manifests that no longer compile, with the reason — surfaced rather than dropped.
-    private(set) var brokenStrategies: [(manifest: StrategyManifest, reason: String)] = []
+    /// Files that no longer compile — or no longer decode — with the reason.
+    /// Surfaced rather than dropped, and their budgets left untouched.
+    private(set) var brokenStrategies: [BrokenStrategy] = []
     private(set) var reports: [String: StrategyBacktestReport] = [:]
     private(set) var backtestPhase: [String: BacktestPhase] = [:]
-    private(set) var accountBalances: [AccountBalance] = []
-    private(set) var exchangePositions: [ExchangePosition] = []
-    private(set) var accountError: String?
-    private(set) var cliInfo: CLIInfo?
+    var accountBalances: [AccountBalance] = []
+    var exchangePositions: [ExchangePosition] = []
+    var accountError: String?
+    var accountRefreshedAt: Date?
+    var isRefreshingAccount = false
+    var cliInfo: CLIInfo?
+    var isDetectingCLI = false
+
+    // MARK: Environments
+
+    /// The CLI's profiles, re-read whenever the account page asks.
+    var profileCatalog: OKXProfileCatalog
+    /// One connection verdict per environment.
+    var connections: [TradingMode: VenueConnectionStatus] = [:]
 
     let demoLedger = StrategyLedger(mode: .demo)
     let liveLedger = StrategyLedger(mode: .live)
-    let heartbeatStore = HeartbeatStore(directory: ConfigIO.defaultDirectory())
+    let heartbeatStore: HeartbeatStore
     /// When the engine last finished a full tick. Nil until the first one.
     private(set) var lastCompletedTickAt: Date?
     let demoEquity = AccountEquityCurve(mode: .demo)
@@ -79,32 +126,41 @@ final class AppState {
 
     @ObservationIgnored private(set) var runner: StrategyRunner!
     @ObservationIgnored private(set) var panel: HoverPanelController!
-    @ObservationIgnored private var statusItems: StatusItemManager!
-    @ObservationIgnored private var settingsController: SettingsWindowController?
-    @ObservationIgnored private var studioController: StrategyStudioWindowController?
+    @ObservationIgnored private var statusItems: StatusItemManager?
+    @ObservationIgnored private var terminalController: TerminalWindowController?
     @ObservationIgnored private var backtestTasks: [String: Task<Void, Never>] = [:]
 
-    init() {
-        store = ConfigStore()
+    init(options: LaunchOptions = LaunchOptions()) {
+        self.options = options
+        dataDirectory = options.dataDirectory
+        store = ConfigStore(directory: options.dataDirectory)
         hub = MarketHub()
         alerts = AlertEngine()
         notifications = NotificationService()
-        strategyStore = StrategyStore(directory: StrategyStore.defaultDirectory())
+        strategyStore = StrategyStore(directory: options.dataDirectory.appendingPathComponent("Strategies"))
+        heartbeatStore = HeartbeatStore(directory: options.dataDirectory)
+        profileCatalog = OKXProfileCatalog.load()
 
         panel = HoverPanelController(appState: self)
-        statusItems = StatusItemManager(appState: self)
+        // A render pass must not put a second set of items in the menu bar.
+        statusItems = options.isSnapshot ? nil : StatusItemManager(appState: self)
         runner = StrategyRunner(host: self)
 
         wire()
         loadLedgers()
         reloadStrategies()
         applyConfig()
-        Task { await detectTradeCLI() }
-        runner.start()
+        Task {
+            await detectTradeCLI()
+            // The active account is checked at launch so the overview can say
+            // whether the engine will even be able to read the book.
+            _ = await verifyConnection(tradingMode)
+        }
+        if !options.isSnapshot { runner.start() }
     }
 
     private func wire() {
-        // Config edits (from Settings) flow into the runtime.
+        // Config edits flow into the runtime.
         store.onChanged = { [weak self] in self?.applyConfig() }
 
         // Every tick feeds the alert engine.
@@ -140,7 +196,7 @@ final class AppState {
     /// Push the current config into hub / status bar / alert engine.
     func applyConfig() {
         hub.setWatchlist(store.config.watchlist)
-        statusItems.sync(watchlist: store.config.watchlist)
+        statusItems?.sync(watchlist: store.config.watchlist)
         if alerts.rules != store.config.alerts {
             alerts.setRules(store.config.alerts)
         }
@@ -149,11 +205,9 @@ final class AppState {
 
     // MARK: Trading plumbing
 
-    var tradeBridge: TradeBridge {
-        TradeBridge(
-            explicitCLIPath: store.config.trading.cliPath,
-            profile: store.config.trading.profile)
-    }
+    /// Built from the settings every time, so a profile edited on the account
+    /// page is what the very next CLI call runs under.
+    var tradeBridge: TradeBridge { TradeBridge(prefs: store.config.trading) }
 
     /// The exchange the runner trades through.
     ///
@@ -165,8 +219,10 @@ final class AppState {
 
     var tradingMode: TradingMode { store.config.strategy.mode }
     var liveTradingUnlocked: Bool { store.config.trading.liveTradingUnlocked }
-    var ledger: StrategyLedger { tradingMode == .demo ? demoLedger : liveLedger }
-    var equityCurve: AccountEquityCurve { tradingMode == .demo ? demoEquity : liveEquity }
+    var ledger: StrategyLedger { ledger(for: tradingMode) }
+    func ledger(for mode: TradingMode) -> StrategyLedger { mode == .demo ? demoLedger : liveLedger }
+    var equityCurve: AccountEquityCurve { equityCurve(for: tradingMode) }
+    func equityCurve(for mode: TradingMode) -> AccountEquityCurve { mode == .demo ? demoEquity : liveEquity }
     var strategyEquityCurves: [String: AccountEquityCurve] {
         tradingMode == .demo ? demoStrategyEquity : liveStrategyEquity
     }
@@ -214,9 +270,7 @@ final class AppState {
     /// already been realised, net of fees and funding.
     ///
     /// This needs no equity history at all — position, average price and mark
-    /// are all available the moment a position exists. Making it wait for the
-    /// trailing windows to fill was a design mistake: it left a profitable
-    /// account reporting nothing.
+    /// are all available the moment a position exists.
     var openPnL: Double? {
         let positions = ledger.positions.values.filter { !$0.isFlat || $0.realisedPnL != 0 }
         guard !positions.isEmpty else { return nil }
@@ -240,18 +294,37 @@ final class AppState {
     }
 
     func detectTradeCLI() async {
+        isDetectingCLI = true
+        defer { isDetectingCLI = false }
         cliInfo = await tradeBridge.detectCLI()
     }
 
-    /// True once the CLI exists *and* has a profile — without both, nothing
-    /// authenticated works, not even demo.
-    var tradingReady: Bool { cliInfo != nil && tradeBridge.hasCredentials() }
+    /// True once the CLI exists *and* the active environment has a profile to
+    /// run under — without both, nothing authenticated works, not even demo.
+    var tradingReady: Bool { cliInfo != nil && credentialsConfigured(for: tradingMode) }
+
+    /// Why trading is not ready, in words. Nil when it is.
+    var tradingBlocker: String? {
+        if cliInfo == nil { return "未检测到 okx CLI" }
+        if !profileCatalog.fileExists { return "okx CLI 尚未配置 API Key（运行 okx config）" }
+        if !credentialsConfigured(for: tradingMode) {
+            return "\(tradingMode.displayName)没有可用的 profile（账户与连接页配置）"
+        }
+        return nil
+    }
 
     func refreshAccount() async {
+        guard !isRefreshingAccount else { return }
+        isRefreshingAccount = true
+        defer { isRefreshingAccount = false }
+        // A refresh asked for before launch-time detection has finished must
+        // not report "no CLI" for a CLI that is there.
+        if cliInfo == nil { await detectTradeCLI() }
+        if !profileCatalog.fileExists { reloadProfiles() }
         guard tradingReady else {
             accountBalances = []
             exchangePositions = []
-            accountError = cliInfo == nil ? "未检测到 okx CLI" : "okx CLI 尚未配置 API Key"
+            accountError = tradingBlocker
             return
         }
         let bridge = tradeBridge
@@ -260,9 +333,37 @@ final class AppState {
             accountBalances = try await bridge.balances(mode: mode)
             exchangePositions = (try? await bridge.positions(mode: mode, instType: .swap)) ?? []
             accountError = nil
+            accountRefreshedAt = Date()
         } catch {
             accountError = String(describing: error)
+            return
         }
+        // Equity is the runner's figure — marked with the same prices the
+        // engine trades on — so a refresh asks it to sample, rather than
+        // computing a second, slightly different number here.
+        await runner.sampleEquityNow()
+    }
+
+    /// Pull this account's real fee rates into the schedule the backtester uses.
+    /// Returns the failure, if any, in words.
+    func syncFeeRates() async -> String? {
+        guard tradingReady else { return tradingBlocker }
+        let bridge = tradeBridge
+        let mode = tradingMode
+        var schedule = store.config.strategy.feeSchedule
+        var failures: [String] = []
+        for instType in InstrumentType.allCases {
+            do {
+                schedule.apply(try await bridge.feeRates(instType: instType, mode: mode))
+            } catch {
+                failures.append("\(instType.displayName)：\(error)")
+            }
+        }
+        guard failures.count < InstrumentType.allCases.count else {
+            return failures.joined(separator: "\n")
+        }
+        store.update { $0.strategy.feeSchedule = schedule }
+        return failures.isEmpty ? nil : failures.joined(separator: "\n")
     }
 
     // MARK: Strategy library
@@ -271,13 +372,18 @@ final class AppState {
         strategyStore.installPresetsIfEmpty()
         let loaded = strategyStore.loadCompiled()
         strategies = loaded.ready
-        brokenStrategies = loaded.broken.map { (manifest: $0.0, reason: $0.1) }
+        brokenStrategies = loaded.broken
+        runner.reloadKernel()
 
-        // Drop allocations whose strategy file is gone, so budget isn't held
-        // hostage by something that can no longer trade.
-        let known = Set(strategies.map(\.id))
+        // Drop allocations whose strategy file is *gone*, so budget isn't held
+        // hostage by something that can no longer trade. A file that is still
+        // there but will not load keeps its budget: that is a file this build
+        // cannot read, not a strategy the user removed, and taking its money
+        // away would turn a version mismatch into a silent reallocation.
+        let known = Set(strategies.map(\.id)).union(brokenStrategies.map(\.id))
         let stale = store.config.strategy.allocations.filter { !known.contains($0.strategyId) }
         if !stale.isEmpty {
+            Log.warn("strategies: dropping budgets for missing files \(stale.map(\.strategyId))")
             store.update { config in
                 config.strategy.allocations.removeAll { !known.contains($0.strategyId) }
             }
@@ -290,7 +396,7 @@ final class AppState {
 
     @discardableResult
     func importStrategy(from url: URL) throws -> StrategyManifest {
-        let existing = strategies.map(\.manifest) + brokenStrategies.map(\.manifest)
+        let existing = strategies.map(\.manifest) + brokenStrategies.compactMap(\.manifest)
         let manifest = try strategyStore.importManifest(from: url, existing: existing)
         reloadStrategies()
         return manifest
@@ -319,6 +425,9 @@ final class AppState {
     func runBacktest(strategyId: String) {
         guard backtestTasks[strategyId] == nil, let strategy = strategy(id: strategyId) else { return }
         let capital = store.config.strategy.backtestCapital
+        // The fee schedule the user configured, not the library default: a
+        // setting the backtester never read was a promise the app did not keep.
+        let feeSchedule = store.config.strategy.feeSchedule
         backtestPhase[strategyId] = .fetchingCandles(loaded: 0, target: 0)
 
         // Strong self is intentional: the task is finite, and AppState is the
@@ -329,7 +438,7 @@ final class AppState {
                 self.backtestPhase[strategyId] = nil
             }
             do {
-                let report = try await BacktestRunner().run(
+                let report = try await BacktestRunner(feeSchedule: feeSchedule).run(
                     strategy: strategy, capital: capital,
                     onPhase: { phase in
                         Task { @MainActor in self.backtestPhase[strategyId] = phase }
@@ -359,19 +468,8 @@ final class AppState {
         store.update { $0.strategy.setTotalCapital(amount) }
     }
 
-    func setMode(_ mode: TradingMode) {
-        guard mode == .demo || liveTradingUnlocked else { return }
-        store.update { config in
-            config.strategy.mode = mode
-            // Switching accounts must never leave strategies armed against a
-            // book they were not sized for.
-            for index in config.strategy.allocations.indices {
-                config.strategy.allocations[index].running = false
-            }
-        }
-        Task { await refreshAccount() }
-    }
-
+    /// Arm a strategy. The live-account confirmation lives in
+    /// `requestStartStrategy`; this is the state change itself.
     func startStrategy(id: String) {
         guard let allocation = store.config.strategy.allocation(for: id), allocation.capital > 0 else { return }
         store.update {
@@ -404,7 +502,7 @@ final class AppState {
     // MARK: Ledger persistence
 
     private func ledgerStore(_ mode: TradingMode) -> StrategyLedgerStore {
-        StrategyLedgerStore(directory: ConfigIO.defaultDirectory(), mode: mode)
+        StrategyLedgerStore(directory: dataDirectory, mode: mode)
     }
 
     private func loadLedgers() {
@@ -417,7 +515,7 @@ final class AppState {
         for (mode, curve) in [(TradingMode.demo, demoEquity), (.live, liveEquity)] {
             curve.replace(points: equityStore(mode).load())
         }
-        for mode in [TradingMode.demo, TradingMode.live] {
+        for mode in TradingMode.allCases {
             var curves: [String: AccountEquityCurve] = [:]
             for (strategyId, points) in strategyEquityStore(mode).loadByStrategy() {
                 let curve = AccountEquityCurve(mode: mode)
@@ -430,24 +528,22 @@ final class AppState {
     }
 
     private func saveLedger(_ mode: TradingMode) {
-        let ledger = mode == .demo ? demoLedger : liveLedger
+        let ledger = ledger(for: mode)
         try? ledgerStore(mode).save(
             fills: ledger.fills, positions: ledger.positions,
             fundingIds: ledger.recordedFundingIds)
     }
 
     private func equityStore(_ mode: TradingMode) -> AccountEquityStore {
-        AccountEquityStore(directory: ConfigIO.defaultDirectory(), mode: mode)
+        AccountEquityStore(directory: dataDirectory, mode: mode)
     }
 
     private func saveEquity(_ mode: TradingMode) {
-        let curve = mode == .demo ? demoEquity : liveEquity
-        try? equityStore(mode).save(curve.points)
+        try? equityStore(mode).save(equityCurve(for: mode).points)
     }
 
     private func strategyEquityStore(_ mode: TradingMode) -> AccountEquityStore {
-        AccountEquityStore(
-            directory: ConfigIO.defaultDirectory(), mode: mode, perStrategy: true)
+        AccountEquityStore(directory: dataDirectory, mode: mode, perStrategy: true)
     }
 
     private func saveStrategyEquity(_ mode: TradingMode) {
@@ -471,31 +567,36 @@ final class AppState {
 
     // MARK: Windows
 
-    func openSettings(tab: SettingsTab = .watchlist) {
-        if settingsController == nil {
-            settingsController = SettingsWindowController(appState: self)
+    /// The one window. Every entry point — menu, panel, alert — lands on a page
+    /// of it, optionally with a strategy selected.
+    func openTerminal(_ page: TerminalPage = .overview, strategyId: String? = nil, instId: String? = nil) {
+        if terminalController == nil {
+            terminalController = TerminalWindowController(appState: self)
         }
-        settingsController?.show(tab: tab)
+        terminalController?.show(page: page, strategyId: strategyId, instId: instId)
+        if page == .overview || page == .strategies || page == .account {
+            Task { await refreshAccount() }
+        }
     }
 
-    func openStrategyStudio(selecting strategyId: String? = nil) {
-        if studioController == nil {
-            studioController = StrategyStudioWindowController(appState: self)
-        }
-        studioController?.show(selecting: strategyId)
-        Task { await refreshAccount() }
-    }
+    var terminalWindow: NSWindow? { terminalController?.window }
 
     func openAbout() {
         NSApp.activate(ignoringOtherApps: true)
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: "MayStock",
-            .applicationVersion: "2.1",
+            .applicationVersion: AppInfo.version,
             .credits: NSAttributedString(
-                string: "优雅的菜单栏行情终端 · 低频量化工作台 · 数据源 OKX",
+                string: "菜单栏行情终端 · 低频量化工作台 · 数据源 OKX",
                 attributes: [.font: NSFont.systemFont(ofSize: 11)]),
         ])
     }
+}
+
+enum AppInfo {
+    static let version: String = {
+        (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "2.2"
+    }()
 }
 
 // MARK: - Strategy runner host
@@ -545,6 +646,7 @@ extension AppState: StrategyRunnerHost {
         // The curve is per mode; the runner only ever samples the active one.
         equityCurve.record(equity: equity, at: ts)
         accountBalances = runner.accountBalances
+        accountRefreshedAt = ts
     }
 
     func runnerDidSampleStrategyEquity(

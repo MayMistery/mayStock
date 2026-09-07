@@ -25,7 +25,7 @@ final class HoverPanelController {
     /// rows and open positions, and a hard-coded height was already short of
     /// what the strip needs.
     private var panelSize = NSSize(width: PanelRootView.width, height: 512)
-    private static let heightBounds: ClosedRange<CGFloat> = 360...760
+    private static let heightBounds: ClosedRange<CGFloat> = 360...820
 
     init(appState: AppState) {
         self.appState = appState
@@ -206,8 +206,8 @@ final class HoverPanelController {
     }
 }
 
-/// Borderless panels refuse key status by default; text fields in the trade
-/// ticket need it. Non-activating style keeps focus with the frontmost app.
+/// Borderless panels refuse key status by default; the alert menu and the
+/// chart filters need it. Non-activating style keeps focus with the frontmost app.
 private final class KeyablePanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }

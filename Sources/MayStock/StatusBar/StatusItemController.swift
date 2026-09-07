@@ -107,13 +107,40 @@ final class StatusItemController: NSObject {
 
     private func showContextMenu() {
         let menu = NSMenu()
-        let studio = NSMenuItem(title: "策略工作台…", action: #selector(openStudio), keyEquivalent: "s")
-        studio.target = self
-        menu.addItem(studio)
-        let settings = NSMenuItem(title: "设置…", action: #selector(openSettings), keyEquivalent: ",")
-        settings.target = self
-        menu.addItem(settings)
+        let mode = appState.tradingMode
+
+        let terminal = NSMenuItem(title: "打开 MayStock 终端", action: #selector(openTerminal), keyEquivalent: "t")
+        terminal.target = self
+        menu.addItem(terminal)
+        let markets = NSMenuItem(title: "\(watchItem.instId) 行情…", action: #selector(openMarkets), keyEquivalent: "")
+        markets.target = self
+        menu.addItem(markets)
+        let strategies = NSMenuItem(title: "策略…", action: #selector(openStrategies), keyEquivalent: "s")
+        strategies.target = self
+        menu.addItem(strategies)
         menu.addItem(.separator())
+
+        // The account in play, and the switch. Selecting the other account
+        // runs the same verify-then-confirm flow as the terminal's switch.
+        let header = NSMenuItem(title: "交易环境：\(mode.displayName)", action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
+        for candidate in TradingMode.allCases {
+            let item = NSMenuItem(title: candidate.displayName, action: #selector(switchMode(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = candidate.rawValue
+            item.state = candidate == mode ? .on : .off
+            if candidate == .live && !appState.liveTradingUnlocked {
+                item.isEnabled = false
+                item.title = "实盘（未解锁）"
+            }
+            menu.addItem(item)
+        }
+        let account = NSMenuItem(title: "账户与连接…", action: #selector(openAccount), keyEquivalent: ",")
+        account.target = self
+        menu.addItem(account)
+        menu.addItem(.separator())
+
         let about = NSMenuItem(title: "关于 MayStock", action: #selector(openAbout), keyEquivalent: "")
         about.target = self
         menu.addItem(about)
@@ -127,10 +154,17 @@ final class StatusItemController: NSObject {
         statusItem.menu = nil // restore normal click handling
     }
 
-    @objc private func openStudio() { appState.openStrategyStudio() }
-    @objc private func openSettings() { appState.openSettings() }
+    @objc private func openTerminal() { appState.openTerminal(.overview) }
+    @objc private func openMarkets() { appState.openTerminal(.markets, instId: watchItem.instId) }
+    @objc private func openStrategies() { appState.openTerminal(.strategies) }
+    @objc private func openAccount() { appState.openTerminal(.account) }
     @objc private func openAbout() { appState.openAbout() }
     @objc private func quit() { NSApp.terminate(nil) }
+
+    @objc private func switchMode(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let mode = TradingMode(rawValue: raw) else { return }
+        appState.requestModeSwitch(to: mode)
+    }
 
     // MARK: Observation-driven rendering (throttled)
 
