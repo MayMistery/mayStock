@@ -175,10 +175,17 @@ private struct TerminalSidebar: View {
         }
     }
 
-    /// Liveness at a glance: the two feeds, the CLI and the trading loop.
+    /// Liveness at a glance: every venue's feed, the CLI and the trading loop.
     private var footer: some View {
         VStack(alignment: .leading, spacing: 6) {
-            statusLine(color: feedColor, text: "行情 " + feedText)
+            let venues = appState.hub.activeVenues
+            if venues.isEmpty {
+                statusLine(color: .secondary, text: "行情 空闲")
+            }
+            ForEach(venues) { venue in
+                let state = appState.hub.feedState(for: venue)
+                statusLine(color: feedColor(state), text: "\(venue.displayName)行情 " + feedText(state))
+            }
             statusLine(color: appState.cliInfo == nil ? Theme.down : Theme.up,
                        text: appState.cliInfo.map { "okx CLI \($0.version)" } ?? "okx CLI 未检测到")
             statusLine(color: heartbeatColor, text: heartbeatText)
@@ -197,20 +204,20 @@ private struct TerminalSidebar: View {
         }
     }
 
-    private var feedColor: Color {
-        switch (appState.hub.publicState, appState.hub.businessState) {
-        case (.connected, .connected): return Theme.up
-        case (.degraded, _), (_, .degraded): return Theme.warning
-        default: return .secondary
+    private func feedColor(_ state: FeedState) -> Color {
+        switch state {
+        case .connected: return Theme.up
+        case .degraded: return Theme.warning
+        case .idle, .connecting: return .secondary
         }
     }
 
-    private var feedText: String {
-        switch (appState.hub.publicState, appState.hub.businessState) {
-        case (.connected, .connected): return "已连接"
-        case (.degraded, _), (_, .degraded): return "重连中"
-        case (.idle, .idle): return "空闲"
-        default: return "连接中"
+    private func feedText(_ state: FeedState) -> String {
+        switch state {
+        case .connected: return "已连接"
+        case .degraded: return "重连中"
+        case .idle: return "空闲"
+        case .connecting: return "连接中"
         }
     }
 

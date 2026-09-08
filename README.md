@@ -30,7 +30,17 @@
   `/public`, `candle*` on `/business`), ~100ms pushes, REST backfill of 300
   bars on launch and on interval switch, client-side `ping` keepalive,
   auto-reconnect with jittered backoff + resubscribe.
-- **Alerts** — price cross (with hysteresis), 24h change thresholds,
+- **US equities, too** — the same watchlist holds tickers such as `TSLA`
+  and `QQQ` alongside the pairs. Each venue has its own feed behind one
+  `MarketFeed` port: stocks are read from Yahoo Finance's chart endpoint
+  (no key; the interim source while the Schwab Trader API application is
+  pending), quoted against the previous close with the session phase —
+  pre-market, regular, after-hours, closed — on every surface, charted in
+  New York time with closed hours collapsed, and refused a 4H bar their
+  session cannot hold. The kernel's NYSE calendar keeps backtests honest
+  about weekends and holidays.
+- **Alerts** — price cross (with hysteresis), daily change thresholds (the
+  trailing day on OKX, the session on a stock exchange),
   volatility within a window; system notifications, optional sound, optional
   shell hook (env vars let you chain the `okx` CLI: alert → order).
 - **Terminal window** — one window with a sidebar: 总览 (account equity with

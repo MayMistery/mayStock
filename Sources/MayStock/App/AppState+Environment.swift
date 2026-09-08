@@ -198,7 +198,7 @@ extension AppState {
             lines.append("\(mode.displayName)账户台账上有 \(held) 个持仓，切换后由这边的策略接管。")
         }
         if let report = status.report, let equity = report.totalEquity {
-            lines.append("\(mode.displayName)账户权益 \(PriceFormatter.money(equity)) USDT"
+            lines.append("\(mode.displayName)账户权益 \(PriceFormatter.money(equity)) \(runner.quoteCurrency)"
                 + (report.profile.map { "，profile「\($0)」" } ?? "，CLI 默认 profile") + "。")
         }
         lines.append(mode.isDemo

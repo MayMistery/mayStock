@@ -30,7 +30,7 @@ final class StatusItemController: NSObject {
     private var sparkImage: NSImage?
     private var sparkImageKey: SparkKey?
 
-    private struct SparkKey: Equatable { let newest: Date?; let minutes: Int }
+    private struct SparkKey: Equatable { let newest: Date?; let window: SparkWindow }
 
     init(watchItem: WatchItem, session: InstrumentSession, appState: AppState) {
         self.itemID = watchItem.id
@@ -223,22 +223,30 @@ final class StatusItemController: NSObject {
             ]))
         }
 
-        // Price.
+        // Price. A closed market's last print is still the price, drawn a
+        // shade quieter so the bar says "not moving" without saying "stale".
         if let ticker {
+            let closed = ticker.phase == .closed
             let price = PriceFormatter.price(ticker.last, decimals: decimals)
             title.append(NSAttributedString(string: price, attributes: [
                 .font: baseFont,
-                .foregroundColor: NSColor.labelColor,
+                .foregroundColor: closed ? NSColor.secondaryLabelColor : NSColor.labelColor,
             ]))
 
-            // Change chip.
+            // Change chip, against whatever the venue measures a day from.
             if watchItem.style == .priceAndChange || watchItem.style == .full {
-                let up = ticker.changePct24h >= 0
+                let up = ticker.changePct >= 0
                 let arrow = up ? " ▲" : " ▼"
-                let pct = String(format: "%.2f%%", abs(ticker.changePct24h))
+                let pct = String(format: "%.2f%%", abs(ticker.changePct))
                 title.append(NSAttributedString(string: arrow + pct, attributes: [
                     .font: smallFont,
                     .foregroundColor: up ? NSColor.systemGreen : NSColor.systemRed,
+                ]))
+            }
+            if let phase = ticker.phase, phase != .regular {
+                title.append(NSAttributedString(string: " " + Self.phaseMark(phase), attributes: [
+                    .font: smallFont,
+                    .foregroundColor: NSColor.tertiaryLabelColor,
                 ]))
             }
         } else {
@@ -253,11 +261,12 @@ final class StatusItemController: NSObject {
 
         // Trailing sparkline, redrawn only when the series actually advanced.
         if watchItem.style == .sparkline || watchItem.style == .full {
-            let key = SparkKey(newest: spark.last?.ts, minutes: watchItem.sparklineMinutes)
+            let window = watchItem.sparkWindow
+            let key = SparkKey(newest: spark.last?.ts, window: window)
             if key != sparkImageKey || sparkImage == nil {
                 sparkImageKey = key
                 sparkImage = SparklineRenderer.image(
-                    points: spark.window(minutes: watchItem.sparklineMinutes))
+                    points: window.points(from: spark, venue: watchItem.venue))
             }
             button.image = sparkImage
             button.imagePosition = .imageTrailing
@@ -270,12 +279,25 @@ final class StatusItemController: NSObject {
         button.toolTip = toolTip(ticker: ticker, connection: connection)
     }
 
-    private func toolTip(ticker: Ticker?, connection: OKXConnectionState) -> String {
-        guard let ticker else { return "\(watchItem.instId) — 连接中 (\(connection.rawValue))" }
+    /// One character of session state for the bar: 前 / 后 / 休.
+    private static func phaseMark(_ phase: MarketPhase) -> String {
+        switch phase {
+        case .preMarket: return "前"
+        case .afterHours: return "后"
+        case .closed: return "休"
+        case .regular: return ""
+        }
+    }
+
+    private func toolTip(ticker: Ticker?, connection: FeedState) -> String {
+        let venue = watchItem.venue
+        guard let ticker else { return "\(watchItem.instId) · \(venue.displayName) — 连接中 (\(connection.rawValue))" }
+        let phase = ticker.phase.map { " · \($0.displayName)" } ?? ""
+        let period = ticker.basis.periodLabel
         return """
-        \(watchItem.instId) · OKX
-        最新 \(PriceFormatter.auto(ticker.last))   24h \(PriceFormatter.signedPercent(ticker.changePct24h))
-        高 \(PriceFormatter.auto(ticker.high24h))   低 \(PriceFormatter.auto(ticker.low24h))
+        \(watchItem.instId) · \(venue.displayName)\(phase)
+        最新 \(PriceFormatter.auto(ticker.last))   \(ticker.basis.changeLabel) \(PriceFormatter.signedPercent(ticker.changePct))
+        \(period)高 \(PriceFormatter.auto(ticker.high))   \(period)低 \(PriceFormatter.auto(ticker.low))
         """
     }
 }

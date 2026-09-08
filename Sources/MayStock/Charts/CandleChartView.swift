@@ -13,6 +13,9 @@ struct CandleChartView: View {
     let candles: [Candle]
     let bar: BarInterval
     let decimals: Int
+    /// The clock the axis is labelled in: the viewer's for a market that never
+    /// closes, the exchange's for one with sessions.
+    var timeZone: TimeZone = .current
 
     @State private var hover: CGPoint? = nil
 
@@ -128,7 +131,7 @@ struct CandleChartView: View {
         // O/H/L/C rather than 开/高/低/收: single Latin letters are half the
         // width of CJK glyphs, which is what lets four prices share one row.
         var items: [ChartLegendItem] = [
-            ChartLegendItem(key: "t", value: ChartFormatters.string(candle.ts, format),
+            ChartLegendItem(key: "t", value: ChartFormatters.string(candle.ts, format, timeZone: timeZone),
                             tint: .secondary, priority: 4),
             ChartLegendItem(key: "o", label: "O",
                             value: PriceFormatter.price(candle.open, decimals: decimals), priority: 6),
@@ -241,7 +244,7 @@ struct CandleChartView: View {
     private func drawTimeAxis(context: GraphicsContext, layout: Layout) {
         let geometry = layout.geometry
         let ticks = ChartMath.axisTicks(timestamps: layout.visible.map(\.ts),
-                                        maxLabels: 5, barSeconds: bar.seconds)
+                                        maxLabels: 5, barSeconds: bar.seconds, timeZone: timeZone)
         for tick in ticks {
             let x = layout.x(tick.index)
             guard x > 14, x < geometry.plotWidth - 14 else { continue }
@@ -249,7 +252,7 @@ struct CandleChartView: View {
                                to: CGPoint(x: x, y: layout.volumeTop + layout.volumeHeight),
                                color: ChartStyle.grid)
             let format = tick.isMajor || bar.seconds >= 86_400 ? "MM-dd" : "HH:mm"
-            context.drawText(ChartFormatters.string(tick.date, format),
+            context.drawText(ChartFormatters.string(tick.date, format, timeZone: timeZone),
                              font: ChartStyle.axisFont,
                              color: tick.isMajor ? .secondary : ChartStyle.axisLabel,
                              at: CGPoint(x: x, y: geometry.axisBaseline), anchor: .bottom)
@@ -266,7 +269,7 @@ struct CandleChartView: View {
                            to: CGPoint(x: x, y: layout.volumeTop + layout.volumeHeight),
                            color: ChartStyle.crosshair, dash: [2, 2])
         let format = bar.seconds >= 86_400 ? "MM-dd" : "MM-dd HH:mm"
-        context.drawTimeTag(ChartFormatters.string(candle.ts, format), x: x, geometry: geometry,
+        context.drawTimeTag(ChartFormatters.string(candle.ts, format, timeZone: timeZone), x: x, geometry: geometry,
                             fill: ChartStyle.tagFill, text: ChartStyle.tagText)
 
         // Horizontal arm + price tag only while inside the price pane.

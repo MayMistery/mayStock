@@ -13,6 +13,10 @@ struct PanelAccountStrip: View {
     let instId: String
 
     private var mode: TradingMode { appState.tradingMode }
+    /// The asset the panel is scoped to, on the instrument's own venue.
+    private var panelUnderlying: String {
+        AppState.underlying(instId, venue: appState.venue(of: instId))
+    }
 
     /// Strategies holding this *underlying*, with their live P&L.
     ///
@@ -21,7 +25,7 @@ struct PanelAccountStrip: View {
     /// though the watchlist tracks spot `BTC-USDT`.
     private var holdings: [StrategyPositionState] {
         appState.ledger.positions.values
-            .filter { AppState.underlying($0.instId) == AppState.underlying(instId) && !$0.isFlat }
+            .filter { AppState.underlying($0.instId, venue: $0.venue) == panelUnderlying && !$0.isFlat }
             .sorted { abs($0.quantity) > abs($1.quantity) }
     }
 
@@ -29,13 +33,13 @@ struct PanelAccountStrip: View {
     /// ever silently invisible just because the panel is scoped to one symbol.
     private var elsewhere: [StrategyPositionState] {
         appState.ledger.positions.values
-            .filter { AppState.underlying($0.instId) != AppState.underlying(instId) && !$0.isFlat }
+            .filter { AppState.underlying($0.instId, venue: $0.venue) != panelUnderlying && !$0.isFlat }
             .sorted { $0.instId < $1.instId }
     }
 
     private var runningHere: Int {
         appState.strategies
-            .filter { AppState.underlying($0.market.instId) == AppState.underlying(instId) }
+            .filter { AppState.underlying($0.market.instId, venue: $0.market.venue) == panelUnderlying }
             .filter { appState.store.config.strategy.allocation(for: $0.id)?.running == true }
             .count
     }
@@ -223,7 +227,7 @@ struct PanelAccountStrip: View {
             VStack(spacing: 4) {
                 HStack(spacing: 6) {
                     Badge(text: totalQuantity >= 0 ? "多" : "空", tint: Theme.trend(totalQuantity >= 0), size: .small)
-                    Text(PriceFormatter.plain(abs(totalQuantity)) + " " + WatchItem.venue.currencies(of: instId).base)
+                    Text(PriceFormatter.plain(abs(totalQuantity)) + " " + appState.venue(of: instId).currencies(of: instId).base)
                         .font(Theme.Text.secondaryMedium).numeric()
                     Text(PriceFormatter.signedMoney(totalNetPnL))
                         .font(Theme.Text.secondaryMedium).numeric().foregroundStyle(Theme.signed(totalNetPnL))

@@ -52,13 +52,16 @@ extension AppState {
         Array(ledger.fills.suffix(limit).reversed())
     }
 
-    /// The currency an instrument is exposure to, whatever family it is.
-    static func underlying(_ instId: String) -> String {
+    /// The asset an instrument is exposure to, whatever family it is, on the
+    /// venue it trades.
+    static func underlying(_ instId: String, venue: Venue) -> String {
         // "BTC-USDT-SWAP", "BTC-USDT" and "BTC-USD-260926-80000-C" are all
         // BTC exposure. Grouped by base currency: an option settles against
         // the USD index while the watchlist tracks the USDT pair, and
-        // splitting the two would hide a BTC option on the BTC panel.
-        WatchItem.venue.currencies(of: instId).base
+        // splitting the two would hide a BTC option on the BTC panel. The
+        // venue is part of the key so a ticker on one exchange never merges
+        // with a coin of the same letters on another.
+        "\(venue.rawValue):\(venue.currencies(of: instId).base)"
     }
 
     /// The reasons the engine is currently refusing new exposure, worst first.

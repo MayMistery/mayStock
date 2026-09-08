@@ -156,16 +156,16 @@ thinkorswim 对这个项目唯一的用处是**手工验证**。API 没有模拟
 - 日内熔断的「今天」按 `session_key`：美股是纽约交易日，OKX 仍是 UTC 日。（权益曲线的日历窗口与心跳静默尚未改，它们属于运维层，接交易时一起做。）
 - 手续费从一个 bps 数变成费用组件（`kernel/src/fees.rs`），嘉信的 SEC §31 与 TAF 才写得出来；`FeeSchedule` 成为协议，`OKXFeeSchedule` / `SchwabFeeSchedule` 各一份，`StrategyPortfolioPrefs.feeSchedules` 按 venue 存，旧的 `feeSchedule` 键只读不写（AppConfig schema 4）。
 - `StrategyMarket.venue`（okx / schwab，缺省 okx），manifest schema 2；`InstrumentType.STOCK`，能否做空、杠杆上限、保证金制度只在内核 `InstrumentPolicy` 里声明一次，Swift 经 FFI 读同一份。
-- Swift 侧删掉了所有 `天数 × 86400 / bar` 与 `BASE-QUOTE` 拆字符串的算术：bar 计数问 `KernelCalendar`，计价币与 id 解析问 `Venue`。研究台 `maystock-lab` 的行情拉取仍只有 OKX 一个来源（`requireMarketData` 对 schwab 明确报错），`fees` 同时打印两家，`new --venue schwab` 可生成美股清单。
+- Swift 侧删掉了所有 `天数 × 86400 / bar` 与 `BASE-QUOTE` 拆字符串的算术：bar 计数问 `KernelCalendar`，计价币与 id 解析问 `Venue`。研究台 `maystock-lab` 按清单的 venue 取行情（美股走 Yahoo 过渡源，见 7.6），`fees` 同时打印两家，`new --venue schwab` 可生成美股清单。
 - 覆盖：内核 211 项、Swift 496 项测试全绿；新增日历、费用、清单 venue、持久化四组测试，全部遍历 `Venue` / `InstrumentType` / `BarInterval` 的声明而不点名。
 
 ### 7.3 顺序（依赖最少 → 最多）
 
 0. **今天**：你去开发者门户注册并提交两段申请。等审核的两三周正好做 1。（2026-09-08：Trader API – Individual 已提交，Dashboard → Subscriptions 显示 **Pending**；Create App 在审批通过前不可用——表单直接提示 *You do not have access to any Active API products*，产品下拉为空。审批通过后再建 App，回调填 `https://127.0.0.1:8182`。条款要点见 §7.5。）
 1. ~~内核与 manifest 的通用化（7.2）~~ **已完成（2026-09-08）**，全部离线测试。
-2. `schwabctl login + candles`，maystock-lab 先跑美股日线研究（日线可回到 1985 年，365 天回测没问题；1H/4H 策略只有约 9 个月的 30 分钟线可重采样，更长要另找数据源）。
+2. ~~`schwabctl login + candles`~~ **行情部分先用 Yahoo 过渡（2026-09-08，见 7.6）**：maystock-lab 与 App 的回测已能取美股历史（日线不限、1H 两年、分钟线两个月）；`schwabctl login` 与嘉信自己的行情等审批。
 3. `SchwabVenue` + 本地影子撮合；再用最小手数上实盘。
-4. `MarketDataFeed` 端口 + 菜单栏美股行情。
+4. ~~`MarketDataFeed` 端口 + 菜单栏美股行情~~ **已完成（2026-09-08）**：`MarketFeed` / `MarketDataSource` 端口，`MarketHub` 按 venue 路由；菜单栏、悬浮面板、终端行情页、告警都能看美股。
 
 ### 7.4 已拍板（2026-09-07）
 
@@ -185,6 +185,18 @@ thinkorswim 对这个项目唯一的用处是**手工验证**。API 没有模拟
 - 保留最近 18 个月的使用记录，Schwab 有三年审计权（§10）。
 - 按现状提供，赔偿上限 1000 美元（§19）；开发者对因其应用引起的索赔承担赔偿（§18）。
 - 条款可单方面修改，继续使用即视为接受；通知邮箱 traderapi@schwab.com（§22.1、§22.3）。
+
+### 7.6 美股行情：先用 Yahoo 过渡（2026-09-08 拍板）
+
+嘉信的行情 API 要等审批，先用 Yahoo Finance 的 chart 接口把界面做通：无需 key，实时价（分钟级）、1 分钟 K 线含盘前盘后、代码搜索。做法上把它关在端口后面——`MarketFeed`（实时）与 `MarketDataSource`（历史/元数据/搜索）各一个协议，`MarketHub` 只按自选项的 `venue` 路由——嘉信审批过后换成 `SchwabMarketData` 时，界面一行不改。
+
+已知的坑与取舍：
+
+- 非官方接口，v7 报价端点已经要 cookie + crumb；只用 chart 接口，报价从其 `meta` 读。哪天它再变，就是 `Sources/MayStockKit/Yahoo/` 一个目录的事。
+- 轮询而非推送：交易时段每标的 3 秒一次、休市 60 秒；两三个标的远在其容忍度内。
+- 历史深度：1m 7 天、5m/15m 60 天、1h 730 天、日线不限；没有 4H，界面按 `Venue.supportedBars` 不提供。
+- 涨跌按昨收、高低量按常规时段、最新价含盘前盘后并标出阶段，与所有股票软件一致；OKX 仍按 24 小时。`Ticker` 只有一种形状，基准随行情走。
+- 图表：K 线按纽约时间标注；折线把休市时段压缩成一小段并标出，「今日」窗口是最近一个纽约交易日（含延长时段），「5 日」是最近一周的样本。
 
 ## 8. 来源
 

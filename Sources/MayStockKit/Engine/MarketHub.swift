@@ -1,44 +1,63 @@
 import Foundation
 import Observation
 
-/// Orchestrates market data for the whole watchlist.
+/// Orchestrates market data for the whole watchlist, across venues.
 ///
-/// Owns exactly two shared WebSocket connections:
-///   - `/public`   → `tickers`, `books5`
-///   - `/business` → `candle*`  (moved off `/public` by OKX on 2023-06-20)
-/// plus a REST client for candle backfill, depth snapshots and metadata.
+/// One feed and one one-off source per venue, looked up by the watch item's
+/// venue. The hub knows nothing about how either works: OKX pushes over
+/// WebSockets, Yahoo is polled, and both arrive here as `MarketFeedEvent`s
+/// keyed by instrument id.
+///
+/// Sessions are keyed by instrument id alone, and the watchlist keeps ids
+/// unique across venues. OKX writes the pair into the id (`BTC-USDT`) and a
+/// US ticker never contains a dash, so the same id cannot mean two things —
+/// and a session carries its venue, so every reader can still ask.
 @Observable
 @MainActor
 public final class MarketHub {
     public private(set) var sessions: [String: InstrumentSession] = [:]
-    public private(set) var publicState: OKXConnectionState = .idle
-    public private(set) var businessState: OKXConnectionState = .idle
+    /// Each venue's feed health, once its feed has reported anything.
+    public private(set) var feedStates: [Venue: FeedState] = [:]
 
     /// Called on every ticker update — alert evaluation hooks in here.
     public var onTick: ((InstrumentSession, Ticker) -> Void)?
 
-    private let rest: OKXRESTClient
-    private let wsPublic: OKXWSClient
-    private let wsBusiness: OKXWSClient
+    private let feeds: [Venue: any MarketFeed]
+    private let sources: [Venue: any MarketDataSource]
     private var depthPollTasks: [String: Task<Void, Never>] = [:]
 
-    public init(
-        rest: OKXRESTClient = OKXRESTClient(),
-        publicURL: URL = OKXEndpoints.wsPublic,
-        businessURL: URL = OKXEndpoints.wsBusiness
-    ) {
-        self.rest = rest
-        self.wsPublic = OKXWSClient(url: publicURL)
-        self.wsBusiness = OKXWSClient(url: businessURL)
-
-        Task { [wsPublic, wsBusiness] in
-            await wsPublic.setHandler { [weak self] event in
-                Task { @MainActor in self?.handle(event, from: .publicSocket) }
-            }
-            await wsBusiness.setHandler { [weak self] event in
-                Task { @MainActor in self?.handle(event, from: .businessSocket) }
+    public init(feeds: [any MarketFeed], sources: [any MarketDataSource]) {
+        self.feeds = Dictionary(uniqueKeysWithValues: feeds.map { ($0.venue, $0) })
+        self.sources = Dictionary(uniqueKeysWithValues: sources.map { ($0.venue, $0) })
+        for feed in feeds {
+            let venue = feed.venue
+            Task {
+                await feed.setHandler { [weak self] event in
+                    Task { @MainActor in self?.handle(event, from: venue) }
+                }
             }
         }
+    }
+
+    /// The feeds and sources the app ships with, one pair per venue.
+    public static func standard() -> MarketHub {
+        let sources = MarketDataSources()
+        return MarketHub(
+            feeds: [OKXMarketFeed(), YahooMarketFeed(client: sources.yahoo)],
+            sources: [sources.okx, sources.yahoo])
+    }
+
+    public func source(for venue: Venue) -> (any MarketDataSource)? {
+        sources[venue]
+    }
+
+    public func feedState(for venue: Venue) -> FeedState {
+        feedStates[venue] ?? .idle
+    }
+
+    /// Venues with at least one live session, in declaration order.
+    public var activeVenues: [Venue] {
+        Venue.allCases.filter { venue in sessions.values.contains { $0.venue == venue } }
     }
 
     // MARK: Watchlist lifecycle
@@ -62,36 +81,41 @@ public final class MarketHub {
     }
 
     private func addInstrument(_ item: WatchItem) {
-        let session = InstrumentSession(instId: item.instId, bar: item.defaultBar)
-        sessions[item.instId] = session
-
-        Task { [wsPublic, wsBusiness] in
-            await wsPublic.subscribe([
-                OKXChannelArg(channel: "tickers", instId: item.instId),
-                OKXChannelArg(channel: "books5", instId: item.instId),
-            ])
-            await wsBusiness.subscribe([
-                OKXChannelArg(channel: item.defaultBar.wsChannel, instId: item.instId),
-            ])
+        guard let feed = feeds[item.venue], let source = sources[item.venue] else {
+            // A watch item on a venue this hub was not built with. Said once,
+            // loudly: the item stays in the list with no session, which the
+            // markets page shows as "not subscribed".
+            Log.warn("hub: \(item.instId) 属于 \(item.venue.displayName)，但没有该交易所的行情源")
+            return
         }
+        // A bar the venue's data cannot serve falls back to the venue's
+        // finest, rather than a subscription that never answers.
+        let bar = item.venue.supportedBars.contains(item.defaultBar)
+            ? item.defaultBar : (item.venue.supportedBars.first ?? item.defaultBar)
+        let session = InstrumentSession(instId: item.instId, venue: item.venue, bar: bar)
+        sessions[item.instId] = session
+        Task { await feed.subscribe(instId: item.instId, bar: bar) }
 
-        // REST warm-up: metadata, candle backfill, sparkline seed, first tick.
+        // Warm-up: metadata, candle backfill, sparkline seed, first tick.
         //
-        // The sparkline is seeded at *two* resolutions: 5m bars cover the full
-        // 25h retention (so the 4H/24H line windows have real data the instant
-        // the app launches) and 1m bars refine the most recent 5h.
-        let bar = item.defaultBar
-        Task { [rest] in
-            async let metaTask = try? rest.instrumentMeta(instId: item.instId)
-            async let candlesTask = try? rest.candles(instId: item.instId, bar: bar, target: 300)
-            async let coarseSeedTask = try? rest.candles(instId: item.instId, bar: .m5, target: 300)
-            async let fineSeedTask = try? rest.candles(instId: item.instId, bar: .m1, target: 300)
-            async let tickerTask = try? rest.ticker(instId: item.instId)
+        // The sparkline is seeded at *two* resolutions: coarse bars cover the
+        // buffer's whole retention (so the long line windows have real data
+        // the instant the app launches) and 1m bars refine the recent stretch.
+        // A market with sessions keeps a week, so the coarse seed reaches back
+        // five sessions rather than a day.
+        let coarseTarget = item.venue.tradesContinuously ? 300 : 420
+        let instId = item.instId
+        Task {
+            async let metaTask = try? source.instrumentMeta(instId: instId)
+            async let candlesTask = try? source.candles(instId: instId, bar: bar, target: 300)
+            async let coarseSeedTask = try? source.candles(instId: instId, bar: .m5, target: coarseTarget)
+            async let fineSeedTask = try? source.candles(instId: instId, bar: .m1, target: 300)
+            async let tickerTask = try? source.ticker(instId: instId)
 
             let (meta, candles, coarseSeed, fineSeed, ticker) =
                 await (metaTask, candlesTask, coarseSeedTask, fineSeedTask, tickerTask)
             await MainActor.run {
-                guard let session = self.sessions[item.instId] else { return }
+                guard let session = self.sessions[instId] else { return }
                 if let meta { session.apply(meta: meta) }
                 if let coarseSeed { session.seedSparkline(from: coarseSeed) }
                 if let fineSeed { session.seedSparkline(from: fineSeed) }
@@ -109,30 +133,22 @@ public final class MarketHub {
         guard let session = sessions.removeValue(forKey: instId) else { return }
         stopDepthPolling(instId: instId)
         let bar = session.bar
-        Task { [wsPublic, wsBusiness] in
-            await wsPublic.unsubscribe([
-                OKXChannelArg(channel: "tickers", instId: instId),
-                OKXChannelArg(channel: "books5", instId: instId),
-            ])
-            await wsBusiness.unsubscribe([
-                OKXChannelArg(channel: bar.wsChannel, instId: instId),
-            ])
-        }
+        guard let feed = feeds[session.venue] else { return }
+        Task { await feed.unsubscribe(instId: instId, bar: bar) }
     }
 
     // MARK: Bar switching
 
     public func switchBar(instId: String, to bar: BarInterval) {
-        guard let session = sessions[instId], session.bar != bar else { return }
+        guard let session = sessions[instId], session.bar != bar,
+              session.venue.supportedBars.contains(bar),
+              let feed = feeds[session.venue], let source = sources[session.venue] else { return }
         let old = session.bar
         session.beginBarSwitch(to: bar)
 
-        Task { [wsBusiness] in
-            await wsBusiness.unsubscribe([OKXChannelArg(channel: old.wsChannel, instId: instId)])
-            await wsBusiness.subscribe([OKXChannelArg(channel: bar.wsChannel, instId: instId)])
-        }
-        Task { [rest] in
-            let candles = try? await rest.candles(instId: instId, bar: bar, target: 300)
+        Task { await feed.switchBar(instId: instId, from: old, to: bar) }
+        Task {
+            let candles = try? await source.candles(instId: instId, bar: bar, target: 300)
             await MainActor.run {
                 guard let session = self.sessions[instId] else { return }
                 if let candles, !candles.isEmpty {
@@ -146,13 +162,16 @@ public final class MarketHub {
 
     // MARK: Depth polling (only while a panel shows the depth chart)
 
-    /// 400 levels is the deepest a single `books` call returns, and it is what
-    /// makes a ±0.5% depth window show real structure instead of a spike.
+    /// 400 levels is the deepest a single OKX `books` call returns, and it is
+    /// what makes a ±0.5% depth window show real structure instead of a spike.
+    /// A venue without a book to poll is left alone.
     public func startDepthPolling(instId: String, depth: Int = 400, interval: TimeInterval = 2) {
-        guard depthPollTasks[instId] == nil else { return }
-        depthPollTasks[instId] = Task { [rest] in
+        guard depthPollTasks[instId] == nil,
+              let session = sessions[instId], session.venue.hasOrderBook,
+              let source = sources[session.venue] else { return }
+        depthPollTasks[instId] = Task {
             while !Task.isCancelled {
-                if let book = try? await rest.books(instId: instId, depth: depth) {
+                if let book = try? await source.book(instId: instId, depth: depth) {
                     await MainActor.run {
                         self.sessions[instId]?.apply(deepBook: book)
                     }
@@ -169,37 +188,23 @@ public final class MarketHub {
 
     // MARK: Event routing
 
-    private enum Socket { case publicSocket, businessSocket }
-
-    private func handle(_ event: OKXWSEvent, from socket: Socket) {
+    private func handle(_ event: MarketFeedEvent, from venue: Venue) {
         switch event {
         case .state(let state):
-            switch socket {
-            case .publicSocket: publicState = state
-            case .businessSocket: businessState = state
+            feedStates[venue] = state
+            for session in sessions.values where session.venue == venue {
+                session.apply(connection: state)
             }
-            let combined: OKXConnectionState =
-                (publicState == .connected && businessState == .connected) ? .connected
-                : (publicState == .degraded || businessState == .degraded) ? .degraded
-                : publicState
-            for session in sessions.values { session.apply(connection: combined) }
-
-        case .message(let message):
-            switch message {
-            case .ticker(let ticker):
-                guard let session = sessions[ticker.instId] else { return }
-                session.apply(ticker: ticker)
-                onTick?(session, ticker)
-            case .candles(let instId, let bar, let candles):
-                guard let session = sessions[instId], session.bar == bar else { return }
-                session.apply(candles: candles, reset: false)
-            case .book(let book):
-                sessions[book.instId]?.apply(book: book)
-            case .error(let code, let message):
-                Log.warn("OKX ws error \(code): \(message)")
-            case .pong, .subscribed, .unsubscribed, .ignored:
-                break
-            }
+        case .ticker(let ticker):
+            guard let session = sessions[ticker.instId], session.venue == venue else { return }
+            session.apply(ticker: ticker)
+            onTick?(session, ticker)
+        case .candles(let instId, let bar, let candles):
+            guard let session = sessions[instId], session.venue == venue, session.bar == bar else { return }
+            session.apply(candles: candles, reset: false)
+        case .book(let book):
+            guard let session = sessions[book.instId], session.venue == venue else { return }
+            session.apply(book: book)
         }
     }
 }

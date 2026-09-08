@@ -2,7 +2,8 @@ import Foundation
 
 // MARK: - Bar interval
 
-/// Candlestick intervals supported by MayStock (all exist on OKX v5).
+/// Candlestick intervals MayStock draws. Every one exists on OKX v5; a venue
+/// with sessions may serve fewer — see `Venue.supportedBars`.
 public enum BarInterval: String, Codable, CaseIterable, Sendable, Identifiable, Hashable {
     case m1 = "1m"
     case m5 = "5m"
@@ -36,39 +37,99 @@ public enum BarInterval: String, Codable, CaseIterable, Sendable, Identifiable, 
 
 // MARK: - Ticker
 
-/// Latest market snapshot for one instrument (OKX `tickers` channel).
+/// What a ticker's change is measured from — what "up 1.2%" is up from.
+public enum ChangeBasis: String, Sendable, Codable, Equatable {
+    /// Against the price 24 hours ago: a market that never closes has no
+    /// session to measure a day from.
+    case rolling24h
+    /// Against the previous session's close: what a stock's daily change
+    /// means everywhere it is quoted.
+    case previousClose
+
+    /// The period the high, low and volume cover: "24h" or "今日".
+    public var periodLabel: String {
+        switch self {
+        case .rolling24h: return "24h"
+        case .previousClose: return "今日"
+        }
+    }
+
+    /// What the change chip is relative to, for a tooltip.
+    public var changeLabel: String {
+        switch self {
+        case .rolling24h: return "较 24h 前"
+        case .previousClose: return "较昨收"
+        }
+    }
+}
+
+/// Where a market with sessions is in its day. Nil on a market that never
+/// closes.
+public enum MarketPhase: String, Sendable, Codable, Equatable, CaseIterable {
+    case preMarket, regular, afterHours, closed
+
+    public var displayName: String {
+        switch self {
+        case .preMarket: return "盘前"
+        case .regular: return "交易中"
+        case .afterHours: return "盘后"
+        case .closed: return "休市"
+        }
+    }
+
+    /// Prints are arriving: any session, regular or extended.
+    public var isTrading: Bool { self != .closed }
+}
+
+/// Latest market snapshot for one instrument.
+///
+/// One shape for every venue. `reference`, `high`, `low` and `volume` cover
+/// the period `basis` names — the trailing day on OKX, the current session
+/// on a stock exchange — so a page reads the label off the basis instead of
+/// assuming "24h".
 public struct Ticker: Sendable, Equatable {
     public let instId: String
     public let last: Double
     public let bid: Double?
     public let ask: Double?
-    public let open24h: Double
-    public let high24h: Double
-    public let low24h: Double
-    public let vol24h: Double // in base currency
+    /// The price `change` is measured from; see `basis`.
+    public let reference: Double
+    /// The period's opening print, where the venue reports one.
+    public let open: Double?
+    public let high: Double
+    public let low: Double
+    /// In base units — coins, shares.
+    public let volume: Double
+    public let basis: ChangeBasis
+    /// Session phase on a market that has sessions; nil on a continuous one.
+    public let phase: MarketPhase?
     public let ts: Date
 
     public init(
         instId: String, last: Double, bid: Double?, ask: Double?,
-        open24h: Double, high24h: Double, low24h: Double, vol24h: Double, ts: Date
+        reference: Double, open: Double? = nil, high: Double, low: Double, volume: Double,
+        basis: ChangeBasis, phase: MarketPhase? = nil, ts: Date
     ) {
         self.instId = instId
         self.last = last
         self.bid = bid
         self.ask = ask
-        self.open24h = open24h
-        self.high24h = high24h
-        self.low24h = low24h
-        self.vol24h = vol24h
+        self.reference = reference
+        self.open = open
+        self.high = high
+        self.low = low
+        self.volume = volume
+        self.basis = basis
+        self.phase = phase
         self.ts = ts
     }
 
-    public var change24h: Double { last - open24h }
+    public var change: Double { last - reference }
 
-    /// 24h change in percent, e.g. `1.24` for +1.24%.
-    public var changePct24h: Double {
-        guard open24h > 0 else { return 0 }
-        return (last - open24h) / open24h * 100
+    /// Change in percent against `reference`, e.g. `1.24` for +1.24%.
+    public var changePct: Double {
+        guard reference > 0 else { return 0 }
+        return (last - reference) / reference * 100
     }
 
     public var spread: Double? {

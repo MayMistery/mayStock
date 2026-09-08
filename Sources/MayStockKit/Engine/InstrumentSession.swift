@@ -7,6 +7,7 @@ import Observation
 @MainActor
 public final class InstrumentSession {
     public let instId: String
+    public let venue: Venue
 
     public private(set) var ticker: Ticker?
     public private(set) var bar: BarInterval
@@ -21,18 +22,24 @@ public final class InstrumentSession {
     public private(set) var liveBook: OrderBook?
     /// 50-level REST snapshot for the depth chart (refreshed while panel open).
     public private(set) var deepBook: OrderBook?
-    public private(set) var spark = SparklineBuffer()
+    public private(set) var spark: SparklineBuffer
     public private(set) var meta: InstrumentMeta?
-    public private(set) var connection: OKXConnectionState = .idle
+    public private(set) var connection: FeedState = .idle
     public private(set) var lastUpdate: Date?
 
     /// Direction of the most recent price change (+1 / -1 / 0), for tick pulses.
     public private(set) var lastTickDirection: Int = 0
 
-    public init(instId: String, bar: BarInterval = .m1) {
+    public init(instId: String, venue: Venue = .okx, bar: BarInterval = .m1) {
         self.instId = instId
+        self.venue = venue
         self.bar = bar
+        self.spark = SparklineBuffer.standard(for: venue)
     }
+
+    /// Where the venue's day is, from the latest ticker; nil on a market
+    /// that never closes.
+    public var marketPhase: MarketPhase? { ticker?.phase }
 
     public var priceDecimals: Int {
         if let meta { return meta.priceDecimals }
@@ -78,7 +85,7 @@ public final class InstrumentSession {
         meta = new
     }
 
-    public func apply(connection new: OKXConnectionState) {
+    public func apply(connection new: FeedState) {
         connection = new
     }
 

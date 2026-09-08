@@ -7,7 +7,7 @@ import Testing
 struct AlertEngineTests {
     private func tick(_ price: Double, at ts: Date) -> Ticker {
         Ticker(instId: "T-USDT", last: price, bid: nil, ask: nil,
-               open24h: 100, high24h: 120, low24h: 80, vol24h: 0, ts: ts)
+               reference: 100, high: 120, low: 80, volume: 0, basis: .rolling24h, ts: ts)
     }
 
     @Test func priceAboveFiresOnCrossOnly() {

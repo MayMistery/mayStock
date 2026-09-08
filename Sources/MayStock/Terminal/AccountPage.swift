@@ -1,13 +1,17 @@
+import AppKit
 import SwiftUI
 import MayStockKit
 
-/// The two accounts, side by side: which CLI profile reaches each, whether it
-/// does, and the switch between them. Plus the risk limits and cost model the
-/// engine runs under — every trading-side setting the app has, on one page.
+/// Every account, one card each: OKX's two environments side by side — which
+/// CLI profile reaches each, whether it does, and the switch between them —
+/// and Schwab's, which for now is where its application stands. Plus the risk
+/// limits and the cost model per venue that the engine and the backtester run
+/// under — every trading-side setting the app has, on one page.
 struct AccountPage: View {
     let appState: AppState
     @State private var feeSyncMessage: String?
     @State private var syncingFees = false
+    @State private var costVenue: Venue = .okx
 
     private var prefs: TradingPrefs { appState.store.config.trading }
     private var portfolio: StrategyPortfolioPrefs { appState.store.config.strategy }
@@ -16,7 +20,7 @@ struct AccountPage: View {
         PageScroll {
             VStack(alignment: .leading, spacing: Theme.sectionSpacing) {
                 PageHeader(title: "账户与连接",
-                           subtitle: "API Key 由官方 okx CLI 管理（okx config），MayStock 不接触、不存储任何密钥。回测只用公开行情，无需凭证。") {
+                           subtitle: "OKX 的 API Key 由官方 okx CLI 管理（okx config），MayStock 不接触、不存储任何密钥；嘉信 Trader API 审批中。回测只用公开行情，无需凭证。") {
                     Button {
                         appState.reloadProfiles()
                         Task {
@@ -36,6 +40,8 @@ struct AccountPage: View {
                         EnvironmentCard(appState: appState, mode: mode).frame(maxWidth: .infinity)
                     }
                 }
+
+                schwabCard
 
                 HStack(alignment: .top, spacing: Theme.sectionSpacing) {
                     riskCard.frame(maxWidth: .infinity)
@@ -88,6 +94,40 @@ struct AccountPage: View {
                      : "未找到 ~/.okx/config.toml —— 运行 okx config 添加 API Key")
                     .font(Theme.Text.secondary).foregroundStyle(.secondary)
             }
+        }
+    }
+
+    // MARK: Schwab
+
+    /// Where the US-equity side stands. Honest about what exists: quotes flow
+    /// from the interim source, the trading API is still being approved, and
+    /// nothing here holds a key.
+    private var schwabCard: some View {
+        let feed = appState.hub.feedState(for: .schwab)
+        let feedText: (String, Color) = switch feed {
+        case .connected: ("已连接", Theme.up)
+        case .degraded: ("读取失败，重试中", Theme.warning)
+        case .connecting: ("连接中", .secondary)
+        case .idle: ("自选里没有美股，未启动", .secondary)
+        }
+        return Card(title: "嘉信证券 · 美股",
+                    subtitle: "Trader API – Individual 申请已提交，等待审批；审批通过后建 App 取 Key，再用 schwabctl 登录") {
+            Button {
+                NSWorkspace.shared.open(URL(string: "https://developer.schwab.com/dashboard")!)
+            } label: {
+                Label("开发者门户", systemImage: "arrow.up.right.square")
+            }
+            .controlSize(.small)
+        } content: {
+            VStack(alignment: .leading, spacing: 4) {
+                KeyValueRow(label: "美股行情", value: "\(Venue.schwab.marketDataSourceName) · \(feedText.0)", tint: feedText.1)
+                KeyValueRow(label: "API 申请", value: "审批中 · Dashboard → Subscriptions 显示 Pending", tint: Theme.warning)
+                KeyValueRow(label: "交易", value: "尚未接入：美股清单可以回测，不能下单")
+            }
+            .rowStyle()
+            Text("审批通过后：Dashboard → Create App（回调 https://127.0.0.1:8182）→ 等 App 变为 Ready For Use → schwabctl login。"
+                 + "密钥只在 schwabctl 进程里，MayStock 只拿 30 分钟有效的 access token；refresh token 每 7 天重新登录一次。")
+                .font(Theme.Text.caption).foregroundStyle(.secondary)
         }
     }
 
@@ -161,22 +201,39 @@ struct AccountPage: View {
     // MARK: Costs
 
     private var costCard: some View {
-        let schedule = portfolio.feeSchedules.okx
-        return Card(title: "回测资金与成本", subtitle: "回测与寻优按这套费率计算；清单里自带 costs 的策略优先用自己的") {
-            EmptyView()
+        Card(title: "回测资金与成本", subtitle: "回测与寻优按每家交易所自己的费率计算；清单里自带 costs 的策略优先用自己的") {
+            Picker("", selection: $costVenue) {
+                ForEach(Venue.allCases) { Text($0.displayName).tag($0) }
+            }
+            .pickerStyle(.segmented).labelsHidden().controlSize(.small).frame(width: 150)
         } content: {
             Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
                 GridRow {
-                    settingLabel("回测起始资金", help: "与实际分配无关，只决定回测的起点。")
+                    settingLabel("回测起始资金", help: "与实际分配无关，只决定回测的起点。按策略所在交易所的计价币计。")
                     HStack(spacing: 4) {
                         CommitTextField(placeholder: "10000", value: PriceFormatter.plain(portfolio.backtestCapital), width: 90) { text in
                             if let value = Double(text), value > 0 { appState.store.update { $0.strategy.backtestCapital = value } }
                         }
-                        Text(portfolio.quoteCurrency).font(Theme.Text.secondary).foregroundStyle(.secondary)
+                        Text(costVenue.quoteCurrency).font(Theme.Text.secondary).foregroundStyle(.secondary)
                     }
                 }
-                GridRow {
-                    settingLabel("费率档位", help: "OKX 公布的档位表。新账户是普通 Lv1。")
+                switch costVenue {
+                case .okx: okxCostRows
+                case .schwab: schwabCostRows
+                }
+            }
+            switch costVenue {
+            case .okx: okxCostFooter
+            case .schwab: schwabCostFooter
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var okxCostRows: some View {
+        let schedule = portfolio.feeSchedules.okx
+        GridRow {
+            settingLabel("费率档位", help: "OKX 公布的档位表。新账户是普通 Lv1。")
                     Picker("", selection: Binding(
                         get: { schedule.tier },
                         set: { tier in appState.store.update { $0.strategy.feeSchedules.okx.tier = tier } })) {
@@ -194,41 +251,103 @@ struct AccountPage: View {
                     }
                     .labelsHidden().frame(width: 160)
                 }
-                GridRow {
-                    settingLabel("滑点假设", help: "每次成交在费率之外再假设的不利偏移。实测 BTC 永续不到 0.1 bps；用「实盘对照」里的实测值校准。")
-                    HStack(spacing: 4) {
-                        CommitTextField(placeholder: "1", value: PriceFormatter.plain(schedule.slippageBps), width: 60) { text in
-                            if let value = Double(text), value >= 0 { appState.store.update { $0.strategy.feeSchedules.setSlippageBps(value) } }
-                        }
-                        Text("bps").font(Theme.Text.secondary).foregroundStyle(.secondary)
-                    }
+        GridRow {
+            settingLabel("滑点假设", help: "每次成交在费率之外再假设的不利偏移。实测 BTC 永续不到 0.1 bps；用「实盘对照」里的实测值校准。")
+            HStack(spacing: 4) {
+                CommitTextField(placeholder: "1", value: PriceFormatter.plain(schedule.slippageBps), width: 60) { text in
+                    if let value = Double(text), value >= 0 { appState.store.update { $0.strategy.feeSchedules.okx.slippageBps = value } }
                 }
-            }
-            HStack(spacing: 8) {
-                Text(schedule.summary).font(Theme.Text.caption).foregroundStyle(.secondary)
-                Spacer()
-                if schedule.syncedFromAccount {
-                    Button("改回档位表") { appState.store.update { $0.strategy.feeSchedules.okx.clearSync() } }.controlSize(.small)
-                }
-                if syncingFees {
-                    ProgressView().controlSize(.small)
-                } else {
-                    Button("从账户同步实际费率") {
-                        syncingFees = true
-                        Task {
-                            feeSyncMessage = await appState.syncFeeRates()
-                            syncingFees = false
-                        }
-                    }
-                    .controlSize(.small)
-                    .disabled(!appState.tradingReady)
-                    .help(appState.tradingBlocker ?? "读取 \(appState.tradingMode.displayName)账户的真实费率并覆盖档位表")
-                }
-            }
-            if let feeSyncMessage {
-                InlineNotice(kind: .warning, message: feeSyncMessage)
+                Text("bps").font(Theme.Text.secondary).foregroundStyle(.secondary)
             }
         }
+    }
+
+    @ViewBuilder
+    private var okxCostFooter: some View {
+        let schedule = portfolio.feeSchedules.okx
+        HStack(spacing: 8) {
+            Text(schedule.summary).font(Theme.Text.caption).foregroundStyle(.secondary)
+            Spacer()
+            if schedule.syncedFromAccount {
+                Button("改回档位表") { appState.store.update { $0.strategy.feeSchedules.okx.clearSync() } }.controlSize(.small)
+            }
+            if syncingFees {
+                ProgressView().controlSize(.small)
+            } else {
+                Button("从账户同步实际费率") {
+                    syncingFees = true
+                    Task {
+                        feeSyncMessage = await appState.syncFeeRates()
+                        syncingFees = false
+                    }
+                }
+                .controlSize(.small)
+                .disabled(!appState.tradingReady)
+                .help(appState.tradingBlocker ?? "读取 \(appState.tradingMode.displayName)账户的真实费率并覆盖档位表")
+            }
+        }
+        if let feeSyncMessage {
+            InlineNotice(kind: .warning, message: feeSyncMessage)
+        }
+    }
+
+    /// Schwab's costs are two regulatory levies on sales plus an assumed
+    /// slippage — numbers with a date on them, edited here when the SEC or
+    /// FINRA restates them.
+    @ViewBuilder
+    private var schwabCostRows: some View {
+        let schedule = portfolio.feeSchedules.schwab
+        GridRow {
+            settingLabel("佣金", help: "每笔订单的佣金，美元。嘉信上市股票与 ETF 为 0。")
+            HStack(spacing: 4) {
+                CommitTextField(placeholder: "0", value: PriceFormatter.plain(schedule.commissionPerOrder), width: 60) { text in
+                    if let value = Double(text), value >= 0 { appState.store.update { $0.strategy.feeSchedules.schwab.commissionPerOrder = value } }
+                }
+                Text("USD / 笔").font(Theme.Text.secondary).foregroundStyle(.secondary)
+            }
+        }
+        GridRow {
+            settingLabel("SEC §31", help: "只在卖出时按成交额收的监管费，每个财年重定。")
+            HStack(spacing: 4) {
+                CommitTextField(placeholder: "0.278", value: PriceFormatter.decimals(schedule.secFeeBpsOfSale, 3), width: 60) { text in
+                    if let value = Double(text), value >= 0 { appState.store.update { $0.strategy.feeSchedules.schwab.secFeeBpsOfSale = value } }
+                }
+                Text("bps · 卖出").font(Theme.Text.secondary).foregroundStyle(.secondary)
+            }
+        }
+        GridRow {
+            settingLabel("FINRA TAF", help: "只在卖出时按股数收的交易活动费，单笔有上限。")
+            HStack(spacing: 4) {
+                CommitTextField(placeholder: "0.000166", value: PriceFormatter.plain(schedule.tafPerShareSold), width: 80) { text in
+                    if let value = Double(text), value >= 0 { appState.store.update { $0.strategy.feeSchedules.schwab.tafPerShareSold = value } }
+                }
+                Text("USD / 股，上限").font(Theme.Text.secondary).foregroundStyle(.secondary)
+                CommitTextField(placeholder: "8.30", value: PriceFormatter.plain(schedule.tafCapPerOrder), width: 60) { text in
+                    if let value = Double(text), value >= 0 { appState.store.update { $0.strategy.feeSchedules.schwab.tafCapPerOrder = value } }
+                }
+            }
+        }
+        GridRow {
+            settingLabel("滑点假设", help: "每次成交在费率之外再假设的不利偏移。大盘股一美分价差约合 1 bps。")
+            HStack(spacing: 4) {
+                CommitTextField(placeholder: "2", value: PriceFormatter.plain(schedule.slippageBps), width: 60) { text in
+                    if let value = Double(text), value >= 0 { appState.store.update { $0.strategy.feeSchedules.schwab.slippageBps = value } }
+                }
+                Text("bps").font(Theme.Text.secondary).foregroundStyle(.secondary)
+            }
+        }
+        GridRow {
+            settingLabel("费率核对于", help: "上面两个监管费率最近一次对照官方公告的日期。改了费率就改这里。")
+            CommitTextField(placeholder: "2025-05", value: schedule.ratesAsOf, width: 90, alignment: .leading) { text in
+                let cleaned = text.trimmingCharacters(in: .whitespaces)
+                if !cleaned.isEmpty { appState.store.update { $0.strategy.feeSchedules.schwab.ratesAsOf = cleaned } }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var schwabCostFooter: some View {
+        Text(portfolio.feeSchedules.schwab.summary).font(Theme.Text.caption).foregroundStyle(.secondary)
     }
 
     // MARK: Panel

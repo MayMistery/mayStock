@@ -134,7 +134,7 @@ final class AppState {
         self.options = options
         dataDirectory = options.dataDirectory
         store = ConfigStore(directory: options.dataDirectory)
-        hub = MarketHub()
+        hub = MarketHub.standard()
         alerts = AlertEngine()
         notifications = NotificationService()
         strategyStore = StrategyStore(directory: options.dataDirectory.appendingPathComponent("Strategies"))
@@ -191,6 +191,20 @@ final class AppState {
         liveLedger.onChanged = { [weak self] in self?.saveLedger(.live) }
         demoEquity.onChanged = { [weak self] in self?.saveEquity(.demo) }
         liveEquity.onChanged = { [weak self] in self?.saveEquity(.live) }
+    }
+
+    /// The venue an instrument belongs to: its live session's, else its
+    /// watchlist entry's. Only a watch item can be asked about, and one that
+    /// is not there is the OKX default the app grew up with.
+    func venue(of instId: String) -> Venue {
+        hub.session(for: instId)?.venue
+            ?? store.config.watchlist.first { $0.instId == instId }?.venue
+            ?? .okx
+    }
+
+    /// How a day's change is measured for an instrument, for alert summaries.
+    func changeBasis(for instId: String) -> ChangeBasis {
+        venue(of: instId).changeBasis
     }
 
     /// Push the current config into hub / status bar / alert engine.
@@ -607,7 +621,7 @@ final class AppState {
         var env = ProcessInfo.processInfo.environment
         env["MAYSTOCK_INSTID"] = event.rule.instId
         env["MAYSTOCK_PRICE"] = PriceFormatter.plain(event.price)
-        env["MAYSTOCK_RULE"] = event.rule.condition.summary
+        env["MAYSTOCK_RULE"] = event.summary
         process.environment = env
         try? process.run()
     }
@@ -634,7 +648,7 @@ final class AppState {
             .applicationName: "MayStock",
             .applicationVersion: AppInfo.version,
             .credits: NSAttributedString(
-                string: "菜单栏行情终端 · 低频量化工作台 · 数据源 OKX",
+                string: "菜单栏行情终端 · 低频量化工作台 · 行情 " + Venue.allCases.map(\.marketDataSourceName).joined(separator: " / "),
                 attributes: [.font: NSFont.systemFont(ofSize: 11)]),
         ])
     }

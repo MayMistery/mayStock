@@ -26,16 +26,13 @@ public enum BacktestPhase: Sendable, Equatable {
 /// as a single 365-day run.
 /// Why a report could not be produced.
 public enum BacktestRunnerError: Error, CustomStringConvertible, Sendable, Equatable {
-    /// The strategy's venue has no market-data source wired up yet. The
-    /// manifest compiles; it cannot be backtested until the venue's data path
-    /// exists, and fetching its instrument from another exchange would be a
-    /// wrong answer with a real-looking number on it.
-    case noMarketData(Venue)
+    /// The venue's source served no history for the instrument.
+    case noHistory(instId: String, venue: Venue)
 
     public var description: String {
         switch self {
-        case .noMarketData(let venue):
-            return "\(venue.displayName)的行情源尚未接入，这份清单只能编译，还不能回测"
+        case .noHistory(let instId, let venue):
+            return "\(venue.displayName)的行情源取不到 \(instId) 的历史 K 线"
         }
     }
 }
@@ -45,19 +42,19 @@ public struct BacktestRunner: Sendable {
     /// of 5m bars does not, and the report says so rather than lying about coverage.
     public static let maxBars = 12_000
 
-    /// The one market-data source there is. `run` refuses any other venue
-    /// rather than asking OKX for a stock.
-    public let rest: OKXRESTClient
+    /// History comes from the strategy's own venue; funding and the
+    /// alternative-data feeds are OKX's and only ever asked for OKX markets.
+    public let sources: MarketDataSources
     /// Nil takes the instrument's documented default.
     public let maintenanceMarginRate: Double?
     public let feeSchedules: FeeSchedules
 
     public init(
-        rest: OKXRESTClient = OKXRESTClient(),
+        sources: MarketDataSources = MarketDataSources(),
         maintenanceMarginRate: Double? = nil,
         feeSchedules: FeeSchedules = FeeSchedules()
     ) {
-        self.rest = rest
+        self.sources = sources
         self.maintenanceMarginRate = maintenanceMarginRate
         self.feeSchedules = feeSchedules
     }
@@ -74,7 +71,8 @@ public struct BacktestRunner: Sendable {
         onPhase: (@Sendable (BacktestPhase) -> Void)? = nil
     ) async throws -> StrategyBacktestReport {
         let market = strategy.market
-        guard market.venue == .okx else { throw BacktestRunnerError.noMarketData(market.venue) }
+        let source = sources.source(for: market.venue)
+        let rest = sources.okx
         let calendar = market.calendar
         // Bars per calendar day on this market — 24 for hourly crypto, 7 for
         // hourly stocks — so a window of days is sized by what the venue
@@ -92,12 +90,12 @@ public struct BacktestRunner: Sendable {
         let targetBars = Swift.min(wantedBars, Self.maxBars)
 
         onPhase?(.fetchingCandles(loaded: 0, target: targetBars))
-        let candles = try await rest.historyCandles(
+        let candles = try await source.historyCandles(
             instId: market.instId, bar: market.bar, target: targetBars,
             progress: { loaded in onPhase?(.fetchingCandles(loaded: loaded, target: targetBars)) })
 
         guard let firstCandle = candles.first, let lastCandle = candles.last else {
-            throw OKXError.decoding("回测取不到 \(market.instId) 的历史 K 线")
+            throw BacktestRunnerError.noHistory(instId: market.instId, venue: market.venue)
         }
 
         var fundingRates: [FundingRate] = []

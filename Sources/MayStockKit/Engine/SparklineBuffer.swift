@@ -55,6 +55,15 @@ public struct SparklineBuffer: Sendable, Equatable {
         self.retention = max(retention, fineWindow)
     }
 
+    /// The buffer a venue's sessions call for: a market that never closes
+    /// keeps a day, a market with sessions keeps a trading week so a line
+    /// window of "the last five sessions" has something to draw.
+    public static func standard(for venue: Venue) -> SparklineBuffer {
+        venue.tradesContinuously
+            ? SparklineBuffer()
+            : SparklineBuffer(retention: 7 * 24 * 3_600)
+    }
+
     /// Whole series, ascending by ts.
     public var points: [SparkPoint] { coarse + fine }
 

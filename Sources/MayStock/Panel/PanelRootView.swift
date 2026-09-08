@@ -8,6 +8,9 @@ import MayStockKit
 /// Everything deeper — switching accounts, arming strategies, editing rules —
 /// is one click away in the terminal window, never on the panel itself, where
 /// an accidental click could put money at risk.
+///
+/// Every label that names a period reads it off the instrument's venue: a
+/// coin has a trailing day, a share has a session, and the panel says which.
 struct PanelRootView: View {
     let appState: AppState
     let instId: String
@@ -56,7 +59,7 @@ struct PanelRootView: View {
         .onHover(perform: onHoverChange)
         .onChange(of: appState.charts.mode, initial: true) { _, mode in
             // The 400-level book snapshot is only worth fetching while it is
-            // actually on screen.
+            // actually on screen; the hub ignores venues without a book.
             if mode == .depth { appState.hub.startDepthPolling(instId: instId) }
             else { appState.hub.stopDepthPolling(instId: instId) }
         }
@@ -65,14 +68,18 @@ struct PanelRootView: View {
     // MARK: Header
 
     private func header(_ session: InstrumentSession) -> some View {
-        HStack(alignment: .firstTextBaseline) {
+        let venue = session.venue
+        return HStack(alignment: .firstTextBaseline) {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     Text(instId).font(.system(size: 14, weight: .semibold))
-                    Badge(text: WatchItem.venue.instrumentType(of: instId).displayName, tint: .secondary, size: .small)
+                    Badge(text: venue.instrumentType(of: instId).displayName, tint: .secondary, size: .small)
+                    if let phase = session.marketPhase {
+                        MarketPhaseBadge(phase: phase)
+                    }
                     connectionDot(session.connection)
                 }
-                Text("OKX · \(subtitle(session))").font(Theme.Text.caption).foregroundStyle(.secondary)
+                Text("\(venue.displayName) · \(subtitle(session))").font(Theme.Text.caption).foregroundStyle(.secondary)
             }
             Spacer()
             VStack(alignment: .trailing, spacing: 1) {
@@ -81,42 +88,52 @@ struct PanelRootView: View {
                     .contentTransition(.numericText())
                     .animation(.snappy(duration: 0.15), value: session.ticker?.last)
                 if let ticker = session.ticker {
-                    let up = ticker.changePct24h >= 0
-                    Text("\(up ? "▲" : "▼") \(PriceFormatter.signedPercent(ticker.changePct24h)) · 24h")
+                    let up = ticker.changePct >= 0
+                    Text("\(up ? "▲" : "▼") \(PriceFormatter.signedPercent(ticker.changePct)) · \(ticker.basis.periodLabel)")
                         .font(Theme.Text.secondaryMedium).numeric()
                         .foregroundStyle(Theme.trend(up))
+                        .help(ticker.basis.changeLabel)
                 }
             }
         }
     }
 
     private func subtitle(_ session: InstrumentSession) -> String {
-        switch appState.charts.mode {
+        switch effectiveMode(for: session) {
         case .line: return "折线 \(appState.charts.lineWindow.title)"
         case .candles: return "K线 \(session.bar.rawValue)"
         case .depth: return "深度 \(appState.charts.depthZoom.title)"
         }
     }
 
-    private func connectionDot(_ state: OKXConnectionState) -> some View {
+    private func connectionDot(_ state: FeedState) -> some View {
         StatusDot(color: state == .connected ? Theme.up : state == .degraded ? Theme.warning : .secondary, size: 6)
-            .help(state == .connected ? "实时连接正常" : state == .degraded ? "连接降级，正在重连" : "连接中…")
+            .help(state == .connected ? "行情连接正常" : state == .degraded ? "行情降级，正在重连" : "连接中…")
     }
 
     // MARK: Chart
 
+    /// The panel's chart mode is shared across instruments; a venue without a
+    /// book shows candles where the depth chart would be empty.
+    private func effectiveMode(for session: InstrumentSession) -> ChartMode {
+        appState.charts.mode.available(on: session.venue) ? appState.charts.mode : .candles
+    }
+
     @ViewBuilder
     private func chartArea(_ session: InstrumentSession) -> some View {
         let decimals = watchItem?.decimals ?? session.priceDecimals
+        let venue = session.venue
         ZStack {
-            switch appState.charts.mode {
+            switch effectiveMode(for: session) {
             case .line:
-                LineChartView(points: session.spark.window(minutes: appState.charts.lineWindow.minutes),
-                              window: appState.charts.lineWindow, decimals: decimals)
+                let window = appState.charts.lineWindow.resolved(for: venue)
+                LineChartView(points: window.sparkWindow.points(from: session.spark, venue: venue),
+                              window: window, decimals: decimals, venue: venue)
             case .candles:
                 let display = session.displayCandles
                 let isStale = session.isBackfilling && !display.candles.isEmpty
-                CandleChartView(candles: display.candles, bar: display.bar, decimals: decimals)
+                CandleChartView(candles: display.candles, bar: display.bar, decimals: decimals,
+                                timeZone: venue.tradesContinuously ? .current : venue.timeZone)
                     .opacity(isStale ? 0.45 : 1)
                 if isStale {
                     // Keep the outgoing interval on screen while the new one
@@ -136,14 +153,19 @@ struct PanelRootView: View {
         _ session: InstrumentSession, mode: Binding<ChartMode>,
         lineWindow: Binding<LineWindow>, depthZoom: Binding<DepthZoom>
     ) -> some View {
-        HStack(spacing: 6) {
-            SegmentedFilter(segments: ChartMode.segments, selection: mode)
+        let venue = session.venue
+        return HStack(spacing: 6) {
+            SegmentedFilter(segments: ChartMode.segments(for: venue), selection: Binding(
+                get: { effectiveMode(for: session) },
+                set: { mode.wrappedValue = $0 }))
             Spacer(minLength: 2)
-            switch mode.wrappedValue {
+            switch effectiveMode(for: session) {
             case .line:
-                SegmentedFilter(segments: LineWindow.segments, selection: lineWindow)
+                SegmentedFilter(segments: LineWindow.segments(for: venue), selection: Binding(
+                    get: { lineWindow.wrappedValue.resolved(for: venue) },
+                    set: { lineWindow.wrappedValue = $0 }))
             case .candles:
-                SegmentedFilter(segments: BarInterval.segments, selection: Binding(
+                SegmentedFilter(segments: BarInterval.segments(for: venue), selection: Binding(
                     get: { session.bar },
                     set: { appState.hub.switchBar(instId: instId, to: $0) }))
             case .depth:
@@ -157,12 +179,23 @@ struct PanelRootView: View {
     private func statsRow(_ session: InstrumentSession) -> some View {
         let ticker = session.ticker
         let decimals = watchItem?.decimals ?? session.priceDecimals
+        let period = (ticker?.basis ?? session.venue.changeBasis).periodLabel
         return HStack(spacing: 0) {
-            stat("24h 高", ticker.map { PriceFormatter.price($0.high24h, decimals: decimals) })
-            stat("24h 低", ticker.map { PriceFormatter.price($0.low24h, decimals: decimals) })
-            stat("24h 量", ticker.map { PriceFormatter.compact($0.vol24h) })
-            stat("买一", (ticker?.bid ?? session.liveBook?.bestBid).map { PriceFormatter.price($0, decimals: decimals) }, tint: Theme.up)
-            stat("卖一", (ticker?.ask ?? session.liveBook?.bestAsk).map { PriceFormatter.price($0, decimals: decimals) }, tint: Theme.down)
+            if session.venue.hasOrderBook {
+                stat("\(period) 高", ticker.map { PriceFormatter.price($0.high, decimals: decimals) })
+                stat("\(period) 低", ticker.map { PriceFormatter.price($0.low, decimals: decimals) })
+                stat("\(period) 量", ticker.map { PriceFormatter.compact($0.volume) })
+                stat("买一", (ticker?.bid ?? session.liveBook?.bestBid).map { PriceFormatter.price($0, decimals: decimals) }, tint: Theme.up)
+                stat("卖一", (ticker?.ask ?? session.liveBook?.bestAsk).map { PriceFormatter.price($0, decimals: decimals) }, tint: Theme.down)
+            } else {
+                // A stock's day: where it opened, where it has been, what it
+                // closed at yesterday, and how much of it changed hands.
+                stat("今开", ticker?.open.map { PriceFormatter.price($0, decimals: decimals) })
+                stat("\(period)高", ticker.map { PriceFormatter.price($0.high, decimals: decimals) })
+                stat("\(period)低", ticker.map { PriceFormatter.price($0.low, decimals: decimals) })
+                stat("昨收", ticker.map { PriceFormatter.price($0.reference, decimals: decimals) })
+                stat("成交量", ticker.map { PriceFormatter.compact($0.volume) })
+            }
         }
         .padding(.vertical, 6)
         .background(Theme.rowFill, in: RoundedRectangle(cornerRadius: Theme.rowRadius))
@@ -182,6 +215,7 @@ struct PanelRootView: View {
 
     private func alertsRow(_ session: InstrumentSession) -> some View {
         let rules = appState.alerts.rules(for: instId)
+        let basis = session.venue.changeBasis
         return HStack(spacing: 6) {
             Image(systemName: "bell").font(.system(size: 10)).foregroundStyle(.secondary)
             if rules.isEmpty {
@@ -190,7 +224,7 @@ struct PanelRootView: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 4) {
                         ForEach(rules) { rule in
-                            Text(rule.condition.summary)
+                            Text(rule.condition.summary(basis: basis))
                                 .font(.system(size: 10, weight: .medium)).numeric()
                                 .padding(.horizontal, 6).padding(.vertical, 2)
                                 .background((rule.enabled ? Theme.accent : Color.secondary).opacity(0.14), in: Capsule())
@@ -224,7 +258,7 @@ struct PanelRootView: View {
 
     private func footer(_ session: InstrumentSession) -> some View {
         HStack(spacing: 6) {
-            Text("数据源 OKX 公共行情")
+            Text("数据源 \(session.venue.marketDataSourceName)").lineLimit(1)
             if let last = session.lastUpdate {
                 Text("· 更新 \(last.formatted(date: .omitted, time: .standard))").numeric()
             }
@@ -242,5 +276,34 @@ struct PanelRootView: View {
         }
         .font(Theme.Text.caption)
         .foregroundStyle(.secondary)
+    }
+}
+
+/// Where a market with sessions is in its day, as a chip: green while the
+/// regular session runs, accent for the extended sessions, grey when closed.
+struct MarketPhaseBadge: View {
+    let phase: MarketPhase
+    var size: Badge.Size = .small
+
+    var body: some View {
+        Badge(text: phase.displayName, tint: tint, size: size)
+            .help(help)
+    }
+
+    private var tint: Color {
+        switch phase {
+        case .regular: return Theme.up
+        case .preMarket, .afterHours: return Theme.accent
+        case .closed: return .secondary
+        }
+    }
+
+    private var help: String {
+        switch phase {
+        case .regular: return "常规交易时段（纽约 09:30–16:00）"
+        case .preMarket: return "盘前交易（纽约 04:00–09:30），成交稀薄"
+        case .afterHours: return "盘后交易（纽约 16:00–20:00），成交稀薄"
+        case .closed: return "休市，显示的是最近一次成交"
+        }
     }
 }

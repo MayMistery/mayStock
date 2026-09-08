@@ -22,12 +22,18 @@ public struct WatchItem: Codable, Identifiable, Sendable, Equatable {
     }
 
     public var id: UUID
+    /// Where the instrument trades, which decides which feed quotes it, how
+    /// its id reads and how its day is framed. Files written before venues
+    /// existed only ever meant OKX.
+    public var venue: Venue
     public var instId: String
     /// Custom menu bar label; `nil` derives from instId (BTC-USDT → BTC).
     public var label: String?
     public var enabled: Bool
     public var style: MenuBarStyle
-    /// Trailing window of the menu bar sparkline, in minutes.
+    /// Trailing window of the menu bar sparkline, in minutes. On a market
+    /// with sessions, a day or more means sessions rather than clock hours —
+    /// see `sparkWindow`.
     public var sparklineMinutes: Int
     /// Price fraction digits; `nil` = auto from exchange tick size.
     public var decimals: Int?
@@ -36,6 +42,7 @@ public struct WatchItem: Codable, Identifiable, Sendable, Equatable {
 
     public init(
         id: UUID = UUID(),
+        venue: Venue = .okx,
         instId: String,
         label: String? = nil,
         enabled: Bool = true,
@@ -45,6 +52,7 @@ public struct WatchItem: Codable, Identifiable, Sendable, Equatable {
         defaultBar: BarInterval = .m1
     ) {
         self.id = id
+        self.venue = venue
         self.instId = instId
         self.label = label
         self.enabled = enabled
@@ -54,26 +62,52 @@ public struct WatchItem: Codable, Identifiable, Sendable, Equatable {
         self.defaultBar = defaultBar
     }
 
-    /// The watchlist is fed by `MarketHub`, which speaks OKX and nothing else
-    /// until a market-data port exists; an item here is an OKX instrument.
-    public static let venue = Venue.okx
-
-    /// "BTC-USDT" → "BTC", "BTC-USDT-SWAP" → "BTC⚡︎"
-    public var displayLabel: String {
-        if let label, !label.isEmpty { return label }
-        let base = Self.venue.currencies(of: instId).base
-        return Self.venue.instrumentType(of: instId) == .swap ? base + "⚡︎" : base
+    private enum CodingKeys: String, CodingKey {
+        case id, venue, instId, label, enabled, style, sparklineMinutes, decimals, defaultBar
     }
 
-    /// Currency glyph shown before the price in `.full` style.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        venue = try c.decodeIfPresent(Venue.self, forKey: .venue) ?? .okx
+        instId = try c.decode(String.self, forKey: .instId)
+        label = try c.decodeIfPresent(String.self, forKey: .label)
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        style = try c.decodeIfPresent(MenuBarStyle.self, forKey: .style) ?? .full
+        sparklineMinutes = try c.decodeIfPresent(Int.self, forKey: .sparklineMinutes) ?? 60
+        decimals = try c.decodeIfPresent(Int.self, forKey: .decimals)
+        defaultBar = try c.decodeIfPresent(BarInterval.self, forKey: .defaultBar) ?? .m1
+    }
+
+    /// "BTC-USDT" → "BTC", "BTC-USDT-SWAP" → "BTC⚡︎", "TSLA" → "TSLA"
+    public var displayLabel: String {
+        if let label, !label.isEmpty { return label }
+        return venue.shortLabel(for: instId)
+    }
+
+    /// Currency glyph shown before the price in `.full` style. Coins have
+    /// one; a share does not.
     public var glyph: String? {
-        let base = instId.split(separator: "-").first.map(String.init) ?? ""
-        switch base {
+        guard venue == .okx else { return nil }
+        switch venue.currencies(of: instId).base {
         case "BTC": return "₿"
         case "ETH": return "Ξ"
         case "LTC": return "Ł"
         default: return nil
         }
+    }
+
+    /// The stretch of history the menu bar sparkline draws.
+    ///
+    /// The minutes are read literally on a market that never closes. On one
+    /// with sessions, a day means the session and a week means the last
+    /// five sessions: an hour of a closed market is a flat line, and the
+    /// figure the menu bar owes is "how did it trade today".
+    public var sparkWindow: SparkWindow {
+        if venue.tradesContinuously || sparklineMinutes < 1_440 {
+            return .trailing(minutes: sparklineMinutes)
+        }
+        return sparklineMinutes >= 7 * 1_440 ? .days(7) : .session
     }
 }
 
@@ -184,11 +218,12 @@ public struct AppConfig: Codable, Sendable, Equatable {
     /// Strategy portfolio: mode, capital and per-strategy allocations.
     public var strategy: StrategyPortfolioPrefs
 
+    /// v5 gives every watch item a `venue`; items written before it are OKX.
     /// v4 replaces `strategy.feeSchedule` (OKX only) with `strategy.feeSchedules`,
     /// one per venue; a v3 file's schedule is read into the OKX slot.
     /// v3 added `strategy` and dropped the manual order ticket's default size.
     /// v2 files still load — every field decodes with a default.
-    public static let currentSchemaVersion = 4
+    public static let currentSchemaVersion = 5
     public static let minimumSupportedSchemaVersion = 2
 
     public init(

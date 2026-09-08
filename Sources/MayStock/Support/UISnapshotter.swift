@@ -51,7 +51,7 @@ final class UISnapshotter {
 
     private func render() async throws {
         let instId = appState.store.config.watchlist.first(where: \.enabled)?.instId
-            ?? appState.store.config.watchlist.first?.instId ?? "BTC-USDT"
+            ?? appState.store.config.watchlist.first?.instId ?? ""
 
         // The hover panel, at the height it lays out to.
         let panel = NSHostingView(rootView: PanelRootView(appState: appState, instId: instId))

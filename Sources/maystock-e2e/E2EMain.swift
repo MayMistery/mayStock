@@ -66,7 +66,7 @@ struct E2EMain {
             let ticker = try await rest.ticker(instId: instId)
             restTicker = ticker
             pass("REST ticker", "last=\(PriceFormatter.auto(ticker.last)) " +
-                 "24h=\(PriceFormatter.signedPercent(ticker.changePct24h)) " +
+                 "\(ticker.basis.periodLabel)=\(PriceFormatter.signedPercent(ticker.changePct)) " +
                  "(\(Int(Date().timeIntervalSince(t0) * 1000))ms)")
         } catch {
             fail("REST ticker", String(describing: error)); allOK = false
@@ -150,9 +150,9 @@ struct E2EMain {
         let ws = OKXWSClient(url: OKXEndpoints.wsPublic)
         await ws.setHandler { event in
             if case .message(.ticker(let t)) = event {
-                let arrow = t.changePct24h >= 0 ? "↑" : "↓"
+                let arrow = t.changePct >= 0 ? "↑" : "↓"
                 print("\(t.ts)  \(t.instId)  \(PriceFormatter.auto(t.last))  " +
-                      "\(arrow)\(PriceFormatter.signedPercent(t.changePct24h))")
+                      "\(arrow)\(PriceFormatter.signedPercent(t.changePct))")
             }
         }
         await ws.subscribe([OKXChannelArg(channel: "tickers", instId: instId)])
@@ -169,7 +169,7 @@ struct E2EMain {
         let fired = FiredBox()
 
         let setupOK: Bool = await MainActor.run {
-            engine.onAlert = { event in Task { await fired.append(event.rule.condition.summary) } }
+            engine.onAlert = { event in Task { await fired.append(event.summary) } }
             engine.setRules([
                 AlertRule(instId: "SIM-USDT", condition: .priceAbove(105)),
                 AlertRule(instId: "SIM-USDT", condition: .priceBelow(95)),
@@ -183,7 +183,8 @@ struct E2EMain {
                 step += 1
                 spark.sample(price: price, at: ts)
                 let ticker = Ticker(instId: "SIM-USDT", last: price, bid: nil, ask: nil,
-                                    open24h: 100, high24h: 110, low24h: 90, vol24h: 0, ts: ts)
+                                    reference: 100, high: 110, low: 90, volume: 0,
+                                    basis: .rolling24h, ts: ts)
                 engine.evaluate(instId: "SIM-USDT", ticker: ticker, spark: spark, now: ts)
             }
             return true

@@ -50,9 +50,12 @@ struct VenuePersistenceTests {
         #expect(rewritten["feeSchedule"] == nil, "the legacy key is read, never written")
     }
 
-    @Test func theWatchlistIsOKX() {
-        // Every watch item prices on OKX; the venue is a fact of the list, not
-        // of the item, until another venue's quotes are wired in.
-        #expect(WatchItem.venue == .okx)
+    @Test func aWatchItemWithoutAVenueIsOKX() throws {
+        // Files written before venues existed only ever meant OKX.
+        let item = WatchItem(venue: .schwab, instId: "TSLA")
+        let data = try JSONEncoder().encode(item)
+        #expect(try JSONDecoder().decode(WatchItem.self, from: data).venue == .schwab)
+        let legacy = try JSONDecoder().decode(WatchItem.self, from: stripping("venue", from: data))
+        #expect(legacy.venue == .okx)
     }
 }

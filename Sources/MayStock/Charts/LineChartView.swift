@@ -9,16 +9,23 @@ import MayStockKit
 /// and stretched the last few minutes across most of the width. Positioning by
 /// timestamp inside a window anchored to *now* is what makes the window filter
 /// mean anything at all.
+///
+/// On a market with sessions the clock keeps running while the tape does not,
+/// and a time-proportional axis would spend most of a five-day window on
+/// nights and weekends. There, every gap longer than a few minutes is drawn
+/// at a fixed small width and marked, so the line is trading time — which is
+/// how every stock chart is drawn.
 struct LineChartView: View {
     let points: [SparkPoint]
     let window: LineWindow
     let decimals: Int
+    var venue: Venue = .okx
 
     @State private var hover: CGPoint? = nil
 
     var body: some View {
         GeometryReader { geo in
-            let domain = Domain(points: points, window: window, size: geo.size)
+            let domain = Domain(points: points, window: window, venue: venue, size: geo.size)
             ZStack {
                 if let domain {
                     Canvas(rendersAsynchronously: false) { context, size in
@@ -26,7 +33,7 @@ struct LineChartView: View {
                     }
                     .chartLegend(legend(domain))
                 } else {
-                    ChartPlaceholder(text: "正在收集实时价格…")
+                    ChartPlaceholder(text: venue.tradesContinuously ? "正在收集实时价格…" : "本窗口还没有成交")
                         .chartLegend([])
                 }
             }
@@ -44,11 +51,24 @@ struct LineChartView: View {
 
     /// Everything the draw pass needs, resolved once per render.
     private struct Domain {
+        /// A gap between samples longer than this is closed-market time on a
+        /// venue with sessions, and is collapsed.
+        static let gapThreshold: TimeInterval = 5 * 60
+        /// What a collapsed gap is drawn as, in axis seconds.
+        static let collapsedGap: TimeInterval = 90
+
         let geometry: PlotGeometry
         let series: [SparkPoint]
+        /// Axis position of each `series` point, in axis seconds from `start`.
+        let positions: [TimeInterval]
         let start: Date
         let end: Date
+        /// Length of the axis in axis seconds — clock seconds on a continuous
+        /// market, trading seconds plus collapsed gaps on one with sessions.
         let span: TimeInterval
+        let collapsesGaps: Bool
+        /// Where collapsed gaps sit on the axis, for the markers.
+        let gaps: [TimeInterval]
         let minPrice: Double
         let maxPrice: Double
         let open: Double
@@ -58,23 +78,64 @@ struct LineChartView: View {
         /// Left edge of real data, when the window reaches further back than
         /// the history we hold.
         let coverageStart: Date
+        let timeZone: TimeZone
 
-        init?(points: [SparkPoint], window: LineWindow, size: CGSize) {
+        init?(points: [SparkPoint], window: LineWindow, venue: Venue, size: CGSize) {
             let geometry = PlotGeometry(size: size)
             let now = Date()
             let end = max(now, points.last?.ts ?? now)
-            let start = end.addingTimeInterval(-window.seconds)
+            let collapsesGaps = !venue.tradesContinuously
+            // A session window is as long as what it holds; a trailing window
+            // is a fixed stretch of clock time ending now.
+            let start: Date
+            if let seconds = window.seconds, !collapsesGaps {
+                start = end.addingTimeInterval(-seconds)
+            } else if let seconds = window.seconds, let first = points.first?.ts {
+                start = max(first, end.addingTimeInterval(-seconds))
+            } else {
+                start = points.first?.ts ?? end
+            }
 
             let inWindow = points.filter { $0.ts >= start && $0.ts <= end }
             guard inWindow.count >= 2 else { return nil }
 
             // One or two points per horizontal pixel is plenty; extremes survive.
-            self.series = ChartMath.downsample(inWindow, buckets: Int(geometry.plotWidth))
+            let series = ChartMath.downsample(inWindow, buckets: Int(geometry.plotWidth))
+            self.series = series
             self.geometry = geometry
             self.start = start
             self.end = end
-            self.span = max(end.timeIntervalSince(start), 1)
+            self.collapsesGaps = collapsesGaps
             self.coverageStart = inWindow[0].ts
+            self.timeZone = collapsesGaps ? venue.timeZone : .current
+
+            if collapsesGaps {
+                // Trading time: each step is the real interval, except across
+                // a gap, which is drawn at a fixed small width.
+                var positions: [TimeInterval] = []
+                var gaps: [TimeInterval] = []
+                var cursor: TimeInterval = 0
+                positions.reserveCapacity(series.count)
+                for (index, point) in series.enumerated() {
+                    if index > 0 {
+                        let dt = point.ts.timeIntervalSince(series[index - 1].ts)
+                        if dt > Self.gapThreshold {
+                            gaps.append(cursor + Self.collapsedGap / 2)
+                            cursor += Self.collapsedGap
+                        } else {
+                            cursor += dt
+                        }
+                    }
+                    positions.append(cursor)
+                }
+                self.positions = positions
+                self.gaps = gaps
+                self.span = max(cursor, 1)
+            } else {
+                self.positions = series.map { $0.ts.timeIntervalSince(start) }
+                self.gaps = []
+                self.span = max(end.timeIntervalSince(start), 1)
+            }
 
             let prices = inWindow.map(\.price)
             let rawMin = prices.min() ?? 0
@@ -91,14 +152,16 @@ struct LineChartView: View {
         var isUp: Bool { last >= open }
         var changePct: Double { open > 0 ? (last - open) / open * 100 : 0 }
 
-        func x(_ ts: Date) -> CGFloat {
-            let fraction = ts.timeIntervalSince(start) / span
-            return geometry.plotWidth * CGFloat(min(max(fraction, 0), 1))
+        /// Axis position → pixel.
+        func x(position: TimeInterval) -> CGFloat {
+            geometry.plotWidth * CGFloat(min(max(position / span, 0), 1))
         }
 
-        func date(atX x: CGFloat) -> Date {
-            let fraction = min(max(x / geometry.plotWidth, 0), 1)
-            return start.addingTimeInterval(span * Double(fraction))
+        func x(index: Int) -> CGFloat { x(position: positions[index]) }
+
+        /// A clock instant → pixel, on a continuous axis only.
+        func x(_ ts: Date) -> CGFloat {
+            x(position: ts.timeIntervalSince(start))
         }
 
         func y(_ price: Double) -> CGFloat {
@@ -106,17 +169,58 @@ struct LineChartView: View {
             return geometry.top + (1 - CGFloat((price - minPrice) / range)) * geometry.height
         }
 
-        /// Sample nearest a cursor position, for the crosshair.
-        func sample(nearX x: CGFloat) -> SparkPoint? {
+        /// Index of the sample nearest a cursor position, for the crosshair.
+        func index(nearX x: CGFloat) -> Int? {
             guard !series.isEmpty else { return nil }
-            let target = date(atX: x)
-            var best = series[0]
-            var bestDelta = abs(best.ts.timeIntervalSince(target))
-            for point in series.dropFirst() {
-                let delta = abs(point.ts.timeIntervalSince(target))
-                if delta < bestDelta { best = point; bestDelta = delta }
+            let target = TimeInterval(min(max(x / geometry.plotWidth, 0), 1)) * span
+            var best = 0
+            var bestDelta = abs(positions[0] - target)
+            for index in positions.indices.dropFirst() {
+                let delta = abs(positions[index] - target)
+                if delta < bestDelta { best = index; bestDelta = delta }
             }
             return best
+        }
+
+        func sample(nearX x: CGFloat) -> SparkPoint? {
+            index(nearX: x).map { series[$0] }
+        }
+
+        /// The axis ticks: clock instants on a continuous axis, or the first
+        /// sample on or after each candidate instant when gaps are collapsed —
+        /// a tick that lands inside a collapsed gap is dropped rather than
+        /// drawn where nothing traded.
+        var timeTicks: [(x: CGFloat, date: Date, major: Bool)] {
+            if !collapsesGaps {
+                return ChartMath.timeTicks(from: start, to: end, maxLabels: 5)
+                    .map { (x($0), $0, false) }
+            }
+            var ticks: [(x: CGFloat, date: Date, major: Bool)] = []
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = timeZone
+            let multiDay = !calendar.isDate(series[0].ts, inSameDayAs: series[series.count - 1].ts)
+            if multiDay {
+                // One tick per session, at its first sample.
+                var lastDay: Date?
+                for (index, point) in series.enumerated() {
+                    let day = calendar.startOfDay(for: point.ts)
+                    guard day != lastDay else { continue }
+                    lastDay = day
+                    ticks.append((x(index: index), point.ts, true))
+                }
+                return ticks
+            }
+            let tradingSpan = span - Double(gaps.count) * Self.collapsedGap
+            let step = ChartMath.niceTimeStep(span: tradingSpan, maxLabels: 5)
+            var next = ceil(series[0].ts.timeIntervalSince1970 / step) * step
+            for (index, point) in series.enumerated() where point.ts.timeIntervalSince1970 >= next {
+                // Skip ticks that fell inside a gap: the sample is far past them.
+                if point.ts.timeIntervalSince1970 - next < Self.gapThreshold {
+                    ticks.append((x(index: index), Date(timeIntervalSince1970: next), false))
+                }
+                next = ceil((point.ts.timeIntervalSince1970 + 1) / step) * step
+            }
+            return ticks
         }
     }
 
@@ -127,7 +231,7 @@ struct LineChartView: View {
         if let probe {
             let delta = domain.open > 0 ? (probe.price - domain.open) / domain.open * 100 : 0
             return [
-                ChartLegendItem(key: "t", value: ChartFormatters.string(probe.ts, "HH:mm:ss"),
+                ChartLegendItem(key: "t", value: ChartFormatters.string(probe.ts, hoverFormat(domain), timeZone: domain.timeZone),
                                 tint: .secondary, priority: 8),
                 ChartLegendItem(key: "p", value: PriceFormatter.price(probe.price, decimals: decimals),
                                 priority: 10),
@@ -148,6 +252,12 @@ struct LineChartView: View {
         ]
     }
 
+    private func hoverFormat(_ domain: Domain) -> String {
+        let clockSpan = domain.end.timeIntervalSince(domain.start)
+        if clockSpan > 86_400 { return "MM-dd HH:mm" }
+        return clockSpan <= 3_600 ? "HH:mm:ss" : "HH:mm"
+    }
+
     // MARK: Drawing
 
     private func draw(context: GraphicsContext, size: CGSize, domain: Domain) {
@@ -156,19 +266,20 @@ struct LineChartView: View {
 
         drawGrid(context: context, domain: domain)
         drawUncovered(context: context, domain: domain)
+        drawGaps(context: context, domain: domain)
 
         // Price path.
         var line = Path()
-        for (index, point) in domain.series.enumerated() {
-            let position = CGPoint(x: domain.x(point.ts), y: domain.y(point.price))
+        for index in domain.series.indices {
+            let position = CGPoint(x: domain.x(index: index), y: domain.y(domain.series[index].price))
             if index == 0 { line.move(to: position) } else { line.addLine(to: position) }
         }
 
         // Gradient area under the line.
-        if let firstPoint = domain.series.first, let lastPoint = domain.series.last {
+        if let firstIndex = domain.series.indices.first, let lastIndex = domain.series.indices.last {
             var area = line
-            area.addLine(to: CGPoint(x: domain.x(lastPoint.ts), y: geometry.bottom))
-            area.addLine(to: CGPoint(x: domain.x(firstPoint.ts), y: geometry.bottom))
+            area.addLine(to: CGPoint(x: domain.x(index: lastIndex), y: geometry.bottom))
+            area.addLine(to: CGPoint(x: domain.x(index: firstIndex), y: geometry.bottom))
             area.closeSubpath()
             context.fill(area, with: .linearGradient(
                 Gradient(colors: [color.opacity(0.26), color.opacity(0.015)]),
@@ -199,15 +310,16 @@ struct LineChartView: View {
                              at: CGPoint(x: geometry.plotWidth + 5, y: y), anchor: .leading)
         }
 
-        let format = ChartMath.timeAxisFormat(span: domain.span)
-        for tick in ChartMath.timeTicks(from: domain.start, to: domain.end, maxLabels: 5) {
-            let x = domain.x(tick)
+        let format = ChartMath.timeAxisFormat(span: domain.end.timeIntervalSince(domain.start))
+        for tick in domain.timeTicks {
+            let x = tick.x
             guard x > 12, x < geometry.plotWidth - 12 else { continue }
             context.strokeLine(from: CGPoint(x: x, y: geometry.top),
                                to: CGPoint(x: x, y: geometry.bottom),
                                color: ChartStyle.grid)
-            context.drawText(ChartFormatters.string(tick, format),
-                             font: ChartStyle.axisFont, color: ChartStyle.axisLabel,
+            context.drawText(ChartFormatters.string(tick.date, tick.major ? "MM-dd" : format, timeZone: domain.timeZone),
+                             font: ChartStyle.axisFont,
+                             color: tick.major ? .secondary : ChartStyle.axisLabel,
                              at: CGPoint(x: x, y: geometry.axisBaseline), anchor: .bottom)
         }
     }
@@ -215,6 +327,7 @@ struct LineChartView: View {
     /// Shade the stretch of the window we simply do not have data for, instead
     /// of stretching what we do have across it and lying about the time base.
     private func drawUncovered(context: GraphicsContext, domain: Domain) {
+        guard !domain.collapsesGaps else { return }
         let edge = domain.x(domain.coverageStart)
         guard edge > domain.geometry.plotWidth * 0.02 else { return }
         let rect = CGRect(x: 0, y: domain.geometry.top,
@@ -227,18 +340,32 @@ struct LineChartView: View {
         }
     }
 
+    /// A closed-market gap, drawn as a faint band so a five-day line is
+    /// visibly five sessions rather than one unbroken tape.
+    private func drawGaps(context: GraphicsContext, domain: Domain) {
+        guard domain.collapsesGaps else { return }
+        let width = domain.x(position: Domain.collapsedGap) - domain.x(position: 0)
+        for gap in domain.gaps {
+            let centre = domain.x(position: gap)
+            let rect = CGRect(x: centre - width / 2, y: domain.geometry.top,
+                              width: width, height: domain.geometry.height)
+            context.fill(Path(rect), with: .color(Color.primary.opacity(0.05)))
+        }
+    }
+
     /// Faint line at the window's opening price — the reference the trend
     /// colour and the percentage in the legend are measured against.
     private func drawOpenBaseline(context: GraphicsContext, domain: Domain) {
         let y = domain.y(domain.open)
+        let from = domain.collapsesGaps ? 0 : domain.x(domain.coverageStart)
         context.stroke(
-            Path.dashedHorizontal(y: y, from: domain.x(domain.coverageStart), to: domain.geometry.plotWidth),
+            Path.dashedHorizontal(y: y, from: from, to: domain.geometry.plotWidth),
             with: .color(Color.secondary.opacity(0.35)), lineWidth: 1)
     }
 
     private func drawLast(context: GraphicsContext, domain: Domain, color: Color) {
-        guard let lastPoint = domain.series.last else { return }
-        let position = CGPoint(x: domain.x(lastPoint.ts), y: domain.y(lastPoint.price))
+        guard let lastIndex = domain.series.indices.last else { return }
+        let position = CGPoint(x: domain.x(index: lastIndex), y: domain.y(domain.series[lastIndex].price))
         context.stroke(
             Path.dashedHorizontal(y: position.y, from: 0, to: domain.geometry.plotWidth),
             with: .color(color.opacity(0.55)), lineWidth: 1)
@@ -246,14 +373,15 @@ struct LineChartView: View {
                      with: .color(color.opacity(0.22)))
         context.fill(Path(ellipseIn: CGRect(x: position.x - 2.5, y: position.y - 2.5, width: 5, height: 5)),
                      with: .color(color))
-        context.drawPriceTag(PriceFormatter.price(lastPoint.price, decimals: decimals),
+        context.drawPriceTag(PriceFormatter.price(domain.series[lastIndex].price, decimals: decimals),
                              y: position.y, geometry: domain.geometry, fill: color)
     }
 
     private func drawCrosshair(context: GraphicsContext, domain: Domain, at point: CGPoint, color: Color) {
-        guard let sample = domain.sample(nearX: point.x) else { return }
+        guard let index = domain.index(nearX: point.x) else { return }
+        let sample = domain.series[index]
         let geometry = domain.geometry
-        let x = domain.x(sample.ts)
+        let x = domain.x(index: index)
         let y = domain.y(sample.price)
 
         context.strokeLine(from: CGPoint(x: x, y: geometry.top),
@@ -268,8 +396,7 @@ struct LineChartView: View {
         context.drawPriceTag(PriceFormatter.price(sample.price, decimals: decimals),
                              y: y, geometry: geometry, fill: ChartStyle.tagFill,
                              text: ChartStyle.tagText)
-        let format = domain.span <= 3_600 ? "HH:mm:ss" : "HH:mm"
-        context.drawTimeTag(ChartFormatters.string(sample.ts, format),
+        context.drawTimeTag(ChartFormatters.string(sample.ts, hoverFormat(domain), timeZone: domain.timeZone),
                             x: x, geometry: geometry, fill: ChartStyle.tagFill,
                             text: ChartStyle.tagText)
     }

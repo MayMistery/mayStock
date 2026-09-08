@@ -3,6 +3,10 @@ import MayStockKit
 
 /// The watchlist at full size: the same charts as the hover panel with room to
 /// breathe, plus everything about how an instrument shows in the menu bar.
+///
+/// One list for every venue, grouped: a coin and a share sit in the same
+/// column, each read the way its own market reads — a trailing day for the
+/// coin, a session for the share.
 struct MarketsPage: View {
     let appState: AppState
     @Bindable var selection: TerminalSelection
@@ -14,12 +18,17 @@ struct MarketsPage: View {
             Divider()
             if let instId = selection.instId, let session = appState.hub.session(for: instId) {
                 InstrumentDetail(appState: appState, instId: instId, session: session)
-            } else if let instId = selection.instId {
+            } else if let instId = selection.instId,
+                      let index = appState.store.config.watchlist.firstIndex(where: { $0.instId == instId }) {
+                // A hidden item has no session and therefore no editor, so the
+                // way back on has to live right here.
                 EmptyState(icon: "eye.slash", title: "\(instId) 未在菜单栏启用",
-                           message: "标的关闭后不再订阅行情。打开左侧的开关即可恢复。")
+                           message: "隐藏的标的不再订阅行情。启用后重新订阅，并回到菜单栏。",
+                           actionTitle: "启用并订阅",
+                           action: { appState.store.update { $0.watchlist[index].enabled = true } })
             } else {
                 EmptyState(icon: "chart.xyaxis.line", title: "选择一个标的",
-                           message: "或在左下角输入 instId 添加，例如 SOL-USDT、BTC-USDT-SWAP。")
+                           message: "或在左下角添加：OKX 标的如 SOL-USDT、BTC-USDT-SWAP，美股代码如 TSLA、QQQ。")
             }
         }
         .onAppear {
@@ -34,6 +43,7 @@ private struct WatchlistColumn: View {
     let appState: AppState
     @Bindable var selection: TerminalSelection
     @State private var newInstId = ""
+    @State private var newVenue: Venue = .okx
     @State private var validating = false
     @State private var addError: String?
 
@@ -42,16 +52,35 @@ private struct WatchlistColumn: View {
     var body: some View {
         VStack(spacing: 0) {
             List(selection: $selection.instId) {
-                ForEach(items) { item in
-                    row(item).tag(item.instId)
-                }
-                .onMove { indices, destination in
-                    appState.store.update { $0.watchlist.move(fromOffsets: indices, toOffset: destination) }
+                ForEach(Venue.allCases) { venue in
+                    let venueItems = items.filter { $0.venue == venue }
+                    if !venueItems.isEmpty {
+                        Section(venue.displayName) {
+                            ForEach(venueItems) { item in
+                                row(item).tag(item.instId)
+                            }
+                            .onMove { indices, destination in
+                                move(venue: venue, indices: indices, destination: destination)
+                            }
+                        }
+                    }
                 }
             }
             .listStyle(.inset)
             Divider()
             addRow
+        }
+    }
+
+    /// Reorder within one venue's group. The menu bar follows the whole
+    /// list's order, so the group's items keep the slots they already occupy
+    /// and only swap among themselves.
+    private func move(venue: Venue, indices: IndexSet, destination: Int) {
+        appState.store.update { config in
+            let slots = config.watchlist.indices.filter { config.watchlist[$0].venue == venue }
+            var group = slots.map { config.watchlist[$0] }
+            group.move(fromOffsets: indices, toOffset: destination)
+            for (slot, item) in zip(slots, group) { config.watchlist[slot] = item }
         }
     }
 
@@ -64,6 +93,8 @@ private struct WatchlistColumn: View {
                     Text(item.displayLabel).font(Theme.Text.bodyMedium)
                     if !item.enabled {
                         Badge(text: "已隐藏", tint: .secondary, size: .small)
+                    } else if let phase = session?.marketPhase, phase != .regular {
+                        MarketPhaseBadge(phase: phase)
                     }
                 }
                 Text(item.instId).font(Theme.Text.caption).foregroundStyle(.secondary)
@@ -73,19 +104,39 @@ private struct WatchlistColumn: View {
                 Text(session?.formattedPrice ?? "—")
                     .font(Theme.Text.numberSmall).numeric()
                 if let ticker {
-                    Text(PriceFormatter.signedPercent(ticker.changePct24h))
+                    Text(PriceFormatter.signedPercent(ticker.changePct))
                         .font(Theme.Text.captionMedium).numeric()
-                        .foregroundStyle(Theme.signed(ticker.changePct24h))
+                        .foregroundStyle(Theme.signed(ticker.changePct))
+                        .help(ticker.basis.changeLabel)
                 }
             }
         }
         .padding(.vertical, 3)
+        .contextMenu {
+            Button(item.enabled ? "从菜单栏隐藏" : "在菜单栏启用") { setEnabled(!item.enabled, for: item) }
+            Divider()
+            Button("从自选移除", role: .destructive) {
+                appState.store.update { $0.watchlist.removeAll { $0.id == item.id } }
+                if selection.instId == item.instId { selection.instId = items.first?.instId }
+            }
+        }
+    }
+
+    private func setEnabled(_ enabled: Bool, for item: WatchItem) {
+        appState.store.update { config in
+            guard let index = config.watchlist.firstIndex(where: { $0.id == item.id }) else { return }
+            config.watchlist[index].enabled = enabled
+        }
     }
 
     private var addRow: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 6) {
+            Picker("", selection: $newVenue) {
+                ForEach(Venue.allCases) { Text($0.displayName).tag($0) }
+            }
+            .pickerStyle(.segmented).labelsHidden().controlSize(.small)
             HStack(spacing: 6) {
-                TextField("添加标的，如 ETH-USDT", text: $newInstId)
+                TextField(newVenue == .okx ? "添加标的，如 ETH-USDT" : "添加美股代码，如 TSLA", text: $newInstId)
                     .textFieldStyle(.roundedBorder)
                     .font(Theme.Text.mono)
                     .onSubmit { Task { await add() } }
@@ -103,24 +154,38 @@ private struct WatchlistColumn: View {
         .padding(10)
     }
 
+    /// Validate against the venue's own source before adding, so the list
+    /// never holds a symbol nothing can quote. The id is unique across venues:
+    /// the hub keys sessions by id, and one name must mean one instrument.
     private func add() async {
         let instId = newInstId.trimmingCharacters(in: .whitespaces).uppercased()
         guard !instId.isEmpty else { return }
-        guard !items.contains(where: { $0.instId == instId }) else {
-            addError = "已在自选中"
+        if let existing = items.first(where: { $0.instId == instId }) {
+            addError = existing.venue == newVenue ? "已在自选中" : "\(instId) 已作为\(existing.venue.displayName)标的在自选中"
+            return
+        }
+        guard let source = appState.hub.source(for: newVenue) else {
+            addError = "\(newVenue.displayName)没有行情源"
             return
         }
         validating = true
         addError = nil
         defer { validating = false }
         do {
-            guard let meta = try await OKXRESTClient().instrumentMeta(instId: instId) else {
-                addError = "OKX 上不存在该标的（示例：SOL-USDT / BTC-USDT-SWAP）"
+            let matches = try await source.search(instId)
+            guard let match = matches.first(where: { $0.instId.uppercased() == instId }) else {
+                let suggestions = matches.prefix(3).map { "\($0.instId)（\($0.name)）" }
+                addError = suggestions.isEmpty
+                    ? (newVenue == .okx
+                       ? "OKX 上不存在该标的（示例：SOL-USDT / BTC-USDT-SWAP）"
+                       : "没有找到美股代码 \(instId)")
+                    : "没有 \(instId)；相近的有 " + suggestions.joined(separator: "、")
                 return
             }
-            appState.store.update { $0.watchlist.append(WatchItem(instId: meta.instId)) }
+            let venue = newVenue
+            appState.store.update { $0.watchlist.append(WatchItem(venue: venue, instId: match.instId)) }
             newInstId = ""
-            selection.instId = meta.instId
+            selection.instId = match.instId
         } catch {
             addError = "校验失败：\(error)"
         }
@@ -139,6 +204,11 @@ private struct InstrumentDetail: View {
     private var watchItem: WatchItem? { appState.store.config.watchlist.first { $0.instId == instId } }
     private var decimals: Int { watchItem?.decimals ?? session.priceDecimals }
     private var charts: ChartPreferences { appState.terminalCharts }
+    private var venue: Venue { session.venue }
+
+    /// The page's chart mode is shared across instruments; a venue without a
+    /// book shows candles where the depth chart would be empty.
+    private var mode: ChartMode { charts.mode.available(on: venue) ? charts.mode : .candles }
 
     var body: some View {
         PageScroll {
@@ -173,10 +243,15 @@ private struct InstrumentDetail: View {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 8) {
                     Text(instId).font(Theme.Text.title)
-                    Badge(text: WatchItem.venue.instrumentType(of: instId).displayName, tint: .secondary, size: .small)
+                    Badge(text: venue.instrumentType(of: instId).displayName, tint: .secondary, size: .small)
+                    if let phase = session.marketPhase {
+                        MarketPhaseBadge(phase: phase)
+                    }
                     connectionBadge
                 }
-                Text("OKX · " + (session.meta.map { "最小价位 \(PriceFormatter.plain($0.tickSize)) · 最小数量 \(PriceFormatter.plain($0.minSize))" } ?? "公共行情"))
+                Text(venue.displayName + " · " + (session.meta.map {
+                    "最小价位 \(PriceFormatter.plain($0.tickSize)) · 最小数量 \(PriceFormatter.plain($0.minSize))"
+                } ?? venue.marketDataSourceName))
                     .font(Theme.Text.secondary).foregroundStyle(.secondary)
             }
             Spacer()
@@ -186,9 +261,10 @@ private struct InstrumentDetail: View {
                     .contentTransition(.numericText())
                     .animation(.snappy(duration: 0.15), value: session.ticker?.last)
                 if let ticker = session.ticker {
-                    Text("\(ticker.changePct24h >= 0 ? "▲" : "▼") \(PriceFormatter.signedPercent(ticker.changePct24h)) · 24h · \(PriceFormatter.signedMoney(ticker.change24h, decimals: decimals))")
+                    Text("\(ticker.changePct >= 0 ? "▲" : "▼") \(PriceFormatter.signedPercent(ticker.changePct)) · \(ticker.basis.periodLabel) · \(PriceFormatter.signedMoney(ticker.change, decimals: decimals))")
                         .font(Theme.Text.secondaryMedium).numeric()
-                        .foregroundStyle(Theme.signed(ticker.changePct24h))
+                        .foregroundStyle(Theme.signed(ticker.changePct))
+                        .help(ticker.basis.changeLabel)
                 }
             }
         }
@@ -206,13 +282,16 @@ private struct InstrumentDetail: View {
         return Card {
             VStack(spacing: 8) {
                 HStack {
-                    SegmentedFilter(segments: ChartMode.segments, selection: $charts.mode)
+                    SegmentedFilter(segments: ChartMode.segments(for: venue), selection: Binding(
+                        get: { mode }, set: { charts.mode = $0 }))
                     Spacer()
-                    switch charts.mode {
+                    switch mode {
                     case .line:
-                        SegmentedFilter(segments: LineWindow.segments, selection: $charts.lineWindow)
+                        SegmentedFilter(segments: LineWindow.segments(for: venue), selection: Binding(
+                            get: { charts.lineWindow.resolved(for: venue) },
+                            set: { charts.lineWindow = $0 }))
                     case .candles:
-                        SegmentedFilter(segments: BarInterval.segments, selection: Binding(
+                        SegmentedFilter(segments: BarInterval.segments(for: venue), selection: Binding(
                             get: { session.bar },
                             set: { appState.hub.switchBar(instId: instId, to: $0) }))
                     case .depth:
@@ -229,14 +308,16 @@ private struct InstrumentDetail: View {
     @ViewBuilder
     private var chart: some View {
         ZStack {
-            switch charts.mode {
+            switch mode {
             case .line:
-                LineChartView(points: session.spark.window(minutes: charts.lineWindow.minutes),
-                              window: charts.lineWindow, decimals: decimals)
+                let window = charts.lineWindow.resolved(for: venue)
+                LineChartView(points: window.sparkWindow.points(from: session.spark, venue: venue),
+                              window: window, decimals: decimals, venue: venue)
             case .candles:
                 let display = session.displayCandles
                 let isStale = session.isBackfilling && !display.candles.isEmpty
-                CandleChartView(candles: display.candles, bar: display.bar, decimals: decimals)
+                CandleChartView(candles: display.candles, bar: display.bar, decimals: decimals,
+                                timeZone: venue.tradesContinuously ? .current : venue.timeZone)
                     .opacity(isStale ? 0.45 : 1)
                 if isStale { ChartLoadingBadge(text: "加载 \(session.bar.rawValue)…") }
             case .depth:
@@ -248,20 +329,34 @@ private struct InstrumentDetail: View {
     private var statsRow: some View {
         let ticker = session.ticker
         let book = session.liveBook
+        let period = (ticker?.basis ?? venue.changeBasis).periodLabel
         return HStack(spacing: Theme.itemSpacing) {
-            StatTile(label: "24h 最高", value: ticker.map { PriceFormatter.price($0.high24h, decimals: decimals) } ?? "—")
-            StatTile(label: "24h 最低", value: ticker.map { PriceFormatter.price($0.low24h, decimals: decimals) } ?? "—")
-            StatTile(label: "24h 成交量", value: ticker.map { PriceFormatter.compact($0.vol24h) } ?? "—",
-                     caption: WatchItem.venue.currencies(of: instId).base)
-            StatTile(label: "买一", value: (ticker?.bid ?? book?.bestBid).map { PriceFormatter.price($0, decimals: decimals) } ?? "—", tint: Theme.up)
-            StatTile(label: "卖一", value: (ticker?.ask ?? book?.bestAsk).map { PriceFormatter.price($0, decimals: decimals) } ?? "—", tint: Theme.down)
-            StatTile(label: "价差", value: book?.spread.map { PriceFormatter.price($0, decimals: decimals) } ?? "—",
-                     caption: book?.spreadBps.map { String(format: "%.2f bp", $0) })
+            if venue.hasOrderBook {
+                StatTile(label: "\(period) 最高", value: ticker.map { PriceFormatter.price($0.high, decimals: decimals) } ?? "—")
+                StatTile(label: "\(period) 最低", value: ticker.map { PriceFormatter.price($0.low, decimals: decimals) } ?? "—")
+                StatTile(label: "\(period) 成交量", value: ticker.map { PriceFormatter.compact($0.volume) } ?? "—",
+                         caption: venue.currencies(of: instId).base)
+                StatTile(label: "买一", value: (ticker?.bid ?? book?.bestBid).map { PriceFormatter.price($0, decimals: decimals) } ?? "—", tint: Theme.up)
+                StatTile(label: "卖一", value: (ticker?.ask ?? book?.bestAsk).map { PriceFormatter.price($0, decimals: decimals) } ?? "—", tint: Theme.down)
+                StatTile(label: "价差", value: book?.spread.map { PriceFormatter.price($0, decimals: decimals) } ?? "—",
+                         caption: book?.spreadBps.map { String(format: "%.2f bp", $0) })
+            } else {
+                StatTile(label: "今开", value: ticker?.open.map { PriceFormatter.price($0, decimals: decimals) } ?? "—")
+                StatTile(label: "\(period)最高", value: ticker.map { PriceFormatter.price($0.high, decimals: decimals) } ?? "—")
+                StatTile(label: "\(period)最低", value: ticker.map { PriceFormatter.price($0.low, decimals: decimals) } ?? "—")
+                StatTile(label: "昨收", value: ticker.map { PriceFormatter.price($0.reference, decimals: decimals) } ?? "—",
+                         caption: "涨跌幅的基准")
+                StatTile(label: "成交量", value: ticker.map { PriceFormatter.compact($0.volume) } ?? "—",
+                         caption: "股 · 常规时段")
+                StatTile(label: "时段", value: session.marketPhase?.displayName ?? "—",
+                         caption: "纽约 09:30–16:00")
+            }
         }
     }
 
     private var alertsCard: some View {
         let rules = appState.alerts.rules(for: instId)
+        let basis = venue.changeBasis
         return Card(title: "告警", subtitle: rules.isEmpty ? "本标的暂无规则" : "\(rules.count) 条规则") {
             if let price = session.ticker?.last {
                 Menu {
@@ -292,7 +387,7 @@ private struct InstrumentDetail: View {
                             appState.alerts.update(updated)
                         }))
                     .toggleStyle(.switch).controlSize(.mini).labelsHidden()
-                    Text(rule.condition.summary).font(Theme.Text.mono)
+                    Text(rule.condition.summary(basis: basis)).font(Theme.Text.mono)
                     if !rule.note.isEmpty {
                         Text(rule.note).font(Theme.Text.caption).foregroundStyle(.secondary).lineLimit(1)
                     }
@@ -339,6 +434,14 @@ private struct MenuBarEditor: View {
             })
     }
 
+    /// The sparkline windows a venue offers, as (label, minutes). A market with
+    /// sessions counts a day as the session and a week as five of them.
+    private func sparklineOptions(for venue: Venue) -> [(label: String, minutes: Int)] {
+        venue.tradesContinuously
+            ? [("15 分钟", 15), ("1 小时", 60), ("4 小时", 240), ("24 小时", 1_440)]
+            : [("15 分钟", 15), ("1 小时", 60), ("今日", 1_440), ("5 日", 7 * 1_440)]
+    }
+
     var body: some View {
         if let item {
             Card(title: "菜单栏显示", subtitle: "改动即时生效") {
@@ -368,8 +471,9 @@ private struct MenuBarEditor: View {
                     GridRow {
                         label("趋势图窗口")
                         Picker("", selection: bind(\.sparklineMinutes, default: 60)) {
-                            Text("15 分钟").tag(15); Text("1 小时").tag(60)
-                            Text("4 小时").tag(240); Text("24 小时").tag(1440)
+                            ForEach(sparklineOptions(for: item.venue), id: \.minutes) { option in
+                                Text(option.label).tag(option.minutes)
+                            }
                         }
                         .labelsHidden().frame(width: 160)
                     }
@@ -391,7 +495,7 @@ private struct MenuBarEditor: View {
                     GridRow {
                         label("默认 K 线周期")
                         Picker("", selection: bind(\.defaultBar, default: .m1)) {
-                            ForEach(BarInterval.allCases) { Text($0.rawValue).tag($0) }
+                            ForEach(item.venue.supportedBars) { Text($0.rawValue).tag($0) }
                         }
                         .labelsHidden().frame(width: 160)
                     }

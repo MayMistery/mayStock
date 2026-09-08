@@ -66,7 +66,7 @@ struct AlertsPage: View {
                 }))
             .toggleStyle(.switch).controlSize(.mini).labelsHidden()
 
-            Text(rule.condition.summary)
+            Text(rule.condition.summary(basis: appState.changeBasis(for: rule.instId)))
                 .font(Theme.Text.mono)
                 .padding(.horizontal, 6).padding(.vertical, 2)
                 .background(Theme.accent.opacity(0.12), in: Capsule())
@@ -106,7 +106,7 @@ struct AlertsPage: View {
             ], rows: events.map(IdentifiedEvent.init), emptyText: "尚无触发记录") { entry in
                 GridText(Format.stamp(entry.event.firedAt), tint: .secondary, mono: true, fit: true)
                 GridText(entry.event.rule.instId, weight: .medium, fit: true)
-                GridText(entry.event.rule.condition.summary, mono: true, fit: true)
+                GridText(entry.event.summary, mono: true, fit: true)
                 GridText(PriceFormatter.auto(entry.event.price), mono: true, alignment: .trailing)
                 GridText(entry.event.rule.note.isEmpty ? "—" : entry.event.rule.note, tint: .secondary)
             }
@@ -128,13 +128,13 @@ struct AlertRuleEditor: View {
     private enum Kind: String, CaseIterable, Identifiable {
         case above = "价格上穿"
         case below = "价格下穿"
-        case pct24hUp = "24h 涨幅 ≥"
-        case pct24hDown = "24h 跌幅 ≤"
+        case pct24hUp = "涨幅 ≥"
+        case pct24hDown = "跌幅 ≤"
         case window = "N 分钟波动 ≥"
         var id: String { rawValue }
     }
 
-    @State private var instId = "BTC-USDT"
+    @State private var instId = ""
     @State private var kind: Kind = .above
     @State private var threshold = ""
     @State private var windowMinutes = 5
@@ -153,6 +153,12 @@ struct AlertRuleEditor: View {
                     }
                     Picker("类型", selection: $kind) {
                         ForEach(Kind.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    if kind == .pct24hUp || kind == .pct24hDown {
+                        // What a day's change is measured from is the
+                        // market's business, and the rule follows the market.
+                        Text("涨跌幅\(appState.changeBasis(for: instId).changeLabel)计算")
+                            .font(Theme.Text.caption).foregroundStyle(.secondary)
                     }
                     if kind == .window {
                         Picker("时间窗口", selection: $windowMinutes) {

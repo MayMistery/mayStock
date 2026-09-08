@@ -53,7 +53,7 @@ struct StrategyDetailView: View {
                     if let report { RobustnessBadge(assessment: report.robustness) }
                     if strategy.isScriptEngine { Badge(text: "外部脚本", tint: Theme.warning, size: .small) }
                 }
-                Text("\(strategy.market.instId) · \(strategy.market.instType.displayName) · \(strategy.market.bar.rawValue) · v\(strategy.manifest.version)"
+                Text("\(strategy.market.venue.displayName) · \(strategy.market.instId) · \(strategy.market.instType.displayName) · \(strategy.market.bar.rawValue) · v\(strategy.manifest.version)"
                      + (strategy.manifest.author.map { " · \($0)" } ?? ""))
                     .font(Theme.Text.secondary).foregroundStyle(.secondary)
                 if let notes = strategy.manifest.notes, !notes.isEmpty {
@@ -416,8 +416,10 @@ struct StrategyDetailView: View {
                 Label(appState.tradingMode.isDemo ? "开始交易" : "在实盘开始交易", systemImage: "play.fill")
             }
             .buttonStyle(ProminentButtonStyle(tint: appState.tradingMode.isDemo ? Theme.up : Theme.down))
-            .disabled(capital <= 0 || !appState.tradingReady || appState.store.config.strategy.emergencyStop)
-            .help(capital <= 0 ? "先分配预算"
+            .disabled(capital <= 0 || !appState.tradingReady || appState.store.config.strategy.emergencyStop
+                      || !tradesOnTheAccount)
+            .help(!tradesOnTheAccount ? "\(strategy.market.venue.displayName)的交易尚未接入（API 审批中），这份策略现在只能回测"
+                  : capital <= 0 ? "先分配预算"
                   : appState.store.config.strategy.emergencyStop ? "急停中，先解除急停"
                   : (appState.tradingReady ? "按 \(strategy.market.bar.rawValue) 收盘评估信号并自动下单" : (appState.tradingBlocker ?? "")))
             if !(appState.ledger.position(for: strategy.id)?.isFlat ?? true) {
@@ -426,6 +428,10 @@ struct StrategyDetailView: View {
             }
         }
     }
+
+    /// Whether the account the engine trades through is on this strategy's
+    /// venue. The runner refuses the mismatch too; the button says so first.
+    private var tradesOnTheAccount: Bool { strategy.market.venue == appState.venue.venue }
 
     private var runtimeSummary: String {
         let state = runtime

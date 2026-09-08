@@ -121,8 +121,9 @@ public struct OKXRESTClient: Sendable {
         return Ticker(
             instId: row.instId, last: last,
             bid: row.bidPx.flatMap(Double.init), ask: row.askPx.flatMap(Double.init),
-            open24h: open, high24h: high, low24h: low,
-            vol24h: Double(row.vol24h) ?? 0,
+            reference: open, high: high, low: low,
+            volume: Double(row.vol24h) ?? 0,
+            basis: .rolling24h,
             ts: Date(timeIntervalSince1970: tsMs / 1000))
     }
 

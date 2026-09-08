@@ -168,33 +168,26 @@ enum Lab {
         return schedules
     }
 
-    /// The bench reads OKX and nothing else until a venue's data path exists.
-    /// A strategy on another venue compiles and stops here, by name, rather
-    /// than having its ticker looked up on the wrong exchange.
-    static func requireMarketData(for strategy: CompiledStrategy) throws {
-        guard strategy.market.venue == .okx else {
-            throw LabError.usage(
-                "\(strategy.market.venue.displayName)的行情源尚未接入（方案第 2 阶段），"
-                + "\(strategy.market.instId) 只能编译、还不能回测")
-        }
-    }
-
     /// Enough candles for `days` of the strategy's interval, plus warm-up —
-    /// counted on the market's calendar, not by dividing the clock.
+    /// counted on the market's calendar, not by dividing the clock, and read
+    /// from the strategy's own venue's source.
     static func fetchCandles(
-        strategy: CompiledStrategy, days: Int, rest: OKXRESTClient = OKXRESTClient()
+        strategy: CompiledStrategy, days: Int, sources: MarketDataSources = MarketDataSources()
     ) async throws -> [Candle] {
-        try requireMarketData(for: strategy)
-        let bars = strategy.market.calendar.barCount(days: days)
+        let market = strategy.market
+        let bars = market.calendar.barCount(days: days)
         let target = Swift.min(bars + strategy.warmupBars, BacktestRunner.maxBars)
         if let cached = CandleCache.load(
-            instId: strategy.market.instId, bar: strategy.market.bar, atLeast: target) {
+            venue: market.venue, instId: market.instId, bar: market.bar, atLeast: target) {
             return cached
         }
-        let fetched = try await rest.historyCandles(
-            instId: strategy.market.instId, bar: strategy.market.bar, target: target)
+        let fetched = try await sources.source(for: market.venue).historyCandles(
+            instId: market.instId, bar: market.bar, target: target, progress: nil)
+        guard !fetched.isEmpty else {
+            throw LabError.usage("\(market.venue.displayName)的行情源取不到 \(market.instId) 的历史 K 线")
+        }
         CandleCache.save(
-            fetched, instId: strategy.market.instId, bar: strategy.market.bar,
+            fetched, venue: market.venue, instId: market.instId, bar: market.bar,
             requested: target)
         return fetched
     }
@@ -207,10 +200,10 @@ enum Lab {
     /// a short held across days, funding is not a rounding error.
     static func fundingRates(
         strategy: CompiledStrategy, candles: [Candle], days: Int,
-        rest: OKXRESTClient = OKXRESTClient()
+        sources: MarketDataSources = MarketDataSources()
     ) async -> [FundingRate] {
         guard strategy.market.instType == .swap, let first = candles.first else { return [] }
-        return (try? await rest.fundingRateHistory(
+        return (try? await sources.okx.fundingRateHistory(
             instId: strategy.market.instId, since: first.ts,
             limit: days * 3 + 10)) ?? []
     }
@@ -232,11 +225,11 @@ enum Lab {
 
     /// Candles plus every series the manifest declares, aligned and reported.
     static func fetchMarketData(
-        strategy: CompiledStrategy, days: Int, rest: OKXRESTClient = OKXRESTClient()
+        strategy: CompiledStrategy, days: Int, sources: MarketDataSources = MarketDataSources()
     ) async throws -> (candles: [Candle], series: [String: [Double]], coverage: [SeriesCoverage]) {
-        let candles = try await fetchCandles(strategy: strategy, days: days, rest: rest)
+        let candles = try await fetchCandles(strategy: strategy, days: days, sources: sources)
         guard strategy.usesAlternativeData else { return (candles, [:], []) }
-        let loaded = await AlternativeDataProvider(rest: rest).load(
+        let loaded = await AlternativeDataProvider(rest: sources.okx).load(
             specs: strategy.manifest.data, market: strategy.market,
             candles: candles, days: days)
         return (candles, loaded.series, loaded.coverage)
@@ -437,8 +430,11 @@ enum CandleCache {
             .appendingPathComponent("maystock-lab-candles", isDirectory: true)
     }
 
-    private static func url(instId: String, bar: BarInterval) -> URL {
-        directory.appendingPathComponent("\(instId)-\(bar.rawValue).json")
+    /// The venue is part of the key: a ticker and a pair could not collide
+    /// today, but a cache that mixed two venues' histories under one name
+    /// would fail in exactly the quiet way this cache is meant to avoid.
+    private static func url(venue: Venue, instId: String, bar: BarInterval) -> URL {
+        directory.appendingPathComponent("\(venue.rawValue)-\(instId)-\(bar.rawValue).json")
     }
 
     private struct Payload: Codable {
@@ -466,9 +462,9 @@ enum CandleCache {
     /// A cached window, but only when it is fresh *and* long enough. A shorter
     /// window silently truncates a longer backtest, which would look like a
     /// coverage problem in the data rather than a cache miss.
-    static func load(instId: String, bar: BarInterval, atLeast: Int) -> [Candle]? {
+    static func load(venue: Venue, instId: String, bar: BarInterval, atLeast: Int) -> [Candle]? {
         guard !ProcessInfo.processInfo.environment.keys.contains("MAYSTOCK_NO_CACHE"),
-              let data = try? Data(contentsOf: url(instId: instId, bar: bar)) else { return nil }
+              let data = try? Data(contentsOf: url(venue: venue, instId: instId, bar: bar)) else { return nil }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         guard let payload = try? decoder.decode(Payload.self, from: data),
@@ -490,12 +486,12 @@ enum CandleCache {
     }
 
     static func save(
-        _ candles: [Candle], instId: String, bar: BarInterval, requested: Int
+        _ candles: [Candle], venue: Venue, instId: String, bar: BarInterval, requested: Int
     ) {
         guard !candles.isEmpty else { return }
         // Never shrink a cached window: a 500-day fetch must not be replaced by
         // a 30-day one just because that ran second.
-        if let existing = try? Data(contentsOf: url(instId: instId, bar: bar)) {
+        if let existing = try? Data(contentsOf: url(venue: venue, instId: instId, bar: bar)) {
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
             if let previous = try? decoder.decode(Payload.self, from: existing),
@@ -516,6 +512,6 @@ enum CandleCache {
         try? FileManager.default.createDirectory(
             at: directory, withIntermediateDirectories: true)
         try? encoder.encode(payload).write(
-            to: url(instId: instId, bar: bar), options: .atomic)
+            to: url(venue: venue, instId: instId, bar: bar), options: .atomic)
     }
 }

@@ -277,7 +277,7 @@ private struct StrategyRow: View {
                 .help(state.status.displayName + (state.message.map { " · \($0)" } ?? ""))
             VStack(alignment: .leading, spacing: 3) {
                 Text(strategy.name).font(Theme.Text.bodyMedium).lineLimit(1)
-                Text("\(strategy.market.instId) · \(strategy.market.instType.displayName) · \(strategy.market.bar.rawValue)")
+                Text("\(strategy.market.venue.displayName) · \(strategy.market.instId) · \(strategy.market.instType.displayName) · \(strategy.market.bar.rawValue)")
                     .font(Theme.Text.caption).foregroundStyle(.secondary)
                 HStack(spacing: 6) {
                     Text(allocation.map { "预算 \(PriceFormatter.money($0.capital, decimals: 0))" } ?? "未分配")

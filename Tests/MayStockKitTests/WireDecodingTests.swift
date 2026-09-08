@@ -18,7 +18,8 @@ struct WireDecodingTests {
         #expect(t.last == 118234.5)
         #expect(t.bid == 118234.4)
         #expect(t.ask == 118234.6)
-        #expect(abs(t.changePct24h - (118234.5 - 116800.0) / 116800.0 * 100) < 1e-9)
+        #expect(t.basis == .rolling24h)
+        #expect(abs(t.changePct - (118234.5 - 116800.0) / 116800.0 * 100) < 1e-9)
         #expect(t.ts == Date(timeIntervalSince1970: 1_783_500_000))
     }
 

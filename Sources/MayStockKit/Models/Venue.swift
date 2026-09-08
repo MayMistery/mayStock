@@ -125,4 +125,68 @@ public enum Venue: String, Codable, Sendable, CaseIterable, Identifiable, Hashab
         KernelCalendar(market: StrategyMarket(
             instId: "", instType: instrumentTypes[0], bar: bar, venue: self)).barsPerYear
     }
+
+    // MARK: Market data
+
+    /// Whether the venue trades around the clock or in sessions. The kernel's
+    /// calendar is the authority on *when*; this is the one Swift-side flag
+    /// that decides how a day of prices is framed, and the vocabulary test
+    /// checks it against the kernel's calendar for every venue.
+    public var tradesContinuously: Bool {
+        switch self {
+        case .okx: return true
+        case .schwab: return false
+        }
+    }
+
+    /// What "change" means on this venue's tickers.
+    public var changeBasis: ChangeBasis {
+        tradesContinuously ? .rolling24h : .previousClose
+    }
+
+    /// The clock the venue's day runs on.
+    public var timeZone: TimeZone {
+        switch self {
+        case .okx: return TimeZone(identifier: "UTC")!
+        case .schwab: return TimeZone(identifier: "America/New_York")!
+        }
+    }
+
+    /// Whether the venue's public data carries an order book worth drawing.
+    public var hasOrderBook: Bool {
+        switch self {
+        case .okx: return true
+        case .schwab: return false
+        }
+    }
+
+    /// The candle intervals the venue's data source serves. There is no
+    /// four-hour bar on a six-and-a-half-hour session.
+    public var supportedBars: [BarInterval] {
+        switch self {
+        case .okx: return BarInterval.allCases
+        case .schwab: return BarInterval.allCases.filter { $0 != .h4 }
+        }
+    }
+
+    /// Where the venue's prices come from, for the footer and the settings.
+    public var marketDataSourceName: String {
+        switch self {
+        case .okx: return "OKX 公共行情"
+        case .schwab: return "Yahoo Finance（嘉信审批期间的过渡源）"
+        }
+    }
+
+    /// The short name a watchlist row shows for an id: OKX pairs shed their
+    /// quote (`BTC-USDT` → `BTC`) and mark perpetuals; a ticker is its own
+    /// name.
+    public func shortLabel(for instId: String) -> String {
+        switch self {
+        case .okx:
+            let base = currencies(of: instId).base
+            return instrumentType(of: instId) == .swap ? base + "⚡︎" : base
+        case .schwab:
+            return instId
+        }
+    }
 }

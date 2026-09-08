@@ -72,7 +72,7 @@ public final class AlertEngine {
             if rules[idx].rearmAfterSeconds == nil {
                 rules[idx].enabled = false // one-shot
             }
-            let event = AlertEvent(rule: rules[idx], price: ticker.last, firedAt: now)
+            let event = AlertEvent(rule: rules[idx], price: ticker.last, basis: ticker.basis, firedAt: now)
             recentEvents.insert(event, at: 0)
             if recentEvents.count > 50 { recentEvents.removeLast() }
             onAlert?(event)
@@ -100,10 +100,10 @@ public final class AlertEngine {
             return previous > threshold + band && price <= threshold
 
         case .changePct24hAbove(let pct):
-            return ticker.changePct24h >= pct
+            return ticker.changePct >= pct
 
         case .changePct24hBelow(let pct):
-            return ticker.changePct24h <= pct
+            return ticker.changePct <= pct
 
         case .movePctWithin(let minutes, let pct):
             guard let move = spark.movePct(minutes: minutes, now: now) else { return false }

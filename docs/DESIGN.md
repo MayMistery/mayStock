@@ -77,13 +77,13 @@
 **关键决策**
 
 1. **Kit 与 App 分层**：MayStockKit 不依赖 AppKit，可在 Linux/CI 编译测试 —— E2E 驱动 `maystock-e2e` 直接复用同一套引擎，「测试的就是线上跑的代码」。
-2. **双 WebSocket 复用**：public 与 business 各一条连接，所有标的共享；订阅表由 MarketHub 维护，重连后自动重放。
+2. **行情按交易所走端口**：`MarketHub` 每家交易所各持一个 `MarketFeed`（实时推送）和一个 `MarketDataSource`（历史、元数据、搜索），按自选项的 `venue` 路由，自己不认识任何一家的协议。OKX 是两条共享的 WebSocket（public 与 business 各一条，订阅表由 feed 维护，重连后自动重放）；美股是轮询 Yahoo Finance 的图表接口（交易时段每 3 秒、休市每 60 秒），嘉信审批通过后换成它的行情 API 时页面不用动。`Ticker` 只有一种形状，涨跌的基准（24 小时前 / 昨收）和会话阶段随行情走，界面从上面读标签，不写死「24h」。
 3. **数据正确性**：K 线以 `ts` 为主键 replace-or-append；未确认 K 线（confirm=0）实时刷新；REST 回填与 WS 增量在同一 actor 内合并，无竞态。
 4. **交易走官方 CLI 而非自持密钥**：API Key 由 OKX 官方 `okx` CLI 的 `~/.okx/config.toml` 管理，MayStock 不接触、不存储任何私钥 —— 合规且边界干净。默认 demo（模拟盘），实盘需在「账户与连接」页显式解锁，切换前先验证目标账户并确认，每个策略在实盘启动时再单独确认。
    模拟盘与实盘是**两个账户、两套密钥**（OKX 对另一环境的 Key 一律回 "APIKey does not match current environment"），所以配置里每个环境各有一个 profile（`trading.demoProfile` / `trading.liveProfile`），`TradeBridge` 按调用的 mode 选 profile；App 只读 `config.toml` 的 profile 名与 `demo` 标记，从不读密钥。
 5. **Swift 6 工具链 + v5 语言模式**：并发注解按 v6 纪律书写（actor/@MainActor/Sendable），语言模式暂锁 v5 保证首编通过，后续可无痛升 v6。
 
-## 3. 数据面（OKX，已核实 2026-07）
+## 3. 数据面（OKX，已核实 2026-07；美股见 3.1）
 
 | 用途 | 通道/端点 | 说明 |
 |------|-----------|------|
@@ -96,6 +96,17 @@
 | 交易 | `okx` CLI（`npm i -g @okx_ai/okx-trade-cli`）：`okx spot place --instId … --json [--demo]`、`okx account balance --json` | 官方 Agent Trade Kit |
 
 限频遵循：REST candles 20 req/2s，回填分页间隔 ≥120ms；UI 侧节流不影响推送接收。
+
+### 3.1 美股数据面（Yahoo Finance 过渡源，已核实 2026-09）
+
+| 用途 | 端点 | 说明 |
+|------|------|------|
+| 实时价 | `GET query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1m&range=1d&includePrePost=true` | 报价从 `meta` 读（`regularMarketPrice`、`chartPreviousClose`、日内高低量），最新价取最后一根有成交的分钟 bar，含盘前盘后；`currentTradingPeriod` 给出当天三个时段，用来判断阶段 |
+| K 线 | 同上，`interval` = 1m/5m/15m/1h/1d/1wk，`period1`/`period2` 指定区间 | 1m 只有最近 7 天，5m/15m 60 天，1h 730 天，日线周线不限；没有 4H |
+| 代码搜索 | `GET query2.finance.yahoo.com/v1/finance/search?q=` | 只保留美国交易所的股票与 ETF |
+| 不存在的代码 | `{"chart":{"result":null,"error":{"code":"Not Found",…}}}` | 解成 `MarketDataError.unknownInstrument`，自选校验据此拒绝 |
+
+非官方接口，v7 报价端点已经要 cookie 与 crumb，所以只用 chart。它的存在只在 `Sources/MayStockKit/Yahoo/` 一个目录里。
 
 ## 4. 告警引擎
 

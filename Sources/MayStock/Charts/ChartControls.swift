@@ -18,8 +18,18 @@ enum ChartMode: String, CaseIterable, Identifiable, Hashable {
         }
     }
 
-    static var segments: [FilterSegment<ChartMode>] {
-        allCases.map { FilterSegment(value: $0, title: $0.title, help: $0.help) }
+    /// Whether the venue's data can draw this chart at all.
+    func available(on venue: Venue) -> Bool {
+        self != .depth || venue.hasOrderBook
+    }
+
+    static var segments: [FilterSegment<ChartMode>] { segments(for: .okx) }
+
+    /// The modes worth offering on a venue: no depth chart where there is no
+    /// book to draw it from.
+    static func segments(for venue: Venue) -> [FilterSegment<ChartMode>] {
+        allCases.filter { $0.available(on: venue) }
+            .map { FilterSegment(value: $0, title: $0.title, help: $0.help) }
     }
 }
 
@@ -90,17 +100,45 @@ struct SegmentedFilter<Value: Hashable>: View {
 
 // MARK: - Domain filters
 
-/// Trailing window of the tick-level line chart.
-enum LineWindow: Int, CaseIterable, Identifiable, Hashable {
-    case m5 = 5
-    case m15 = 15
-    case h1 = 60
-    case h4 = 240
-    case d1 = 1_440
+/// Window of the price line.
+///
+/// A market that never closes is drawn as a trailing stretch of clock time.
+/// A market with sessions is drawn by session: "the last hour" of a closed
+/// market is an empty picture, and what a stock app shows is today — or the
+/// last five days of it.
+enum LineWindow: String, CaseIterable, Identifiable, Hashable {
+    case m5, m15, h1, h4, d1
+    /// The current or most recent trading day, extended hours included.
+    case session
+    /// The last five sessions.
+    case d5
 
-    var id: Int { rawValue }
-    var minutes: Int { rawValue }
-    var seconds: TimeInterval { TimeInterval(rawValue) * 60 }
+    var id: String { rawValue }
+
+    /// The stretch of the sparkline buffer this window draws.
+    var sparkWindow: SparkWindow {
+        switch self {
+        case .m5: return .trailing(minutes: 5)
+        case .m15: return .trailing(minutes: 15)
+        case .h1: return .trailing(minutes: 60)
+        case .h4: return .trailing(minutes: 240)
+        case .d1: return .trailing(minutes: 1_440)
+        case .session: return .session
+        case .d5: return .days(7)
+        }
+    }
+
+    /// How much clock time the window spans, for a time-proportional axis;
+    /// nil when the window is a session, whose span is whatever it holds.
+    var seconds: TimeInterval? {
+        switch self {
+        case .session: return nil
+        case .d5: return 7 * 86_400
+        case .m5, .m15, .h1, .h4, .d1:
+            if case .trailing(let minutes) = sparkWindow { return TimeInterval(minutes) * 60 }
+            return nil
+        }
+    }
 
     var title: String {
         switch self {
@@ -109,6 +147,8 @@ enum LineWindow: Int, CaseIterable, Identifiable, Hashable {
         case .h1: return "1H"
         case .h4: return "4H"
         case .d1: return "1D"
+        case .session: return "今日"
+        case .d5: return "5日"
         }
     }
 
@@ -119,11 +159,34 @@ enum LineWindow: Int, CaseIterable, Identifiable, Hashable {
         case .h1: return "最近 1 小时"
         case .h4: return "最近 4 小时"
         case .d1: return "最近 24 小时"
+        case .session: return "当前或最近一个交易日，含盘前盘后"
+        case .d5: return "最近五个交易日"
         }
     }
 
-    static var segments: [FilterSegment<LineWindow>] {
-        allCases.map { FilterSegment(value: $0, title: $0.title, help: $0.help) }
+    /// The windows a venue offers.
+    static func options(for venue: Venue) -> [LineWindow] {
+        venue.tradesContinuously ? [.m5, .m15, .h1, .h4, .d1] : [.m15, .h1, .session, .d5]
+    }
+
+    /// This window on a venue that offers it, else the venue's own nearest:
+    /// the panel's choice is shared across instruments, and a stock's "today"
+    /// has to mean something when the next hover is a coin.
+    func resolved(for venue: Venue) -> LineWindow {
+        let options = Self.options(for: venue)
+        if options.contains(self) { return self }
+        switch self {
+        case .m5, .m15: return venue.tradesContinuously ? .m15 : .m15
+        case .h1: return .h1
+        case .h4, .session: return venue.tradesContinuously ? .h4 : .session
+        case .d1, .d5: return venue.tradesContinuously ? .d1 : .d5
+        }
+    }
+
+    static var segments: [FilterSegment<LineWindow>] { segments(for: .okx) }
+
+    static func segments(for venue: Venue) -> [FilterSegment<LineWindow>] {
+        options(for: venue).map { FilterSegment(value: $0, title: $0.title, help: $0.help) }
     }
 }
 
@@ -185,7 +248,10 @@ extension BarInterval {
         }
     }
 
-    static var segments: [FilterSegment<BarInterval>] {
-        allCases.map { FilterSegment(value: $0, title: $0.title, help: $0.help) }
+    static var segments: [FilterSegment<BarInterval>] { segments(for: .okx) }
+
+    /// The intervals the venue's data serves.
+    static func segments(for venue: Venue) -> [FilterSegment<BarInterval>] {
+        venue.supportedBars.map { FilterSegment(value: $0, title: $0.title, help: $0.help) }
     }
 }

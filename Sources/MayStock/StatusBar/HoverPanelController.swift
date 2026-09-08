@@ -162,7 +162,7 @@ final class HoverPanelController {
         // NSHostingController to a borderless panel collapses its frame to
         // zero, and an invisible panel is a far worse failure than a slightly
         // wrong height.
-        let root = makeRootView(instId: currentInstId ?? "BTC-USDT")
+        let root = makeRootView(instId: currentInstId ?? appState.store.config.watchlist.first?.instId ?? "")
         let hosting = FirstMouseHostingView(rootView: root)
         hosting.frame = NSRect(origin: .zero, size: panelSize)
         panel.contentView = hosting
