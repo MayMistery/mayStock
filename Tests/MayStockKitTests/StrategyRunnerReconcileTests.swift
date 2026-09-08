@@ -1882,3 +1882,102 @@ struct TickRoundingTests {
         #expect(StrategyRunner.snapToTick(5, tick: 0, roundingUp: true) == 5, "no tick, no snapping")
     }
 }
+
+// MARK: - Per-account figures
+
+/// Everything the runner reports about "the account" is about one account,
+/// and the exchange's word on what that account holds outranks the book's.
+@MainActor
+struct AccountScopedRunnerTests {
+    private func exchangeSwap(
+        _ instId: String, contracts: Double, notionalUsd: Double?
+    ) -> ExchangePosition {
+        ExchangePosition(
+            instId: instId, posSide: .long, quantity: contracts, averagePrice: 100,
+            markPrice: 100, unrealisedPnL: 0, leverage: 10, liquidationPrice: nil,
+            notionalUsd: notionalUsd)
+    }
+
+    @Test("敞口按交易所持仓计算，而不是按本地台账")
+    func exposureCountsWhatTheExchangeHolds() async {
+        let host = FakeHost()
+        host.fake.equity = 2_000
+        // The book holds nothing; the exchange holds a swap opened by hand.
+        host.fake.positionsResult = .success([
+            exchangeSwap("ETH-USDT-SWAP", contracts: 472.3, notionalUsd: 1_000),
+        ])
+        let runner = runner(for: host)
+
+        await runner.sampleEquityNow()
+
+        #expect(runner.nonStableExposure == 1_000)
+        #expect(runner.nonStableExposurePct == 50)
+        #expect(runner.exposureIsComplete)
+    }
+
+    @Test("交易所不报名义额时按张数 × 合约面值 × 标记价估值")
+    func exposureFallsBackToContractsTimesMark() async {
+        let host = FakeHost()
+        host.fake.equity = 1_000
+        // FakeVenue's meta: 0.01 base units per contract; mark 100.
+        host.fake.positionsResult = .success([
+            exchangeSwap("BTC-USDT-SWAP", contracts: 10, notionalUsd: nil),
+        ])
+        let runner = runner(for: host)
+
+        await runner.sampleEquityNow()
+
+        #expect(abs(runner.nonStableExposure - 10 * 0.01 * 100) < 1e-9)
+        #expect(runner.exposureIsComplete)
+    }
+
+    @Test("持仓读取失败时敞口标记为不完整，而不是悄悄变小")
+    func aFailedListingMarksExposureIncomplete() async {
+        let host = FakeHost()
+        host.fake.equity = 1_000
+        host.fake.positionsResult = .failure(TradeError.cliNotFound)
+        let runner = runner(for: host)
+
+        await runner.sampleEquityNow()
+
+        #expect(runner.accountEquity == 1_000, "equity is still known")
+        #expect(!runner.exposureIsComplete)
+    }
+
+    @Test("切换账户后回撤高点重置，模拟盘的峰值不会把实盘判成熔断")
+    func switchingAccountsResetsTheHighWaterMark() async {
+        let host = FakeHost()
+        host.portfolio.maxDrawdownPct = 25
+        host.fake.equity = 65_000
+        let runner = runner(for: host)
+        await runner.tick()
+        #expect(runner.accountEquity == 65_000)
+        #expect(runner.protectionTripped == nil)
+
+        // The live account is a different, smaller account.
+        host.portfolio.mode = .live
+        host.fake.equity = 13_000
+        await runner.tick()
+
+        #expect(runner.accountEquity == 13_000)
+        #expect(runner.accountDrawdownPct == 0)
+        #expect(runner.protectionTripped == nil,
+                "a 13k account is not 80% under water because a 65k account once existed")
+    }
+
+    @Test("同一账户上的回撤照常触发熔断")
+    func drawdownOnTheSameAccountStillTrips() async {
+        let host = FakeHost()
+        host.portfolio.maxDrawdownPct = 25
+        host.fake.equity = 65_000
+        let runner = runner(for: host)
+        await runner.tick()
+
+        host.fake.equity = 13_000
+        await runner.sampleEquityNow()
+        await runner.tick()
+
+        #expect(runner.accountDrawdownPct == 80)
+        #expect(runner.protectionTripped != nil)
+    }
+}

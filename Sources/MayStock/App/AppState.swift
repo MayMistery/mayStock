@@ -104,7 +104,24 @@ final class AppState {
     var exchangePositions: [ExchangePosition] = []
     var accountError: String?
     var accountRefreshedAt: Date?
+    /// Everything the exchange is holding open on the active account, whoever
+    /// placed it. Kept apart from `accountError`: a refused order book must
+    /// not blank the equity and positions that were read fine.
+    var openOrders: [ExchangeOpenOrder] = []
+    /// Books the listing could not read, in words; nil when it read them all.
+    var openOrdersNote: String?
+    var openOrdersError: String?
+    /// The exchange's own ledger of the active account, as last read. What
+    /// the window figures are summed from — see `BilledPnL`.
+    var exchangeBills: ExchangeBillListing?
+    var billsError: String?
     var isRefreshingAccount = false
+    /// The account is re-read on a clock, not only on a button: positions
+    /// opened by hand, stops firing and bills settling all happen on the
+    /// exchange with no word to this app.
+    static let accountRefreshInterval: TimeInterval = 300
+    private var accountRefreshLoop: Task<Void, Never>?
+    private var lastLoggedAccountError: String?
     var cliInfo: CLIInfo?
     var isDetectingCLI = false
 
@@ -158,10 +175,15 @@ final class AppState {
         Task {
             await detectTradeCLI()
             // The active account is checked at launch so the overview can say
-            // whether the engine will even be able to read the book.
+            // whether the engine will even be able to read the book — and then
+            // read, so what it holds is on screen before anyone asks.
             _ = await verifyConnection(tradingMode)
+            await refreshAccount()
         }
-        if !options.isSnapshot { runner.start() }
+        if !options.isSnapshot {
+            runner.start()
+            startAccountRefreshLoop()
+        }
         intelligence.start(watchlist: { [weak self] in
             self?.store.config.watchlist.map(\.instId) ?? []
         }, quote: { [weak self] instId in
@@ -296,6 +318,20 @@ final class AppState {
     /// Live account equity in USDT, sampled by the runner.
     var accountEquity: Double? { runner.accountEquity }
 
+    /// What the exchange's bills say the account realised over a window.
+    /// Nil until the ledger has been read.
+    func billedPnL(_ window: EquityWindow) -> BilledPnL? {
+        exchangeBills.map { BilledPnL.over(window, listing: $0) }
+    }
+
+    /// Unrealised profit on every position the exchange holds — whoever
+    /// opened it — at the exchange's own mark. Nil until the account has
+    /// been read.
+    var exchangeUnrealisedPnL: Double? {
+        guard accountRefreshedAt != nil else { return nil }
+        return exchangePositions.reduce(0) { $0 + $1.unrealisedPnL }
+    }
+
     /// Share of equity exposed to non-stablecoin price risk.
     var nonStableExposurePct: Double? { runner.nonStableExposurePct }
 
@@ -353,7 +389,7 @@ final class AppState {
         // A refresh asked for before launch-time detection has finished must
         // not report "no CLI" for a CLI that is there.
         if cliInfo == nil { await detectTradeCLI() }
-        if !profileCatalog.fileExists { reloadProfiles() }
+        reloadProfilesIfChanged()
         guard tradingReady else {
             accountBalances = []
             exchangePositions = []
@@ -364,20 +400,35 @@ final class AppState {
         let mode = tradingMode
         do {
             accountBalances = try await bridge.balances(mode: mode)
-            // Every family the exchange reports per instrument, so the
+            // Every position the exchange holds, whatever family, so the
             // reconciliation panel can judge an option leg as well as a
-            // perpetual one. A failed listing is an error on screen, not an
-            // empty list that reads as "nothing held".
-            var positions: [ExchangePosition] = []
-            for instType in InstrumentType.allCases where instType.isDerivative {
-                positions += try await bridge.positions(mode: mode, instType: instType)
-            }
-            exchangePositions = positions
+            // perpetual one and a delivery future is not invisible. A failed
+            // listing is an error on screen, not an empty list that reads as
+            // "nothing held".
+            exchangePositions = try await bridge.allPositions(mode: mode)
             accountError = nil
             accountRefreshedAt = Date()
         } catch {
             accountError = String(describing: error)
             return
+        }
+        do {
+            let listing = try await bridge.openOrders(mode: mode)
+            openOrders = listing.orders
+            openOrdersNote = listing.unavailable.isEmpty
+                ? nil : "未能读取：" + listing.unavailable.joined(separator: "、") + "。这些簿上若有挂单，这里不会显示。"
+            openOrdersError = nil
+        } catch {
+            openOrders = []
+            openOrdersNote = nil
+            openOrdersError = String(describing: error)
+        }
+        do {
+            exchangeBills = try await bridge.bills(mode: mode)
+            billsError = nil
+        } catch {
+            exchangeBills = nil
+            billsError = String(describing: error)
         }
         // Equity is the runner's figure — marked with the same prices the
         // engine trades on — so a refresh asks it to sample, rather than
@@ -413,7 +464,7 @@ final class AppState {
     // MARK: Strategy library
 
     func reloadStrategies() {
-        strategyStore.installPresetsIfEmpty()
+        strategyStore.seedPresetsOnFirstRun()
         let loaded = strategyStore.loadCompiled()
         strategies = loaded.ready
         brokenStrategies = loaded.broken
@@ -655,7 +706,42 @@ final class AppState {
         }
         terminalController?.show(page: page, strategyId: strategyId, instId: instId)
         if page == .overview || page == .strategies || page == .account {
-            Task { await refreshAccount() }
+            refreshAccountIfStale(maxAge: 60)
+        }
+    }
+
+    // MARK: Account freshness
+
+    /// Re-read the account when what is on screen is older than `maxAge`.
+    ///
+    /// Every surface that shows account figures asks here on appearing, so
+    /// which door the user came through — the intelligence page at launch,
+    /// the sidebar, the hover panel — never decides whether the figures are
+    /// there. They used to be read only when the overview was opened from
+    /// outside the window or its button pressed: launched onto the
+    /// intelligence page and switching to the overview showed an empty book.
+    func refreshAccountIfStale(maxAge: TimeInterval) {
+        if isRefreshingAccount { return }
+        if let at = accountRefreshedAt, Date().timeIntervalSince(at) < maxAge { return }
+        Task { await refreshAccount() }
+    }
+
+    func startAccountRefreshLoop() {
+        accountRefreshLoop?.cancel()
+        accountRefreshLoop = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(Self.accountRefreshInterval * 1_000_000_000))
+                guard !Task.isCancelled, let self else { return }
+                await self.refreshAccount()
+                // A refresh that keeps failing is on screen as a notice; the
+                // log gets it once per distinct failure, not once per tick.
+                if let error = self.accountError, error != self.lastLoggedAccountError {
+                    self.lastLoggedAccountError = error
+                    Log.warn("account: 定时刷新失败：\(error)")
+                } else if self.accountError == nil {
+                    self.lastLoggedAccountError = nil
+                }
+            }
         }
     }
 

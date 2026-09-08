@@ -10,6 +10,12 @@ struct OverviewPage: View {
     private var mode: TradingMode { appState.tradingMode }
 
     var body: some View {
+        pageBody
+            // Whatever brought the page up, the book on it must be current.
+            .onAppear { appState.refreshAccountIfStale(maxAge: 60) }
+    }
+
+    private var pageBody: some View {
         PageScroll {
             VStack(alignment: .leading, spacing: Theme.sectionSpacing) {
                 PageHeader(title: "总览",
@@ -31,6 +37,8 @@ struct OverviewPage: View {
                     positionsCard.frame(maxWidth: .infinity)
                     strategiesCard.frame(width: 360)
                 }
+
+                ordersCard
 
                 HStack(alignment: .top, spacing: Theme.sectionSpacing) {
                     balancesCard.frame(width: 400)
@@ -90,15 +98,23 @@ struct OverviewPage: View {
                      value: Format.money(appState.accountEquity),
                      caption: appState.nonStableExposurePct.map {
                          "非稳定币敞口 \(PriceFormatter.decimals($0, 1))%"
+                             + (appState.runner.exposureIsComplete ? "" : "*")
                      } ?? (appState.tradingBlocker ?? "等待引擎采样"),
                      captionTint: riskTint,
-                     help: "现货币种持仓 + 永续名义额，占账户权益的比例。做空同样计入敞口。")
+                     help: appState.runner.exposureIsComplete
+                         ? "现货币种持仓 + 交易所上全部衍生品名义额（含非 MayStock 开的仓），占账户权益的比例。做空同样计入敞口。"
+                         : "* 部分持仓未能从交易所读到或无法估值，实际敞口只会更高。现货币种持仓 + 衍生品名义额，占账户权益的比例。")
             StatTile(label: "账本盈亏 · 已实现 + 浮动",
                      value: Format.signedMoney(appState.openPnL),
                      tint: appState.openPnL.map(Theme.signed) ?? .secondary,
                      caption: appState.openPnLPct.map { "占已动用预算 " + PriceFormatter.signedPercent($0) }
                          ?? "扣手续费与资金费",
                      help: "本账户台账上每个策略的已实现盈亏加当前持仓的浮动盈亏，扣除手续费与资金费。不依赖权益历史。")
+            StatTile(label: "浮动盈亏 · 交易所标记",
+                     value: Format.signedMoney(appState.exchangeUnrealisedPnL),
+                     tint: appState.exchangeUnrealisedPnL.map(Theme.signed) ?? .secondary,
+                     caption: appState.exchangeUnrealisedPnL == nil ? "等待账户读数" : "\(appState.exchangePositions.count) 个持仓 · upl",
+                     help: "交易所对当前全部持仓（含非 MayStock 开的）按标记价算出的未实现盈亏之和。")
             ForEach(EquityWindow.allCases) { window in
                 windowTile(window)
             }
@@ -113,25 +129,36 @@ struct OverviewPage: View {
         }
     }
 
+    /// What the exchange's bills say the window realised — its figure, not
+    /// this app's. See `BilledPnL` for why there is no other period figure.
     private func windowTile(_ window: EquityWindow) -> some View {
-        let change = appState.equityChange(window)
-        let tint: Color = change.map { Theme.signed($0.changeQuote) } ?? .secondary
-        var caption = change.flatMap { $0.changePct.map(PriceFormatter.signedPercent) } ?? "等待记录"
-        if let change {
-            if change.hasGaps { caption += " · 有空洞" } else if !change.isAnchored { caption += " · 记录未满" }
-        }
-        return StatTile(label: window.longLabel.components(separatedBy: "（").first ?? window.label,
-                        value: Format.signedMoney(change?.changeQuote, decimals: 0),
+        let billed = appState.billedPnL(window)
+        let tint: Color = billed.map { Theme.signed($0.total) } ?? .secondary
+        var caption = billed.map { "已实现 · \($0.billCount) 条账单" }
+            ?? (appState.billsError == nil ? "等待账单" : "账单读取失败")
+        if let billed, !billed.coversWindow { caption += " · 账单未翻到起点" }
+        return StatTile(label: (window.longLabel.components(separatedBy: "（").first ?? window.label) + " · 账单",
+                        value: Format.signedMoney(billed?.total, decimals: 0),
                         tint: tint,
                         caption: caption,
-                        captionTint: change.map { $0.hasGaps ? Theme.down : ($0.isAnchored ? .secondary : .secondary) } ?? .secondary,
-                        help: tooltip(window, change))
+                        captionTint: billed?.coversWindow == false ? Theme.warning : .secondary,
+                        help: tooltip(window, billed))
     }
 
-    private func tooltip(_ window: EquityWindow, _ change: EquityChange?) -> String {
-        guard let change else { return "\(window.longLabel)：还没有任何权益采样" }
-        let range = "\(PriceFormatter.money(change.startEquity)) → \(PriceFormatter.money(change.endEquity)) \(appState.runner.quoteCurrency)"
-        return change.coverageNote.isEmpty ? "\(window.longLabel)\n\(range)" : "\(window.longLabel)\n\(range)\n\(change.coverageNote)"
+    private func tooltip(_ window: EquityWindow, _ billed: BilledPnL?) -> String {
+        let head = "\(window.longLabel) · OKX 账单口径"
+        guard let billed else { return head + "\n" + (appState.billsError ?? "还没有读到账单") }
+        var lines = [
+            head,
+            "平仓盈亏 \(PriceFormatter.signedMoney(billed.closedTradePnL)) · 资金费 \(PriceFormatter.signedMoney(billed.funding))"
+                + " · 手续费 \(PriceFormatter.signedMoney(billed.fees))"
+                + (billed.interest != 0 ? " · 利息 \(PriceFormatter.signedMoney(billed.interest))" : ""),
+        ]
+        if !billed.coversWindow, let oldest = appState.exchangeBills?.oldestBillAt {
+            lines.append("* 账单只翻到 \(Format.stamp(oldest))，更早的没算进来")
+        }
+        lines.append("OKX 的 API 不提供分时段盈亏和权益历史（App 里的今日收益是其服务端算的）；浮动盈亏见左侧，按交易所标记价。")
+        return lines.joined(separator: "\n")
     }
 
     // MARK: Equity
@@ -193,7 +220,87 @@ struct OverviewPage: View {
                 GridText(PriceFormatter.signedMoney(pnl), tint: Theme.signed(pnl), mono: true, alignment: .trailing)
                 GridText(pct.map(PriceFormatter.signedPercent) ?? "—", tint: Theme.signed(pct ?? 0), mono: true, alignment: .trailing)
             }
+            externalPositionsGrid
         }
+    }
+
+    /// What the exchange holds that no strategy's book does. Listed, not
+    /// alarmed about: there is nothing for the book to be wrong about, but a
+    /// 10× long opened by hand is the account's risk all the same.
+    @ViewBuilder
+    private var externalPositionsGrid: some View {
+        let external = appState.externalPositions
+        if !external.isEmpty {
+            Text("交易所持仓 · 非 MayStock 策略开仓（手动、其它程序，或本机安装前就有）")
+                .font(Theme.Text.caption).foregroundStyle(.secondary).padding(.top, 6)
+            DataGrid(columns: [
+                GridColumn(title: "标的"), GridColumn(title: "族"), GridColumn(title: "方向"),
+                GridColumn(title: "张数", alignment: .trailing), GridColumn(title: "均价", alignment: .trailing),
+                GridColumn(title: "标记价", alignment: .trailing), GridColumn(title: "名义额", alignment: .trailing),
+                GridColumn(title: "未实现", alignment: .trailing), GridColumn(title: "杠杆", alignment: .trailing),
+            ], rows: external) { position in
+                GridText(position.instId, mono: true, weight: .medium, fit: true)
+                GridText(position.familyLabel, tint: .secondary, fit: true)
+                GridText(position.quantity > 0 ? "多" : "空", tint: Theme.trend(position.quantity > 0), weight: .semibold, fit: true)
+                GridText(PriceFormatter.plain(abs(position.quantity)), mono: true, alignment: .trailing)
+                GridText(PriceFormatter.auto(position.averagePrice), mono: true, alignment: .trailing)
+                GridText(position.markPrice.map(PriceFormatter.auto) ?? "—", mono: true, alignment: .trailing)
+                GridText(position.notionalUsd.map { PriceFormatter.money($0, decimals: 0) } ?? "—", mono: true, alignment: .trailing)
+                GridText(PriceFormatter.signedMoney(position.unrealisedPnL), tint: Theme.signed(position.unrealisedPnL), mono: true, alignment: .trailing)
+                GridText(position.leverage.map { "\(PriceFormatter.decimals($0, 0))×" } ?? "—", mono: true, alignment: .trailing)
+            }
+        }
+    }
+
+    // MARK: Open orders
+
+    /// Everything the exchange is holding open on this account — resting
+    /// limits and armed stops alike — and who placed each: a strategy of ours
+    /// by its tag, otherwise "外部".
+    private var ordersCard: some View {
+        Card(title: "挂单", subtitle: "交易所当前挂着的 · 普通委托 + 策略委托（止盈止损、计划、移动止损）· 最新在前") {
+            EmptyView()
+        } content: {
+            if let error = appState.openOrdersError {
+                InlineNotice(kind: .danger, title: "挂单读取失败", message: error)
+            } else if let note = appState.openOrdersNote {
+                InlineNotice(kind: .warning, title: "挂单列表不完整", message: note)
+            }
+            DataGrid(columns: [
+                GridColumn(title: "时间"), GridColumn(title: "标的"), GridColumn(title: "类型"), GridColumn(title: "方向"),
+                GridColumn(title: "价格", alignment: .trailing), GridColumn(title: "触发价", alignment: .trailing),
+                GridColumn(title: "数量", alignment: .trailing), GridColumn(title: "已成交", alignment: .trailing),
+                GridColumn(title: "来源"),
+            ], rows: appState.openOrders,
+               emptyText: appState.openOrdersError == nil ? "交易所上没有挂单" : "—") { order in
+                GridText(order.createdAt.map(Format.stamp) ?? "—", tint: .secondary, mono: true, fit: true)
+                GridText(order.instId, mono: true, fit: true)
+                GridText(order.kindLabel, weight: .medium, fit: true)
+                GridText(Self.directionLabel(order), tint: Theme.trend(order.side == .buy), weight: .semibold, fit: true)
+                GridText(order.price.map(PriceFormatter.auto) ?? "市价", mono: true, alignment: .trailing)
+                GridText(order.triggerPrice.map(PriceFormatter.auto) ?? "—", mono: true, alignment: .trailing)
+                GridText(Self.sizeLabel(order), mono: true, alignment: .trailing)
+                GridText(order.filledSize > 0 ? PriceFormatter.plain(order.filledSize) : "—", mono: true, alignment: .trailing)
+                GridText(appState.orderSource(order), tint: .secondary, fit: true)
+            }
+        }
+    }
+
+    /// "卖出平多", "买入开空", or plain "买入" on a market without legs.
+    static func directionLabel(_ order: ExchangeOpenOrder) -> String {
+        let action = order.side == .buy ? "买入" : "卖出"
+        guard let posSide = order.posSide, posSide != .net else {
+            return order.reduceOnly ? action + "·只减仓" : action
+        }
+        return action + (order.reduceOnly ? "平" : "开") + (posSide == .long ? "多" : "空")
+    }
+
+    static func sizeLabel(_ order: ExchangeOpenOrder) -> String {
+        if let size = order.size { return PriceFormatter.plain(size) }
+        if let fraction = order.closeFraction {
+            return fraction >= 1 ? "全平" : "平 \(PriceFormatter.decimals(fraction * 100, 0))%"
+        }
+        return "—"
     }
 
     // MARK: Strategies

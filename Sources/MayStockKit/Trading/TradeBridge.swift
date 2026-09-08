@@ -302,12 +302,20 @@ public struct ExchangePosition: Sendable, Equatable, Identifiable {
     public let unrealisedPnL: Double
     public let leverage: Double?
     public let liquidationPrice: Double?
+    /// The exchange's own statement of what the position controls, in USD
+    /// (`notionalUsd`). Nil when the venue does not report one.
+    public let notionalUsd: Double?
+    /// The family the exchange files the position under — `SWAP`, `FUTURES`,
+    /// `OPTION`, `MARGIN` — as it spells it. Read rather than inferred from
+    /// the id, so a delivery future is not mistaken for spot.
+    public let instType: String
 
     public var id: String { instId + posSide.rawValue }
 
     public init(
         instId: String, posSide: PositionSide, quantity: Double, averagePrice: Double,
-        markPrice: Double?, unrealisedPnL: Double, leverage: Double?, liquidationPrice: Double?
+        markPrice: Double?, unrealisedPnL: Double, leverage: Double?, liquidationPrice: Double?,
+        notionalUsd: Double? = nil, instType: String = ""
     ) {
         self.instId = instId
         self.posSide = posSide
@@ -317,6 +325,129 @@ public struct ExchangePosition: Sendable, Equatable, Identifiable {
         self.unrealisedPnL = unrealisedPnL
         self.leverage = leverage
         self.liquidationPrice = liquidationPrice
+        self.notionalUsd = notionalUsd
+        self.instType = instType
+    }
+
+    public var isOption: Bool { instType == "OPTION" }
+
+    /// The family in words.
+    public var familyLabel: String {
+        switch instType {
+        case "SWAP": return "永续"
+        case "FUTURES": return "交割"
+        case "OPTION": return "期权"
+        case "MARGIN": return "杠杆"
+        case "SPOT": return "现货"
+        default: return instType.isEmpty ? "—" : instType
+        }
+    }
+}
+
+/// An order the exchange is holding open, however it got there: a resting
+/// limit in the order book, or an algo order — conditional, OCO, trigger,
+/// trailing — waiting on its trigger. Read from the exchange rather than
+/// remembered, and listed whoever placed it: what is armed on the account is
+/// the account's business, not only the part MayStock placed.
+public struct ExchangeOpenOrder: Sendable, Equatable, Identifiable {
+    /// Which of the exchange's two books the order sits in.
+    public enum Book: String, Sendable, CaseIterable {
+        case order, algo
+
+        public var displayName: String { self == .order ? "普通委托" : "策略委托" }
+    }
+
+    /// `ordId`, or `algoId` for the algo book.
+    public let id: String
+    public let book: Book
+    public let instId: String
+    /// The exchange's own type word: `limit`, `post_only`, `conditional`,
+    /// `oco`, `trigger`, `move_order_stop`, `twap`…
+    public let ordType: String
+    public let side: OrderSide
+    public let posSide: PositionSide?
+    /// The price the order rests at, or fills at once triggered. Nil is market.
+    public let price: Double?
+    /// The level an algo order waits for: its own trigger, or the single
+    /// stop / take-profit leg's trigger when it has just one.
+    public let triggerPrice: Double?
+    public let stopTriggerPrice: Double?
+    public let takeProfitTriggerPrice: Double?
+    /// Contracts or base units. Nil when the order is sized as a fraction of
+    /// the position instead — see `closeFraction`.
+    public let size: Double?
+    /// The share of the position the order closes, when it is sized that way
+    /// (1 is "close all").
+    public let closeFraction: Double?
+    public let filledSize: Double
+    /// The exchange's state word: `live`, `partially_filled`, `effective`…
+    public let state: String
+    public let reduceOnly: Bool
+    public let clOrdId: String?
+    public let createdAt: Date?
+
+    public init(
+        id: String, book: Book, instId: String, ordType: String, side: OrderSide,
+        posSide: PositionSide?, price: Double?, triggerPrice: Double?, stopTriggerPrice: Double?,
+        takeProfitTriggerPrice: Double?, size: Double?, closeFraction: Double?, filledSize: Double,
+        state: String, reduceOnly: Bool, clOrdId: String?, createdAt: Date?
+    ) {
+        self.id = id
+        self.book = book
+        self.instId = instId
+        self.ordType = ordType
+        self.side = side
+        self.posSide = posSide
+        self.price = price
+        self.triggerPrice = triggerPrice
+        self.stopTriggerPrice = stopTriggerPrice
+        self.takeProfitTriggerPrice = takeProfitTriggerPrice
+        self.size = size
+        self.closeFraction = closeFraction
+        self.filledSize = filledSize
+        self.state = state
+        self.reduceOnly = reduceOnly
+        self.clOrdId = clOrdId
+        self.createdAt = createdAt
+    }
+
+    /// The order in words: what kind, and for a conditional order which leg.
+    public var kindLabel: String {
+        switch ordType {
+        case "limit": return "限价"
+        case "market": return "市价"
+        case "post_only": return "只挂单"
+        case "fok": return "FOK"
+        case "ioc": return "IOC"
+        case "optimal_limit_ioc": return "市价 IOC"
+        case "conditional":
+            switch (stopTriggerPrice != nil, takeProfitTriggerPrice != nil) {
+            case (true, true): return "止盈止损"
+            case (true, false): return "止损"
+            case (false, true): return "止盈"
+            case (false, false): return "条件单"
+            }
+        case "oco": return "OCO 止盈止损"
+        case "trigger": return "计划委托"
+        case "move_order_stop": return "移动止损"
+        case "chase": return "追单"
+        case "iceberg": return "冰山"
+        case "twap": return "TWAP"
+        default: return ordType
+        }
+    }
+}
+
+/// What `openOrders` could and could not read.
+public struct OpenOrderListing: Sendable, Equatable {
+    public var orders: [ExchangeOpenOrder]
+    /// Books that could not be listed, in words, so an empty list is never
+    /// mistaken for "nothing armed" on a book that could not be asked.
+    public var unavailable: [String]
+
+    public init(orders: [ExchangeOpenOrder] = [], unavailable: [String] = []) {
+        self.orders = orders
+        self.unavailable = unavailable
     }
 }
 
@@ -730,6 +861,14 @@ public struct TradeBridge: Sendable {
         return Self.parsePositions(json: output)
     }
 
+    /// Every position the exchange holds, whatever family — perpetuals,
+    /// delivery futures, options, margin — in one unfiltered listing. The
+    /// per-family call above only knows the families this app trades; an
+    /// account can hold more than that, and all of it is price risk.
+    public func allPositions(mode: TradingMode) async throws -> [ExchangePosition] {
+        Self.parsePositions(json: try await runCLI(["account", "positions"], mode: mode))
+    }
+
     /// Resolve an order by its client id.
     ///
     /// A timeout is not a rejection: the request may have reached the exchange
@@ -813,7 +952,7 @@ public struct TradeBridge: Sendable {
             guard let billId = dict["billId"] as? String, !billId.isEmpty,
                   let inst = dict["instId"] as? String,
                   instId == nil || inst == instId,
-                  let amount = number(dict, "balChg") ?? number(dict, "pnl"),
+                  let amount = fundingAmount(dict),
                   let ms = number(dict, "ts") else { return }
             found.append(FundingPayment(
                 id: billId, instId: inst, amount: amount,
@@ -821,6 +960,65 @@ public struct TradeBridge: Sendable {
                 ts: Date(timeIntervalSince1970: ms / 1000)))
         }
         return found.sorted { $0.ts < $1.ts }
+    }
+
+    /// The settlement on a funding bill, wherever the exchange put it.
+    ///
+    /// Isolated margin books funding to the position: `balChg` is "0" and the
+    /// settlement is `pnl`. Cross margin books it to the cash balance, so
+    /// `balChg` carries it and `pnl` may too. Reading `balChg` first booked
+    /// every isolated settlement as nothing — on a book that is all isolated,
+    /// that is every settlement.
+    static func fundingAmount(_ dict: [String: Any]) -> Double? {
+        let pnl = number(dict, "pnl")
+        let balanceChange = number(dict, "balChg")
+        if let pnl, pnl != 0 { return pnl }
+        if let balanceChange, balanceChange != 0 { return balanceChange }
+        return pnl ?? balanceChange
+    }
+
+    /// The exchange's own ledger of this account, newest first.
+    ///
+    /// Read to sum what a window *realised* — the one period figure the
+    /// exchange can vouch for; see `BilledPnL`. The live listing is one page
+    /// of the last seven days. The archive reaches three months but is slow
+    /// and lags the newest settlements, so it is read only when the live page
+    /// was full and did not reach the earliest window anyone will ask about.
+    /// The two overlap and are merged on bill id.
+    public func bills(mode: TradingMode, limit: Int = 100, now: Date = Date()) async throws -> ExchangeBillListing {
+        let live = Self.parseBills(json: try await runCLI(["account", "bills", "--limit", String(limit)], mode: mode))
+        var byId = Dictionary(live.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var exhausted = live.count < limit
+        let earliestAnchor = EquityWindow.allCases.map { $0.anchor(now: now) }.min() ?? now
+        if !exhausted, (live.map(\.ts).min() ?? now) > earliestAnchor {
+            let archive = Self.parseBills(json: try await runCLI(
+                ["account", "bills", "--archive", "--limit", String(limit)],
+                mode: mode, timeout: Self.archiveCommandTimeout))
+            for bill in archive where byId[bill.id] == nil { byId[bill.id] = bill }
+            exhausted = archive.count < limit
+        }
+        return ExchangeBillListing(bills: byId.values.sorted { $0.ts > $1.ts }, exhausted: exhausted, fetchedAt: now)
+    }
+
+    static func parseBills(json: String) -> [ExchangeBill] {
+        var byId: [String: ExchangeBill] = [:]
+        walkObjects(in: json) { dict in
+            guard let id = dict["billId"] as? String, !id.isEmpty,
+                  let ms = number(dict, "ts"),
+                  let type = (dict["type"] as? String).flatMap(Int.init) ?? number(dict, "type").map({ Int($0) })
+            else { return }
+            byId[id] = ExchangeBill(
+                id: id, ts: Date(timeIntervalSince1970: ms / 1_000), type: type,
+                subType: (dict["subType"] as? String).flatMap(Int.init),
+                instId: (dict["instId"] as? String).flatMap { $0.isEmpty ? nil : $0 },
+                ccy: (dict["ccy"] as? String) ?? "",
+                pnl: number(dict, "pnl") ?? 0,
+                fee: number(dict, "fee") ?? 0,
+                interest: number(dict, "interest") ?? 0,
+                balanceChange: number(dict, "balChg") ?? 0,
+                positionBalanceChange: number(dict, "posBalChg") ?? 0)
+        }
+        return byId.values.sorted { $0.ts > $1.ts }
     }
 
     /// What the *exchange* says a derivative instrument has earned, cost and
@@ -880,7 +1078,7 @@ public struct TradeBridge: Sendable {
                     type: type,
                     fee: number(dict, "fee") ?? 0,
                     amount: type == 8
-                        ? (number(dict, "balChg") ?? number(dict, "pnl") ?? 0)
+                        ? (fundingAmount(dict) ?? 0)
                         : (number(dict, "pnl") ?? 0),
                     tradeId: (dict["tradeId"] as? String).flatMap { $0.isEmpty ? nil : $0 })
             }
@@ -951,6 +1149,83 @@ public struct TradeBridge: Sendable {
                 uid: dict["uid"] as? String)
         }
         return result
+    }
+
+    // MARK: Open orders
+
+    /// Every order the exchange is holding open on this account: the normal
+    /// book and the algo book of each family the CLI has a module for.
+    ///
+    /// A book that cannot be listed is reported by name rather than skipped.
+    /// The CLI's option algo listing, for one, is refused by the exchange
+    /// ("Parameter instType error"), and an empty list in its place would
+    /// read as "nothing armed" on an account that may well have a stop there.
+    /// Only when no book at all could be read is the failure an error.
+    public func openOrders(mode: TradingMode) async throws -> OpenOrderListing {
+        var listing = OpenOrderListing()
+        var firstError: Error?
+        var attempted = 0
+        for instType in InstrumentType.allCases {
+            guard let module = instType.cliModule else { continue }
+            for book in ExchangeOpenOrder.Book.allCases {
+                attempted += 1
+                let arguments = book == .order ? [module, "orders"] : [module, "algo", "orders"]
+                do {
+                    let output = try await runCLI(arguments, mode: mode)
+                    listing.orders += Self.parseOpenOrders(json: output, book: book)
+                } catch {
+                    firstError = firstError ?? error
+                    listing.unavailable.append("\(instType.displayName)\(book.displayName)")
+                    Log.warn("bridge: 读取\(instType.displayName)\(book.displayName)失败：\(error)")
+                }
+            }
+        }
+        if listing.unavailable.count == attempted, let firstError { throw firstError }
+        listing.orders.sort { ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast) }
+        return listing
+    }
+
+    /// States in which an order is still on the book. The listing endpoints
+    /// only return open orders, but their history variants share the shape,
+    /// and a finished order must never be shown as armed.
+    static let openOrderStates: Set<String> = [
+        "live", "partially_filled", "effective", "partially_effective", "pause",
+    ]
+
+    static func parseOpenOrders(json: String, book: ExchangeOpenOrder.Book) -> [ExchangeOpenOrder] {
+        var out: [ExchangeOpenOrder] = []
+        walkObjects(in: json) { dict in
+            guard let id = dict[book == .algo ? "algoId" : "ordId"] as? String, !id.isEmpty,
+                  let instId = dict["instId"] as? String, !instId.isEmpty,
+                  let sideRaw = dict["side"] as? String, let side = OrderSide(rawValue: sideRaw)
+            else { return }
+            let state = (dict["state"] as? String) ?? ""
+            guard state.isEmpty || openOrderStates.contains(state) else { return }
+
+            let stop = number(dict, "slTriggerPx")
+            let target = number(dict, "tpTriggerPx")
+            // A leg priced at -1 fills at market; only a real level is a price.
+            let legPrice = [number(dict, "tpOrdPx"), number(dict, "slOrdPx")].compactMap { $0 }.first { $0 > 0 }
+            let price = number(dict, "px") ?? number(dict, "orderPx") ?? legPrice
+            let trigger = number(dict, "triggerPx") ?? number(dict, "moveTriggerPx")
+                ?? (stop != nil && target != nil ? nil : (stop ?? target))
+            let createdAt = number(dict, "cTime").map { Date(timeIntervalSince1970: $0 / 1_000) }
+            out.append(ExchangeOpenOrder(
+                id: id, book: book, instId: instId,
+                ordType: (dict["ordType"] as? String) ?? "",
+                side: side,
+                posSide: (dict["posSide"] as? String).flatMap(PositionSide.init(rawValue:)),
+                price: price, triggerPrice: trigger,
+                stopTriggerPrice: stop, takeProfitTriggerPrice: target,
+                size: number(dict, "sz"),
+                closeFraction: number(dict, "closeFraction"),
+                filledSize: number(dict, "fillSz") ?? number(dict, "actualSz") ?? 0,
+                state: state,
+                reduceOnly: flag(dict, "reduceOnly") ?? false,
+                clOrdId: (dict["clOrdId"] as? String).flatMap { $0.isEmpty ? nil : $0 },
+                createdAt: createdAt))
+        }
+        return out
     }
 
     // MARK: Protective orders
@@ -1175,7 +1450,9 @@ public struct TradeBridge: Sendable {
                 markPrice: number(dict, "markPx"),
                 unrealisedPnL: number(dict, "upl") ?? 0,
                 leverage: number(dict, "lever"),
-                liquidationPrice: number(dict, "liqPx")))
+                liquidationPrice: number(dict, "liqPx"),
+                notionalUsd: number(dict, "notionalUsd"),
+                instType: (dict["instType"] as? String) ?? ""))
         }
         return out
     }

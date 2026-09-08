@@ -121,7 +121,8 @@ public struct StrategyStore: Sendable {
         }
     }
 
-    /// Seed the library with the built-in presets the first time it is opened.
+    /// Fill an empty library with the built-in presets — the deliberate way
+    /// *back* to the examples, offered as a button on the strategies page.
     @discardableResult
     public func installPresetsIfEmpty() -> [StrategyManifest] {
         guard load().isEmpty else { return [] }
@@ -130,6 +131,22 @@ public struct StrategyStore: Sendable {
             installed.append(preset)
         }
         return installed
+    }
+
+    /// Seed the library the first time this install opens it.
+    ///
+    /// Seeding on every reload — which is what calling `installPresetsIfEmpty`
+    /// from the reload path did — meant an emptied library refilled itself at
+    /// the next launch: "remove every strategy" was a state the app would not
+    /// hold, and the empty state that offers the restore button could never be
+    /// reached. So seeding hangs on the library folder not existing yet, which
+    /// is true exactly once per install. Emptying the folder keeps it empty;
+    /// deleting the folder is how you ask for the examples back without the
+    /// button.
+    @discardableResult
+    public func seedPresetsOnFirstRun() -> [StrategyManifest] {
+        guard !FileManager.default.fileExists(atPath: directory.path) else { return [] }
+        return installPresetsIfEmpty()
     }
 
     func fileURL(for id: String) -> URL {

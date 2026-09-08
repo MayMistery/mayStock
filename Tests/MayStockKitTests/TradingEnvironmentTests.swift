@@ -161,6 +161,39 @@ struct TradingEnvironmentTests {
                 == #"passphrase = "a#b" "#)
     }
 
+    /// The catalogue is a snapshot of the file; it must know when the file
+    /// has moved on, or a profile added while the app is open stays invisible
+    /// until a restart.
+    @Test func catalogueKnowsWhenTheFileChanged() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("maystock-okx-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("config.toml")
+
+        let missing = OKXProfileCatalog.load(from: url)
+        #expect(!missing.fileExists)
+        #expect(!missing.isStale(against: url), "no file then, no file now")
+
+        try Self.sampleTOML.write(to: url, atomically: true, encoding: .utf8)
+        #expect(missing.isStale(against: url), "a file appeared")
+
+        let loaded = OKXProfileCatalog.load(from: url)
+        #expect(loaded.fileExists)
+        #expect(!loaded.isStale(against: url))
+
+        // Rewrite with a later timestamp: a same-second rewrite must still count.
+        try (Self.sampleTOML + "\n[profiles.added]\ndemo = false\n")
+            .write(to: url, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(5)], ofItemAtPath: url.path)
+        #expect(loaded.isStale(against: url), "the file was rewritten")
+        #expect(OKXProfileCatalog.load(from: url).profile(named: "added")?.isDemo == false)
+
+        try FileManager.default.removeItem(at: url)
+        #expect(loaded.isStale(against: url), "the file is gone")
+    }
+
     // MARK: Connection diagnostics
 
     @Test func environmentMismatchGetsAnActionableHint() {

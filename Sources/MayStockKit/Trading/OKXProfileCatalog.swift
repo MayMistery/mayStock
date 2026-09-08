@@ -34,11 +34,19 @@ public struct OKXProfileCatalog: Sendable, Equatable {
     /// False when the config file does not exist at all: the CLI has never
     /// been configured, which is a different message from "no profiles".
     public var fileExists: Bool
+    /// When the file this catalogue was read from was last written; nil when
+    /// it did not exist. The catalogue is a snapshot of the file, and this is
+    /// what says whether the snapshot is still the file.
+    public var fileModifiedAt: Date?
 
-    public init(profiles: [OKXProfile] = [], defaultProfile: String? = nil, fileExists: Bool = false) {
+    public init(
+        profiles: [OKXProfile] = [], defaultProfile: String? = nil, fileExists: Bool = false,
+        fileModifiedAt: Date? = nil
+    ) {
         self.profiles = profiles
         self.defaultProfile = defaultProfile
         self.fileExists = fileExists
+        self.fileModifiedAt = fileModifiedAt
     }
 
     public static let empty = OKXProfileCatalog()
@@ -66,7 +74,30 @@ public struct OKXProfileCatalog: Sendable, Equatable {
         }
         var catalog = parse(text)
         catalog.fileExists = true
+        catalog.fileModifiedAt = modificationDate(of: url)
         return catalog
+    }
+
+    /// The file's last-write time, nil when it is not there.
+    public static func modificationDate(of url: URL) -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+    }
+
+    /// True when the file has been created, removed or rewritten since this
+    /// catalogue was read from it.
+    ///
+    /// The app used to read the file once at launch and then only again when
+    /// the read had found no file at all. A profile added with `okx config
+    /// init` while the app was open therefore never appeared — the account
+    /// page kept offering the launch-time snapshot as if it were the file —
+    /// until a restart. Whether the snapshot is current is a question about
+    /// the file, so it is answered from the file.
+    public func isStale(against url: URL = defaultFileURL()) -> Bool {
+        switch (Self.modificationDate(of: url), fileExists) {
+        case (nil, false): return false
+        case (nil, true), (.some, false): return true
+        case (let onDisk?, true): return onDisk != fileModifiedAt
+        }
     }
 
     /// A deliberately narrow TOML reader.

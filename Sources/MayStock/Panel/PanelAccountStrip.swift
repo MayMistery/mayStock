@@ -37,6 +37,42 @@ struct PanelAccountStrip: View {
             .sorted { $0.instId < $1.instId }
     }
 
+    /// Exchange positions on this underlying that no strategy's book holds —
+    /// opened by hand or by another program. The panel is the account's
+    /// window, so they belong on it as much as the strategies' own.
+    private var externalHere: [ExchangePosition] {
+        appState.externalPositions.filter {
+            AppState.underlying($0.instId, venue: appState.venue(of: $0.instId)) == panelUnderlying
+        }
+    }
+
+    private var externalElsewhere: [ExchangePosition] {
+        appState.externalPositions
+            .filter { AppState.underlying($0.instId, venue: appState.venue(of: $0.instId)) != panelUnderlying }
+            .sorted { $0.instId < $1.instId }
+    }
+
+    /// Orders the exchange holds on this underlying, whoever placed them.
+    private var ordersHere: [ExchangeOpenOrder] {
+        appState.openOrders.filter {
+            AppState.underlying($0.instId, venue: appState.venue(of: $0.instId)) == panelUnderlying
+        }
+    }
+
+    /// One line: what is armed here, and how much is armed elsewhere.
+    private var ordersSummary: String? {
+        let here = ordersHere
+        let elsewhere = appState.openOrders.count - here.count
+        var parts: [String] = here.prefix(3).map { order in
+            let level = (order.triggerPrice ?? order.price).map(PriceFormatter.auto) ?? "市价"
+            return "\(order.kindLabel) \(order.side == .buy ? "买" : "卖") @ \(level)"
+        }
+        if here.count > 3 { parts.append("另 \(here.count - 3) 笔") }
+        if elsewhere > 0 { parts.append("其它标的 \(elsewhere) 笔") }
+        guard !parts.isEmpty else { return nil }
+        return "挂单 · " + parts.joined(separator: " · ")
+    }
+
     private var runningHere: Int {
         appState.strategies
             .filter { AppState.underlying($0.market.instId, venue: $0.market.venue) == panelUnderlying }
@@ -49,6 +85,7 @@ struct PanelAccountStrip: View {
             equityRow
             if appState.openPnL != nil { currentPnLRow }
             returnsRow
+            exchangePnLRow
             notice
             Divider().opacity(0.35)
             positionsBlock
@@ -56,6 +93,9 @@ struct PanelAccountStrip: View {
         .padding(10)
         .background(Theme.rowFill, in: RoundedRectangle(cornerRadius: 10))
         .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Theme.mode(mode).opacity(0.25), lineWidth: 1))
+        // A hover is not a button press: the panel shows what it has and only
+        // asks the exchange again when that is minutes old.
+        .onAppear { appState.refreshAccountIfStale(maxAge: AppState.accountRefreshInterval) }
     }
 
     // MARK: Equity
@@ -76,8 +116,12 @@ struct PanelAccountStrip: View {
                     .animation(.snappy(duration: 0.2), value: equity)
                 Text(appState.runner.quoteCurrency).font(Theme.Text.caption).foregroundStyle(.secondary).baselineOffset(-1)
                 if let nonStablePct = appState.nonStableExposurePct {
-                    Badge(text: "敞口 \(PriceFormatter.decimals(nonStablePct, 0))%", tint: riskTint(nonStablePct), size: .small)
-                        .help("现货币种持仓 + 永续名义额，占账户权益的比例。做空同样计入敞口。")
+                    let complete = appState.runner.exposureIsComplete
+                    Badge(text: "敞口 \(PriceFormatter.decimals(nonStablePct, 0))%" + (complete ? "" : "*"),
+                          tint: complete ? riskTint(nonStablePct) : Theme.warning, size: .small)
+                        .help(complete
+                              ? "现货币种持仓 + 交易所上全部衍生品名义额（含非 MayStock 开的仓），占账户权益的比例。做空同样计入敞口。"
+                              : "* 部分持仓未能从交易所读到或无法估值，实际敞口只会更高。现货币种持仓 + 衍生品名义额，占账户权益的比例。")
                 }
             } else {
                 Text(appState.accountError ?? appState.tradingBlocker ?? "读取账户权益…")
@@ -136,45 +180,69 @@ struct PanelAccountStrip: View {
         }
     }
 
-    /// The number is always shown once a single sample exists; the caveats
-    /// ride alongside it as a marker and spell themselves out on hover.
+    /// What the exchange's bills say the window realised. The exchange's
+    /// figure, not this app's: its API publishes no period P&L and no equity
+    /// history, so the bills it filed in the window are the one period number
+    /// it can vouch for. A listing that ran out inside the window is marked.
     private func cell(_ window: EquityWindow) -> some View {
-        let change = appState.equityChange(window)
-        let pct = change?.changePct
-        let tint = Theme.trend((change?.changeQuote ?? 0) >= 0)
+        let billed = appState.billedPnL(window)
+        let tint = Theme.trend((billed?.total ?? 0) >= 0)
 
         return VStack(spacing: 2) {
             Text(window.label).font(Theme.Text.caption).foregroundStyle(.secondary)
-            Text(change.map { PriceFormatter.signedMoney($0.changeQuote, decimals: 0) } ?? "—")
+            Text(billed.map { PriceFormatter.signedMoney($0.total, decimals: 0) } ?? "—")
                 .font(.system(size: 12, weight: .semibold)).numeric()
-                .foregroundStyle(change == nil ? Color.secondary : tint)
+                .foregroundStyle(billed == nil ? Color.secondary : tint)
                 .lineLimit(1).minimumScaleFactor(0.7)
             Group {
-                if let change, let pct {
+                if let billed {
                     HStack(spacing: 1) {
-                        Text(PriceFormatter.signedPercent(pct)).foregroundStyle(tint.opacity(0.75))
-                        if change.hasGaps {
-                            Text("!").foregroundStyle(Theme.down)
-                        } else if !change.isAnchored {
-                            Text("*").foregroundStyle(.tertiary)
-                        }
+                        Text("已实现").foregroundStyle(.tertiary)
+                        if !billed.coversWindow { Text("*").foregroundStyle(Theme.warning) }
                     }
                 } else {
-                    Text("等待记录").foregroundStyle(.tertiary)
+                    Text(appState.billsError == nil ? "等待账单" : "账单读取失败").foregroundStyle(.tertiary)
                 }
             }
             .font(Theme.Text.captionMedium).numeric()
             .lineLimit(1).minimumScaleFactor(0.8)
         }
         .frame(maxWidth: .infinity)
-        .help(tooltip(window, change))
+        .help(tooltip(window, billed))
     }
 
-    private func tooltip(_ window: EquityWindow, _ change: EquityChange?) -> String {
-        guard let change else { return "\(window.longLabel)：还没有任何权益采样" }
-        let range = "\(PriceFormatter.money(change.startEquity)) → \(PriceFormatter.money(change.endEquity)) \(appState.runner.quoteCurrency)"
-        let head = "\(window.longLabel)\n\(range)"
-        return change.coverageNote.isEmpty ? head : "\(head)\n\(change.coverageNote)"
+    private func tooltip(_ window: EquityWindow, _ billed: BilledPnL?) -> String {
+        let head = "\(window.longLabel) · OKX 账单口径"
+        guard let billed else { return head + "\n" + (appState.billsError ?? "还没有读到账单") }
+        var lines = [
+            head,
+            "平仓盈亏 \(PriceFormatter.signedMoney(billed.closedTradePnL)) · 资金费 \(PriceFormatter.signedMoney(billed.funding))"
+                + " · 手续费 \(PriceFormatter.signedMoney(billed.fees))"
+                + (billed.interest != 0 ? " · 利息 \(PriceFormatter.signedMoney(billed.interest))" : "")
+                + " · \(billed.billCount) 条账单",
+        ]
+        if !billed.coversWindow, let oldest = appState.exchangeBills?.oldestBillAt {
+            lines.append("* 账单只翻到 \(Format.stamp(oldest))，更早的没算进来")
+        }
+        lines.append("OKX 的 API 不提供分时段盈亏和权益历史；浮动盈亏在下一行，按交易所标记价")
+        return lines.joined(separator: "\n")
+    }
+
+    /// Unrealised profit on what the exchange holds, at its own mark — the
+    /// other half of the account's result, which no window can contain.
+    private var exchangePnLRow: some View {
+        let pnl = appState.exchangeUnrealisedPnL
+        return HStack(spacing: 5) {
+            Text("浮动盈亏").font(Theme.Text.caption).foregroundStyle(.secondary)
+            Text(pnl.map { PriceFormatter.signedMoney($0, decimals: 2) } ?? "—")
+                .font(.system(size: 13, weight: .semibold)).numeric()
+                .foregroundStyle(pnl.map(Theme.signed) ?? .secondary)
+                .contentTransition(.numericText())
+            Spacer(minLength: 0)
+            Text(pnl == nil ? "等待账户读数" : "交易所标记 · \(appState.exchangePositions.count) 个持仓")
+                .font(Theme.Text.caption).foregroundStyle(.tertiary)
+        }
+        .help("交易所对当前全部持仓（含非 MayStock 开的）按标记价算出的未实现盈亏之和。")
     }
 
     // MARK: Notices
@@ -221,6 +289,8 @@ struct PanelAccountStrip: View {
                         .font(Theme.Text.caption).foregroundStyle(.secondary)
                     Spacer()
                 }
+                externalRows
+                ordersRow
                 elsewhereRow
             }
         } else {
@@ -242,20 +312,59 @@ struct PanelAccountStrip: View {
                     Text("另有 \(holdings.count - 3) 个策略持仓").font(Theme.Text.caption).foregroundStyle(.tertiary)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
+                externalRows
+                ordersRow
                 elsewhereRow
             }
+        }
+    }
+
+    /// One line per position the exchange holds here that no strategy opened.
+    @ViewBuilder
+    private var externalRows: some View {
+        ForEach(externalHere) { position in
+            let family = appState.venue(of: position.instId).instrumentType(of: position.instId).displayName
+            HStack(spacing: 6) {
+                StatusDot(color: Theme.trend(position.quantity > 0), size: 5)
+                Text("外部").font(Theme.Text.caption).foregroundStyle(.secondary)
+                Badge(text: family, tint: .secondary, size: .small)
+                Spacer(minLength: 2)
+                Text("\(PriceFormatter.plain(abs(position.quantity))) 张").font(Theme.Text.caption).numeric().foregroundStyle(.tertiary)
+                Text("@ \(PriceFormatter.auto(position.averagePrice))").font(Theme.Text.caption).numeric().foregroundStyle(.tertiary)
+                Text(PriceFormatter.signedMoney(position.unrealisedPnL))
+                    .font(Theme.Text.captionMedium).numeric()
+                    .foregroundStyle(Theme.signed(position.unrealisedPnL))
+                    .frame(width: 50, alignment: .trailing)
+            }
+            .help("非 MayStock 策略开的仓（手动、其它程序，或本机安装前就有）· 名义 "
+                  + (position.notionalUsd.map { PriceFormatter.money($0, decimals: 0) } ?? "—")
+                  + (position.leverage.map { " · \(PriceFormatter.decimals($0, 0))×" } ?? ""))
+        }
+    }
+
+    @ViewBuilder
+    private var ordersRow: some View {
+        if let summary = ordersSummary {
+            HStack(spacing: 4) {
+                Image(systemName: "clock.badge").font(.system(size: 8)).foregroundStyle(.tertiary)
+                Text(summary).font(Theme.Text.caption).foregroundStyle(.secondary).lineLimit(1)
+                Spacer(minLength: 0)
+            }
+            .help("交易所当前挂着的委托，含非 MayStock 下的；完整列表在终端「总览」")
         }
     }
 
     /// One line naming every other underlying the book is exposed to.
     @ViewBuilder
     private var elsewhereRow: some View {
-        let others = elsewhere
+        let others = elsewhere.map { "\($0.venue.currencies(of: $0.instId).base) \($0.quantity > 0 ? "多" : "空")" }
+            + externalElsewhere.map {
+                "\(appState.venue(of: $0.instId).currencies(of: $0.instId).base) \($0.quantity > 0 ? "多" : "空")(外部)"
+            }
         if !others.isEmpty {
             HStack(spacing: 4) {
                 Image(systemName: "arrow.triangle.branch").font(.system(size: 8)).foregroundStyle(.tertiary)
-                Text(others.map { "\($0.venue.currencies(of: $0.instId).base) \($0.quantity > 0 ? "多" : "空")" }
-                    .joined(separator: " · "))
+                Text(others.joined(separator: " · "))
                     .font(Theme.Text.caption).foregroundStyle(.secondary).lineLimit(1)
                 Spacer(minLength: 0)
             }

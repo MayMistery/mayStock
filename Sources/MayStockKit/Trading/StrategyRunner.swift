@@ -96,6 +96,20 @@ public final class StrategyRunner {
     /// Shorts count as exposure, not as a credit — being short 4 ETH is 4 ETH
     /// of price risk. Netting the two would report a hedged book as flat.
     public private(set) var nonStableExposure: Double = 0
+    /// False when some position the exchange holds could not be listed or
+    /// valued, so `nonStableExposure` is a floor rather than the figure. The
+    /// badge says so; a risk number that quietly shrinks on a failed read is
+    /// the one kind of wrong a risk number must never be.
+    public private(set) var exposureIsComplete = true
+
+    /// The account every figure above was measured on.
+    ///
+    /// Equity, exposure, the drawdown high-water mark and the stop-out tally
+    /// are facts about *an account*, and the demo and live accounts are
+    /// different accounts with different balances. A switch has to reset all
+    /// of them together: the breaker once carried the demo book's 65k peak
+    /// across a switch and read a 13k live account as 79% under water.
+    private var measuredAccount: TradingMode?
 
     /// Fiat-pegged currencies, which carry no price risk worth reporting.
     public static let stableCurrencies: Set<String> = [
@@ -319,6 +333,7 @@ public final class StrategyRunner {
 
     public func tick() async {
         guard let host else { return }
+        adoptAccountIfChanged(host.portfolio.mode)
         if isTicking {
             // Overlapping ticks would size a second order against a position
             // the first has not booked yet — so a tick in flight wins, right
@@ -803,6 +818,7 @@ public final class StrategyRunner {
     }
 
     private func sampleEquity(for host: StrategyRunnerHost) async {
+        adoptAccountIfChanged(host.portfolio.mode)
         let now = Date()
         if let last = lastEquitySampleAt,
            now.timeIntervalSince(last) < Self.equitySampleInterval { return }
@@ -838,7 +854,9 @@ public final class StrategyRunner {
         guard let equity = snapshot.totalEquity ?? (pricedEverything ? total : nil),
               equity > 0 else { return }
         accountEquity = equity
-        nonStableExposure = await measureNonStableExposure(snapshot: snapshot, host: host)
+        let measured = await measureNonStableExposure(snapshot: snapshot, host: host)
+        nonStableExposure = measured.exposure
+        exposureIsComplete = measured.complete
         host.runnerDidSampleEquity(equity, at: now)
     }
 
@@ -870,8 +888,9 @@ public final class StrategyRunner {
     /// Market value of every non-stablecoin holding and derivative position.
     private func measureNonStableExposure(
         snapshot: AccountSnapshot, host: StrategyRunnerHost
-    ) async -> Double {
+    ) async -> (exposure: Double, complete: Bool) {
         var exposure = 0.0
+        var complete = true
 
         // Spot coin balances.
         for balance in snapshot.balances where balance.total > 0 {
@@ -884,14 +903,60 @@ public final class StrategyRunner {
             exposure += balance.total * price
         }
 
-        // Derivative positions, at their own mark and contract size. For an
-        // option that is the premium's current value — what would be lost if
-        // it went to zero — not the notional it controls.
-        for state in host.ledger.positions.values where !state.isFlat {
-            guard state.venue.instrumentType(of: state.instId).isDerivative else { continue }
-            exposure += state.exposure(mark: marks[state.instId])
+        // Derivative positions as the *exchange* holds them, not as the ledger
+        // remembers them. The ledger knows only what this app's strategies
+        // opened; a position opened by hand, by another program or before this
+        // install existed is just as much price risk — and reading the ledger
+        // here reported an account 10× long as "敞口 0%". A family that does
+        // not answer is not a family that holds nothing: the figure is marked
+        // incomplete rather than quietly reported lower.
+        // One unfiltered listing, so a delivery future or a margin position
+        // — families this app never trades — counts like the perpetuals do.
+        do {
+            for position in try await host.venue.allPositions(mode: host.portfolio.mode)
+            where position.quantity != 0 {
+                if let risk = await priceRisk(of: position, host: host) {
+                    exposure += risk
+                } else {
+                    complete = false
+                    Log.warn("runner: \(position.instId) 无法估值，敞口按已知部分计算")
+                }
+            }
+        } catch {
+            complete = false
+            Log.warn("runner: 读取交易所持仓失败，敞口按已知部分计算：\(error)")
         }
-        return exposure
+        return (exposure, complete)
+    }
+
+    /// What one exchange-held derivative position puts at risk, in the quote
+    /// currency; nil when the venue gave nothing to value it with.
+    ///
+    /// A linear contract carries its notional, which the exchange states
+    /// outright. An option carries the premium currently on the books — what
+    /// is lost if it goes to zero — not the notional it controls, so it is
+    /// valued at the venue's mark the way the ledger values its own.
+    private func priceRisk(
+        of position: ExchangePosition, host: StrategyRunnerHost
+    ) async -> Double? {
+        let mode = host.portfolio.mode
+        // The exchange's own family word first; the id's shape when the
+        // venue did not say.
+        if position.isOption || host.venue.venue.instrumentType(of: position.instId) == .option {
+            guard let meta = try? await host.venue.instrumentMeta(instId: position.instId, mode: mode),
+                  let contractValue = meta.contractValue,
+                  let premium = try? await host.venue.valuationPrice(instId: position.instId, mode: mode)
+            else { return nil }
+            return abs(position.quantity) * contractValue * premium
+        }
+        if let notional = position.notionalUsd { return abs(notional) }
+        guard let meta = try? await host.venue.instrumentMeta(instId: position.instId, mode: mode),
+              let contractValue = meta.contractValue else { return nil }
+        var mark = position.markPrice ?? 0
+        if mark <= 0 { mark = (try? await host.venue.lastPrice(instId: position.instId, mode: mode)) ?? 0 }
+        if mark <= 0 { mark = position.averagePrice }
+        guard mark > 0 else { return nil }
+        return abs(position.quantity) * contractValue * mark
     }
 
     // MARK: Per-strategy evaluation
@@ -1275,6 +1340,28 @@ public final class StrategyRunner {
 
     /// Account equity high-water mark, for the drawdown breaker.
     private var highWaterEquity: Double?
+
+    /// Forget every per-account figure when the account changes. See
+    /// `measuredAccount`. Orders in flight are deliberately kept: an order
+    /// the previous account never confirmed is still an order somewhere.
+    private func adoptAccountIfChanged(_ mode: TradingMode) {
+        guard measuredAccount != mode else { return }
+        if let previous = measuredAccount {
+            Log.warn("runner: 账户从 \(previous.rawValue) 切到 \(mode.rawValue)，"
+                     + "权益、敞口、回撤高点与止损计数已重置")
+        }
+        measuredAccount = mode
+        accountEquity = nil
+        accountBalances = []
+        lastEquitySampleAt = nil
+        nonStableExposure = 0
+        exposureIsComplete = true
+        highWaterEquity = nil
+        accountDrawdownPct = 0
+        protectionTripped = nil
+        stopOuts = []
+        pendingExternal = [:]
+    }
     /// When protective exits fired, for the stop-loss guard.
     private var stopOuts: [Date] = []
 

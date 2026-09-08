@@ -16,6 +16,19 @@ extension AppState {
         profileCatalog = OKXProfileCatalog.load()
     }
 
+    /// Re-read the CLI's config file if it has changed since it was last read.
+    ///
+    /// Called wherever the catalogue is about to be shown or acted on, so a
+    /// profile added or renamed while the app is open is on screen the next
+    /// time the account page opens — not after a restart.
+    func reloadProfilesIfChanged() {
+        guard profileCatalog.isStale() else { return }
+        reloadProfiles()
+        Log.warn("profiles: ~/.okx/config.toml 有变化，已重新读取（\(profileCatalog.profiles.count) 个 profile"
+                 + (profileCatalog.defaultProfile.map { "，默认 \($0)" } ?? "") + "）")
+        for mode in TradingMode.allCases { connections[mode] = .unknown }
+    }
+
     /// True when the CLI has a profile this mode can run under.
     func credentialsConfigured(for mode: TradingMode) -> Bool {
         guard profileCatalog.fileExists else { return false }
@@ -153,6 +166,11 @@ extension AppState {
         Log.warn("mode: switched to \(mode.rawValue); disarmed \(armed.isEmpty ? "nothing" : armed.joined(separator: ", "))")
         accountBalances = []
         exchangePositions = []
+        openOrders = []
+        openOrdersNote = nil
+        openOrdersError = nil
+        exchangeBills = nil
+        billsError = nil
         accountError = nil
         Task {
             await refreshAccount()

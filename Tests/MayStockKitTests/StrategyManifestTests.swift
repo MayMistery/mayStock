@@ -288,6 +288,23 @@ struct StrategyStoreTests {
         #expect(store.installPresetsIfEmpty().isEmpty, "seeding must not duplicate")
     }
 
+    /// An emptied library must stay empty: the app reloads the library on every
+    /// import, delete and launch, and re-seeding there would undo "remove every
+    /// strategy" the next time the app started.
+    @Test func anEmptiedLibraryIsNotReseeded() throws {
+        let store = tempStore()
+        defer { try? FileManager.default.removeItem(at: store.directory) }
+        #expect(store.seedPresetsOnFirstRun().count == StrategyLibrary.presets.count)
+
+        for manifest in store.load() { try store.delete(id: manifest.id) }
+        #expect(store.load().isEmpty)
+        #expect(store.seedPresetsOnFirstRun().isEmpty, "an emptied library must stay empty")
+        #expect(store.load().isEmpty)
+
+        // The explicit restore is still how the examples come back.
+        #expect(store.installPresetsIfEmpty().count == StrategyLibrary.presets.count)
+    }
+
     @Test func brokenManifestsAreReportedNotSilentlyDropped() throws {
         let store = tempStore()
         defer { try? FileManager.default.removeItem(at: store.directory) }

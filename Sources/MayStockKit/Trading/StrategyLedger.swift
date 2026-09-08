@@ -355,6 +355,12 @@ public struct LedgerReconciliation: Sendable, Equatable, Identifiable {
     /// that were already there. Shown, never silently absorbed.
     public var unattributed: Double { exchangeQuantity - ledgerQuantity }
 
+    /// Held on the exchange with no strategy claiming any of it: opened by
+    /// hand, by another program, or before this book existed. Not a mismatch
+    /// — there is nothing here for the book to be wrong about — but real
+    /// exposure, so it is listed as a holding rather than raised as an alarm.
+    public var isExternal: Bool { ledgerQuantity == 0 && exchangeQuantity != 0 }
+
     public var isMaterial: Bool {
         let scale = Swift.max(abs(exchangeQuantity), abs(ledgerQuantity))
         guard scale > 0 else { return false }

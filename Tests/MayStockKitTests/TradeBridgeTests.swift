@@ -675,3 +675,101 @@ struct FailureTextTests {
         #expect(TradeBridge.failureText(stdout: "", stderr: "  \n") == "")
     }
 }
+
+// MARK: - Open orders
+
+/// The exchange's open-order books, read as they come off the CLI: the algo
+/// fixture is the shape OKX actually returns for a close-all take-profit.
+@Suite("Open orders")
+struct OpenOrderParsingTests {
+    static let algoBook = """
+    [{"algoId":"3902370090634240000","instId":"SOL-USDT-SWAP","instType":"SWAP","ordType":"conditional",
+      "side":"sell","posSide":"long","sz":"","closeFraction":"1","tpTriggerPx":"107.2","tpOrdPx":"-1",
+      "slTriggerPx":"","slOrdPx":"","triggerPx":"","state":"live","reduceOnly":"true","cTime":"1788802091517",
+      "clOrdId":"","tag":"","tdMode":"isolated","linkedOrd":{"ordId":""},"attachAlgoOrds":[]},
+     {"algoId":"777","instId":"BTC-USDT-SWAP","ordType":"conditional","side":"sell","posSide":"long",
+      "sz":"10","slTriggerPx":"58000","slOrdPx":"57900","state":"canceled","cTime":"1788800000000"}]
+    """
+
+    static let orderBook = """
+    {"data":[{"ordId":"1001","instId":"ETH-USDT","ordType":"limit","side":"buy","px":"2400","sz":"0.5",
+              "fillSz":"0.1","state":"partially_filled","reduceOnly":"false","cTime":"1788801000000",
+              "clOrdId":"MSemaTrend1a2b3c"},
+             {"ordId":"1002","instId":"ETH-USDT","ordType":"limit","side":"sell","px":"2600","sz":"0.5",
+              "fillSz":"0.5","state":"filled","cTime":"1788800500000"}]}
+    """
+
+    @Test("全平止盈条件单：读出触发价、方向、全平，且 -1 不当成价格")
+    func aCloseAllTakeProfitIsRead() throws {
+        let orders = TradeBridge.parseOpenOrders(json: Self.algoBook, book: .algo)
+        #expect(orders.count == 1, "the cancelled one is history, not an open order")
+        let order = try #require(orders.first)
+        #expect(order.id == "3902370090634240000")
+        #expect(order.book == .algo)
+        #expect(order.kindLabel == "止盈")
+        #expect(order.side == .sell)
+        #expect(order.posSide == .long)
+        #expect(order.reduceOnly)
+        #expect(order.triggerPrice == 107.2)
+        #expect(order.takeProfitTriggerPrice == 107.2)
+        #expect(order.stopTriggerPrice == nil)
+        #expect(order.price == nil, "tpOrdPx -1 means market")
+        #expect(order.size == nil)
+        #expect(order.closeFraction == 1)
+        #expect(order.clOrdId == nil)
+        #expect(order.createdAt == Date(timeIntervalSince1970: 1_788_802_091.517))
+    }
+
+    @Test("普通挂单：只保留还在簿上的，部分成交计入已成交")
+    func onlyOpenOrdersAreKept() throws {
+        let orders = TradeBridge.parseOpenOrders(json: Self.orderBook, book: .order)
+        #expect(orders.map(\.id) == ["1001"])
+        let order = try #require(orders.first)
+        #expect(order.kindLabel == "限价")
+        #expect(order.price == 2_400)
+        #expect(order.size == 0.5)
+        #expect(order.filledSize == 0.1)
+        #expect(order.triggerPrice == nil)
+        #expect(order.clOrdId == "MSemaTrend1a2b3c")
+    }
+
+    @Test("每个可用模块的两本簿都会被问到，读不到的簿按名字报出来而不是当成空")
+    func everyBookIsAskedAndFailuresAreNamed() async throws {
+        // A stub that answers every listing with the same open algo order —
+        // enough to prove each book is asked, and that the listing is one list.
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("maystock-stub-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let cli = dir.appendingPathComponent("okx")
+        let log = dir.appendingPathComponent("calls.txt")
+        let script = """
+        #!/bin/sh
+        printf '%s ' "$@" >> "\(log.path)"; printf '\\n' >> "\(log.path)"
+        case "$*" in
+          *"option algo orders"*) echo 'Error: HTTP 400 from OKX: Parameter instType error' >&2; exit 1 ;;
+        esac
+        cat <<'JSON'
+        \(Self.algoBook.replacingOccurrences(of: "\n", with: " "))
+        JSON
+        """
+        try script.write(to: cli, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cli.path)
+        let bridge = TradeBridge(explicitCLIPath: cli.path)
+
+        let listing = try await bridge.openOrders(mode: .demo)
+
+        let calls = try String(contentsOf: log, encoding: .utf8).split(separator: "\n").map(String.init)
+        let books = Set(InstrumentType.allCases.compactMap(\.cliModule))
+            .flatMap { ["\($0) orders", "\($0) algo orders"] }
+        for book in books {
+            #expect(calls.contains { $0.contains(book) }, "\(book) was never asked")
+        }
+        #expect(listing.unavailable == ["期权策略委托"])
+        // The fixture is an algo-book record (it carries an algoId, no ordId),
+        // so it is an order only when read as an algo book: one per algo book
+        // that answered — spot's and swap's — and none from the order books.
+        #expect(listing.orders.count == 2)
+        #expect(listing.orders.allSatisfy { $0.book == .algo && $0.id == "3902370090634240000" })
+    }
+}

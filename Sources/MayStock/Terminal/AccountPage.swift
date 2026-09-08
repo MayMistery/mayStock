@@ -17,6 +17,13 @@ struct AccountPage: View {
     private var portfolio: StrategyPortfolioPrefs { appState.store.config.strategy }
 
     var body: some View {
+        pageBody
+            // The picker offers the file's profiles; make sure it is the file
+            // as it is now, not as it was at launch.
+            .onAppear { appState.reloadProfilesIfChanged() }
+    }
+
+    private var pageBody: some View {
         PageScroll {
             VStack(alignment: .leading, spacing: Theme.sectionSpacing) {
                 PageHeader(title: "账户与连接",
