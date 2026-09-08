@@ -39,7 +39,8 @@ final class IntelligenceCenter {
             do {
                 let archive = try IntelligenceJSON.decoder().decode(Archive.self, from: Data(contentsOf: file))
                 settings = archive.settings; statuses = archive.statuses
-                reports = archive.reports; events = archive.events
+                reports = IntelligenceLibrary.canonicalReports(archive.reports)
+                events = archive.events
             } catch {
                 let backup = self.directory.appendingPathComponent("archive-unreadable-\(UUID().uuidString).json")
                 do {
@@ -54,6 +55,12 @@ final class IntelligenceCenter {
         if TimeZone(identifier: settings.timezone) == nil { settings.timezone = "Asia/Taipei" }
         settings.dailyHour = min(23, max(0, settings.dailyHour))
         settings.horizonHours = min(120, max(1, settings.horizonHours))
+    }
+
+    /// Every screen reads one projection of the archive. Reading it never
+    /// changes a report's timestamps or promotes a check into a new analysis.
+    func library(now: Date) -> IntelligenceLibrary {
+        IntelligenceLibrary(reports: reports, events: events, now: now, timezone: settings.timezone)
     }
 
     func start(watchlist: @escaping () -> [String], quote: @escaping (String) -> Ticker?,
@@ -174,10 +181,11 @@ final class IntelligenceCenter {
             if report.events.isEmpty { report.predictions = [] }
         }
         var nextReports = reports
-        if report.kind != .flash || !report.events.isEmpty {
+        if IntelligenceLibrary.hasContent(report) {
             nextReports.insert(report, at: 0)
             // Preserve enough history for the complete seven-day calendar.
-            nextReports = Array(nextReports.filter { now.timeIntervalSince($0.generatedAt) < 8 * 86_400 }.prefix(600))
+            nextReports = Array(IntelligenceLibrary.canonicalReports(nextReports)
+                .filter { now.timeIntervalSince($0.generatedAt) < 8 * 86_400 }.prefix(600))
         }
         var merged = Dictionary(events.map { ($0.id, $0) }, uniquingKeysWith: { _, newer in newer })
         for event in report.events { merged[event.id] = event }
@@ -196,6 +204,8 @@ final class IntelligenceCenter {
             status.note = (report.coverageComplete == false
                 ? "来源覆盖不完整；已读取资料中未核验到窗口内新事件，本次静默。"
                 : "未发现符合发生时间要求的新事件，本次静默。") + report.coverage
+        } else if !IntelligenceLibrary.hasContent(report) {
+            status.note = "本次检查未形成新的有效研究，继续保留上次分析。" + report.coverage
         } else {
             status.note = report.coverage
         }
