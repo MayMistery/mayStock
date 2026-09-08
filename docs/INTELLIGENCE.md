@@ -28,7 +28,9 @@ MayStock 的原生情报窗口提供今天前 7 天至后 30 天的事件日历�
 
 文件内容是环境变量名到字符串值的 JSON 映射，支持 `ANTHROPIC_BASE_URL`、`ANTHROPIC_CUSTOM_HEADERS`、`ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_API_KEY` 等连接字段。该文件应保持权限 `0600`，不放入仓库或应用包。可用 `MAYSTOCK_INTELLIGENCE_CONNECTION` 指向其他受保护文件。认证值不会进入研究提示词、日志或报告。
 
-连接读取顺序为：Claude 用户设置中的允许列表 `env` → 情报专用连接文件 → 当前进程的显式环境变量。后者优先。不会执行 `apiKeyHelper`、Shell 配置、用户 hooks 或插件。需要指定 Claude Code 二进制时可设置 `MAYSTOCK_CLAUDE_PATH`；默认使用 PATH 中的 Claude，否则使用 SDK 自带版本。
+连接按完整配置组选择，优先级为：**情报专用连接文件 > 当前进程的连接环境变量 > Claude 用户设置中的允许列表 `env` > 原生登录**。存在专用文件时，启动器继承的地址、API key、OAuth 和云服务路由不会覆盖或补入该文件；不会把不同来源的地址和凭证拼接。专用文件损坏或显式指定的文件不存在时会报告 `CONNECTION_CONFIG`，保留已有情报。代理与 CA 设置可独立继承，专用文件中显式设置的值优先。
+
+本地 relay 只需 `ANTHROPIC_BASE_URL` 和 `ANTHROPIC_CUSTOM_HEADERS`：后者包含 `x-relay-passthrough: anthropic` 与 `x-relay-api-key` 两个 header，以真正的换行分隔（JSON 文件中用 `\n` 表达），无需补充 `ANTHROPIC_API_KEY`。工作进程在启动 SDK 前会清除继承的 Claude 会话、宿主 IPC 和未选中的认证变量，再写入选中的连接配置。不会执行 `apiKeyHelper`、Shell 配置、用户 hooks 或插件。默认让 SDK 选择其自带的匹配版 Claude Code；需要指定二进制时可设置 `MAYSTOCK_CLAUDE_PATH`。
 
 诊断命令（将 Python 路径替换为实际虚拟环境路径）：
 
@@ -38,7 +40,7 @@ python Intelligence/runner.py --smoke-model
 python Intelligence/runner.py --smoke-retrieval
 ```
 
-`--doctor` 不访问模型，只报告版本、路径和已配置的环境变量**名称**。`--smoke-model` 会实际调用固定模型并检查结构化输出。`--smoke-retrieval` 检查新闻发现与官方日历，明确返回不可读取的来源。
+`--doctor` 不访问模型，报告版本、CLI 路径、连接来源、服务 origin、header **名称**和被忽略的环境变量**名称**，不输出凭证值。`--smoke-model` 会实际调用固定模型并检查结构化输出。`--smoke-retrieval` 检查新闻发现与官方日历，明确返回不可读取的来源。模型失败按 SDK 提供的 HTTP 状态或明确错误类型区分认证、权限、限流、上游故障和请求拒绝；含糊的“所选模型有问题”不会直接断言模型不存在。
 
 ## 来源与时间规则
 

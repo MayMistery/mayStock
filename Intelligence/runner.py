@@ -13,7 +13,6 @@ import inspect
 import json
 import os
 import re
-from pathlib import Path
 import shutil
 import signal
 import sys
@@ -26,25 +25,19 @@ import urllib.parse
 sys.dont_write_bytecode = True
 
 if __package__:
+    from .connection import AUTH_ENV, resolve_connection, isolated_environment
+    from .model_diagnostics import model_error, model_error_fields
     from .research import SEARCH_TOPICS, Research, ResearchError
     from .schema import MODEL_REPORT_SCHEMA
     from .validation import parse_request, validate_report, window
 else:
+    from connection import AUTH_ENV, resolve_connection, isolated_environment
+    from model_diagnostics import model_error, model_error_fields
     from research import SEARCH_TOPICS, Research, ResearchError
     from schema import MODEL_REPORT_SCHEMA
     from validation import parse_request, validate_report, window
 
 MODEL = "model_hub/es1_orange_o50[1m]"
-AUTH_ENV = {
-    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
-    "ANTHROPIC_CUSTOM_HEADERS", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "ANTHROPIC_FOUNDRY_RESOURCE",
-    "ANTHROPIC_FOUNDRY_BASE_URL", "ANTHROPIC_FOUNDRY_API_KEY", "ANTHROPIC_VERTEX_PROJECT_ID",
-    "CLOUD_ML_REGION", "AWS_REGION", "AWS_PROFILE", "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "GOOGLE_APPLICATION_CREDENTIALS",
-    "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
-    "https_proxy", "http_proxy", "all_proxy", "no_proxy", "NODE_EXTRA_CA_CERTS",
-}
 SAFE_SETTINGS = {"disableAllHooks": True, "disableClaudeAiConnectors": True,
                  "autoMemoryEnabled": False, "enabledPlugins": {}}
 if __package__:
@@ -54,37 +47,25 @@ else:
 
 MODEL_SECONDS = {"daily": 600, "hourly": 600, "flash": 360}
 PUBLIC_REQUEST_BUDGET = 120
-
+_active_connection = None
 
 
 def routing_environment() -> dict[str, str]:
-    """Read values without executing helpers, hooks, plugins or shell configuration."""
-    env = {}
-    directory = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
-    settings = directory / "settings.json"
-    if settings.is_file():
-        try:
-            data = json.loads(settings.read_text())
-            configured = data.get("env", {})
-            if isinstance(configured, dict):
-                env.update({key: value for key, value in configured.items()
-                            if key in AUTH_ENV and isinstance(value, str)})
-        except (OSError, ValueError, AttributeError):
-            raise ResearchError("CLAUDE_SETTINGS: cannot parse existing Claude routing settings") from None
-    connection = Path(os.environ.get("MAYSTOCK_INTELLIGENCE_CONNECTION", str(
-        Path.home() / "Library/Application Support/MayStock/Intelligence/connection.json")))
-    if connection.is_file():
-        try:
-            configured = json.loads(connection.read_text())
-            if not isinstance(configured, dict):
-                raise ValueError("invalid connection object")
-            env.update({key: value for key, value in configured.items()
-                        if key in AUTH_ENV and isinstance(value, str)})
-        except (OSError, ValueError):
-            raise ResearchError("CONNECTION_CONFIG: cannot parse protected intelligence connection settings") from None
-    env.update({key: os.environ[key] for key in AUTH_ENV if key in os.environ})
-    env.update({"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1", "ENABLE_CLAUDEAI_MCP_SERVERS": "false"})
-    return env
+    return dict((_active_connection or resolve_connection()).env)
+
+
+def configure_runtime():
+    """Choose one profile before removing inherited launcher credentials/IPC.
+
+    The SDK merges options.env into os.environ, so omitted keys alone cannot
+    isolate it. This runs once in the dedicated worker, before creating a client.
+    """
+    global _active_connection
+    _active_connection = resolve_connection()
+    cleaned = isolated_environment(dict(os.environ), _active_connection)
+    os.environ.clear()
+    os.environ.update(cleaned)
+    return _active_connection
 
 
 def sdk_options(cwd: str, mcp_servers=None, schema=None):
@@ -96,24 +77,14 @@ def sdk_options(cwd: str, mcp_servers=None, schema=None):
         mcp_servers=mcp_servers or {}, strict_mcp_config=True,
         setting_sources=[], settings=json.dumps(SAFE_SETTINGS), plugins=[], skills=[],
         system_prompt=SYSTEM_PROMPT, cwd=cwd,
-        cli_path=os.environ.get("MAYSTOCK_CLAUDE_PATH") or shutil.which("claude"),
+        # The SDK selects its matching bundled CLI by default. A global Claude
+        # update must not silently change this application's protocol/runtime.
+        cli_path=os.environ.get("MAYSTOCK_CLAUDE_PATH") or None,
         permission_mode="dontAsk",
         env=routing_environment(), effort="medium", max_turns=40, max_buffer_size=4_000_000,
         output_format={"type": "json_schema", "schema": schema or MODEL_REPORT_SCHEMA},
         extra_args={"no-session-persistence": None}, stderr=lambda _line: None,
     )
-
-
-def model_error(message=None) -> ResearchError:
-    # Never print upstream stderr, request headers, URLs with credentials, or raw model output.
-    raw = str(getattr(message, "result", "") or "").lower()
-    if any(term in raw for term in ("selected model", "unrecognized_model", "model not found", "model_not_found")):
-        return ResearchError("MODEL_UNAVAILABLE: 当前 Claude 路由无法访问 model_hub/es1_orange_o50[1m]；请配置对应 ANTHROPIC_BASE_URL 与认证。未替换模型。")
-    if any(term in raw for term in ("unauthorized", "authentication", "login", "log in", "invalid api key", "401")):
-        return ResearchError("AUTH_REQUIRED: Claude 登录或路由认证不可用；请先完成 Claude 登录或配置认证。")
-    if any(term in raw for term in ("429", "rate limit", "quota", "usage limit")):
-        return ResearchError("MODEL_RATE_LIMIT: Claude 调用额度或速率受限，稍后重试。")
-    return ResearchError("MODEL_FAILED: Claude SDK 未返回成功的结构化报告；保留已有情报。")
 
 
 def progress(stage, **fields):
@@ -123,24 +94,28 @@ def progress(stage, **fields):
 async def invoke_model(options, prompt, validator=None):
     from claude_agent_sdk import AssistantMessage, ClaudeSDKClient, ResultMessage, ToolUseBlock
 
-    result = None
+    assistant_error = None
     try:
         async with ClaudeSDKClient(options=options) as client:
             for attempt in range(2):
+                assistant_error = None
                 progress("model_query", attempt=attempt + 1)
                 await client.query(prompt)
                 output = None
                 async for message in client.receive_response():
                     if isinstance(message, AssistantMessage):
+                        if getattr(message, "error", None):
+                            assistant_error = message.error
                         names = [block.name for block in message.content if isinstance(block, ToolUseBlock)]
                         if names:
                             progress("model_tools", tools=names)
                     if isinstance(message, ResultMessage):
-                        result = message
-                        progress("model_result", subtype=message.subtype, isError=message.is_error,
-                                 structured=isinstance(message.structured_output, dict))
+                        fields = model_error_fields(message, assistant_error)
+                        progress("model_result", subtype=fields["subtype"], isError=message.is_error,
+                                 apiStatus=fields["apiStatus"], structured=isinstance(message.structured_output, dict))
                         if message.is_error or message.subtype != "success":
-                            raise model_error(message)
+                            progress("model_failure", **fields)
+                            raise model_error(message, assistant_error)
                         if not isinstance(message.structured_output, dict):
                             raise ResearchError("MODEL_SCHEMA: Claude did not return structured output")
                         output = message.structured_output
@@ -165,9 +140,8 @@ async def invoke_model(options, prompt, validator=None):
     except ResearchError:
         raise
     except Exception as exc:
-        progress("model_exception", errorClass=type(exc).__name__, subtype=getattr(exc, "subtype", None),
-                 apiStatus=getattr(exc, "api_error_status", None))
-        raise model_error(result or exc) from None
+        progress("model_exception", **model_error_fields(exc, assistant_error))
+        raise model_error(exc, assistant_error) from None
     raise ResearchError("MODEL_EMPTY: Claude SDK ended without a report")
 
 
@@ -297,16 +271,23 @@ async def refresh_reference_quotes(market, request):
 
 
 def doctor():
+    profile = _active_connection or resolve_connection()
+    override = os.environ.get("MAYSTOCK_CLAUDE_PATH")
+    claude_path = override
     try:
         sdk_version = importlib.metadata.version("claude-agent-sdk")
+        if not claude_path:
+            bundled = importlib.metadata.distribution("claude-agent-sdk").locate_file("claude_agent_sdk/_bundled/claude")
+            claude_path = str(bundled) if bundled.is_file() else shutil.which("claude")
     except importlib.metadata.PackageNotFoundError:
         sdk_version = None
-    route = routing_environment()
+    route = profile.env
     return {"model": MODEL, "sdkVersion": sdk_version, "python": sys.executable,
-            "claudePath": os.environ.get("MAYSTOCK_CLAUDE_PATH") or shutil.which("claude"),
+            "claudePath": claude_path, "cliSelection": "override" if override else "sdk_default",
+            **profile.diagnostics(),
             "routingEnvironmentKeys": sorted(key for key in route if key in AUTH_ENV),
             "routingConfigured": bool(route.get("ANTHROPIC_BASE_URL")),
-            "authNote": "Native Claude login/keychain is retained; model access requires --smoke-model.",
+            "authNote": "Connection selection is isolated from launcher sessions; model access requires --smoke-model.",
             "quoteMaxAgeSeconds": 300, "settingsIsolated": True}
 
 
@@ -350,6 +331,9 @@ def main():
     group.add_argument("--smoke-retrieval", action="store_true")
     args = parser.parse_args()
     try:
+        profile = configure_runtime()
+        progress("connection_configured", **profile.diagnostics(), model=MODEL,
+                 cliSelection="override" if os.environ.get("MAYSTOCK_CLAUDE_PATH") else "sdk_default")
         result = asyncio.run(asyncio.wait_for(main_async(args), timeout=840))
         print(json.dumps(result, ensure_ascii=False, allow_nan=False))
         return 0

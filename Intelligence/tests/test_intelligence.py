@@ -389,13 +389,15 @@ class RetrievalAndIsolationTests(unittest.TestCase):
             self.assertNotIn("occurredAt", row)
             self.assertEqual(store.documents, {})
 
-    def test_routing_settings_read_only_auth_allowlist_current_env_wins(self):
+    def test_explicit_environment_selects_complete_profile_over_user_settings(self):
         with tempfile.TemporaryDirectory() as directory:
             Path(directory, "settings.json").write_text(json.dumps({"hooks": {"x": "arbitrary"},
                 "env": {"ANTHROPIC_BASE_URL": "https://old.example", "PATH": "/bad", "ANTHROPIC_AUTH_TOKEN": "secret"}}))
-            with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": directory, "ANTHROPIC_BASE_URL": "https://new.example"}, clear=True):
+            with patch.dict(os.environ, {"HOME": directory, "CLAUDE_CONFIG_DIR": directory,
+                                         "ANTHROPIC_BASE_URL": "https://new.example"}, clear=True):
                 env = routing_environment()
                 self.assertEqual(env["ANTHROPIC_BASE_URL"], "https://new.example")
+                self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
                 self.assertNotIn("PATH", env)
                 self.assertNotIn("hooks", env)
 
