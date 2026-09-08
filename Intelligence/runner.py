@@ -21,6 +21,10 @@ import tempfile
 import time
 import urllib.parse
 
+# This source ships inside the signed app. Import caches must not modify its
+# sealed Resources directory, including when diagnostics run it directly.
+sys.dont_write_bytecode = True
+
 if __package__:
     from .research import SEARCH_TOPICS, Research, ResearchError
     from .schema import MODEL_REPORT_SCHEMA
