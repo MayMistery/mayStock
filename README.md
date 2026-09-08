@@ -90,6 +90,16 @@
   multiple-testing corrections. See [docs/STRATEGY-DEV.md](docs/STRATEGY-DEV.md).
 - **Watchlist** — any OKX spot/perp instrument, validated against the
   exchange when added. BTC-USDT out of the box.
+- **Intelligence station** — a terminal calendar covering seven days back and
+  thirty days ahead, with daily macro reports, hourly geopolitical updates,
+  and a news check every thirty minutes. Claude Agent SDK uses exactly
+  `model_hub/es1_orange_o50[1m]`. Flash reports require verified event occurrence
+  times and are silent when no eligible new event exists. Every watched
+  instrument receives an evidence-linked directional assessment or an explicit
+  insufficient-evidence result. Run `./Scripts/setup-intelligence.sh` and
+  configure Claude access to the requested model first. Defaults: daily at
+  08:00 Asia/Taipei, 1-hour forecast horizon. The app must be running and the
+  computer awake; waking checks the current window. See [setup and verification](docs/INTELLIGENCE.md).
 
 ```bash
 ./Scripts/new-strategy.sh "My ETH trend" trend ETH-USDT 4H   # scaffold, backtest, walk-forward

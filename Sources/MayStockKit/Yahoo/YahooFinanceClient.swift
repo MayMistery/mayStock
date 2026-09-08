@@ -392,9 +392,10 @@ public enum YahooWire {
         let low = chart.regularDayLow ?? regularBars.compactMap(\.low).min() ?? last
         let volume = chart.regularVolume ?? regularBars.compactMap(\.volume).reduce(0, +)
 
-        // The print's own time, or the official last-trade time when the
-        // chart holds no bars at all (a listing before its first session).
-        let ts = latest?.ts ?? chart.regularMarketTime ?? now
+        // A quote needs the print's own time, or the official last-trade time
+        // when the chart has no prints. Retrieval time cannot make it fresh.
+        guard let ts = latest?.ts ?? chart.regularMarketTime,
+              ts.timeIntervalSince1970.isFinite, ts.timeIntervalSince1970 > 0 else { return nil }
         return Ticker(
             instId: chart.symbol, last: last, bid: nil, ask: nil,
             reference: reference, open: open, high: high, low: low, volume: volume,

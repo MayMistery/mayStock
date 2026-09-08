@@ -58,6 +58,14 @@
   免费无需 Key，最长 65 年历史），配 `ic` 信息系数分析（含重叠窗口与多重检验修正）。
   见 [docs/STRATEGY-DEV.md](docs/STRATEGY-DEV.md)。
 - **自选列表**：任意 OKX 现货/永续标的，添加时经交易所校验。默认 BTC-USDT。
+- **情报站**：终端侧栏中的宏观与全球局势日历，覆盖过去 7 天到未来 30 天。
+  Claude Agent SDK 使用 `model_hub/es1_orange_o50[1m]` 每日生成报告，每小时回看
+  最新局势，每 30 分钟检查快报。按事件发生时间核验、去重，无合格新事件时静默。
+  对全部自选标的展示方向判断、置信度、证据、参考价和失效条件；报价或证据不足会明确标注。
+  首次使用运行 `./Scripts/setup-intelligence.sh`，并配置有权限访问上述模型的 Claude 接入。
+  默认台北时间 08:00 日报、未来 1 小时预测，均可在「生成计划」调整。
+  应用需运行且电脑保持唤醒；退出或睡眠后恢复时只检索当前时间窗口。
+  见 [情报站配置与验证](docs/INTELLIGENCE.md)。
 
 ```bash
 ./Scripts/new-strategy.sh "我的ETH趋势" trend ETH-USDT 4H   # 脚手架 + 回测 + 走向前验证

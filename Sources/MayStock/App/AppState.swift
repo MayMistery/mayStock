@@ -49,6 +49,7 @@ final class ConfigStore {
 struct LaunchOptions: Sendable {
     var dataDirectory: URL = ConfigIO.defaultDirectory()
     var snapshotDirectory: URL? = nil
+    var openIntelligence = false
 
     var isSnapshot: Bool { snapshotDirectory != nil }
 
@@ -62,6 +63,8 @@ struct LaunchOptions: Sendable {
                 if let value = iterator.next() { options.dataDirectory = URL(fileURLWithPath: value) }
             case "--snapshot":
                 if let value = iterator.next() { options.snapshotDirectory = URL(fileURLWithPath: value) }
+            case "--intelligence":
+                options.openIntelligence = true
             default:
                 break
             }
@@ -81,6 +84,7 @@ final class AppState {
     let hub: MarketHub
     let alerts: AlertEngine
     let notifications: NotificationService
+    let intelligence: IntelligenceCenter
     /// Chart mode / window selections for the hover panel.
     let charts = ChartPreferences()
     /// The terminal's markets page keeps its own, so flipping the big chart to
@@ -137,6 +141,7 @@ final class AppState {
         hub = MarketHub.standard()
         alerts = AlertEngine()
         notifications = NotificationService()
+        intelligence = IntelligenceCenter(directory: options.dataDirectory, snapshotMode: options.isSnapshot)
         strategyStore = StrategyStore(directory: options.dataDirectory.appendingPathComponent("Strategies"))
         heartbeatStore = HeartbeatStore(directory: options.dataDirectory)
         profileCatalog = OKXProfileCatalog.load()
@@ -157,6 +162,17 @@ final class AppState {
             _ = await verifyConnection(tradingMode)
         }
         if !options.isSnapshot { runner.start() }
+        intelligence.start(watchlist: { [weak self] in
+            self?.store.config.watchlist.map(\.instId) ?? []
+        }, quote: { [weak self] instId in
+            self?.hub.session(for: instId)?.ticker
+        }, fetchQuote: { [weak self] instId in
+            guard let self, let item = self.store.config.watchlist.first(where: { $0.instId == instId }),
+                  let source = self.hub.source(for: item.venue) else { return nil }
+            return try? await source.ticker(instId: instId)
+        }, onFlash: { [weak self] body in
+            self?.notifications.post(title: "MayStock · 局势快报", body: body, sound: false)
+        })
     }
 
     private func wire() {

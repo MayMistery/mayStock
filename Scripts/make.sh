@@ -114,6 +114,9 @@ cmd_install() {
   mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
   cp "$BUILD_DIR/$APP_NAME" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
   cp "$INFO_PLIST" "$APP_BUNDLE/Contents/Info.plist"
+  # Keep Python packages outside the signed bundle; only research source ships inside it.
+  cp -R Intelligence "$APP_BUNDLE/Contents/Resources/Intelligence"
+  find "$APP_BUNDLE/Contents/Resources/Intelligence" -type d -name __pycache__ -prune -exec rm -rf {} +
   if [ -f "$ICON_DIR/icon_512x512.png" ]; then
     rm -rf "/tmp/$APP_NAME.iconset" && mkdir -p "/tmp/$APP_NAME.iconset"
     cp "$ICON_DIR"/icon_*.png "/tmp/$APP_NAME.iconset/" 2>/dev/null || true
