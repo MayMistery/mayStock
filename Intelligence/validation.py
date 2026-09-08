@@ -19,6 +19,7 @@ else:
 
 UTC = dt.timezone.utc
 MAX_QUOTE_AGE = 300
+DISCOVERY_HOSTS = {"news.google.com", "www.bing.com", "bing.com"}
 PUBLISHING = re.compile(r"\b(?:published|updated|posted|last modified|datepublished|datemodified)\b", re.I)
 ISO_TIME = re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|\s*(?:UTC|GMT)|[+-]\d{2}:?\d{2})\b", re.I)
 NATURAL_DATE = re.compile(r"\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{1,2}(?:st|nd|rd|th)?[,]?\s+\d{4}\b", re.I)
@@ -51,6 +52,10 @@ def parse_request(request: dict) -> dict:
         raise ResearchError("REQUEST_INVALID: prediction horizon must be in (0, 720] hours")
     if not isinstance(request.get("quotes", []), list) or not isinstance(request.get("knownEvents", []), list):
         raise ResearchError("REQUEST_INVALID: quotes and knownEvents must be arrays")
+    venues = request.get("venues", {})
+    if not isinstance(venues, dict) or any(inst not in watchlist or venue not in {"okx", "schwab"}
+                                           for inst, venue in venues.items()):
+        raise ResearchError("REQUEST_INVALID: venues must map watchlist instruments to supported venues")
     request = copy.deepcopy(request)
     request["watchlist"] = list(dict.fromkeys(watchlist))
     request.setdefault("quotes", [])
@@ -237,12 +242,64 @@ def is_known(event, known):
     return False
 
 
-def insufficient(inst, request, reason, reference_price=None):
+def verified_sources(sources, research, subject):
+    """Bind every citation to a document actually read by this run's host."""
+    for source in sources:
+        key = canonical_url(source["url"])
+        current = research.documents.get(key)
+        versions = ([current] if current else []) + list(getattr(research, "document_history", {}).get(key, []))
+        if not versions:
+            raise ResearchError(f"SOURCE_UNFETCHED: {subject} cites a URL that was not read this run")
+        evidence = normalize(source["evidence"])
+        document = next((d for d in versions if evidence in normalize(d.text)), None)
+        if not 30 <= len(evidence) <= 2000 or not document:
+            raise ResearchError(f"SOURCE_EVIDENCE: {subject} evidence is not an exact fetched-source excerpt")
+        key = canonical_url(document.url)
+        if urllib.parse.urlsplit(key).hostname in DISCOVERY_HOSTS:
+            raise ResearchError("SOURCE_DISCOVERY_ONLY: search feeds do not establish evidence")
+        source.update(url=key, retrievedAt=document.retrieved_at)
+
+
+def validated_findings(findings, request, research, report_id):
+    aliases, seen, retained, rejected = {}, set(), [], 0
+    watchlist = set(request["watchlist"])
+    for finding in findings:
+        local_id = finding["id"].strip()
+        if not local_id or local_id in seen:
+            raise ResearchError("FINDING_ID: analysis identifiers must be nonempty and unique")
+        if not finding["title"].strip() or not finding["body"].strip():
+            raise ResearchError("FINDING_CONTENT: analysis title and body must be nonempty")
+        if len(set(finding["instIds"])) != len(finding["instIds"]) or not set(finding["instIds"]) <= watchlist:
+            raise ResearchError("FINDING_INSTRUMENT: analysis must reference unique watchlist instruments")
+        seen.add(local_id)
+        try:
+            if finding["kind"] != "unknown" and not finding["sources"]:
+                raise ResearchError("FINDING_SOURCE: observations and inferences require fetched evidence")
+            verified_sources(finding["sources"], research, "analysis")
+        except ResearchError as exc:
+            if not str(exc).startswith(("SOURCE_", "FINDING_SOURCE:")):
+                raise
+            # Isolate one bad conclusion, never keep its claim after stripping
+            # the citation. Other independently verified research remains useful.
+            rejected += 1
+            continue
+        except ValueError:
+            # A malformed model-supplied URL can fail urllib parsing directly.
+            rejected += 1
+            continue
+        host_id = "finding_" + hashlib.sha256(f"{report_id}|{local_id}".encode()).hexdigest()[:24]
+        aliases[finding["id"]] = host_id
+        finding["id"] = host_id
+        retained.append(finding)
+    return retained, aliases, rejected
+
+
+def insufficient(inst, request, reason, reference_price=None, completed_at=None):
     return {"instId": inst, "direction": "insufficient", "confidence": "low",
-            "horizonHours": request["horizonHours"], "generatedAt": request["now"],
+            "horizonHours": request["horizonHours"], "generatedAt": request["now"] if completed_at is None else completed_at,
             "referencePrice": reference_price, "drivers": [reason],
-            "invalidation": "取得可核验事件依据后重新评估。" if reference_price is not None else "取得新鲜报价及可核验事件后重新评估。",
-            "eventIds": []}
+            "invalidation": "取得可核验市场依据后重新评估。" if reference_price is not None else "取得新鲜报价及可核验市场依据后重新评估。",
+            "eventIds": [], "findingIds": []}
 
 
 def validate_report(report: dict, request: dict, research: Research, completed_at=None) -> dict:
@@ -252,18 +309,28 @@ def validate_report(report: dict, request: dict, research: Research, completed_a
     if errors:
         raise ResearchError("REPORT_SCHEMA: model output does not match the intelligence contract")
     report = copy.deepcopy(report)
-    if research.failures or not all(q in research.searches for q in SEARCH_TOPICS.values()):
-        raise ResearchError("RESEARCH_INCOMPLETE: required news searches were not completed")
+    completed_at = request["now"] if completed_at is None else completed_at
+    if not finite(completed_at) or completed_at < request["now"]:
+        raise ResearchError("REPORT_TIME: completion must be a finite timestamp at or after request time")
+    report_id = "rpt_" + hashlib.sha256(f"{request['kind']}|{request['now']}".encode()).hexdigest()[:24]
+    findings, finding_aliases, rejected_findings = validated_findings(report.get("analysis", []), request, research, report_id)
+    if not research.searches:
+        raise ResearchError("RESEARCH_INCOMPLETE: no news searches were completed")
+    missing_topics = [q for q in SEARCH_TOPICS.values() if q not in research.searches]
+    market_urls = set(getattr(research, "market_document_urls", set()))
+    market_failures = getattr(research, "market_failures", [])
     has_news_leads = any(research.searches.values())
     publisher_docs = [doc for doc in research.documents.values()
                       if canonical_url(doc.url) not in research.calendar_document_urls
-                      and urllib.parse.urlsplit(doc.url).hostname not in {"news.google.com", "www.bing.com", "bing.com"}]
+                      and canonical_url(doc.url) not in market_urls
+                      and urllib.parse.urlsplit(doc.url).hostname not in DISCOVERY_HOSTS]
     unread_news = has_news_leads and not publisher_docs
-    if unread_news:
+    sourced_analysis = any(f["kind"] != "unknown" and f["sources"] for f in findings)
+    if unread_news and (request["kind"] == "flash" or not sourced_analysis):
         raise ResearchError("RESEARCH_UNVERIFIED: news leads were found but no original publisher was read; this is not a no-news result")
-    coverage_complete = not (research.failed_fetches or research.failed_searches or research.calendar_failures)
+    coverage_complete = not (getattr(research, "review_failed", False) or rejected_findings or research.failures or missing_topics or unread_news or market_failures
+                             or research.failed_fetches or research.failed_searches or research.calendar_failures)
     start, end = window(request)
-    completed_at = request["now"] if completed_at is None else completed_at
     eligible_start = start
     if request["kind"] != "daily":
         eligible_start = max(start, completed_at - (1800 if request["kind"] == "flash" else 3600))
@@ -272,18 +339,7 @@ def validate_report(report: dict, request: dict, research: Research, completed_a
     for event in report["events"]:
         if not finite(event["occurredAt"]):
             raise ResearchError("EVENT_TIME: invalid occurrence timestamp")
-        for source in event["sources"]:
-            key = canonical_url(source["url"])
-            document = research.documents.get(key)
-            if not document:
-                raise ResearchError("SOURCE_UNFETCHED: an event cites a URL that was not read this run")
-            if urllib.parse.urlsplit(document.url).hostname in {"news.google.com", "www.bing.com", "bing.com"}:
-                raise ResearchError("SOURCE_DISCOVERY_ONLY: search feeds do not establish event occurrence")
-            evidence = normalize(source["evidence"])
-            if len(evidence) < 30 or len(evidence) > 2000 or evidence not in normalize(document.text):
-                raise ResearchError("SOURCE_EVIDENCE: event evidence is not an exact fetched-source excerpt")
-            source["url"] = document.url
-            source["retrievedAt"] = document.retrieved_at
+        verified_sources(event["sources"], research, "event")
         precise = event["timePrecision"] == "minute" and verified_minute(event, research)
         if event["timePrecision"] == "minute" and not precise:
             event["timePrecision"] = "unknown"
@@ -309,45 +365,91 @@ def validate_report(report: dict, request: dict, research: Research, completed_a
         seen.add(event["id"])
         events.append(event)
     event_ids = {e["id"] for e in events if e["status"] != "unverified"}
+    finding_by_id = {f["id"]: f for f in findings}
     input_predictions = {p["instId"]: p for p in report["predictions"]}
-    quotes = {q.get("instId"): q for q in request["quotes"] if isinstance(q, dict)}
+    # Input quotes were observed before request time; tool quotes may be newer.
+    # In either case a slow research run must not extend their actual freshness.
+    quotes = {}
+    quote_candidates = [(q, request["now"]) for q in request["quotes"] if isinstance(q, dict)]
+    market_quotes = getattr(research, "market_quotes", {})
+    quote_candidates.extend(({**q, "instId": inst}, completed_at) for inst, q in market_quotes.items()
+                            if isinstance(q, dict) and q.get("instId", inst) == inst
+                            and inst in request["watchlist"])
+    for quote, observed_at in quote_candidates:
+        price, as_of, inst = quote.get("price"), quote.get("asOf"), quote.get("instId")
+        if (not finite(price) or price <= 0 or not finite(as_of) or as_of > observed_at
+                or not 0 <= completed_at - as_of <= MAX_QUOTE_AGE):
+            continue
+        if inst not in quotes or as_of > quotes[inst]["asOf"]:
+            quotes[inst] = quote
     predictions = []
     for inst in request["watchlist"]:
         quote = quotes.get(inst, {})
-        price, as_of = quote.get("price"), quote.get("asOf")
-        if not finite(price) or price <= 0 or not finite(as_of) or not 0 <= request["now"] - as_of <= MAX_QUOTE_AGE:
-            predictions.append(insufficient(inst, request, "缺少最近5分钟内的有效报价，无法给出有依据的方向判断。"))
+        price = quote.get("price")
+        if price is None:
+            predictions.append(insufficient(inst, request, "截至报告完成时缺少最近5分钟内的有效报价，无法给出有依据的方向判断。", completed_at=completed_at))
             continue
         prediction = input_predictions.get(inst)
         if not prediction:
-            predictions.append(insufficient(inst, request, "模型未给出该标的的证据支持判断。", price))
+            predictions.append(insufficient(inst, request, "模型未给出该标的的证据支持判断。", price, completed_at))
             continue
         referenced = list(dict.fromkeys(aliases.get(e, e) for e in prediction["eventIds"]))
-        if prediction["direction"] != "insufficient" and (not referenced or not set(referenced) <= event_ids or not prediction["drivers"] or not prediction["invalidation"].strip()):
-            prediction = insufficient(inst, request, "方向判断缺少本次已核验事件、驱动因素或失效条件。", price)
+        finding_refs = list(dict.fromkeys(finding_aliases.get(f, f) for f in prediction.get("findingIds", [])))
+        supported_findings = {fid for fid, finding in finding_by_id.items()
+                              if finding["kind"] != "unknown" and inst in finding["instIds"]}
+        invalid_references = not set(referenced) <= event_ids or not set(finding_refs) <= supported_findings
+        if invalid_references or (prediction["direction"] != "insufficient" and (
+                not (referenced or finding_refs)
+                or not prediction["drivers"] or not all(d.strip() for d in prediction["drivers"])
+                or not prediction["invalidation"].strip())):
+            prediction = insufficient(inst, request, "方向判断缺少适用于该标的的已核验事件或研究依据、驱动因素或失效条件。", price, completed_at)
         else:
             prediction["eventIds"] = [e for e in referenced if e in event_ids]
+            prediction["findingIds"] = [f for f in finding_refs if f in supported_findings]
         prediction["referencePrice"] = price
         prediction["horizonHours"] = request["horizonHours"]
-        prediction["generatedAt"] = request["now"]
+        prediction["generatedAt"] = completed_at
         predictions.append(prediction)
-    report.update({"id": "rpt_" + hashlib.sha256(f"{request['kind']}|{request['now']}".encode()).hexdigest()[:24],
+    report.update({"id": report_id,
                    "kind": request["kind"], "generatedAt": completed_at,
                    "windowStart": start, "windowEnd": end, "events": sorted(events, key=lambda e: e["occurredAt"]),
-                   "predictions": predictions, "coverageComplete": coverage_complete})
+                   "analysis": findings, "predictions": predictions, "coverageComplete": coverage_complete})
     verified = len({id(d) for d in research.documents.values()})
-    report["coverage"] = f"已检索全球局势、美国政策、加密市场；读取 {verified} 个来源。" + report["coverage"]
+    market_count = len({canonical_url(d.url) for d in research.documents.values()
+                        if canonical_url(d.url) in market_urls})
+    if rejected_findings:
+        # The model's free-form lead/coverage could repeat a rejected claim.
+        # Rebuild the lead solely from retained, explicitly typed conclusions.
+        report["coverage"] = f"{rejected_findings} 条分析未通过来源校验，已整条移除；仅保留独立通过校验的内容。"
+        if not sourced_analysis and not events:
+            report["title"] = "研究证据未通过校验"
+            report["summary"] = "本轮分析的事实与推断未保留可核验依据，无法据此形成方向判断；这不代表市场没有新事件。"
+        else:
+            labels = {"observation": "观察", "inference": "推断", "unknown": "待核实"}
+            report["title"] = "市场研究 · 部分结论未通过核验"
+            report["summary"] = "部分分析的来源证据未通过校验，已移除。保留内容：" + "；".join(
+                f"{labels[f['kind']]}：{f['title']}" for f in findings)
+            if not findings:
+                report["summary"] = "分析结论的来源证据未通过校验，已移除；通过校验的事件保留在日历中。"
+    report["coverage"] = (f"完成 {len(research.searches)} 次新闻搜索；读取 {verified} 个来源"
+                          f"（含 {market_count} 个市场数据来源），核验 {len(findings)} 条研究结论。" + report["coverage"])
     report["coverage"] += " ".join(research.coverage_notes)
+    if missing_topics or research.failures:
+        report["coverage"] += f" 基础新闻覆盖存在缺口：{len(missing_topics)} 个主题未完成；未据此推断这些领域没有新事件。"
+    if unread_news:
+        report["coverage"] += " 新闻线索的原始正文尚未读到；当前保留的是有来源的市场研究，不能据此判断全面无新闻。"
+    if market_failures:
+        report["coverage"] += f" {len(market_failures)} 次市场数据请求未完成；未将缺失数据解释为零变动或零成交。"
     if research.calendar_failures:
         report["coverage"] += " 日历覆盖不完整：" + "、".join(research.calendar_failures) + "官方来源本轮读取失败；未推算缺失日程。"
     if research.failed_fetches or research.failed_searches:
         report["coverage"] += (f" 部分研究未完成：{len(research.failed_fetches)} 个页面、"
-                               f"{len(research.failed_searches)} 次额外搜索读取失败；仅展示成功核验的事件。")
+                               f"{len(research.failed_searches)} 次额外搜索读取失败；仅展示成功核验的事件与研究依据。")
     if rejected_precision:
         report["coverage"] += f" {rejected_precision} 条事件未通过发生时间核验；不作为小时更新或快报。"
     if not coverage_complete:
         report["coverage"] = "覆盖不完整：部分来源或补充搜索未完成，本报告仅代表已成功读取的来源。 " + report["coverage"]
-    if not events:
+    if not rejected_findings and not events and (request["kind"] == "flash" or not findings):
         period = {"flash": "最近30分钟", "hourly": "最近60分钟", "daily": "本次日历窗口"}[request["kind"]]
         report["title"] = "已读取来源未核验到新事件"
         report["summary"] = f"仅在本轮已完成检索和成功读取的来源范围内，未核验到符合{period}发生时间与去重条件的新事件。"

@@ -323,7 +323,7 @@ class EventValidationTests(unittest.TestCase):
         self.assertEqual(out["events"], [])
         self.assertEqual(out["windowEnd"], NOW)
         self.assertEqual(out["generatedAt"], NOW+1800)
-        self.assertEqual(out["predictions"][0]["generatedAt"], NOW)
+        self.assertEqual(out["predictions"][0]["generatedAt"], NOW+1800)
 
     def test_request_rejects_nan_and_unknown_timezone(self):
         for field, value in (("now", float("nan")), ("timezone", "invalid"), ("horizonHours", 0)):

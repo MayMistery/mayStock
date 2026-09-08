@@ -18,6 +18,7 @@ final class IntelligenceCenter {
     @ObservationIgnored private let snapshotMode: Bool
     @ObservationIgnored private var timer: Task<Void, Never>?
     @ObservationIgnored private var watchlist: () -> [String] = { [] }
+    @ObservationIgnored private var venues: () -> [String: String] = { [:] }
     @ObservationIgnored private var liveQuote: (String) -> Ticker? = { _ in nil }
     @ObservationIgnored private var fetchQuote: @MainActor (String) async -> Ticker? = { _ in nil }
     @ObservationIgnored private var onFlash: (String) -> Void = { _ in }
@@ -57,8 +58,10 @@ final class IntelligenceCenter {
 
     func start(watchlist: @escaping () -> [String], quote: @escaping (String) -> Ticker?,
                fetchQuote: @escaping @MainActor (String) async -> Ticker?,
+               venues: @escaping () -> [String: String] = { [:] },
                onFlash: @escaping (String) -> Void) {
         self.watchlist = watchlist; liveQuote = quote; self.fetchQuote = fetchQuote; self.onFlash = onFlash
+        self.venues = venues
         guard !snapshotMode, timer == nil else { return }
         timer = Task { [weak self] in
             // Let launch-time market connections settle first.
@@ -138,7 +141,8 @@ final class IntelligenceCenter {
                 }
                 let request = IntelligenceRequest(kind: kind, now: Date(), settings: capturedSettings,
                     watchlist: instruments, quotes: quotes,
-                    knownEvents: self.events.filter { $0.status == .occurred }.map(IntelligenceKnownEvent.init))
+                    knownEvents: self.events.filter { $0.status == .occurred }.map(IntelligenceKnownEvent.init),
+                    venues: self.venues())
                 let report = try await bridge.generate(request)
                 try self.accept(report, request: request)
             } catch {

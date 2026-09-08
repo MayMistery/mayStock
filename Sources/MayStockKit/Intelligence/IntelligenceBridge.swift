@@ -29,14 +29,17 @@ public struct IntelligenceRequest: Codable, Sendable {
     public var timezone: String
     public var horizonHours: Int
     public var watchlist: [String]
+    public var venues: [String: String]?
     public var quotes: [IntelligenceQuote]
     public var knownEvents: [IntelligenceKnownEvent]
 
     public init(kind: IntelligenceKind, now: Date, settings: IntelligenceSettings,
-                watchlist: [String], quotes: [IntelligenceQuote], knownEvents: [IntelligenceKnownEvent]) {
+                watchlist: [String], quotes: [IntelligenceQuote], knownEvents: [IntelligenceKnownEvent],
+                venues: [String: String]? = nil) {
         self.kind = kind; self.now = now; timezone = settings.timezone
         horizonHours = settings.horizonHours; self.watchlist = watchlist
         self.quotes = quotes; self.knownEvents = knownEvents
+        self.venues = venues
     }
 }
 
@@ -69,7 +72,7 @@ public struct IntelligenceBridge: Sendable {
         do {
             output = try await Subprocess.run(executable: python.path, arguments: [script.path],
                 environment: environment, workingDirectory: script.deletingLastPathComponent(),
-                stdin: try IntelligenceJSON.encoder().encode(request), timeout: 600, maxOutputBytes: 4_000_000)
+                stdin: try IntelligenceJSON.encoder().encode(request), timeout: 900, maxOutputBytes: 4_000_000)
         } catch Subprocess.Failure.timedOut {
             throw IntelligenceBridgeError.failed("研究超时，已保留上次结果；稍后重试。")
         } catch {

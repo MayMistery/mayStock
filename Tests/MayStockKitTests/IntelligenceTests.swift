@@ -70,6 +70,8 @@ struct IntelligenceTests {
         #expect(decoded.events[0].publishedAt == nil)
         #expect(decoded.predictions[0].referencePrice == nil)
         #expect(decoded.coverageComplete == nil) // Existing archives stay readable.
+        #expect(decoded.analysis == nil && decoded.findings.isEmpty)
+        #expect(decoded.predictions[0].findingIds == nil)
         let data = try IntelligenceJSON.encoder().encode(decoded)
         #expect(try IntelligenceJSON.decoder().decode(IntelligenceReport.self, from: data) == decoded)
         var partial = decoded

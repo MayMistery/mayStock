@@ -28,6 +28,10 @@ public enum IntelligenceConfidence: String, Codable, CaseIterable, Sendable {
     case low, medium, high
 }
 
+public enum IntelligenceFindingKind: String, Codable, CaseIterable, Sendable {
+    case observation, inference, unknown
+}
+
 /// Dates in the bridge use Unix seconds; callers configure their JSON coder's
 /// date strategy to secondsSince1970. Day boundaries belong to the display zone.
 public struct IntelligenceSource: Codable, Equatable, Sendable {
@@ -79,6 +83,28 @@ public struct IntelligenceEvent: Codable, Identifiable, Equatable, Sendable {
     }
 }
 
+/// An agent-chosen section of the market analysis. Observations, causal
+/// interpretations and unresolved questions retain their own evidence.
+public struct IntelligenceFinding: Codable, Identifiable, Equatable, Sendable {
+    public var id: String
+    public var title: String
+    public var body: String
+    public var kind: IntelligenceFindingKind
+    public var instIds: [String]
+    public var sources: [IntelligenceSource]
+
+    public init(id: String = UUID().uuidString, title: String, body: String,
+                kind: IntelligenceFindingKind, instIds: [String] = [],
+                sources: [IntelligenceSource] = []) {
+        self.id = id
+        self.title = title
+        self.body = body
+        self.kind = kind
+        self.instIds = instIds
+        self.sources = sources
+    }
+}
+
 /// Direction and confidence are uncalibrated model judgments, never trade
 /// instructions or an empirically measured probability of a price move.
 public struct IntelligencePrediction: Codable, Identifiable, Equatable, Sendable {
@@ -92,11 +118,14 @@ public struct IntelligencePrediction: Codable, Identifiable, Equatable, Sendable
     public var drivers: [String]
     public var invalidation: String
     public var eventIds: [String]
+    /// Absent in reports generated before research findings were supported.
+    public var findingIds: [String]?
 
     public init(instId: String, direction: IntelligenceDirection = .insufficient,
                 confidence: IntelligenceConfidence = .low, horizonHours: Int = 1,
                 generatedAt: Date = Date(), referencePrice: Double? = nil,
-                drivers: [String] = [], invalidation: String = "", eventIds: [String] = []) {
+                drivers: [String] = [], invalidation: String = "", eventIds: [String] = [],
+                findingIds: [String]? = nil) {
         self.instId = instId
         self.direction = direction
         self.confidence = confidence
@@ -106,6 +135,7 @@ public struct IntelligencePrediction: Codable, Identifiable, Equatable, Sendable
         self.drivers = drivers
         self.invalidation = invalidation
         self.eventIds = eventIds
+        self.findingIds = findingIds
     }
 
     public var expiresAt: Date { generatedAt.addingTimeInterval(Double(horizonHours) * 3_600) }
@@ -124,12 +154,16 @@ public struct IntelligenceReport: Codable, Identifiable, Equatable, Sendable {
     public var coverageComplete: Bool?
     public var events: [IntelligenceEvent]
     public var predictions: [IntelligencePrediction]
+    /// Optional so pre-analysis report archives continue to decode unchanged.
+    public var analysis: [IntelligenceFinding]?
+
+    public var findings: [IntelligenceFinding] { analysis ?? [] }
 
     public init(id: String = UUID().uuidString, kind: IntelligenceKind,
                 generatedAt: Date = Date(), windowStart: Date = Date(), windowEnd: Date = Date(),
                 title: String = "", summary: String = "", coverage: String = "",
                 events: [IntelligenceEvent] = [], predictions: [IntelligencePrediction] = [],
-                coverageComplete: Bool? = nil) {
+                coverageComplete: Bool? = nil, analysis: [IntelligenceFinding]? = nil) {
         self.id = id
         self.kind = kind
         self.generatedAt = generatedAt
@@ -141,6 +175,30 @@ public struct IntelligenceReport: Codable, Identifiable, Equatable, Sendable {
         self.coverageComplete = coverageComplete
         self.events = events
         self.predictions = predictions
+        self.analysis = analysis
+    }
+}
+
+/// The forecast and evidence are resolved from the same report, even when
+/// several archives reuse a short event or finding identifier.
+public struct IntelligencePredictionContext: Equatable, Sendable {
+    public let reportId: String
+    public let prediction: IntelligencePrediction
+    public let events: [IntelligenceEvent]
+    public let findings: [IntelligenceFinding]
+
+    public init(prediction: IntelligencePrediction, report: IntelligenceReport) {
+        self.reportId = report.id
+        self.prediction = prediction
+        let belongsToReport = report.predictions.contains(prediction)
+        self.events = belongsToReport ? report.events.filter { prediction.eventIds.contains($0.id) } : []
+        self.findings = belongsToReport ? report.findings.filter { (prediction.findingIds ?? []).contains($0.id) } : []
+    }
+
+    public static func latest(for instId: String, in reports: [IntelligenceReport]) -> Self? {
+        reports.flatMap { report in
+            report.predictions.filter { $0.instId == instId }.map { Self(prediction: $0, report: report) }
+        }.max { $0.prediction.generatedAt < $1.prediction.generatedAt }
     }
 }
 

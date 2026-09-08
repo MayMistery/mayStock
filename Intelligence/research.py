@@ -168,6 +168,12 @@ SEARCH_TOPICS = {
     "crypto_ethereum": "Ethereum",
 }
 
+MARKET_API_HOSTS = {
+    "data-api.binance.vision", "api.binance.com", "fapi.binance.com",
+    "www.okx.com", "query1.finance.yahoo.com", "query2.finance.yahoo.com",
+    "api.exchange.coinbase.com", "api.coinbase.com", "api.kraken.com",
+}
+
 
 class Research:
     def __init__(self, timeout: float = 12, max_requests: int = 45):
@@ -180,6 +186,7 @@ class Research:
         self.failed_fetches: set[str] = set()
         self.failed_searches: set[str] = set()
         self.calendar_document_urls: set[str] = {canonical_url(url) for url in CALENDARS.values()}
+        self.market_document_urls: set[str] = set()
         self.coverage_notes: list[str] = []
         self.blocked_urls: dict[str, str] = {}
 
@@ -196,6 +203,12 @@ class Research:
             "User-Agent": "curl/8.7.1" if urllib.parse.urlsplit(url).hostname == "fred.stlouisfed.org" else "Mozilla/5.0 (compatible; MayStockResearch/1.0)",
             "Accept": "text/html,application/rss+xml,application/xml,text/calendar,text/plain;q=0.9",
         }
+        # These public data endpoints negotiate JSON and reject the news crawler's
+        # HTML/RSS Accept header with 406. Match the app's existing market client;
+        # keep the same pinned public-IP connection and original-host TLS checks.
+        if urllib.parse.urlsplit(url).hostname in MARKET_API_HOSTS:
+            headers.update({"Accept": "application/json",
+                            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) MayStock"})
         if data is not None:
             headers["Content-Type"] = "application/x-www-form-urlencoded;charset=UTF-8"
         request = urllib.request.Request(url, data=data, headers=headers)
@@ -258,6 +271,10 @@ class Research:
             raise ResearchError("SOURCE_BLOCKED: publisher denied automated reading")
         document = Document(final, text[:100_000], time.time(), list(dict.fromkeys(links)))
         self.documents[key] = self.documents[final] = document
+        if content_type == "application/json" or urllib.parse.urlsplit(final).hostname in MARKET_API_HOSTS:
+            # Public JSON is valid research evidence, but reading a ticker does
+            # not resolve the original-news coverage requirement for a flash.
+            self.market_document_urls.update((key, final))
         return document
 
     async def fetch(self, url: str) -> dict:
@@ -341,8 +358,10 @@ class Research:
                     self.failures.append(name)
             else:
                 output[name] = value
+        if not self.searches:
+            raise ResearchError("RESEARCH_INCOMPLETE: all news discovery sources unavailable")
         if self.failures:
-            raise ResearchError("RESEARCH_INCOMPLETE: required sources unavailable: " + ", ".join(self.failures))
+            output["searchCoverageGaps"] = self.failures.copy()
         if self.calendar_failures:
             output["calendarCoverageGaps"] = self.calendar_failures.copy()
         if "BLS" in self.calendar_failures:

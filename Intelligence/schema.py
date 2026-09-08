@@ -32,6 +32,15 @@ PREDICTION = obj({
     "generatedAt": NUMBER, "referencePrice": NULLABLE_NUMBER,
     "drivers": STRINGS, "invalidation": STRING, "eventIds": STRINGS,
 })
+FINDING = obj({
+    "id": STRING, "title": STRING, "body": STRING,
+    "kind": enum("observation", "inference", "unknown"),
+    "instIds": STRINGS,
+    "sources": {"type": "array", "items": SOURCE, "maxItems": 5},
+})
+# Existing archived reports can omit these fields. New model responses must
+# explicitly separate evidence/context from newly occurred calendar events.
+PREDICTION["properties"]["findingIds"] = STRINGS
 REPORT_SCHEMA = obj({
     "id": STRING, "kind": enum("daily", "hourly", "flash"),
     "generatedAt": NUMBER, "windowStart": NUMBER, "windowEnd": NUMBER,
@@ -39,8 +48,11 @@ REPORT_SCHEMA = obj({
     "events": {"type": "array", "items": EVENT, "maxItems": 100},
     "predictions": {"type": "array", "items": PREDICTION, "maxItems": 200},
 })
+REPORT_SCHEMA["properties"]["analysis"] = {"type": "array", "items": FINDING, "maxItems": 200}
 
 # Models do not judge their own retrieval coverage. The host appends this
 # optional wire field after checking the per-run retrieval ledger.
 MODEL_REPORT_SCHEMA = copy.deepcopy(REPORT_SCHEMA)
+MODEL_REPORT_SCHEMA["required"].append("analysis")
+MODEL_REPORT_SCHEMA["properties"]["predictions"]["items"]["required"].append("findingIds")
 REPORT_SCHEMA["properties"]["coverageComplete"] = {"type": "boolean"}

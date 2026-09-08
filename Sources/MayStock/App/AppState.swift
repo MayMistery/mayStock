@@ -170,6 +170,9 @@ final class AppState {
             guard let self, let item = self.store.config.watchlist.first(where: { $0.instId == instId }),
                   let source = self.hub.source(for: item.venue) else { return nil }
             return try? await source.ticker(instId: instId)
+        }, venues: { [weak self] in
+            Dictionary((self?.store.config.watchlist ?? []).map { ($0.instId, $0.venue.rawValue) },
+                       uniquingKeysWith: { first, _ in first })
         }, onFlash: { [weak self] body in
             self?.notifications.post(title: "MayStock · 局势快报", body: body, sound: false)
         })
