@@ -156,6 +156,8 @@ public struct IntelligenceReport: Codable, Identifiable, Equatable, Sendable {
     public var predictions: [IntelligencePrediction]
     /// Optional so pre-analysis report archives continue to decode unchanged.
     public var analysis: [IntelligenceFinding]?
+    /// The worker's actual selected model. Earlier archives leave it unknown.
+    public var model: String?
 
     public var findings: [IntelligenceFinding] { analysis ?? [] }
 
@@ -163,7 +165,8 @@ public struct IntelligenceReport: Codable, Identifiable, Equatable, Sendable {
                 generatedAt: Date = Date(), windowStart: Date = Date(), windowEnd: Date = Date(),
                 title: String = "", summary: String = "", coverage: String = "",
                 events: [IntelligenceEvent] = [], predictions: [IntelligencePrediction] = [],
-                coverageComplete: Bool? = nil, analysis: [IntelligenceFinding]? = nil) {
+                coverageComplete: Bool? = nil, analysis: [IntelligenceFinding]? = nil,
+                model: String? = nil) {
         self.id = id
         self.kind = kind
         self.generatedAt = generatedAt
@@ -176,6 +179,7 @@ public struct IntelligenceReport: Codable, Identifiable, Equatable, Sendable {
         self.events = events
         self.predictions = predictions
         self.analysis = analysis
+        self.model = model
     }
 }
 
@@ -203,20 +207,34 @@ public struct IntelligencePredictionContext: Equatable, Sendable {
 }
 
 public struct IntelligenceSettings: Codable, Equatable, Sendable {
+    public static let defaultModel = "model_hub/es1_orange_o50[1m]"
+
     public var enabled: Bool
     public var dailyHour: Int
     public var timezone: String
     public var horizonHours: Int
+    public var model: String
 
     public init(enabled: Bool = true, dailyHour: Int = 8, timezone: String = "Asia/Taipei",
-                horizonHours: Int = 1) {
+                horizonHours: Int = 1, model: String = IntelligenceSettings.defaultModel) {
         self.enabled = enabled
         self.dailyHour = dailyHour
         self.timezone = timezone
         self.horizonHours = horizonHours
+        self.model = model
     }
 
-    private enum CodingKeys: String, CodingKey { case enabled, dailyHour, timezone, horizonHours }
+    /// Accept model identifiers, including routed names, without embedded
+    /// whitespace, controls or command-like leading punctuation.
+    public static func normalizeModel(_ value: String) -> String? {
+        let model = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !model.isEmpty, model.utf8.count <= 200,
+              model.range(of: #"\A[A-Za-z0-9][A-Za-z0-9._:/\[\]-]*\z"#,
+                          options: .regularExpression) != nil else { return nil }
+        return model
+    }
+
+    private enum CodingKeys: String, CodingKey { case enabled, dailyHour, timezone, horizonHours, model }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -224,6 +242,7 @@ public struct IntelligenceSettings: Codable, Equatable, Sendable {
         dailyHour = try c.decodeIfPresent(Int.self, forKey: .dailyHour) ?? 8
         timezone = try c.decodeIfPresent(String.self, forKey: .timezone) ?? "Asia/Taipei"
         horizonHours = try c.decodeIfPresent(Int.self, forKey: .horizonHours) ?? 1
+        model = try c.decodeIfPresent(String.self, forKey: .model) ?? Self.defaultModel
     }
 }
 

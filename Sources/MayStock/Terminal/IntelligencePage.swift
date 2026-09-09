@@ -87,12 +87,16 @@ struct IntelligencePage: View {
                         showUpdateStatus = false
                         showSettings = true
                     } label: {
-                        Label("生成计划", systemImage: "clock")
+                        Label("模型与计划", systemImage: "gearshape")
                     }
                     .controlSize(.small)
                 }
                 .padding(16).frame(width: 380, height: 470)
             }
+            Button { showSettings = true } label: {
+                Label("模型与计划", systemImage: "gearshape")
+            }
+            .controlSize(.small)
             Button { center.refresh(.hourly) } label: {
                 Label(center.isRunning ? "更新中" : "更新分析", systemImage: "arrow.clockwise")
             }
@@ -178,6 +182,10 @@ struct IntelligencePage: View {
                 Text("研究生成 " + stamp(report.generatedAt) + " · 资料窗口 " +
                      stamp(report.windowStart) + " — " + stamp(report.windowEnd))
                     .font(Theme.Text.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                if let model = report.model {
+                    Text("生成模型：" + model)
+                        .font(Theme.Text.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                }
                 if !report.summary.isEmpty {
                     IntelligenceSummaryView(text: report.summary).id(report.id)
                 }
@@ -800,6 +808,10 @@ private struct IntelligenceReportReader: View {
                         Text("资料窗口 " + intelligenceStamp(report.windowStart, timezone: timezone) + " — " +
                              intelligenceStamp(report.windowEnd, timezone: timezone) + " " + timezone)
                             .font(Theme.Text.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                        if let model = report.model {
+                            Text("生成模型：" + model)
+                                .font(Theme.Text.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                        }
                         IntelligenceAnalysisView(report: report, timezone: timezone)
                         if !report.predictions.isEmpty {
                             Card(title: "当时的标的判断", subtitle: "仅反映本报告生成时的研究，过期判断不代表当前方向") {
@@ -838,13 +850,18 @@ private struct IntelligenceSettingsSheet: View {
     @State private var timezone = "Asia/Taipei"
     @State private var horizonHours = 1
     @State private var enabled = true
+    @State private var model = IntelligenceSettings.defaultModel
+    @State private var saveError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("情报生成计划").font(Theme.Text.title)
+            Text("情报模型与计划").font(Theme.Text.title)
             Toggle("自动更新", isOn: $enabled)
                 .font(Theme.Text.body)
             Form {
+                TextField("模型名称", text: $model)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12, design: .monospaced))
                 Picker("日报时间", selection: $dailyHour) {
                     ForEach(0..<24, id: \.self) { Text(String(format: "%02d:00", $0)).tag($0) }
                 }
@@ -856,32 +873,43 @@ private struct IntelligenceSettingsSheet: View {
                 Text("局势更新：每 1 小时，回看近 60 分钟。")
                 Text("新闻快报：每 30 分钟，只报告窗口内新发生且核实的事件。")
                 Text("应用退出或睡眠期间暂停，恢复后只检查当前窗口。")
-                Text("Claude Agent SDK · model_hub/es1_orange_o50[1m]")
-                    .textSelection(.enabled)
+                Text("日报、局势更新、快报及复核共用此模型，保存后从下一轮开始生效。")
+                if center.isRunning { Text("当前研究会继续使用启动时的模型。") }
             }
             .font(Theme.Text.secondary).foregroundStyle(.secondary)
             if TimeZone(identifier: timezone) == nil {
                 Text("请输入有效 IANA 时区，例如 Asia/Taipei 或 America/New_York。")
                     .font(Theme.Text.caption).foregroundStyle(Theme.warning)
             }
+            if IntelligenceSettings.normalizeModel(model) == nil {
+                Text("请输入 1–200 位模型名称，可包含字母、数字、下划线、点、冒号、斜线、短横线和方括号。")
+                    .font(Theme.Text.caption).foregroundStyle(Theme.warning)
+            }
+            if let saveError {
+                Text(saveError).font(Theme.Text.caption).foregroundStyle(Theme.warning)
+            }
             HStack {
                 Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
                 Spacer()
                 Button("保存") {
-                    center.updateSettings(dailyHour: dailyHour, timezone: timezone, horizonHours: horizonHours)
-                    center.setEnabled(enabled)
-                    dismiss()
+                    if center.updateSettings(dailyHour: dailyHour, timezone: timezone, horizonHours: horizonHours,
+                                             model: model, enabled: enabled) {
+                        dismiss()
+                    } else {
+                        saveError = center.error
+                    }
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(TimeZone(identifier: timezone) == nil)
+                .disabled(TimeZone(identifier: timezone) == nil || IntelligenceSettings.normalizeModel(model) == nil)
             }
         }
-        .padding(24).frame(width: 460)
+        .padding(24).frame(width: 560)
         .onAppear {
             dailyHour = center.settings.dailyHour
             timezone = center.settings.timezone
             horizonHours = center.settings.horizonHours
             enabled = center.settings.enabled
+            model = center.settings.model
         }
     }
 }

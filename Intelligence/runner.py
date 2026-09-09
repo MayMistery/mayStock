@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from functools import partial
 import importlib.metadata
 import inspect
 import json
@@ -27,17 +28,19 @@ sys.dont_write_bytecode = True
 if __package__:
     from .connection import AUTH_ENV, resolve_connection, isolated_environment
     from .model_diagnostics import model_error, model_error_fields
+    from .model_selection import DEFAULT_MODEL, normalize_model
     from .research import SEARCH_TOPICS, Research, ResearchError
     from .schema import MODEL_REPORT_SCHEMA
     from .validation import parse_request, validate_report, window
 else:
     from connection import AUTH_ENV, resolve_connection, isolated_environment
     from model_diagnostics import model_error, model_error_fields
+    from model_selection import DEFAULT_MODEL, normalize_model
     from research import SEARCH_TOPICS, Research, ResearchError
     from schema import MODEL_REPORT_SCHEMA
     from validation import parse_request, validate_report, window
 
-MODEL = "model_hub/es1_orange_o50[1m]"
+MODEL = DEFAULT_MODEL
 SAFE_SETTINGS = {"disableAllHooks": True, "disableClaudeAiConnectors": True,
                  "autoMemoryEnabled": False, "enabledPlugins": {}}
 if __package__:
@@ -68,11 +71,11 @@ def configure_runtime():
     return _active_connection
 
 
-def sdk_options(cwd: str, mcp_servers=None, schema=None):
+def sdk_options(cwd: str, mcp_servers=None, schema=None, model=MODEL):
     from claude_agent_sdk import ClaudeAgentOptions
 
     return ClaudeAgentOptions(
-        model=MODEL, fallback_model=None, tools=[],
+        model=normalize_model(model), fallback_model=None, tools=[],
         allowed_tools=["mcp__research__search_news", "mcp__research__fetch_page", "mcp__research__market_data"] if mcp_servers else [],
         mcp_servers=mcp_servers or {}, strict_mcp_config=True,
         setting_sources=[], settings=json.dumps(SAFE_SETTINGS), plugins=[], skills=[],
@@ -95,11 +98,12 @@ async def invoke_model(options, prompt, validator=None):
     from claude_agent_sdk import AssistantMessage, ClaudeSDKClient, ResultMessage, ToolUseBlock
 
     assistant_error = None
+    selected_model = getattr(options, "model", None)
     try:
         async with ClaudeSDKClient(options=options) as client:
             for attempt in range(2):
                 assistant_error = None
-                progress("model_query", attempt=attempt + 1)
+                progress("model_query", attempt=attempt + 1, model=selected_model)
                 await client.query(prompt)
                 output = None
                 async for message in client.receive_response():
@@ -108,13 +112,13 @@ async def invoke_model(options, prompt, validator=None):
                             assistant_error = message.error
                         names = [block.name for block in message.content if isinstance(block, ToolUseBlock)]
                         if names:
-                            progress("model_tools", tools=names)
+                            progress("model_tools", tools=names, model=selected_model)
                     if isinstance(message, ResultMessage):
                         fields = model_error_fields(message, assistant_error)
-                        progress("model_result", subtype=fields["subtype"], isError=message.is_error,
+                        progress("model_result", model=selected_model, subtype=fields["subtype"], isError=message.is_error,
                                  apiStatus=fields["apiStatus"], structured=isinstance(message.structured_output, dict))
                         if message.is_error or message.subtype != "success":
-                            progress("model_failure", **fields)
+                            progress("model_failure", model=selected_model, **fields)
                             raise model_error(message, assistant_error)
                         if not isinstance(message.structured_output, dict):
                             raise ResearchError("MODEL_SCHEMA: Claude did not return structured output")
@@ -126,7 +130,7 @@ async def invoke_model(options, prompt, validator=None):
                     return await validated if inspect.isawaitable(validated) else validated
                 except ResearchError as exc:
                     code = str(exc).split(":", 1)[0]
-                    progress("validation_failed", code=code)
+                    progress("validation_failed", code=code, model=selected_model)
                     repairable = code in {
                         "REPORT_SCHEMA", "SOURCE_UNFETCHED", "SOURCE_EVIDENCE", "SOURCE_DISCOVERY_ONLY",
                         "EVENT_TIME", "EVENT_FUTURE", "RESEARCH_UNVERIFIED", "RESEARCH_PARTIAL", "FINDING_ID", "FINDING_CONTENT", "FINDING_INSTRUMENT", "FINDING_SOURCE"}
@@ -140,7 +144,7 @@ async def invoke_model(options, prompt, validator=None):
     except ResearchError:
         raise
     except Exception as exc:
-        progress("model_exception", **model_error_fields(exc, assistant_error))
+        progress("model_exception", model=selected_model, **model_error_fields(exc, assistant_error))
         raise model_error(exc, assistant_error) from None
     raise ResearchError("MODEL_EMPTY: Claude SDK ended without a report")
 
@@ -158,9 +162,11 @@ async def make_report(request):
         from daily import prefetch_news
         from review import audit_report
 
+    request = {**request, "model": normalize_model(request.get("model", MODEL))}
+    options_factory = partial(sdk_options, model=request["model"])
     research = Research(max_requests=PUBLIC_REQUEST_BUDGET)
     market = MarketData(research)
-    progress("research_start", kind=request["kind"])
+    progress("research_start", kind=request["kind"], model=request["model"])
     seed = await research.bootstrap(request["kind"])
     start, end = window(request)
     calendar = assemble_calendar_events(request, research) if request["kind"] == "daily" else []
@@ -237,20 +243,20 @@ async def make_report(request):
                          "请用 market_data catalog 了解可用数据，按关注资产和观察到的异常决定追查路径。"
                          "analysis可引用更早背景与市场证据；events仍严格遵守新事件时间窗口。"}, ensure_ascii=False)
     with tempfile.TemporaryDirectory(prefix="maystock-research-") as cwd:
-        output = await asyncio.wait_for(invoke_model(sdk_options(cwd, {"research": server}), prompt,
+        output = await asyncio.wait_for(invoke_model(options_factory(cwd, {"research": server}), prompt,
                                                      validator=prepare), MODEL_SECONDS[request["kind"]])
     # The short review has its own time allowance. A slow review cannot consume
     # the research's remaining budget and throw away an already completed draft.
     if request["kind"] != "flash" and output.get("analysis"):
-        progress("consistency_review_start")
+        progress("consistency_review_start", model=request["model"])
         try:
-            output = await audit_report(output, request, invoke_model, sdk_options)
+            output = await audit_report(output, request, invoke_model, options_factory)
             research.coverage_notes.append("本轮已完成交付前时间、数值比较及归因一致性复核；仍属模型判断。")
-            progress("consistency_review_done")
+            progress("consistency_review_done", model=request["model"])
         except (ResearchError, TimeoutError):
             research.review_failed = True
             research.coverage_notes.append("一致性复核本轮未完成；保留通过来源校验的初稿，需注意数值与归因局限。")
-            progress("consistency_review_incomplete")
+            progress("consistency_review_incomplete", model=request["model"])
     await refresh_reference_quotes(market, request)
     return validate_report(output, request, research, completed_at=time.time())
 
@@ -270,7 +276,8 @@ async def refresh_reference_quotes(market, request):
     await asyncio.gather(*(refresh(inst) for inst in request["watchlist"]))
 
 
-def doctor():
+def doctor(model=MODEL):
+    model = normalize_model(model)
     profile = _active_connection or resolve_connection()
     override = os.environ.get("MAYSTOCK_CLAUDE_PATH")
     claude_path = override
@@ -282,7 +289,7 @@ def doctor():
     except importlib.metadata.PackageNotFoundError:
         sdk_version = None
     route = profile.env
-    return {"model": MODEL, "sdkVersion": sdk_version, "python": sys.executable,
+    return {"model": model, "sdkVersion": sdk_version, "python": sys.executable,
             "claudePath": claude_path, "cliSelection": "override" if override else "sdk_default",
             **profile.diagnostics(),
             "routingEnvironmentKeys": sorted(key for key in route if key in AUTH_ENV),
@@ -297,14 +304,15 @@ async def main_async(args):
     for signum in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(signum, task.cancel)
     if args.doctor:
-        return doctor()
+        return doctor(getattr(args, "model", MODEL))
     if args.smoke_model:
+        model = normalize_model(getattr(args, "model", MODEL))
         schema = {"type": "object", "properties": {"status": {"type": "string", "enum": ["ok"]}},
                   "required": ["status"], "additionalProperties": False}
         with tempfile.TemporaryDirectory(prefix="maystock-model-probe-") as cwd:
-            value = await asyncio.wait_for(invoke_model(sdk_options(cwd, schema=schema),
+            value = await asyncio.wait_for(invoke_model(sdk_options(cwd, schema=schema, model=model),
                                                        'Return structured output {"status":"ok"}.'), 30)
-        return {"model": MODEL, "result": value}
+        return {"model": model, "result": value}
     if args.smoke_retrieval:
         research = Research()
         seed = await research.bootstrap("daily")
@@ -329,10 +337,12 @@ def main():
     group.add_argument("--doctor", action="store_true")
     group.add_argument("--smoke-model", action="store_true")
     group.add_argument("--smoke-retrieval", action="store_true")
+    parser.add_argument("--model", default=MODEL,
+                        help="Model for --doctor or --smoke-model; report generation uses stdin request.model")
     args = parser.parse_args()
     try:
         profile = configure_runtime()
-        progress("connection_configured", **profile.diagnostics(), model=MODEL,
+        progress("connection_configured", **profile.diagnostics(),
                  cliSelection="override" if os.environ.get("MAYSTOCK_CLAUDE_PATH") else "sdk_default")
         result = asyncio.run(asyncio.wait_for(main_async(args), timeout=840))
         print(json.dumps(result, ensure_ascii=False, allow_nan=False))

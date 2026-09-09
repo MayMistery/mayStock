@@ -2,7 +2,9 @@
 
 MayStock 的原生情报窗口提供今天前 7 天至后 30 天的事件日历、宏观日报、最近 1 小时局势，以及每 30 分钟检查一次的事件快报。每日默认 08:00（Asia/Taipei）生成日报；预测默认覆盖未来 **1 小时**。关注列表中的每个标的均参与判断，包括菜单栏隐藏的标的。
 
-情报通过 Python **Claude Agent SDK 0.2.152** 调用 Claude Code，固定使用 `model_hub/es1_orange_o50[1m]`。模型不可用时显示失败并保留已有情报，不自动替换模型。SDK 的 `[1m]` 后缀由 Claude Code 转换为大上下文请求配置。
+情报通过 Python **Claude Agent SDK 0.2.152** 调用 Claude Code。在终端 **情报站 → 模型与计划 → 模型名称** 中填写并保存模型，例如 `model_hub/es1_orange_o48_for_bench_expert[1m]`。日报、小时分析、快报及一致性复核共用所选模型，从下一轮研究开始生效；正在运行的研究继续使用启动时的模型。模型不可用时显示失败并保留已有情报，不自动替换模型。SDK 的 `[1m]` 后缀由 Claude Code 转换为大上下文请求配置。
+
+模型名称保存在情报归档的 `settings.model`，随每次研究请求传给 SDK。新报告记录实际请求的模型名称，切换设置不会改写历史报告的模型。旧设置没有此字段时沿用原默认值 `model_hub/es1_orange_o50[1m]`，旧报告未记录的模型保持未知。
 
 ## 阅读与更新
 
@@ -37,10 +39,11 @@ MayStock 的原生情报窗口提供今天前 7 天至后 30 天的事件日历�
 ```sh
 python Intelligence/runner.py --doctor
 python Intelligence/runner.py --smoke-model
+python Intelligence/runner.py --smoke-model --model 'model_hub/es1_orange_o48_for_bench_expert[1m]'
 python Intelligence/runner.py --smoke-retrieval
 ```
 
-`--doctor` 不访问模型，报告版本、CLI 路径、连接来源、服务 origin、header **名称**和被忽略的环境变量**名称**，不输出凭证值。`--smoke-model` 会实际调用固定模型并检查结构化输出。`--smoke-retrieval` 检查新闻发现与官方日历，明确返回不可读取的来源。模型失败按 SDK 提供的 HTTP 状态或明确错误类型区分认证、权限、限流、上游故障和请求拒绝；含糊的“所选模型有问题”不会直接断言模型不存在。
+`--doctor` 不访问模型，报告版本、CLI 路径、连接来源、服务 origin、header **名称**和被忽略的环境变量**名称**，不输出凭证值。`--smoke-model` 会实际调用模型并检查结构化输出；这两个诊断命令通过 `--model` 显式选择模型，未提供时使用旧默认值，不会改写终端设置。`--smoke-retrieval` 检查新闻发现与官方日历，明确返回不可读取的来源。模型失败按 SDK 提供的 HTTP 状态或明确错误类型区分认证、权限、限流、上游故障和请求拒绝；含糊的“所选模型有问题”不会直接断言模型不存在。
 
 ## 来源与时间规则
 

@@ -5,17 +5,26 @@ reads one JSON report from stdout. Diagnostics go to stderr. All timestamps are
 Unix seconds (UTC); all UI day boundaries use the request's IANA timezone.
 
 Request:
-`{kind: daily|hourly|flash, now: number, timezone: string, horizonHours: number,
+`{kind: daily|hourly|flash, now: number, timezone: string, horizonHours: number, model?: string,
 watchlist: [string], venues?: {instId: okx|schwab}, quotes: [{instId: string, price: number, change24h?: number,
 asOf: number}], knownEvents: [{id: string, title: string, occurredAt: number}]}`.
 `watchlist` includes every configured instrument, even if hidden in the menu bar.
-Model is always `model_hub/es1_orange_o50[1m]`.
+The app sends `settings.model` explicitly. Legacy requests without a model use
+`model_hub/es1_orange_o50[1m]`. Names are trimmed, contain 1–200 ASCII characters,
+start with a letter or digit, and otherwise allow letters, digits, `.`, `_`, `:`,
+`/`, `-`, `[` and `]`. Invalid values fail with `REQUEST_MODEL`. Generation,
+repair and consistency review use the same selected model, without fallback.
 Default `horizonHours` is 1, per the user's selected prediction horizon.
 
 Report:
 `{id: string, kind: daily|hourly|flash, generatedAt: number, windowStart: number,
 windowEnd: number, title: string, summary: string, coverage: string, coverageComplete?: boolean,
-events: [Event], predictions: [Prediction], analysis?: [Finding]}`.
+events: [Event], predictions: [Prediction], analysis?: [Finding], model?: string}`.
+
+New reports always include the host-owned requested `model`, never a value
+chosen by the model itself. The bridge rejects a newly generated report whose
+model is missing or mismatches the request. Archived reports may omit model;
+changing settings does not relabel old reports.
 
 `coverageComplete` is computed by the host from the retrieval ledger, never by
 the model. It is false when any publisher fetch, supplemental search, or official

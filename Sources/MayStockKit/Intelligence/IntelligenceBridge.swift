@@ -28,6 +28,7 @@ public struct IntelligenceRequest: Codable, Sendable {
     public var now: Date
     public var timezone: String
     public var horizonHours: Int
+    public var model: String
     public var watchlist: [String]
     public var venues: [String: String]?
     public var quotes: [IntelligenceQuote]
@@ -38,8 +39,26 @@ public struct IntelligenceRequest: Codable, Sendable {
                 venues: [String: String]? = nil) {
         self.kind = kind; self.now = now; timezone = settings.timezone
         horizonHours = settings.horizonHours; self.watchlist = watchlist
+        model = settings.model
         self.quotes = quotes; self.knownEvents = knownEvents
         self.venues = venues
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case kind, now, timezone, horizonHours, model, watchlist, venues, quotes, knownEvents
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try values.decode(IntelligenceKind.self, forKey: .kind)
+        now = try values.decode(Date.self, forKey: .now)
+        timezone = try values.decode(String.self, forKey: .timezone)
+        horizonHours = try values.decode(Int.self, forKey: .horizonHours)
+        model = try values.decodeIfPresent(String.self, forKey: .model) ?? IntelligenceSettings.defaultModel
+        watchlist = try values.decode([String].self, forKey: .watchlist)
+        venues = try values.decodeIfPresent([String: String].self, forKey: .venues)
+        quotes = try values.decode([IntelligenceQuote].self, forKey: .quotes)
+        knownEvents = try values.decode([IntelligenceKnownEvent].self, forKey: .knownEvents)
     }
 }
 
@@ -88,6 +107,9 @@ public struct IntelligenceBridge: Sendable {
               report.kind == request.kind,
               abs(report.generatedAt.timeIntervalSince(request.now)) <= 900 else {
             throw IntelligenceBridgeError.failed("模型结果格式或时间无效，未覆盖上次结果。")
+        }
+        guard report.model == request.model else {
+            throw IntelligenceBridgeError.failed("报告模型与本次请求不一致或未提供模型来源，未覆盖上次结果。")
         }
         return report
     }

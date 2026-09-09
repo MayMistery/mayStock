@@ -11,9 +11,11 @@ import urllib.parse
 from zoneinfo import ZoneInfo
 
 if __package__:
+    from .model_selection import DEFAULT_MODEL, normalize_model
     from .research import CALENDARS, SEARCH_TOPICS, Research, ResearchError, canonical_url, normalize
     from .schema import REPORT_SCHEMA
 else:
+    from model_selection import DEFAULT_MODEL, normalize_model
     from research import CALENDARS, SEARCH_TOPICS, Research, ResearchError, canonical_url, normalize
     from schema import REPORT_SCHEMA
 
@@ -57,6 +59,7 @@ def parse_request(request: dict) -> dict:
                                            for inst, venue in venues.items()):
         raise ResearchError("REQUEST_INVALID: venues must map watchlist instruments to supported venues")
     request = copy.deepcopy(request)
+    request["model"] = normalize_model(request.get("model", DEFAULT_MODEL))
     request["watchlist"] = list(dict.fromkeys(watchlist))
     request.setdefault("quotes", [])
     request.setdefault("knownEvents", [])
@@ -305,10 +308,14 @@ def insufficient(inst, request, reason, reference_price=None, completed_at=None)
 def validate_report(report: dict, request: dict, research: Research, completed_at=None) -> dict:
     from jsonschema import Draft202012Validator
 
+    report = copy.deepcopy(report)
+    if isinstance(report, dict):
+        # Provenance belongs to the host's selected request, even if a model
+        # attempts to supply its own name or an invalid metadata value.
+        report["model"] = normalize_model(request.get("model", DEFAULT_MODEL))
     errors = list(Draft202012Validator(REPORT_SCHEMA).iter_errors(report))
     if errors:
         raise ResearchError("REPORT_SCHEMA: model output does not match the intelligence contract")
-    report = copy.deepcopy(report)
     completed_at = request["now"] if completed_at is None else completed_at
     if not finite(completed_at) or completed_at < request["now"]:
         raise ResearchError("REPORT_TIME: completion must be a finite timestamp at or after request time")

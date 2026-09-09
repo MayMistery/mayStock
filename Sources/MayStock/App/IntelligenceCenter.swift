@@ -86,20 +86,37 @@ final class IntelligenceCenter {
         if enabled { tick() }
     }
 
-    func updateSettings(dailyHour: Int, timezone: String, horizonHours: Int) {
+    @discardableResult
+    func updateSettings(dailyHour: Int, timezone: String, horizonHours: Int, model: String, enabled: Bool) -> Bool {
         guard (0...23).contains(dailyHour), TimeZone(identifier: timezone) != nil,
-              (1...120).contains(horizonHours) else {
-            error = "请填写有效时区、0–23 点和 1–120 小时预测周期。"
-            return
+              (1...120).contains(horizonHours), let selectedModel = IntelligenceSettings.normalizeModel(model) else {
+            error = "请填写有效模型名称、时区、0–23 点和 1–120 小时预测周期。"
+            return false
         }
-        settings.dailyHour = dailyHour; settings.timezone = timezone; settings.horizonHours = horizonHours
-        for kind in IntelligenceKind.allCases {
-            var status = statuses[kind] ?? IntelligenceJobStatus()
-            status.nextRunAt = IntelligenceSchedule.nextRun(kind: kind, now: Date(),
-                lastSuccess: status.lastSuccessAt, settings: settings)
-            statuses[kind] = status
+        var nextSettings = settings
+        nextSettings.dailyHour = dailyHour; nextSettings.timezone = timezone
+        nextSettings.horizonHours = horizonHours; nextSettings.model = selectedModel
+        nextSettings.enabled = enabled
+        var nextStatuses = statuses
+        if dailyHour != settings.dailyHour || timezone != settings.timezone || horizonHours != settings.horizonHours {
+            for kind in IntelligenceKind.allCases {
+                var status = nextStatuses[kind] ?? IntelligenceJobStatus()
+                status.nextRunAt = IntelligenceSchedule.nextRun(kind: kind, now: Date(),
+                    lastSuccess: status.lastSuccessAt, settings: nextSettings)
+                nextStatuses[kind] = status
+            }
         }
-        error = nil; persist()
+        do {
+            if !snapshotMode {
+                try saveArchive(Archive(settings: nextSettings, statuses: nextStatuses, reports: reports, events: events))
+            }
+        } catch {
+            self.error = "情报设置保存失败；请检查数据目录权限与磁盘空间。"
+            return false
+        }
+        settings = nextSettings; statuses = nextStatuses; error = nil
+        if enabled { tick() }
+        return true
     }
 
     private func tick() {
@@ -127,13 +144,13 @@ final class IntelligenceCenter {
         status.error = nil; status.note = "正在检索与核验来源"
         statuses[kind] = status
         persist()
+        let capturedSettings = settings
         Task { [weak self] in
             guard let self else { return }
             defer { self.isRunning = false; self.activeKind = nil }
             do {
                 let bridge = try self.resolveBridge()
                 let instruments = Array(Set(self.watchlist())).sorted()
-                let capturedSettings = self.settings
                 var quotes: [IntelligenceQuote] = []
                 // Hidden menu items are still watched. Read public prices for those too.
                 for instId in instruments {

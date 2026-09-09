@@ -56,3 +56,6 @@ MODEL_REPORT_SCHEMA = copy.deepcopy(REPORT_SCHEMA)
 MODEL_REPORT_SCHEMA["required"].append("analysis")
 MODEL_REPORT_SCHEMA["properties"]["predictions"]["items"]["required"].append("findingIds")
 REPORT_SCHEMA["properties"]["coverageComplete"] = {"type": "boolean"}
+# Optional for archived reports; never requested from model output. The host
+# records the exact selected model after generation and consistency review.
+REPORT_SCHEMA["properties"]["model"] = {"type": "string", "minLength": 1, "maxLength": 200}
