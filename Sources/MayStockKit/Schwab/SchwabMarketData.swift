@@ -236,9 +236,11 @@ public struct SchwabMarketDataSource: MarketDataSource {
         do {
             var gathered: [Candle] = []
             var end = now
-            let windowDays = bar.seconds >= BarInterval.d1.seconds ? 365 * 5 : 10
-            // Walk back window by window until the target is met or Schwab
-            // runs out of history; an empty window is the retention edge.
+            // Schwab serves months of minute bars in one call (a 60-day
+            // one-minute request came back with 12,000 rows), so the windows
+            // are wide; walking back window by window still finds the
+            // retention edge, which is an empty window.
+            let windowDays = bar.seconds >= BarInterval.d1.seconds ? 365 * 5 : 60
             for _ in 0..<200 {
                 let start = end.addingTimeInterval(-Double(windowDays) * 86_400)
                 let chunk = try await schwab.candles(symbol: instId, bar: bar, start: start, end: end, now: now)

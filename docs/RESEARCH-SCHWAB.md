@@ -169,7 +169,7 @@ App 侧：`SchwabVenue: ExchangeVenue`（行情走 `SchwabMarketDataSource`：�
 0. **今天**：你去开发者门户注册并提交两段申请。等审核的两三周正好做 1。（2026-09-08：Trader API – Individual 已提交，Dashboard → Subscriptions 显示 **Pending**。**2026-09-15：订阅 Approved，App「MayStock」已建（Production；Accounts and Trading Production + Market Data Production；Order Limit 120；回调 `https://127.0.0.1:8182`），状态直接是 Ready For Use，不用再等第二段审批。** App Key/Secret 只有你看，录进 `schwabctl configure`。条款要点见 §7.5。）
 1. ~~内核与 manifest 的通用化（7.2）~~ **已完成（2026-09-08）**，全部离线测试。
 2. ~~`schwabctl login + candles`~~ **行情部分先用 Yahoo 过渡（2026-09-08，见 7.6）**：maystock-lab 与 App 的回测已能取美股历史（日线不限、1H 两年、分钟线两个月）；`schwabctl login` 与嘉信自己的行情等审批。
-3. ~~`SchwabVenue` + 本地影子撮合~~ **已完成（2026-09-15）**：`ShadowBook`（常规时段按盘口加滑点撮合、扣嘉信费用组件、Reg T 两倍购买力、止损/止盈 OCO、落盘 `shadow-schwab.json`）与 `SchwabVenue`（实盘经 `schwabctl --live`，策略标签本地映射 orderId）。**下一步是你的**：`schwabctl configure` 录入门户上的 App Key/Secret → `schwabctl login` → 账户页看到「已登录」→ 先在模拟盘（影子账户）跑一段，再用最小手数（1 股）解锁实盘。
+3. ~~`SchwabVenue` + 本地影子撮合~~ **已完成（2026-09-15）**：`ShadowBook`（常规时段按盘口加滑点撮合、扣嘉信费用组件、Reg T 两倍购买力、止损/止盈 OCO、落盘 `shadow-schwab.json`）与 `SchwabVenue`（实盘经 `schwabctl --live`，策略标签本地映射 orderId）。**2026-09-15 晚 May 已 configure + login**（回环监听走通，嘉信回传了 state；账户 …703，保证金账户，1 股 MU 外部持仓）。实测：`quotes`/`hours`/`account`/`orders`/`fills`/`search` 与解码器一致；分钟线保留很深（1m 一次请求拿回 60 天 12k 根、5m 120 天、15m 300 天都有），日线戳在纽约 00:00（内核日历对日线不看时钟，只看交易日）。App 日志 14:52:40 「行情恢复为嘉信官方数据」。剩下：先在模拟盘（影子账户）跑一段，再用最小手数（1 股）解锁实盘——下单响应的 `Location` 头要到第一笔真单才能证实。
 4. ~~`MarketDataFeed` 端口 + 菜单栏美股行情~~ **已完成（2026-09-08）**：`MarketFeed` / `MarketDataSource` 端口，`MarketHub` 按 venue 路由；菜单栏、悬浮面板、终端行情页、告警都能看美股。
 
 ### 7.4 已拍板（2026-09-07）

@@ -106,7 +106,7 @@
 | 用途 | 端点 | 说明 |
 |------|------|------|
 | 实时价 | `GET /marketdata/v1/quotes?symbols=A,B&fields=quote,reference,regular,extended` | 所有自选一次批量；`lastPrice`、`closePrice`（昨收）、`openPrice`、日内高低量、买一卖一；阶段由 `/markets` 的时段表判定 |
-| K 线 | `GET /marketdata/v1/pricehistory?symbol=&periodType=&frequencyType=&frequency=&startDate=&endDate=` | 1m/5m/15m 直接取；**没有小时频率**，1H 由 30 分钟 bar 按 09:30 锚定拼成（每天 7 根，最后一根只有半小时）；日线周线用 `daily`/`weekly`；历史按 10 天一窗往回翻到空窗为止 |
+| K 线 | `GET /marketdata/v1/pricehistory?symbol=&periodType=&frequencyType=&frequency=&startDate=&endDate=` | 1m/5m/15m 直接取；**没有小时频率**，1H 由 30 分钟 bar 按 09:30 锚定拼成（每天 7 根，最后一根只有半小时）；日线周线用 `daily`/`weekly`，戳在纽约 00:00（内核日历对日线只认交易日不认时钟）；历史按 60 天一窗往回翻到空窗为止——实测 1m 一次能拿 60 天 12k 根，5m 至少 120 天，15m 至少 300 天 |
 | 交易时段 | `GET /marketdata/v1/markets?markets=equity&date=` | 盘前/常规/盘后三段与是否开市，每个纽约日读一次；读不到时退到 04:00–09:30–16:00–20:00 的标准时段表 |
 | 代码搜索 | `GET /marketdata/v1/instruments?symbol=&projection=symbol-regex|desc-search` | 只保留 EQUITY/ETF |
 | 账户 | `GET /trader/v1/accounts/{hash}?fields=positions` | 现金、`liquidationValue`、持仓（做空为负数），非股票资产只报告不折算 |

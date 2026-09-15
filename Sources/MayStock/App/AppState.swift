@@ -466,7 +466,10 @@ final class AppState {
             if cliInfo == nil { await detectTradeCLI() }
             reloadProfilesIfChanged()
         case .schwab:
-            if schwabCLI == nil || schwabStatus == nil { await detectSchwabCLI() }
+            // The login can change under a running app — `schwabctl login`
+            // in a terminal — so the status is re-read on every refresh. It
+            // is a local read, no network.
+            if schwabCLI == nil { await detectSchwabCLI() } else { schwabStatus = try? await schwabBridge.status() }
         }
         guard tradingReady(for: venue) else {
             books.accountBalances = []
