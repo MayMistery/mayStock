@@ -125,6 +125,10 @@ public struct OKXVenue: ExchangeVenue {
         try await bridge.positions(mode: mode, instType: instType)
     }
 
+    public func allPositions(mode: TradingMode) async throws -> [ExchangePosition] {
+        try await bridge.allPositions(mode: mode)
+    }
+
     public func accountSnapshot(mode: TradingMode) async throws -> AccountSnapshot {
         try await bridge.accountSnapshot(mode: mode)
     }

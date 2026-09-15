@@ -49,6 +49,7 @@ final class ConfigStore {
 struct LaunchOptions: Sendable {
     var dataDirectory: URL = ConfigIO.defaultDirectory()
     var snapshotDirectory: URL? = nil
+    var openIntelligence = false
 
     var isSnapshot: Bool { snapshotDirectory != nil }
 
@@ -62,6 +63,8 @@ struct LaunchOptions: Sendable {
                 if let value = iterator.next() { options.dataDirectory = URL(fileURLWithPath: value) }
             case "--snapshot":
                 if let value = iterator.next() { options.snapshotDirectory = URL(fileURLWithPath: value) }
+            case "--intelligence":
+                options.openIntelligence = true
             default:
                 break
             }
@@ -87,6 +90,7 @@ final class AppState {
     let hub: MarketHub
     let alerts: AlertEngine
     let notifications: NotificationService
+    let intelligence: IntelligenceCenter
     /// Chart mode / window selections for the hover panel.
     let charts = ChartPreferences()
     /// The terminal's markets page keeps its own, so flipping the big chart to
@@ -126,6 +130,12 @@ final class AppState {
     @ObservationIgnored let schwabTags: SchwabOrderTags
 
     @ObservationIgnored private var venueBooks: [Venue: VenueBooks] = [:]
+    /// Every venue's account is re-read on a clock, not only on a button:
+    /// positions opened by hand, stops firing and bills settling all happen
+    /// on the exchange with no word to this app.
+    static let accountRefreshInterval: TimeInterval = 300
+    @ObservationIgnored private var accountRefreshLoop: Task<Void, Never>?
+    @ObservationIgnored private var lastLoggedAccountError: [Venue: String] = [:]
     @ObservationIgnored private(set) var panel: HoverPanelController!
     @ObservationIgnored private var statusItems: StatusItemManager?
     @ObservationIgnored private var terminalController: TerminalWindowController?
@@ -145,6 +155,7 @@ final class AppState {
         hub = MarketHub.standard(sources: marketSources)
         alerts = AlertEngine()
         notifications = NotificationService()
+        intelligence = IntelligenceCenter(directory: options.dataDirectory, snapshotMode: options.isSnapshot)
         strategyStore = StrategyStore(directory: options.dataDirectory.appendingPathComponent("Strategies"))
         profileCatalog = OKXProfileCatalog.load()
         shadowBook = ShadowBook(
@@ -168,10 +179,29 @@ final class AppState {
             await detectSchwabCLI()
             // Every venue's active account is checked at launch so the
             // overview can say whether each engine will be able to read its
-            // book.
+            // book — and then read, so what it holds is on screen before
+            // anyone asks.
             for venue in Venue.allCases { _ = await verifyConnection(tradingMode, venue: venue) }
+            await refreshAccount()
         }
-        if !options.isSnapshot { runners.forEach { $0.start() } }
+        if !options.isSnapshot {
+            runners.forEach { $0.start() }
+            startAccountRefreshLoop()
+        }
+        intelligence.start(watchlist: { [weak self] in
+            self?.store.config.watchlist.map(\.instId) ?? []
+        }, quote: { [weak self] instId in
+            self?.hub.session(for: instId)?.ticker
+        }, fetchQuote: { [weak self] instId in
+            guard let self, let item = self.store.config.watchlist.first(where: { $0.instId == instId }),
+                  let source = self.hub.source(for: item.venue) else { return nil }
+            return try? await source.ticker(instId: instId)
+        }, venues: { [weak self] in
+            Dictionary((self?.store.config.watchlist ?? []).map { ($0.instId, $0.venue.rawValue) },
+                       uniquingKeysWith: { first, _ in first })
+        }, onFlash: { [weak self] body in
+            self?.notifications.post(title: "MayStock · 局势快报", body: body, sound: false)
+        })
     }
 
     private func wire() {
@@ -327,6 +357,21 @@ final class AppState {
     /// Share of a venue's equity exposed to non-stablecoin price risk.
     func nonStableExposurePct(for venue: Venue) -> Double? { runner(for: venue).nonStableExposurePct }
 
+    /// What the exchange's bills say a venue's account realised over a
+    /// window. Nil until the ledger has been read, and on a venue that
+    /// publishes no bill ledger — see `Venue.periodFigure`.
+    func billedPnL(_ window: EquityWindow, venue: Venue) -> BilledPnL? {
+        books(for: venue).exchangeBills.map { BilledPnL.over(window, listing: $0) }
+    }
+
+    /// Unrealised profit on every position a venue holds — whoever opened
+    /// it — at the venue's own mark. Nil until the account has been read.
+    func exchangeUnrealisedPnL(for venue: Venue) -> Double? {
+        let books = books(for: venue)
+        guard books.accountRefreshedAt != nil else { return nil }
+        return books.exchangePositions.reduce(0) { $0 + $1.unrealisedPnL }
+    }
+
     /// Live profit on everything a venue's book currently holds, plus
     /// whatever has already been realised, net of fees and funding.
     ///
@@ -419,7 +464,7 @@ final class AppState {
         switch venue {
         case .okx:
             if cliInfo == nil { await detectTradeCLI() }
-            if !profileCatalog.fileExists { reloadProfiles() }
+            reloadProfilesIfChanged()
         case .schwab:
             if schwabCLI == nil || schwabStatus == nil { await detectSchwabCLI() }
         }
@@ -433,12 +478,13 @@ final class AppState {
         let mode = tradingMode
         do {
             books.accountBalances = try await exchange.accountSnapshot(mode: mode).balances
-            // Every family the venue lists per instrument, so the
-            // reconciliation panel can judge an option leg as well as a
-            // perpetual one — or a share count. A failed listing is an error
-            // on screen, not an empty list that reads as "nothing held".
-            var positions: [ExchangePosition] = []
-            for instType in venue.instrumentTypes where instType.isDerivative || instType == .stock {
+            // Every position the venue holds, whatever family: the unfiltered
+            // derivative listing, plus each family that is held as a
+            // position rather than as a balance but is not a contract — a
+            // share count. A failed listing is an error on screen, not an
+            // empty list that reads as "nothing held".
+            var positions = try await exchange.allPositions(mode: mode)
+            for instType in venue.instrumentTypes where !instType.isDerivative && instType != .spot {
                 positions += try await exchange.positions(mode: mode, instType: instType)
             }
             books.exchangePositions = positions
@@ -447,6 +493,39 @@ final class AppState {
         } catch {
             books.accountError = String(describing: error)
             return
+        }
+        // What the venue is holding open, and its own ledger where it keeps
+        // one. Kept apart from `accountError`: a refused order book must not
+        // blank the equity and positions that were read fine.
+        do {
+            switch venue {
+            case .okx:
+                let listing = try await tradeBridge.openOrders(mode: mode)
+                books.openOrders = listing.orders
+                books.openOrdersNote = listing.unavailable.isEmpty
+                    ? nil : "未能读取：" + listing.unavailable.joined(separator: "、") + "。这些簿上若有挂单，这里不会显示。"
+            case .schwab:
+                books.openOrders = try await (exchange as? SchwabVenue)?.openOrders(mode: mode) ?? []
+                books.openOrdersNote = nil
+            }
+            books.openOrdersError = nil
+        } catch {
+            books.openOrders = []
+            books.openOrdersNote = nil
+            books.openOrdersError = String(describing: error)
+        }
+        switch venue.periodFigure {
+        case .exchangeBills:
+            do {
+                books.exchangeBills = try await tradeBridge.bills(mode: mode)
+                books.billsError = nil
+            } catch {
+                books.exchangeBills = nil
+                books.billsError = String(describing: error)
+            }
+        case .equityCurve:
+            books.exchangeBills = nil
+            books.billsError = nil
         }
         // Equity is the runner's figure — marked with the same prices the
         // engine trades on — so a refresh asks it to sample, rather than
@@ -488,7 +567,7 @@ final class AppState {
     // MARK: Strategy library
 
     func reloadStrategies() {
-        strategyStore.installPresetsIfEmpty()
+        strategyStore.seedPresetsOnFirstRun()
         let loaded = strategyStore.loadCompiled()
         strategies = loaded.ready
         brokenStrategies = loaded.broken
@@ -710,7 +789,47 @@ final class AppState {
         }
         terminalController?.show(page: page, strategyId: strategyId, instId: instId)
         if page == .overview || page == .strategies || page == .account {
-            Task { await refreshAccount() }
+            refreshAccountIfStale(maxAge: 60)
+        }
+    }
+
+    // MARK: Account freshness
+
+    /// Re-read every venue whose reading is older than `maxAge`.
+    ///
+    /// Every surface that shows account figures asks here on appearing, so
+    /// which door the user came through — the intelligence page at launch,
+    /// the sidebar, the hover panel — never decides whether the figures are
+    /// there.
+    func refreshAccountIfStale(maxAge: TimeInterval) {
+        for venue in Venue.allCases {
+            let books = books(for: venue)
+            if books.isRefreshingAccount { continue }
+            if let at = books.accountRefreshedAt, Date().timeIntervalSince(at) < maxAge { continue }
+            Task { await refreshAccount(venue) }
+        }
+    }
+
+    func startAccountRefreshLoop() {
+        accountRefreshLoop?.cancel()
+        accountRefreshLoop = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(Self.accountRefreshInterval * 1_000_000_000))
+                guard !Task.isCancelled, let self else { return }
+                await self.refreshAccount()
+                // A refresh that keeps failing is on screen as a notice; the
+                // log gets it once per distinct failure per venue, not once
+                // per tick.
+                for venue in Venue.allCases {
+                    let error = self.books(for: venue).accountError
+                    if let error, error != self.lastLoggedAccountError[venue] {
+                        self.lastLoggedAccountError[venue] = error
+                        Log.warn("account: \(venue.displayName)定时刷新失败：\(error)")
+                    } else if error == nil {
+                        self.lastLoggedAccountError[venue] = nil
+                    }
+                }
+            }
         }
     }
 

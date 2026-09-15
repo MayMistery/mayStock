@@ -28,6 +28,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let snapshotter = UISnapshotter(appState: state, directory: directory)
             self.snapshotter = snapshotter
             snapshotter.run()
+        } else if options.openIntelligence {
+            state.openTerminal(.intelligence)
         }
     }
 

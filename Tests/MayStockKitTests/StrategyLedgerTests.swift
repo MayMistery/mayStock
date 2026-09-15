@@ -398,6 +398,34 @@ struct StrategyLedgerTests {
         #expect(rows.allSatisfy { !$0.isMaterial })
     }
 
+    /// A position the book has no entry for is somebody else's holding, not a
+    /// discrepancy in the book — it is listed, not alarmed about.
+    @Test func exchangeOnlyPositionsAreExternalNotMismatched() {
+        let ledger = StrategyLedger(mode: .demo)
+        let rows = ledger.reconcile(
+            spotBalances: [],
+            derivativePositions: [ExchangePosition(
+                instId: "ETH-USDT-SWAP", posSide: .long, quantity: 472.3, averagePrice: 100,
+                markPrice: 100, unrealisedPnL: 0, leverage: 10, liquidationPrice: nil,
+                notionalUsd: 116_905)])
+        let row = rows.first { $0.instId == "ETH-USDT-SWAP" }
+        #expect(row?.isMaterial == true, "still material: it is real exposure")
+        #expect(row?.isExternal == true)
+
+        // Once the book holds *something* there, a difference is a mismatch.
+        let tag = OrderTag.make(strategyId: "ema-trend")
+        ledger.setContractSize(0.01, forInstId: "ETH-USDT-SWAP")
+        ledger.record(StrategyFill(
+            id: "entry", strategyId: "ema-trend", instId: "ETH-USDT-SWAP", side: .buy,
+            price: 100, quantity: 1, feeQuote: 0, ts: Date(), clOrdId: tag, mode: .demo))
+        let after = ledger.reconcile(
+            spotBalances: [],
+            derivativePositions: [ExchangePosition(
+                instId: "ETH-USDT-SWAP", posSide: .long, quantity: 472.3, averagePrice: 100,
+                markPrice: 100, unrealisedPnL: 0, leverage: 10, liquidationPrice: nil)])
+        #expect(after.first { $0.instId == "ETH-USDT-SWAP" }?.isExternal == false)
+    }
+
     @Test func persistenceRoundTrips() throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("maystock-ledger-\(UUID().uuidString)")

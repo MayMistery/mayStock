@@ -51,12 +51,35 @@ extension AppState {
             .sorted { abs($0.exposure(mark: mark(for: $0.instId))) > abs($1.exposure(mark: mark(for: $1.instId))) }
     }
 
-    /// Ledger against exchange, material differences only.
+    /// Ledger against exchange, material differences only — on instruments
+    /// the book holds something in. A position the book has never heard of
+    /// is not a difference to reconcile; it is somebody else's holding, and
+    /// `externalPositions` lists it as one.
     func reconciliationIssues(on venue: Venue) -> [LedgerReconciliation] {
         let books = books(for: venue)
         return ledger(for: venue)
             .reconcile(spotBalances: books.accountBalances, derivativePositions: books.exchangePositions)
-            .filter(\.isMaterial)
+            .filter { $0.isMaterial && !$0.isExternal }
+    }
+
+    /// Positions the exchange holds on instruments no strategy's book has a
+    /// position in: opened by hand, by another program, or before this
+    /// install existed. Shown as holdings — they are the account's price
+    /// risk whoever opened them — and counted in exposure by the runner.
+    func externalPositions(on venue: Venue) -> [ExchangePosition] {
+        let held = Set(ledger(for: venue).positions.values.filter { !$0.isFlat }.map(\.instId))
+        return books(for: venue).exchangePositions
+            .filter { $0.quantity != 0 && !held.contains($0.instId) }
+            .sorted { abs($0.notionalUsd ?? 0) > abs($1.notionalUsd ?? 0) }
+    }
+
+    /// Who placed an order the exchange holds: one of our strategies, named
+    /// through its order tag, or somebody else.
+    func orderSource(_ order: ExchangeOpenOrder) -> String {
+        if let id = OrderTag.resolveStrategy(order.clOrdId, among: strategies.map(\.id)) {
+            return strategy(id: id)?.name ?? id
+        }
+        return "外部"
     }
 
     /// The most recent fills across every strategy, newest first — on one

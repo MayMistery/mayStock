@@ -31,6 +31,17 @@ final class VenueBooks {
     var exchangePositions: [ExchangePosition] = []
     var accountError: String?
     var accountRefreshedAt: Date?
+    /// Everything the venue is holding open on the active account, whoever
+    /// placed it. Kept apart from `accountError`: a refused order book must
+    /// not blank the equity and positions that were read fine.
+    var openOrders: [ExchangeOpenOrder] = []
+    /// Books the listing could not read, in words; nil when it read them all.
+    var openOrdersNote: String?
+    var openOrdersError: String?
+    /// The venue's own ledger of the active account, as last read, where the
+    /// venue keeps one — see `Venue.periodFigure`.
+    var exchangeBills: ExchangeBillListing?
+    var billsError: String?
     var isRefreshingAccount = false
     /// One connection verdict per environment.
     var connections: [TradingMode: VenueConnectionStatus] = [:]

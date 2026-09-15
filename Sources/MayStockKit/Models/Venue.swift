@@ -195,6 +195,24 @@ public enum Venue: String, Codable, Sendable, CaseIterable, Identifiable, Hashab
         self == .okx ? "" : "-" + rawValue
     }
 
+    /// What a window's result on this venue is measured from.
+    public enum PeriodFigure: Sendable, Equatable {
+        /// The exchange's own bill ledger — the one period figure it vouches
+        /// for, on a venue that publishes neither period P&L nor an equity
+        /// history.
+        case exchangeBills
+        /// This app's equity curve, on a venue whose account it values at
+        /// the venue's own liquidation value — or whose demo book is exact.
+        case equityCurve
+    }
+
+    public var periodFigure: PeriodFigure {
+        switch self {
+        case .okx: return .exchangeBills
+        case .schwab: return .equityCurve
+        }
+    }
+
     /// The capital a fresh portfolio starts with on this venue, in its
     /// quote currency. Only a starting point for the settings page.
     public var defaultPortfolioCapital: Double {

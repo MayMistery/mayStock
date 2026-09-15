@@ -139,11 +139,41 @@ struct YahooWireTests {
     "error":null}}
     """
 
-    private func decoded() throws -> YahooChart {
-        switch try YahooWire.decodeChart(Data(Self.chart.utf8)) {
+    private func decoded(_ body: String = Self.chart) throws -> YahooChart {
+        switch try YahooWire.decodeChart(Data(body.utf8)) {
         case .success(let chart): return chart
         case .failure(let error): throw error
         }
+    }
+
+    @Test func aPriceWithoutMarketTimeCannotBecomeANewQuote() throws {
+        let body = #"{"chart":{"result":[{"meta":{"symbol":"TSLA","regularMarketPrice":354.08},"timestamp":[],"indicators":{"quote":[]}}],"error":null}}"#
+        let chart = try decoded(body)
+        let now = Date(timeIntervalSince1970: 1_788_848_000)
+        #expect(YahooWire.ticker(from: chart, now: now) == nil)
+        #expect(YahooWire.ticker(from: chart, now: now.addingTimeInterval(3_600)) == nil,
+                "polling again must not manufacture a newer trade time")
+    }
+
+    @Test func aClosedMarketQuoteKeepsItsReportedTradeTime() throws {
+        let body = #"{"chart":{"result":[{"meta":{"symbol":"TSLA","regularMarketPrice":354.08,"regularMarketTime":1788552000},"timestamp":[],"indicators":{"quote":[]}}],"error":null}}"#
+        let chart = try decoded(body)
+        let now = Date(timeIntervalSince1970: 1_788_848_000)
+        let quote = try #require(YahooWire.ticker(from: chart, now: now))
+        let later = try #require(YahooWire.ticker(from: chart, now: now.addingTimeInterval(3_600)))
+        #expect(quote.last == 354.08)
+        #expect(quote.ts == Date(timeIntervalSince1970: 1_788_552_000))
+        #expect(later.ts == quote.ts)
+        #expect(now.timeIntervalSince(quote.ts) > 300)
+    }
+
+    @Test func anExtendedSessionPrintSuppliesItsOwnTimeWithoutMetadataTime() throws {
+        let body = Self.chart.replacingOccurrences(of: #""regularMarketTime":1788552000,"#, with: "")
+        let chart = try decoded(body)
+        let quote = try #require(YahooWire.ticker(from: chart, now: Date(timeIntervalSince1970: 1_788_560_000)))
+        #expect(quote.last == 352.89)
+        #expect(quote.ts == chart.bars.last?.ts)
+        #expect(quote.phase == .afterHours)
     }
 
     @Test func theQuoteReadsTheChartTheWayAStockAppDoes() throws {

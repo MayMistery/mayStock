@@ -268,6 +268,42 @@ public struct SchwabVenue: ExchangeVenue {
         }
     }
 
+    // MARK: Open orders
+
+    /// Everything the account is holding open — resting limits and armed
+    /// stops — for the overview. Not part of `ExchangeVenue`: the runner
+    /// never needs the whole book, only the page does.
+    public func openOrders(mode: TradingMode) async throws -> [ExchangeOpenOrder] {
+        switch mode {
+        case .demo:
+            return await shadow.openOrders.map { order in
+                ExchangeOpenOrder(
+                    id: order.id, book: order.protective ? .algo : .order, instId: order.instId,
+                    ordType: order.stopPrice != nil ? "stop" : order.kind.rawValue, side: order.side, posSide: nil,
+                    price: order.limitPrice, triggerPrice: order.stopPrice, stopTriggerPrice: order.stopPrice,
+                    takeProfitTriggerPrice: nil, size: order.size, closeFraction: nil, filledSize: order.filledSize,
+                    state: order.note ?? order.status.rawValue, reduceOnly: order.reduceOnly,
+                    clOrdId: order.clOrdId, createdAt: order.placedAt)
+            }
+        case .live:
+            let now = Date()
+            let orders = try await bridge.orders(from: now.addingTimeInterval(-60 * 86_400), to: now)
+            var out: [ExchangeOpenOrder] = []
+            for order in orders.flatMap(\.flattened) where order.isWorking {
+                let tag = await tags.clOrdId(forOrderId: order.id)
+                out.append(ExchangeOpenOrder(
+                    id: order.id, book: order.isStop ? .algo : .order, instId: order.symbol ?? "",
+                    ordType: order.orderType.lowercased(), side: order.isSell ? .sell : .buy, posSide: nil,
+                    price: order.price, triggerPrice: order.stopPrice, stopTriggerPrice: order.stopPrice,
+                    takeProfitTriggerPrice: nil, size: order.quantity, closeFraction: nil,
+                    filledSize: order.filledQuantity, state: order.status.lowercased(),
+                    reduceOnly: order.instruction == "SELL" || order.instruction == "BUY_TO_COVER",
+                    clOrdId: tag, createdAt: order.enteredTime))
+            }
+            return out
+        }
+    }
+
     // MARK: Protective orders
 
     public func protectiveOrders(instId: String, instType: InstrumentType, mode: TradingMode) async throws -> [VenueProtectiveOrder] {

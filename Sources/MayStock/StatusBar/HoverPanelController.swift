@@ -16,6 +16,8 @@ final class HoverPanelController {
     private var mouseInsidePanel = false
     private var hideWorkItem: DispatchWorkItem?
     private var clickOutsideMonitor: Any?
+    private var clickInsideAppMonitor: Any?
+    private var activationObserver: NSObjectProtocol?
     /// The status item the panel is currently anchored under, so a content-driven
     /// resize can re-anchor rather than drift up over the menu bar.
     private weak var anchorItem: NSStatusItem?
@@ -65,7 +67,7 @@ final class HoverPanelController {
                 panel.animator().alphaValue = 1
             }
         }
-        installClickOutsideMonitor()
+        installDismissalWatchers()
     }
 
     func togglePinned(instId: String, anchoredTo statusItem: NSStatusItem) {
@@ -94,7 +96,7 @@ final class HoverPanelController {
 
     func hide() {
         hideWorkItem?.cancel()
-        removeClickOutsideMonitor()
+        removeDismissalWatchers()
         guard let panel, panel.isVisible else { return }
         if let instId = currentInstId {
             appState.hub.stopDepthPolling(instId: instId)
@@ -184,24 +186,93 @@ final class HoverPanelController {
                        display: true)
     }
 
-    private func installClickOutsideMonitor() {
-        guard clickOutsideMonitor == nil else { return }
-        clickOutsideMonitor = NSEvent.addGlobalMonitorForEvents(
-            matching: [.leftMouseDown, .rightMouseDown]
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                guard let self, let panel = self.panel, panel.isVisible else { return }
-                if !panel.frame.contains(NSEvent.mouseLocation) {
-                    self.hide()
+    // MARK: Dismissal
+
+    /// A click anywhere that is not the panel, or a switch to another app,
+    /// closes the panel.
+    ///
+    /// Three signals feed the one rule in `dismissForClick` because no single
+    /// one of them sees everything: a global monitor is only told about clicks
+    /// that went to *other* applications, a local monitor only about this
+    /// one's, and neither hears a ⌘-Tab or a Dock click. The panel used to
+    /// rely on the global monitor alone, so a click on the terminal window —
+    /// or any switch made without a click — left a pinned panel floating over
+    /// everything until the status item was clicked again.
+    private func installDismissalWatchers() {
+        if clickOutsideMonitor == nil {
+            clickOutsideMonitor = NSEvent.addGlobalMonitorForEvents(
+                matching: [.leftMouseDown, .rightMouseDown]
+            ) { [weak self] _ in
+                // Read where the click landed *now*: by the time the hop to
+                // the main actor runs, the pointer may be somewhere else.
+                let location = NSEvent.mouseLocation
+                Task { @MainActor [weak self] in self?.dismissForClick(at: location, windowNumber: nil) }
+            }
+            if clickOutsideMonitor == nil {
+                // The system declined to deliver other apps' clicks. The two
+                // watchers below still close the panel, but "clicks elsewhere
+                // do nothing" is otherwise indistinguishable from a bug.
+                Log.warn("panel: 无法监听其它应用的点击，浮窗只会在应用内点击或切换应用时关闭")
+            }
+        }
+        if clickInsideAppMonitor == nil {
+            clickInsideAppMonitor = NSEvent.addLocalMonitorForEvents(
+                matching: [.leftMouseDown, .rightMouseDown]
+            ) { [weak self] event in
+                let location = NSEvent.mouseLocation
+                let windowNumber = event.windowNumber
+                Task { @MainActor [weak self] in
+                    self?.dismissForClick(at: location, windowNumber: windowNumber)
                 }
+                return event
+            }
+        }
+        if activationObserver == nil {
+            let ownPid = ProcessInfo.processInfo.processIdentifier
+            activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+            ) { [weak self] note in
+                let activated = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+                guard let activated, activated.processIdentifier != ownPid else { return }
+                Task { @MainActor [weak self] in self?.hide() }
             }
         }
     }
 
-    private func removeClickOutsideMonitor() {
+    /// The one rule: a click that did not land on the panel closes it —
+    /// unless it landed on a status item, whose own click handler is about to
+    /// pin, unpin or switch the panel and must not be pre-empted.
+    private func dismissForClick(at location: NSPoint, windowNumber: Int?) {
+        guard let panel, panel.isVisible else { return }
+        if panel.frame.contains(location) { return }
+        if let windowNumber, let window = NSApp.window(withWindowNumber: windowNumber) {
+            if window === panel || Self.holdsStatusItem(window) { return }
+        }
+        hide()
+    }
+
+    /// Whether a window is the menu bar's own — the one status item buttons
+    /// live in. Asked of the view tree rather than of a list of items, so a
+    /// watch item added later is covered without anyone registering it.
+    private static func holdsStatusItem(_ window: NSWindow) -> Bool {
+        func search(_ view: NSView) -> Bool {
+            view is NSStatusBarButton || view.subviews.contains(where: search)
+        }
+        return window.contentView.map(search) ?? false
+    }
+
+    private func removeDismissalWatchers() {
         if let monitor = clickOutsideMonitor {
             NSEvent.removeMonitor(monitor)
             clickOutsideMonitor = nil
+        }
+        if let monitor = clickInsideAppMonitor {
+            NSEvent.removeMonitor(monitor)
+            clickInsideAppMonitor = nil
+        }
+        if let observer = activationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+            activationObserver = nil
         }
     }
 }

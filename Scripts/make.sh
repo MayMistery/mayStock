@@ -118,6 +118,9 @@ cmd_install() {
   mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
   cp "$BUILD_DIR/$APP_NAME" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
   cp "$INFO_PLIST" "$APP_BUNDLE/Contents/Info.plist"
+  # Keep Python packages outside the signed bundle; only research source ships inside it.
+  cp -R Intelligence "$APP_BUNDLE/Contents/Resources/Intelligence"
+  find "$APP_BUNDLE/Contents/Resources/Intelligence" -type d -name __pycache__ -prune -exec rm -rf {} +
   # schwabctl rides inside the bundle so the app finds it without PATH, and
   # is linked into the first writable bin directory so `schwabctl login`
   # works from any terminal. Same binary both ways: one keychain identity.

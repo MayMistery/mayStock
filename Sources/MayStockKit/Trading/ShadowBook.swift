@@ -158,7 +158,8 @@ public actor ShadowBook {
                 instId: position.instId, posSide: .net, quantity: position.quantity,
                 averagePrice: position.averagePrice, markPrice: mark,
                 unrealisedPnL: mark.map { ($0 - position.averagePrice) * position.quantity } ?? 0,
-                leverage: nil, liquidationPrice: nil)
+                leverage: nil, liquidationPrice: nil,
+                notionalUsd: mark.map { $0 * position.quantity }, instType: "EQUITY")
         }
     }
 

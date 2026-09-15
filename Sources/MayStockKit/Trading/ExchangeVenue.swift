@@ -102,6 +102,12 @@ public protocol ExchangeVenue: Sendable {
 
     func positions(mode: TradingMode, instType: InstrumentType) async throws -> [ExchangePosition]
 
+    /// Every position the exchange holds on the account, whatever family,
+    /// each carrying the family the venue files it under. What the account's
+    /// risk is measured from: a family this app does not trade is still a
+    /// family the account can be long in.
+    func allPositions(mode: TradingMode) async throws -> [ExchangePosition]
+
     func accountSnapshot(mode: TradingMode) async throws -> AccountSnapshot
 
     /// Funding settled on perpetual positions.
@@ -179,6 +185,18 @@ extension ExchangeVenue {
     public func fundingPayments(
         instId: String?, mode: TradingMode
     ) async throws -> [FundingPayment] { [] }
+
+    /// A venue with no single listing answers with the union of the families
+    /// it has, one position per id however many listings named it.
+    public func allPositions(mode: TradingMode) async throws -> [ExchangePosition] {
+        var byId: [String: ExchangePosition] = [:]
+        for instType in InstrumentType.allCases where instType.isDerivative {
+            for position in try await positions(mode: mode, instType: instType) {
+                byId[position.id] = position
+            }
+        }
+        return byId.values.sorted { $0.id < $1.id }
+    }
 
     public func valuationPrice(instId: String, mode: TradingMode) async throws -> Double {
         try await lastPrice(instId: instId, mode: mode)

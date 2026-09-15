@@ -149,7 +149,8 @@ public struct SchwabAccount: Sendable, Equatable {
                 instId: position.symbol, posSide: .net, quantity: position.quantity,
                 averagePrice: position.averagePrice, markPrice: mark,
                 unrealisedPnL: position.marketValue - position.averagePrice * position.quantity,
-                leverage: nil, liquidationPrice: nil)
+                leverage: nil, liquidationPrice: nil,
+                notionalUsd: position.marketValue, instType: position.assetType)
         }
     }
 
