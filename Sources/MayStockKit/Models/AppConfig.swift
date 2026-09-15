@@ -131,19 +131,24 @@ public struct TradingPrefs: Codable, Sendable, Equatable {
     public var demoProfile: String?
     /// `okx --profile <name>` used for the live account; `nil` = CLI default.
     public var liveProfile: String?
+    /// Explicit path to `schwabctl`; `nil` = the copy inside the app bundle,
+    /// then the usual bin directories and PATH.
+    public var schwabCLIPath: String?
 
     public init(
         enabled: Bool = true,
         cliPath: String? = nil,
         liveTradingUnlocked: Bool = false,
         demoProfile: String? = nil,
-        liveProfile: String? = nil
+        liveProfile: String? = nil,
+        schwabCLIPath: String? = nil
     ) {
         self.enabled = enabled
         self.cliPath = cliPath
         self.liveTradingUnlocked = liveTradingUnlocked
         self.demoProfile = demoProfile
         self.liveProfile = liveProfile
+        self.schwabCLIPath = schwabCLIPath
     }
 
     /// The profile a mode's CLI calls run under. The one place this mapping
@@ -165,7 +170,7 @@ public struct TradingPrefs: Codable, Sendable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case enabled, cliPath, liveTradingUnlocked, demoProfile, liveProfile
+        case enabled, cliPath, liveTradingUnlocked, demoProfile, liveProfile, schwabCLIPath
         /// Pre-2.2 files carried one profile for both environments.
         case legacyProfile = "profile"
     }
@@ -181,6 +186,7 @@ public struct TradingPrefs: Codable, Sendable, Equatable {
         let legacy = try c.decodeIfPresent(String.self, forKey: .legacyProfile)
         demoProfile = try c.decodeIfPresent(String.self, forKey: .demoProfile) ?? legacy
         liveProfile = try c.decodeIfPresent(String.self, forKey: .liveProfile) ?? legacy
+        schwabCLIPath = try c.decodeIfPresent(String.self, forKey: .schwabCLIPath)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -190,6 +196,7 @@ public struct TradingPrefs: Codable, Sendable, Equatable {
         try c.encode(liveTradingUnlocked, forKey: .liveTradingUnlocked)
         try c.encodeIfPresent(demoProfile, forKey: .demoProfile)
         try c.encodeIfPresent(liveProfile, forKey: .liveProfile)
+        try c.encodeIfPresent(schwabCLIPath, forKey: .schwabCLIPath)
     }
 }
 

@@ -51,11 +51,11 @@ struct SettingsPage: View {
                 Card(title: "数据") {
                     VStack(alignment: .leading, spacing: 6) {
                         ForEach(Venue.allCases) { venue in
-                            KeyValueRow(label: "\(venue.displayName)行情", value: venue.marketDataSourceName)
+                            KeyValueRow(label: "\(venue.displayName)行情", value: appState.hub.sourceName(for: venue))
                         }
                         KeyValueRow(label: "推送频率",
-                                    value: "OKX tick ~100ms · 盘口 100ms · 美股轮询 \(Int(YahooMarketFeed.tradingInterval)) 秒"
-                                        + "（休市 \(Int(YahooMarketFeed.closedInterval)) 秒）· 菜单栏渲染 10Hz")
+                                    value: "OKX tick ~100ms · 盘口 100ms · 美股轮询 \(Int(SchwabMarketFeed.tradingInterval)) 秒"
+                                        + "（休市 \(Int(SchwabMarketFeed.closedInterval)) 秒）· 菜单栏渲染 10Hz")
                         KeyValueRow(label: "交易循环", value: "每 \(Int(StrategyRunner.defaultTickInterval)) 秒轮询 · 权益每 \(Int(StrategyRunner.equitySampleInterval)) 秒采样")
                         KeyValueRow(label: "数据目录", value: appState.dataDirectory.path, mono: true)
                     }

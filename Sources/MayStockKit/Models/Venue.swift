@@ -173,7 +173,34 @@ public enum Venue: String, Codable, Sendable, CaseIterable, Identifiable, Hashab
     public var marketDataSourceName: String {
         switch self {
         case .okx: return "OKX 公共行情"
-        case .schwab: return "Yahoo Finance（嘉信审批期间的过渡源）"
+        case .schwab: return "嘉信官方行情（未登录时 Yahoo Finance）"
+        }
+    }
+
+    /// The clock the venue's *book* keeps — what "today" means for the
+    /// equity curve's windows. OKX settles against a Singapore-hours desk;
+    /// a US account's day is New York's.
+    public var accountingTimeZone: TimeZone {
+        switch self {
+        case .okx: return TimeZone(identifier: "Asia/Singapore")!
+        case .schwab: return TimeZone(identifier: "America/New_York")!
+        }
+    }
+
+    /// How this venue's files are named in the state directory. OKX keeps
+    /// the bare names the app has always written — `ledger-demo.json` — so
+    /// a book recorded before there was a second venue stays readable; every
+    /// other venue is spelled into the name.
+    public var stateFileInfix: String {
+        self == .okx ? "" : "-" + rawValue
+    }
+
+    /// The capital a fresh portfolio starts with on this venue, in its
+    /// quote currency. Only a starting point for the settings page.
+    public var defaultPortfolioCapital: Double {
+        switch self {
+        case .okx: return 1_000
+        case .schwab: return 10_000
         }
     }
 

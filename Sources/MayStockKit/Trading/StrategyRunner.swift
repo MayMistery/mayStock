@@ -815,7 +815,10 @@ public final class StrategyRunner {
         var total = 0.0
         var pricedEverything = true
         let venue = host.venue.venue
-        for balance in snapshot.balances where balance.total > 0 {
+        // Signed: a short's negative share count and a borrowed coin's
+        // negative balance both come off the equity, as the cash they
+        // brought in already sits on the quote line.
+        for balance in snapshot.balances where balance.total != 0 {
             if balance.ccy == venue.quoteCurrency {
                 total += balance.total
                 continue
@@ -873,15 +876,16 @@ public final class StrategyRunner {
     ) async -> Double {
         var exposure = 0.0
 
-        // Spot coin balances.
-        for balance in snapshot.balances where balance.total > 0 {
+        // Balances held as the asset itself — coins, shares. A short is
+        // as much price risk as a long, so the count is taken absolute.
+        for balance in snapshot.balances where balance.total != 0 {
             guard !Self.stableCurrencies.contains(balance.ccy.uppercased()) else { continue }
             let instId = host.venue.venue.spotInstId(base: balance.ccy)
             var price = marks[instId]
             if price == nil { price = try? await host.venue.lastPrice(instId: instId, mode: host.portfolio.mode) }
             guard let price, price > 0 else { continue }
             marks[instId] = price
-            exposure += balance.total * price
+            exposure += abs(balance.total) * price
         }
 
         // Derivative positions, at their own mark and contract size. For an

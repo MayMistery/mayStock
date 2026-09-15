@@ -13,6 +13,9 @@ public enum MarketFeedEvent: Sendable {
     case ticker(Ticker)
     case candles(instId: String, bar: BarInterval, candles: [Candle])
     case book(OrderBook)
+    /// Which backend the feed is reading from now — "嘉信官方行情" or the
+    /// interim source — so the footer never labels Yahoo prices as Schwab's.
+    case source(String)
 }
 
 /// Live market data for one venue: subscriptions in, events out.
@@ -95,17 +98,27 @@ public enum MarketDataError: Error, CustomStringConvertible, Sendable, Equatable
 /// but no history in the backtester would be the confusing half.
 public struct MarketDataSources: Sendable {
     public var okx: OKXRESTClient
+    /// The interim US-equity source, kept as the fallback behind `schwab`.
     public var yahoo: YahooFinanceClient
+    public var schwab: SchwabMarketDataSource
 
-    public init(okx: OKXRESTClient = OKXRESTClient(), yahoo: YahooFinanceClient = YahooFinanceClient()) {
+    public init(
+        okx: OKXRESTClient = OKXRESTClient(),
+        yahoo: YahooFinanceClient = YahooFinanceClient(),
+        schwab: SchwabMarketDataSource? = nil,
+        trading: TradingPrefs = TradingPrefs()
+    ) {
         self.okx = okx
         self.yahoo = yahoo
+        self.schwab = schwab ?? SchwabMarketDataSource(
+            schwab: SchwabRESTClient(tokens: SchwabCLITokenSource(bridge: SchwabBridge(prefs: trading))),
+            yahoo: yahoo)
     }
 
     public func source(for venue: Venue) -> any MarketDataSource {
         switch venue {
         case .okx: return okx
-        case .schwab: return yahoo
+        case .schwab: return schwab
         }
     }
 }

@@ -142,12 +142,12 @@ struct LiveVsBacktestPanel: View {
         // the other would report a slippage of several thousand percent and
         // mean nothing by it.
         guard !strategy.isOptionStrategy else { return nil }
-        let fills = appState.ledger.fills(for: strategy.id, limit: 500)
-        guard !fills.isEmpty else { return nil }
+        guard let fills = appState.ledger(forStrategy: strategy.id)?.fills(for: strategy.id, limit: 500),
+              !fills.isEmpty else { return nil }
         // The candles the runner already holds for this strategy — the same
         // bars the decision was made on.
-        let candles = appState.runner.cachedCandles(
-            instId: strategy.market.instId, bar: strategy.market.bar)
+        let candles = appState.runner(forStrategy: strategy.id)?.cachedCandles(
+            instId: strategy.market.instId, bar: strategy.market.bar) ?? []
         guard candles.count > 1 else { return nil }
         // Compared against what the backtest actually assumed: the
         // manifest's own slippage, else the venue schedule's.

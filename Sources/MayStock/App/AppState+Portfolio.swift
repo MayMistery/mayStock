@@ -5,51 +5,68 @@ import MayStockKit
 /// strategy's return", so the panel, the overview and the studio can never
 /// disagree about it.
 extension AppState {
-    /// Latest known price for an instrument: the runner's poll, else a live
+    /// Latest known price for an instrument: any runner's poll, else a live
     /// watchlist session.
     func mark(for instId: String) -> Double? {
-        runner.mark(for: instId) ?? hub.session(for: instId)?.ticker?.last
+        for runner in runners {
+            if let mark = runner.mark(for: instId) { return mark }
+        }
+        return hub.session(for: instId)?.ticker?.last
     }
 
     func netPnL(for strategyId: String) -> Double {
-        guard let position = ledger.position(for: strategyId) else { return 0 }
+        guard let position = ledger(forStrategy: strategyId)?.position(for: strategyId) else { return 0 }
         return position.netPnL(mark: mark(for: position.instId))
     }
 
     func returnPct(for strategyId: String) -> Double? {
         guard let allocation = store.config.strategy.allocation(for: strategyId),
               allocation.capital > 0,
-              let position = ledger.position(for: strategyId),
+              let position = ledger(forStrategy: strategyId)?.position(for: strategyId),
               position.fillCount > 0 else { return nil }
         return position.returnPct(mark: mark(for: position.instId), capital: allocation.capital)
     }
 
-    var portfolioNetPnL: Double {
-        store.config.strategy.allocations.reduce(0) { $0 + netPnL(for: $1.strategyId) }
+    /// Net P&L of every strategy budgeted on a venue, in its currency.
+    func portfolioNetPnL(on venue: Venue) -> Double {
+        store.config.strategy.allocations(on: venue).reduce(0) { $0 + netPnL(for: $1.strategyId) }
     }
 
-    var portfolioReturnPct: Double? {
-        let allocated = store.config.strategy.allocatedCapital
+    func portfolioReturnPct(on venue: Venue) -> Double? {
+        let allocated = store.config.strategy.allocatedCapital(on: venue)
         guard allocated > 0 else { return nil }
-        return portfolioNetPnL / allocated * 100
+        return portfolioNetPnL(on: venue) / allocated * 100
     }
 
-    /// Every open position on the active account, largest first.
+    /// Every open position on the active account of every venue, largest
+    /// first within a venue. Each carries its venue, so a row is never
+    /// mistaken for the other exchange's.
     var openPositions: [StrategyPositionState] {
-        ledger.positions.values
+        Venue.allCases.flatMap { openPositions(on: $0) }
+    }
+
+    func openPositions(on venue: Venue) -> [StrategyPositionState] {
+        ledger(for: venue).positions.values
             .filter { !$0.isFlat }
             .sorted { abs($0.exposure(mark: mark(for: $0.instId))) > abs($1.exposure(mark: mark(for: $1.instId))) }
     }
 
     /// Ledger against exchange, material differences only.
-    var reconciliationIssues: [LedgerReconciliation] {
-        ledger.reconcile(spotBalances: accountBalances, derivativePositions: exchangePositions)
+    func reconciliationIssues(on venue: Venue) -> [LedgerReconciliation] {
+        let books = books(for: venue)
+        return ledger(for: venue)
+            .reconcile(spotBalances: books.accountBalances, derivativePositions: books.exchangePositions)
             .filter(\.isMaterial)
     }
 
-    /// The most recent fills across every strategy on the active account.
-    func recentFills(limit: Int) -> [StrategyFill] {
-        Array(ledger.fills.suffix(limit).reversed())
+    /// The most recent fills across every strategy, newest first — on one
+    /// venue, or across all of them.
+    func recentFills(limit: Int, on venue: Venue? = nil) -> [StrategyFill] {
+        let venues = venue.map { [$0] } ?? Venue.allCases
+        return venues.flatMap { ledger(for: $0).fills.suffix(limit) }
+            .sorted { $0.ts > $1.ts }
+            .prefix(limit)
+            .map { $0 }
     }
 
     /// The asset an instrument is exposure to, whatever family it is, on the
@@ -64,23 +81,44 @@ extension AppState {
         "\(venue.rawValue):\(venue.currencies(of: instId).base)"
     }
 
-    /// The reasons the engine is currently refusing new exposure, worst first.
-    /// A silent loop outranks a tripped breaker: one is a decision, the other is
-    /// a position nobody is managing.
+    /// Set when a venue's engine should be trading and demonstrably is not.
+    ///
+    /// A process that is alive but has stopped doing its job is the failure
+    /// mode that goes unnoticed: nothing errors, the panel keeps showing the
+    /// last numbers it had, and the account simply stops being managed.
+    func heartbeatWarning(for venue: Venue) -> String? {
+        guard store.config.strategy.allocations(on: venue).contains(where: \.running),
+              !store.config.strategy.emergencyStop,
+              let silence = books(for: venue).heartbeatSilence,
+              silence > StrategyRunner.heartbeatTimeout else { return nil }
+        let minutes = Int(silence / 60)
+        return "\(venue.displayName)交易循环已 \(minutes) 分钟没有完成一次轮询，仓位当前无人管理"
+    }
+
+    /// The reasons the engines are currently refusing new exposure, worst
+    /// first. A silent loop outranks a tripped breaker: one is a decision, the
+    /// other is a position nobody is managing.
     var engineNotices: [(kind: EngineNoticeKind, text: String)] {
         var notices: [(EngineNoticeKind, String)] = []
-        if let heartbeat = heartbeatWarning { notices.append((.heartbeat, heartbeat)) }
+        for venue in Venue.allCases {
+            if let heartbeat = heartbeatWarning(for: venue) { notices.append((.heartbeat, heartbeat)) }
+        }
         if store.config.strategy.emergencyStop {
             notices.append((.emergencyStop, "急停已触发：所有策略停止，解除后才能重新开始交易。"))
         }
-        if let over = runner.overCommitted { notices.append((.overCommitted, over)) }
-        if let tripped = runner.protectionTripped { notices.append((.protection, tripped)) }
-        if store.config.strategy.isOverAllocated {
-            let portfolio = store.config.strategy
-            let multiple = portfolio.allocatedCapital / max(portfolio.totalCapital, 1)
+        for venue in Venue.allCases {
+            let runner = runner(for: venue)
+            if let over = runner.overCommitted { notices.append((.overCommitted, "\(venue.displayName)：" + over)) }
+            if let tripped = runner.protectionTripped { notices.append((.protection, "\(venue.displayName)：" + tripped)) }
+        }
+        let portfolio = store.config.strategy
+        for venue in portfolio.overAllocatedVenues {
+            let allocated = portfolio.allocatedCapital(on: venue)
+            let total = portfolio.totalCapital(for: venue)
+            let multiple = allocated / max(total, 1)
             notices.append((.overAllocated,
-                "策略预算合计 \(PriceFormatter.money(portfolio.allocatedCapital, decimals: 0)) 超出本金 "
-                + "\(PriceFormatter.money(portfolio.totalCapital, decimals: 0))：下单按各自预算定量，"
+                "\(venue.displayName)策略预算合计 \(PriceFormatter.money(allocated, decimals: 0)) 超出本金 "
+                + "\(PriceFormatter.money(total, decimals: 0)) \(venue.quoteCurrency)：下单按各自预算定量，"
                 + "全部满仓会下到本金的 \(PriceFormatter.decimals(multiple, 1)) 倍。改本金即可按比例缩回。"))
         }
         return notices

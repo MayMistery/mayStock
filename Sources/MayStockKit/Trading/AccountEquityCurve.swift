@@ -49,22 +49,26 @@ public enum EquityWindow: String, CaseIterable, Sendable, Identifiable {
 
     public var id: String { rawValue }
 
-    /// The book's trading day. Everything the workbench touches settles
-    /// against a Singapore-hours desk, and a "today" that rolled over at some
-    /// other midnight would put two different days' P&L under one label.
-    public static let timeZone = TimeZone(identifier: "Asia/Singapore") ?? .gmt
+    /// The desk's clock, for stamping reports: the OKX book's accounting
+    /// zone, which is where this workbench has always kept its days.
+    public static var timeZone: TimeZone { Venue.okx.accountingTimeZone }
 
-    /// Monday-first, in the book's own time zone.
-    public static var calendar: Calendar {
+    /// Monday-first, in the book's own time zone. Each venue's book keeps
+    /// its own day — Singapore for OKX, New York for a US account — so
+    /// "today" on one never means half of yesterday on the other.
+    public static func calendar(for venue: Venue) -> Calendar {
         var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = timeZone
+        calendar.timeZone = venue.accountingTimeZone
         calendar.firstWeekday = 2      // Monday
         return calendar
     }
 
-    /// The instant this window measures from.
-    public func anchor(now: Date = Date()) -> Date {
-        let calendar = Self.calendar
+    /// The desk calendar, for callers that stamp rather than window.
+    public static var calendar: Calendar { calendar(for: .okx) }
+
+    /// The instant this window measures from, on `venue`'s clock.
+    public func anchor(now: Date = Date(), venue: Venue = .okx) -> Date {
+        let calendar = Self.calendar(for: venue)
         switch self {
         case .hour1:
             return now.addingTimeInterval(-3_600)
@@ -90,11 +94,14 @@ public enum EquityWindow: String, CaseIterable, Sendable, Identifiable {
     }
 
     /// What the label is short for, spelled out in a tooltip.
-    public var longLabel: String {
+    public var longLabel: String { longLabel(for: .okx) }
+
+    public func longLabel(for venue: Venue) -> String {
+        let zone = venue == .okx ? "新加坡时间" : "纽约时间"
         switch self {
         case .hour1: return "最近 1 小时（滚动）"
-        case .day1: return "今日 00:00 起（新加坡时间）"
-        case .day7: return "本周一 00:00 起（新加坡时间）"
+        case .day1: return "今日 00:00 起（\(zone)）"
+        case .day7: return "本周一 00:00 起（\(zone)）"
         }
     }
 }
@@ -217,6 +224,8 @@ public struct EquityChange: Sendable, Equatable {
 public final class AccountEquityCurve {
     public private(set) var points: [AccountEquityPoint] = []
     public let mode: TradingMode
+    /// Whose book this is — decides the clock the calendar windows use.
+    public let venue: Venue
 
     /// Called whenever the series changes, so the app can persist it.
     public var onChanged: (() -> Void)?
@@ -231,8 +240,9 @@ public final class AccountEquityCurve {
     nonisolated public static let coarseInterval: TimeInterval = 900
     nonisolated public static let retention: TimeInterval = 30 * 86_400
 
-    public init(mode: TradingMode) {
+    public init(mode: TradingMode, venue: Venue = .okx) {
         self.mode = mode
+        self.venue = venue
     }
 
     // MARK: Queries
@@ -274,7 +284,7 @@ public final class AccountEquityCurve {
         // before it. Falling back to the oldest sample keeps a number on screen
         // from the first second — flagged, via `isAnchored`, as measured from
         // later than it claims.
-        let anchor = window.anchor(now: endTs)
+        let anchor = window.anchor(now: endTs, venue: venue)
         let start = points.last(where: { $0.ts <= anchor }) ?? points.first
         guard let start, start.equity > 0 else { return nil }
 
@@ -450,15 +460,15 @@ public final class AccountEquityCurve {
 public struct AccountEquityStore: Sendable {
     public let fileURL: URL
 
-    public init(directory: URL, mode: TradingMode) {
-        self.fileURL = directory.appendingPathComponent("equity-\(mode.rawValue).json")
+    public init(directory: URL, mode: TradingMode, venue: Venue = .okx) {
+        self.init(directory: directory, mode: mode, venue: venue, perStrategy: false)
     }
 
     /// Per-strategy curves live in their own file, keyed by strategy id.
-    public init(directory: URL, mode: TradingMode, perStrategy: Bool) {
+    public init(directory: URL, mode: TradingMode, venue: Venue = .okx, perStrategy: Bool) {
         let name = perStrategy
-            ? "strategy-equity-\(mode.rawValue).json"
-            : "equity-\(mode.rawValue).json"
+            ? "strategy-equity\(venue.stateFileInfix)-\(mode.rawValue).json"
+            : "equity\(venue.stateFileInfix)-\(mode.rawValue).json"
         self.fileURL = directory.appendingPathComponent(name)
     }
 
@@ -529,8 +539,8 @@ public struct HeartbeatStore: Sendable {
     }
     private let gate = Gate()
 
-    public init(directory: URL) {
-        self.fileURL = directory.appendingPathComponent("heartbeat.json")
+    public init(directory: URL, venue: Venue = .okx) {
+        self.fileURL = directory.appendingPathComponent("heartbeat\(venue.stateFileInfix).json")
     }
 
     private struct Payload: Codable { var lastTickAt: Date }

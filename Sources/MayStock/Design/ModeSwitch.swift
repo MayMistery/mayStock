@@ -38,13 +38,14 @@ struct TradingModeSwitch: View {
 struct ConnectionChip: View {
     let appState: AppState
     let mode: TradingMode
+    var venue: Venue = .okx
     var showsMode = false
 
-    private var status: VenueConnectionStatus { appState.connectionStatus(for: mode) }
+    private var status: VenueConnectionStatus { appState.connectionStatus(for: mode, venue: venue) }
 
     var body: some View {
         Button {
-            Task { await appState.verifyConnection(mode) }
+            Task { await appState.verifyConnection(mode, venue: venue) }
         } label: {
             HStack(spacing: 5) {
                 if showsMode { ModeBadge(mode: mode, size: .small) }
@@ -84,7 +85,7 @@ struct ConnectionChip: View {
             var parts = ["已连接"]
             if let equity = report.totalEquity {
                 parts.append(PriceFormatter.money(equity, decimals: 0)
-                             + " " + appState.runner.quoteCurrency)
+                             + " " + venue.quoteCurrency)
             }
             return parts.joined(separator: " · ")
         case .failed: return "连接失败"
@@ -94,9 +95,9 @@ struct ConnectionChip: View {
     private var helpText: String {
         switch status {
         case .unknown: return "还没有验证过\(mode.displayName)的连接，点击验证（只读）"
-        case .checking: return "正在用 okx CLI 读取账户…"
+        case .checking: return "正在读取\(venue.displayName)账户…"
         case .connected(let report):
-            var lines = ["\(mode.displayName) · " + (report.profile.map { "profile \($0)" } ?? "CLI 默认 profile")]
+            var lines = ["\(venue.displayName)\(mode.displayName) · " + (report.profile.map { venue == .okx ? "profile \($0)" : $0 } ?? "CLI 默认 profile")]
             if let account = report.account {
                 lines.append("\(account.accountLevelName) · \(account.positionModeName) · 权限 \(account.permissions)")
             }

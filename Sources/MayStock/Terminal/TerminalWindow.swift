@@ -44,6 +44,9 @@ final class TerminalSelection {
     var detailTab: StrategyDetailTab = .backtest
     /// Window of the account equity chart on the overview.
     var equityWindow: EquityWindow = .day1
+    /// Which venue's book the overview is showing. Two accounts in two
+    /// currencies never share a tile.
+    var overviewVenue: Venue = .okx
 }
 
 /// Owns the terminal window — created lazily, reused, and never changing the
@@ -221,14 +224,23 @@ private struct TerminalSidebar: View {
         }
     }
 
+    /// The quietest loop across every venue — the one a person needs to
+    /// hear about first.
+    private var heartbeat: (venue: Venue, silence: TimeInterval)? {
+        Venue.allCases
+            .compactMap { venue in appState.books(for: venue).heartbeatSilence.map { (venue, $0) } }
+            .max { $0.silence < $1.silence }
+    }
+
     private var heartbeatColor: Color {
-        guard let silence = appState.heartbeatSilence else { return .secondary }
-        return silence > StrategyRunner.heartbeatTimeout ? Theme.down : Theme.up
+        guard let heartbeat else { return .secondary }
+        return heartbeat.silence > StrategyRunner.heartbeatTimeout ? Theme.down : Theme.up
     }
 
     private var heartbeatText: String {
-        guard let silence = appState.heartbeatSilence else { return "交易循环 未启动" }
-        return "交易循环 " + (silence < 90 ? "\(Int(silence)) 秒前" : Format.duration(silence) + "前")
+        guard let heartbeat else { return "交易循环 未启动" }
+        let silence = heartbeat.silence
+        return "\(heartbeat.venue.displayName)循环 " + (silence < 90 ? "\(Int(silence)) 秒前" : Format.duration(silence) + "前")
     }
 }
 
@@ -242,7 +254,9 @@ struct EnvironmentBar: View {
     var body: some View {
         HStack(spacing: 12) {
             TradingModeSwitch(appState: appState)
-            ConnectionChip(appState: appState, mode: appState.tradingMode)
+            ForEach(Venue.allCases) { venue in
+                ConnectionChip(appState: appState, mode: appState.tradingMode, venue: venue)
+            }
             equityChip
             Spacer(minLength: 8)
             if appState.store.config.strategy.emergencyStop {
@@ -264,19 +278,24 @@ struct EnvironmentBar: View {
         .background(.bar)
     }
 
+    /// One chip per venue: two accounts, two currencies, never one number.
     private var equityChip: some View {
-        HStack(spacing: 5) {
-            Text("权益").font(Theme.Text.caption).foregroundStyle(.secondary)
-            Text(Format.money(appState.accountEquity))
-                .font(Theme.Text.secondaryMedium).numeric()
-                .contentTransition(.numericText())
-            Text(appState.runner.quoteCurrency).font(Theme.Text.caption).foregroundStyle(.tertiary)
-            if let pct = appState.openPnLPct, let pnl = appState.openPnL {
-                Text("\(PriceFormatter.signedMoney(pnl, decimals: 0)) (\(PriceFormatter.signedPercent(pct)))")
-                    .font(Theme.Text.captionMedium).numeric()
-                    .foregroundStyle(Theme.signed(pnl))
+        HStack(spacing: 14) {
+            ForEach(Venue.allCases) { venue in
+                HStack(spacing: 5) {
+                    Text(venue.displayName).font(Theme.Text.caption).foregroundStyle(.secondary)
+                    Text(Format.money(appState.accountEquity(for: venue)))
+                        .font(Theme.Text.secondaryMedium).numeric()
+                        .contentTransition(.numericText())
+                    Text(venue.quoteCurrency).font(Theme.Text.caption).foregroundStyle(.tertiary)
+                    if let pct = appState.openPnLPct(for: venue), let pnl = appState.openPnL(for: venue) {
+                        Text("\(PriceFormatter.signedMoney(pnl, decimals: 0)) (\(PriceFormatter.signedPercent(pct)))")
+                            .font(Theme.Text.captionMedium).numeric()
+                            .foregroundStyle(Theme.signed(pnl))
+                    }
+                }
+                .help("\(venue.displayName)账户权益（\(venue.quoteCurrency) 计）与当前持仓盈亏")
             }
         }
-        .help("账户权益（\(appState.runner.quoteCurrency) 计）与当前持仓盈亏")
     }
 }

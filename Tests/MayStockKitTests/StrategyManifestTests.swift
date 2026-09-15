@@ -340,8 +340,8 @@ struct StrategyConfigTests {
         let dir = tempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
         var config = AppConfig.default
-        config.strategy.totalCapital = 5_000
-        config.strategy.setCapital(2_000, for: "ema-trend")
+        config.strategy.capital[.okx] = 5_000
+        config.strategy.setCapital(2_000, for: "ema-trend", on: .okx)
         config.strategy.setRunning(true, for: "ema-trend")
         try ConfigIO(directory: dir).save(config)
 

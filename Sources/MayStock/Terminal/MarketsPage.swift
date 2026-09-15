@@ -251,7 +251,7 @@ private struct InstrumentDetail: View {
                 }
                 Text(venue.displayName + " · " + (session.meta.map {
                     "最小价位 \(PriceFormatter.plain($0.tickSize)) · 最小数量 \(PriceFormatter.plain($0.minSize))"
-                } ?? venue.marketDataSourceName))
+                } ?? appState.hub.sourceName(for: venue)))
                     .font(Theme.Text.secondary).foregroundStyle(.secondary)
             }
             Spacer()

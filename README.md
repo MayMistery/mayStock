@@ -32,13 +32,24 @@
   auto-reconnect with jittered backoff + resubscribe.
 - **US equities, too** — the same watchlist holds tickers such as `TSLA`
   and `QQQ` alongside the pairs. Each venue has its own feed behind one
-  `MarketFeed` port: stocks are read from Yahoo Finance's chart endpoint
-  (no key; the interim source while the Schwab Trader API application is
-  pending), quoted against the previous close with the session phase —
-  pre-market, regular, after-hours, closed — on every surface, charted in
-  New York time with closed hours collapsed, and refused a 4H bar their
-  session cannot hold. The kernel's NYSE calendar keeps backtests honest
-  about weekends and holidays.
+  `MarketFeed` port: stocks are read from Charles Schwab's Trader API
+  once `schwabctl` is logged in, and from Yahoo Finance's chart endpoint
+  until then (the footer says which), quoted against the previous close
+  with the session phase — pre-market, regular, after-hours, closed — on
+  every surface, charted in New York time with closed hours collapsed, and
+  refused a 4H bar their session cannot hold. The kernel's NYSE calendar
+  keeps backtests honest about weekends and holidays.
+- **Trading on Schwab** — `schwabctl` (Rust, in `schwabctl/`, installed
+  into the app bundle and linked onto PATH by `make.sh install`) is the
+  credential boundary: `schwabctl configure` stores the App Key/Secret in
+  the keychain, `schwabctl login` runs the OAuth flow against a loopback
+  HTTPS listener on `127.0.0.1:8182` and keeps the refresh token (seven
+  days), the app only ever receives thirty-minute access tokens, and every
+  live order goes through `schwabctl place --live`. Schwab has no paper
+  account, so demo mode is a local shadow book that fills against the live
+  quote during the regular session with Schwab's fees, the configured
+  slippage and Reg T buying power. Each venue keeps its own ledgers, equity
+  curve, heartbeat, capital pot and trading loop.
 - **Alerts** — price cross (with hysteresis), daily change thresholds (the
   trailing day on OKX, the session on a stock exchange),
   volatility within a window; system notifications, optional sound, optional

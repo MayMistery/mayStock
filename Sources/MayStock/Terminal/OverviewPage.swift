@@ -8,19 +8,29 @@ struct OverviewPage: View {
     @Bindable var selection: TerminalSelection
 
     private var mode: TradingMode { appState.tradingMode }
+    /// The venue on show. Every figure on this page is one account's, in
+    /// that account's currency; the picker in the header switches books.
+    private var venue: Venue { selection.overviewVenue }
+    private var books: VenueBooks { appState.books(for: venue) }
 
     var body: some View {
         PageScroll {
             VStack(alignment: .leading, spacing: Theme.sectionSpacing) {
                 PageHeader(title: "总览",
-                           subtitle: "\(mode.displayName)账户 · 账户读数 " + Format.relative(appState.accountRefreshedAt)) {
+                           subtitle: "\(venue.displayName)\(mode.displayName)账户 · 账户读数 " + Format.relative(books.accountRefreshedAt)) {
+                    PillSegments(
+                        segments: Venue.allCases.map {
+                            PillSegments<Venue>.Segment(value: $0, title: $0.displayName, help: "\($0.displayName)账户（\($0.quoteCurrency)）")
+                        },
+                        selection: venue,
+                        onSelect: { selection.overviewVenue = $0 })
                     Button {
-                        Task { await appState.refreshAccount() }
+                        Task { await appState.refreshAccount(venue) }
                     } label: {
                         Label("刷新账户", systemImage: "arrow.clockwise")
                     }
                     .controlSize(.small)
-                    .disabled(appState.isRefreshingAccount)
+                    .disabled(books.isRefreshingAccount)
                 }
 
                 notices
@@ -46,7 +56,7 @@ struct OverviewPage: View {
     @ViewBuilder
     private var notices: some View {
         let engine = appState.engineNotices
-        if !engine.isEmpty || connectionFailure != nil || appState.accountError != nil {
+        if !engine.isEmpty || connectionFailure != nil || books.accountError != nil {
             VStack(spacing: 8) {
                 ForEach(Array(engine.enumerated()), id: \.offset) { _, notice in
                     InlineNotice(kind: notice.kind == .heartbeat ? .danger : .warning,
@@ -55,9 +65,9 @@ struct OverviewPage: View {
                                  action: notice.kind == .emergencyStop ? { appState.clearEmergencyStop() } : nil)
                 }
                 if let failure = connectionFailure {
-                    InlineNotice(kind: .danger, title: "\(mode.displayName)连接失败", message: failure,
+                    InlineNotice(kind: .danger, title: "\(venue.displayName)\(mode.displayName)连接失败", message: failure,
                                  actionTitle: "账户与连接", action: { appState.openTerminal(.account) })
-                } else if let error = appState.accountError {
+                } else if let error = books.accountError {
                     InlineNotice(kind: .warning, title: "读取账户失败", message: error,
                                  actionTitle: "账户与连接", action: { appState.openTerminal(.account) })
                 }
@@ -66,7 +76,7 @@ struct OverviewPage: View {
     }
 
     private var connectionFailure: String? {
-        if case .failed(let message, let hint, _) = appState.connectionStatus(for: mode) {
+        if case .failed(let message, let hint, _) = appState.connectionStatus(for: mode, venue: venue) {
             return [message, hint].compactMap { $0 }.joined(separator: "\n")
         }
         return nil
@@ -86,17 +96,17 @@ struct OverviewPage: View {
 
     private var statsRow: some View {
         HStack(spacing: Theme.itemSpacing) {
-            StatTile(label: "账户权益 · \(appState.runner.quoteCurrency)",
-                     value: Format.money(appState.accountEquity),
-                     caption: appState.nonStableExposurePct.map {
-                         "非稳定币敞口 \(PriceFormatter.decimals($0, 1))%"
-                     } ?? (appState.tradingBlocker ?? "等待引擎采样"),
+            StatTile(label: "\(venue.displayName)账户权益 · \(venue.quoteCurrency)",
+                     value: Format.money(appState.accountEquity(for: venue)),
+                     caption: appState.nonStableExposurePct(for: venue).map {
+                         "\(venue == .okx ? "非稳定币" : "持股")敞口 \(PriceFormatter.decimals($0, 1))%"
+                     } ?? (appState.tradingBlocker(for: venue) ?? "等待引擎采样"),
                      captionTint: riskTint,
                      help: "现货币种持仓 + 永续名义额，占账户权益的比例。做空同样计入敞口。")
             StatTile(label: "账本盈亏 · 已实现 + 浮动",
-                     value: Format.signedMoney(appState.openPnL),
-                     tint: appState.openPnL.map(Theme.signed) ?? .secondary,
-                     caption: appState.openPnLPct.map { "占已动用预算 " + PriceFormatter.signedPercent($0) }
+                     value: Format.signedMoney(appState.openPnL(for: venue)),
+                     tint: appState.openPnL(for: venue).map(Theme.signed) ?? .secondary,
+                     caption: appState.openPnLPct(for: venue).map { "占已动用预算 " + PriceFormatter.signedPercent($0) }
                          ?? "扣手续费与资金费",
                      help: "本账户台账上每个策略的已实现盈亏加当前持仓的浮动盈亏，扣除手续费与资金费。不依赖权益历史。")
             ForEach(EquityWindow.allCases) { window in
@@ -106,7 +116,7 @@ struct OverviewPage: View {
     }
 
     private var riskTint: Color {
-        switch appState.nonStableExposurePct ?? 0 {
+        switch appState.nonStableExposurePct(for: venue) ?? 0 {
         case ..<25: return .secondary
         case ..<75: return Theme.warning
         default: return Theme.down
@@ -114,13 +124,13 @@ struct OverviewPage: View {
     }
 
     private func windowTile(_ window: EquityWindow) -> some View {
-        let change = appState.equityChange(window)
+        let change = appState.equityChange(window, venue: venue)
         let tint: Color = change.map { Theme.signed($0.changeQuote) } ?? .secondary
         var caption = change.flatMap { $0.changePct.map(PriceFormatter.signedPercent) } ?? "等待记录"
         if let change {
             if change.hasGaps { caption += " · 有空洞" } else if !change.isAnchored { caption += " · 记录未满" }
         }
-        return StatTile(label: window.longLabel.components(separatedBy: "（").first ?? window.label,
+        return StatTile(label: window.longLabel(for: venue).components(separatedBy: "（").first ?? window.label,
                         value: Format.signedMoney(change?.changeQuote, decimals: 0),
                         tint: tint,
                         caption: caption,
@@ -129,9 +139,9 @@ struct OverviewPage: View {
     }
 
     private func tooltip(_ window: EquityWindow, _ change: EquityChange?) -> String {
-        guard let change else { return "\(window.longLabel)：还没有任何权益采样" }
-        let range = "\(PriceFormatter.money(change.startEquity)) → \(PriceFormatter.money(change.endEquity)) \(appState.runner.quoteCurrency)"
-        return change.coverageNote.isEmpty ? "\(window.longLabel)\n\(range)" : "\(window.longLabel)\n\(range)\n\(change.coverageNote)"
+        guard let change else { return "\(window.longLabel(for: venue))：还没有任何权益采样" }
+        let range = "\(PriceFormatter.money(change.startEquity)) → \(PriceFormatter.money(change.endEquity)) \(venue.quoteCurrency)"
+        return change.coverageNote.isEmpty ? "\(window.longLabel(for: venue))\n\(range)" : "\(window.longLabel(for: venue))\n\(range)\n\(change.coverageNote)"
     }
 
     // MARK: Equity
@@ -140,24 +150,25 @@ struct OverviewPage: View {
         Card(title: "账户权益曲线", subtitle: coverageSubtitle) {
             PillSegments(
                 segments: EquityWindow.allCases.map {
-                    PillSegments<EquityWindow>.Segment(value: $0, title: $0.label, help: $0.longLabel)
+                    PillSegments<EquityWindow>.Segment(value: $0, title: $0.label, help: $0.longLabel(for: venue))
                 },
                 selection: selection.equityWindow,
                 onSelect: { selection.equityWindow = $0 })
         } content: {
             AccountEquityChartView(
-                points: appState.equityCurve.points,
+                points: appState.equityCurve(for: venue).points,
                 window: selection.equityWindow,
-                latest: appState.accountEquity)
+                latest: appState.accountEquity(for: venue),
+                venue: venue)
             .frame(height: 220)
         }
     }
 
     private var coverageSubtitle: String {
-        let curve = appState.equityCurve
-        guard let oldest = curve.oldest else { return "\(mode.displayName) · 尚无采样" }
-        var text = "\(mode.displayName) · 记录自 \(Format.shortDate(oldest.ts)) · \(curve.points.count) 个样本"
-        if let change = appState.equityChange(selection.equityWindow), !change.coverageNote.isEmpty {
+        let curve = appState.equityCurve(for: venue)
+        guard let oldest = curve.oldest else { return "\(venue.displayName)\(mode.displayName) · 尚无采样" }
+        var text = "\(venue.displayName)\(mode.displayName) · 记录自 \(Format.shortDate(oldest.ts)) · \(curve.points.count) 个样本"
+        if let change = appState.equityChange(selection.equityWindow, venue: venue), !change.coverageNote.isEmpty {
             text += " · " + change.coverageNote
         }
         return text
@@ -166,11 +177,11 @@ struct OverviewPage: View {
     // MARK: Positions
 
     private var positionsCard: some View {
-        Card(title: "持仓", subtitle: "\(mode.displayName)台账 · 按名义额排序") {
+        Card(title: "持仓", subtitle: "\(venue.displayName)\(mode.displayName)台账 · 按名义额排序") {
             Button("策略") { appState.openTerminal(.strategies) }.controlSize(.small)
         } content: {
-            let positions = appState.openPositions
-            ForEach(appState.reconciliationIssues) { issue in
+            let positions = appState.openPositions(on: venue)
+            ForEach(appState.reconciliationIssues(on: venue)) { issue in
                 InlineNotice(kind: .warning, title: "\(issue.instId) 台账与交易所不一致",
                              message: "台账 \(PriceFormatter.plain(issue.ledgerQuantity)) · 交易所 \(PriceFormatter.plain(issue.exchangeQuantity)) · 未归因 \(PriceFormatter.signedMoney(issue.unattributed, decimals: 6))。差额通常来自手动下单或其它程序；策略只调整自己台账内的仓位。")
             }
@@ -179,7 +190,7 @@ struct OverviewPage: View {
                 GridColumn(title: "数量", alignment: .trailing), GridColumn(title: "均价", alignment: .trailing),
                 GridColumn(title: "现价", alignment: .trailing), GridColumn(title: "盈亏", alignment: .trailing),
                 GridColumn(title: "收益率", alignment: .trailing),
-            ], rows: positions, emptyText: appState.strategies.isEmpty ? "还没有策略" : "空仓") { position in
+            ], rows: positions, emptyText: venueStrategies.isEmpty ? "还没有\(venue.displayName)策略" : "空仓") { position in
                 let mark = appState.mark(for: position.instId)
                 let pnl = position.netPnL(mark: mark)
                 let capital = appState.store.config.strategy.allocation(for: position.strategyId)?.capital ?? 0
@@ -198,17 +209,22 @@ struct OverviewPage: View {
 
     // MARK: Strategies
 
+    /// The strategies that trade on the venue on show.
+    private var venueStrategies: [CompiledStrategy] {
+        appState.strategies.filter { $0.market.venue == venue }
+    }
+
     private var strategiesCard: some View {
         let portfolio = appState.store.config.strategy
         return Card(title: "策略",
-                    subtitle: "运行中 \(portfolio.runningCount)/\(appState.strategies.count) · 已分配 \(PriceFormatter.money(portfolio.allocatedCapital, decimals: 0)) / \(PriceFormatter.money(portfolio.totalCapital, decimals: 0)) \(portfolio.quoteCurrency)") {
+                    subtitle: "\(venue.displayName) · 运行中 \(portfolio.runningCount(on: venue))/\(venueStrategies.count) · 已分配 \(PriceFormatter.money(portfolio.allocatedCapital(on: venue), decimals: 0)) / \(PriceFormatter.money(portfolio.totalCapital(for: venue), decimals: 0)) \(venue.quoteCurrency)") {
             EmptyView()
         } content: {
-            if appState.strategies.isEmpty {
-                Text("还没有策略。到「策略」页导入一份清单。").font(Theme.Text.secondary).foregroundStyle(.tertiary)
+            if venueStrategies.isEmpty {
+                Text("还没有\(venue.displayName)策略。到「策略」页导入一份清单。").font(Theme.Text.secondary).foregroundStyle(.tertiary)
             }
             VStack(spacing: 4) {
-                ForEach(appState.strategies, id: \.id) { strategy in
+                ForEach(venueStrategies, id: \.id) { strategy in
                     strategyRow(strategy)
                 }
             }
@@ -217,7 +233,7 @@ struct OverviewPage: View {
 
     private func strategyRow(_ strategy: CompiledStrategy) -> some View {
         let allocation = appState.store.config.strategy.allocation(for: strategy.id)
-        let state = appState.runner.state(for: strategy.id)
+        let state = appState.runtimeState(for: strategy.id)
         let running = allocation?.running ?? false
         return HStack(spacing: 8) {
             StatusDot(color: statusColor(state.status, running: running))
@@ -270,14 +286,15 @@ struct OverviewPage: View {
     // MARK: Balances & fills
 
     private var balancesCard: some View {
-        Card(title: "交易所余额", subtitle: appState.accountBalances.isEmpty ? "尚未读取" : "okx account balance-all") {
+        Card(title: venue == .okx ? "交易所余额" : (mode.isDemo ? "影子账户" : "嘉信账户"),
+             subtitle: books.accountBalances.isEmpty ? "尚未读取" : (venue == .okx ? "okx account balance-all" : (mode.isDemo ? "本地撮合 · 现金与持股" : "schwabctl account"))) {
             EmptyView()
         } content: {
             DataGrid(columns: [
                 GridColumn(title: "币种"), GridColumn(title: "总额", alignment: .trailing),
                 GridColumn(title: "可用", alignment: .trailing), GridColumn(title: "估值 USD", alignment: .trailing),
-            ], rows: appState.accountBalances.sorted { ($0.valuationUsd ?? 0) > ($1.valuationUsd ?? 0) },
-               emptyText: appState.accountError ?? "读取账户后显示") { balance in
+            ], rows: books.accountBalances.sorted { ($0.valuationUsd ?? 0) > ($1.valuationUsd ?? 0) },
+               emptyText: books.accountError ?? "读取账户后显示") { balance in
                 GridText(balance.ccy, weight: .medium, fit: true)
                 GridText(PriceFormatter.plain(balance.total), mono: true, alignment: .trailing)
                 GridText(PriceFormatter.plain(balance.available), mono: true, alignment: .trailing)
@@ -288,14 +305,14 @@ struct OverviewPage: View {
     }
 
     private var fillsCard: some View {
-        Card(title: "最近成交", subtitle: "\(mode.displayName) · 最近 12 笔") {
+        Card(title: "最近成交", subtitle: "\(venue.displayName)\(mode.displayName) · 最近 12 笔") {
             EmptyView()
         } content: {
             DataGrid(columns: [
                 GridColumn(title: "时间"), GridColumn(title: "策略"), GridColumn(title: "操作"),
                 GridColumn(title: "价格", alignment: .trailing), GridColumn(title: "数量", alignment: .trailing),
                 GridColumn(title: "净益", alignment: .trailing),
-            ], rows: appState.recentFills(limit: 12), emptyText: "还没有成交记录") { fill in
+            ], rows: appState.recentFills(limit: 12, on: venue), emptyText: "还没有成交记录") { fill in
                 GridText(Format.stamp(fill.ts), tint: .secondary, mono: true, fit: true)
                 GridText(appState.strategy(id: fill.strategyId)?.name ?? fill.strategyId)
                 GridText(fill.actionLabel, tint: Theme.trend(fill.side == .buy), weight: .medium, fit: true)

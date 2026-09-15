@@ -1614,8 +1614,8 @@ struct OptionRunnerTests {
     private func armedHost(signals: String = #"{"longEntry":"close > 0"}"#) throws -> FakeHost {
         let host = FakeHost()
         host.runnableStrategies = [try strategy(signals: signals)]
-        host.portfolio.totalCapital = 20_000
-        host.portfolio.setCapital(10_000, for: "opt")
+        host.portfolio.capital[.okx] = 20_000
+        host.portfolio.setCapital(10_000, for: "opt", on: .okx)
         host.portfolio.setRunning(true, for: "opt")
         host.fake.equity = 20_000
         host.fake.candlesResult = recentCandles(200)

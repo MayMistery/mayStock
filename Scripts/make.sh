@@ -64,9 +64,13 @@ swift_plugin_flags() {
 
 # The Rust kernel must exist before Swift links against it.
 cmd_kernel() { ./Scripts/build-kernel.sh "${1:-release}"; }
+# schwabctl is the Rust credential boundary for the Schwab venue; the app
+# bundle carries a copy and the bridge looks for it next to the executable.
+cmd_schwabctl() { ./Scripts/build-schwabctl.sh "${1:-release}"; }
 
 cmd_build() {
   cmd_kernel release
+  cmd_schwabctl release
   local plugin_flags=()
   while IFS= read -r line; do plugin_flags+=("$line"); done < <(swift_plugin_flags)
   swift build -c release ${plugin_flags[@]+"${plugin_flags[@]}"}
@@ -114,6 +118,21 @@ cmd_install() {
   mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
   cp "$BUILD_DIR/$APP_NAME" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
   cp "$INFO_PLIST" "$APP_BUNDLE/Contents/Info.plist"
+  # schwabctl rides inside the bundle so the app finds it without PATH, and
+  # is linked into the first writable bin directory so `schwabctl login`
+  # works from any terminal. Same binary both ways: one keychain identity.
+  if [ -x ".build/schwabctl/schwabctl" ]; then
+    cp ".build/schwabctl/schwabctl" "$APP_BUNDLE/Contents/MacOS/schwabctl"
+    for bin in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin"; do
+      if [ -d "$bin" ] && [ -w "$bin" ]; then
+        ln -sf "$APP_BUNDLE/Contents/MacOS/schwabctl" "$bin/schwabctl"
+        echo "linked $bin/schwabctl"
+        break
+      fi
+    done
+  else
+    echo "warning: .build/schwabctl/schwabctl missing — run ./Scripts/make.sh build first" >&2
+  fi
   if [ -f "$ICON_DIR/icon_512x512.png" ]; then
     rm -rf "/tmp/$APP_NAME.iconset" && mkdir -p "/tmp/$APP_NAME.iconset"
     cp "$ICON_DIR"/icon_*.png "/tmp/$APP_NAME.iconset/" 2>/dev/null || true

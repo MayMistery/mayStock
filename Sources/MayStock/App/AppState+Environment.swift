@@ -43,7 +43,7 @@ extension AppState {
     func setProfile(_ name: String?, for mode: TradingMode) {
         store.update { $0.trading.setProfile(name, for: mode) }
         // A changed profile is an unchecked one.
-        connections[mode] = .unknown
+        books(for: .okx).connections[mode] = .unknown
     }
 
     func setCLIPath(_ path: String?) {
@@ -53,50 +53,112 @@ extension AppState {
         Task { await detectTradeCLI() }
     }
 
-    // MARK: Connections
-
-    func connectionStatus(for mode: TradingMode) -> VenueConnectionStatus {
-        connections[mode] ?? .unknown
+    func setSchwabCLIPath(_ path: String?) {
+        let cleaned = path?.trimmingCharacters(in: .whitespaces)
+        store.update { $0.trading.schwabCLIPath = (cleaned?.isEmpty ?? true) ? nil : cleaned }
+        schwabCLI = nil
+        schwabStatus = nil
+        let bridge = schwabBridge
+        Task {
+            await schwabTokens.update(bridge: bridge)
+            await detectSchwabCLI()
+        }
     }
 
-    /// Prove the mode's credentials reach its environment. Read-only.
+    // MARK: Connections
+
+    func connectionStatus(for mode: TradingMode, venue: Venue = .okx) -> VenueConnectionStatus {
+        books(for: venue).connections[mode] ?? .unknown
+    }
+
+    /// Prove the mode's credentials reach its environment on a venue.
+    /// Read-only: a balance read on OKX, a status read plus — for the live
+    /// account — an account read through `schwabctl`.
     @discardableResult
-    func verifyConnection(_ mode: TradingMode) async -> VenueConnectionStatus {
-        if cliInfo == nil { await detectTradeCLI() }
-        guard cliInfo != nil else {
-            let status = VenueConnectionStatus.failed(
-                message: TradeError.cliNotFound.description, hint: nil, at: Date())
-            connections[mode] = status
+    func verifyConnection(_ mode: TradingMode, venue: Venue = .okx) async -> VenueConnectionStatus {
+        let books = books(for: venue)
+        switch venue {
+        case .okx:
+            if cliInfo == nil { await detectTradeCLI() }
+            guard cliInfo != nil else {
+                let status = VenueConnectionStatus.failed(
+                    message: TradeError.cliNotFound.description, hint: nil, at: Date())
+                books.connections[mode] = status
+                return status
+            }
+            guard credentialsConfigured(for: mode) else {
+                let status = VenueConnectionStatus.failed(
+                    message: profileCatalog.fileExists
+                        ? "\(mode.displayName)配置的 profile 在 ~/.okx/config.toml 里不存在"
+                        : TradeError.notConfigured.description,
+                    hint: "在下方为\(mode.displayName)选择一个 profile。", at: Date())
+                books.connections[mode] = status
+                return status
+            }
+            books.connections[mode] = .checking
+            let bridge = tradeBridge
+            let status: VenueConnectionStatus
+            do {
+                let report = try await bridge.verifyConnection(mode: mode)
+                status = .connected(report)
+                Log.warn("connection: okx \(mode.rawValue) verified via profile \(report.profile ?? "<default>")")
+            } catch {
+                let message = String(describing: error)
+                let hint = (error as? TradeError)?.hint ?? profileMismatch(for: mode)
+                status = .failed(message: message, hint: hint, at: Date())
+                Log.warn("connection: okx \(mode.rawValue) failed — \(message)")
+            }
+            books.connections[mode] = status
+            return status
+        case .schwab:
+            if schwabCLI == nil { await detectSchwabCLI() }
+            guard schwabCLI != nil else {
+                let status = VenueConnectionStatus.failed(
+                    message: SchwabBridgeError.cliNotFound.description,
+                    hint: "./Scripts/make.sh install 会把 schwabctl 装进 MayStock.app", at: Date())
+                books.connections[mode] = status
+                return status
+            }
+            books.connections[mode] = .checking
+            let bridge = schwabBridge
+            let status: VenueConnectionStatus
+            do {
+                let credential = try await bridge.status()
+                schwabStatus = credential
+                switch mode {
+                case .live:
+                    guard credential.loggedIn else {
+                        throw SchwabAPIError.loggedOut(credential.blocker ?? "未登录")
+                    }
+                    let account = try await bridge.account()
+                    status = .connected(VenueConnectionReport(
+                        mode: mode, profile: credential.accountSuffix.map { "账户 …\($0)" },
+                        checkedAt: Date(), totalEquity: account.equity,
+                        balanceCount: account.positions.count, account: nil))
+                    Log.warn("connection: schwab live verified, \(account.positions.count) positions")
+                case .demo:
+                    // The shadow book is always reachable; what is worth
+                    // knowing is whether its prices are Schwab's own.
+                    let snapshot = await shadowBook.snapshot()
+                    status = .connected(VenueConnectionReport(
+                        mode: mode, profile: credential.loggedIn ? "影子账户 · 嘉信行情" : "影子账户 · Yahoo 行情",
+                        checkedAt: Date(), totalEquity: snapshot.totalEquity,
+                        balanceCount: snapshot.balances.count, account: nil))
+                }
+            } catch {
+                let message = String(describing: error)
+                status = .failed(message: message, hint: "在终端运行 schwabctl login（每 7 天一次）", at: Date())
+                Log.warn("connection: schwab \(mode.rawValue) failed — \(message)")
+            }
+            books.connections[mode] = status
             return status
         }
-        guard credentialsConfigured(for: mode) else {
-            let status = VenueConnectionStatus.failed(
-                message: profileCatalog.fileExists
-                    ? "\(mode.displayName)配置的 profile 在 ~/.okx/config.toml 里不存在"
-                    : TradeError.notConfigured.description,
-                hint: "在下方为\(mode.displayName)选择一个 profile。", at: Date())
-            connections[mode] = status
-            return status
-        }
-        connections[mode] = .checking
-        let bridge = tradeBridge
-        let status: VenueConnectionStatus
-        do {
-            let report = try await bridge.verifyConnection(mode: mode)
-            status = .connected(report)
-            Log.warn("connection: \(mode.rawValue) verified via profile \(report.profile ?? "<default>")")
-        } catch {
-            let message = String(describing: error)
-            let hint = (error as? TradeError)?.hint ?? profileMismatch(for: mode)
-            status = .failed(message: message, hint: hint, at: Date())
-            Log.warn("connection: \(mode.rawValue) failed — \(message)")
-        }
-        connections[mode] = status
-        return status
     }
 
     func verifyAllConnections() async {
-        for mode in TradingMode.allCases { await verifyConnection(mode) }
+        for venue in Venue.allCases {
+            for mode in TradingMode.allCases { await verifyConnection(mode, venue: venue) }
+        }
     }
 
     // MARK: Live unlock
@@ -113,7 +175,7 @@ extension AppState {
                 }
             }
         }
-        if !unlocked { runner.restart() }
+        if !unlocked { runners.forEach { $0.restart() } }
         Log.warn("trading: live \(unlocked ? "unlocked" : "locked")")
     }
 
@@ -141,7 +203,7 @@ extension AppState {
         if mode == tradingMode { return .alreadyActive }
         if mode == .live && !liveTradingUnlocked { return .liveLocked }
         // Cancel first, then change: see `StrategyRunner.restart`.
-        runner.stop()
+        runners.forEach { $0.stop() }
         let armed = store.config.strategy.allocations.filter(\.running).map(\.strategyId)
         store.update { config in
             config.strategy.mode = mode
@@ -149,14 +211,17 @@ extension AppState {
                 config.strategy.allocations[index].running = false
             }
         }
-        runner.start()
+        runners.forEach { $0.start() }
         Log.warn("mode: switched to \(mode.rawValue); disarmed \(armed.isEmpty ? "nothing" : armed.joined(separator: ", "))")
-        accountBalances = []
-        exchangePositions = []
-        accountError = nil
+        for venue in Venue.allCases {
+            let books = books(for: venue)
+            books.accountBalances = []
+            books.exchangePositions = []
+            books.accountError = nil
+        }
         Task {
             await refreshAccount()
-            await verifyConnection(mode)
+            for venue in Venue.allCases { await verifyConnection(mode, venue: venue) }
         }
         return nil
     }
@@ -178,18 +243,26 @@ extension AppState {
             return
         }
 
-        let status = await verifyConnection(mode)
-        if case .failed(let message, let hint, _) = status {
-            let choice = await presentAlert(
-                title: "无法连接\(mode.displayName)",
-                message: [message, hint].compactMap { $0 }.joined(separator: "\n\n"),
-                style: .critical, buttons: ["前往账户与连接", "取消"])
-            if choice == .alertFirstButtonReturn { openTerminal(.account) }
-            return
+        // Every venue that has a strategy must reach the target account;
+        // one that cannot would leave its strategies deciding against a
+        // book the engine cannot see.
+        let venues = Venue.allCases.filter { venue in strategies.contains { $0.market.venue == venue } }
+        var reports: [(venue: Venue, report: VenueConnectionReport)] = []
+        for venue in venues.isEmpty ? [.okx] : venues {
+            let status = await verifyConnection(mode, venue: venue)
+            if case .failed(let message, let hint, _) = status {
+                let choice = await presentAlert(
+                    title: "无法连接\(venue.displayName)\(mode.displayName)",
+                    message: [message, hint].compactMap { $0 }.joined(separator: "\n\n"),
+                    style: .critical, buttons: ["前往账户与连接", "取消"])
+                if choice == .alertFirstButtonReturn { openTerminal(.account) }
+                return
+            }
+            if let report = status.report { reports.append((venue, report)) }
         }
 
         let running = store.config.strategy.allocations.filter(\.running).count
-        let held = ledger(for: mode).activePositions.count
+        let held = Venue.allCases.reduce(0) { $0 + ledger(for: $1, mode: mode).activePositions.count }
         var lines: [String] = []
         if running > 0 {
             lines.append("当前有 \(running) 个策略在运行，切换会先把它们全部停止（持仓保留，不会平仓）。")
@@ -197,9 +270,13 @@ extension AppState {
         if held > 0 {
             lines.append("\(mode.displayName)账户台账上有 \(held) 个持仓，切换后由这边的策略接管。")
         }
-        if let report = status.report, let equity = report.totalEquity {
-            lines.append("\(mode.displayName)账户权益 \(PriceFormatter.money(equity)) \(runner.quoteCurrency)"
-                + (report.profile.map { "，profile「\($0)」" } ?? "，CLI 默认 profile") + "。")
+        for (venue, report) in reports {
+            guard let equity = report.totalEquity else { continue }
+            lines.append("\(venue.displayName)\(mode.displayName)账户权益 \(PriceFormatter.money(equity)) \(venue.quoteCurrency)"
+                + (report.profile.map { "，\($0)" } ?? "") + "。")
+        }
+        if mode == .demo, venues.contains(.schwab) {
+            lines.append("嘉信没有模拟盘：模拟盘下的美股订单由 MayStock 本地影子账户按实时行情撮合。")
         }
         lines.append(mode.isDemo
                      ? "模拟盘的订单不会动用真实资金。"
@@ -227,10 +304,11 @@ extension AppState {
             Task { _ = await presentAlert(title: "还没有分配仓位", message: "先给「\(strategy.name)」分配预算，再开始交易。", style: .warning, buttons: ["好"]) }
             return
         }
-        guard tradingReady else {
-            let reason = tradingBlocker ?? "交易尚未就绪"
+        let venue = strategy.market.venue
+        guard tradingReady(for: venue) else {
+            let reason = tradingBlocker(for: venue) ?? "交易尚未就绪"
             Task {
-                let choice = await presentAlert(title: "交易尚未就绪", message: reason, style: .warning, buttons: ["前往账户与连接", "取消"])
+                let choice = await presentAlert(title: "\(venue.displayName)交易尚未就绪", message: reason, style: .warning, buttons: ["前往账户与连接", "取消"])
                 if choice == .alertFirstButtonReturn { openTerminal(.account) }
             }
             return
@@ -241,9 +319,9 @@ extension AppState {
         }
         Task {
             let choice = await presentAlert(
-                title: "在实盘启动「\(strategy.name)」？",
+                title: "在\(venue.displayName)实盘启动「\(strategy.name)」？",
                 message: "将以 \(PriceFormatter.money(allocation.capital, decimals: 0)) "
-                    + "\(store.config.strategy.quoteCurrency) 的预算在 \(strategy.market.instId) "
+                    + "\(venue.quoteCurrency) 的预算在 \(strategy.market.instId) "
                     + "（\(strategy.market.instType.displayName) · \(strategy.market.bar.rawValue)）上按信号自动下单，"
                     + "每一笔都会真实成交。",
                 style: .critical, buttons: ["在实盘启动", "取消"])
@@ -254,7 +332,8 @@ extension AppState {
     /// Flatten a strategy's position at market, after asking.
     func requestFlatten(strategyId: String) {
         guard let strategy = strategy(id: strategyId),
-              let position = ledger.position(for: strategyId), !position.isFlat else { return }
+              let runner = runner(forStrategy: strategyId),
+              let position = ledger(forStrategy: strategyId)?.position(for: strategyId), !position.isFlat else { return }
         Task {
             let choice = await presentAlert(
                 title: "市价平掉「\(strategy.name)」的持仓？",
@@ -265,6 +344,19 @@ extension AppState {
             if choice == .alertFirstButtonReturn {
                 await runner.flatten(strategyId: strategyId)
             }
+        }
+    }
+
+    /// Start the Schwab shadow account over, after asking.
+    func requestResetShadowBook() {
+        let cash = store.config.strategy.totalCapital(for: .schwab)
+        Task {
+            let choice = await presentAlert(
+                title: "重置嘉信影子账户？",
+                message: "清空影子账户的持仓与挂单，现金重置为嘉信本金 \(PriceFormatter.money(cash, decimals: 0)) USD。"
+                    + "策略台账上的成交记录保留；正在运行的美股策略会按新账户重新决策。",
+                style: .warning, buttons: ["重置", "取消"])
+            if choice == .alertFirstButtonReturn { await resetShadowBook() }
         }
     }
 

@@ -139,12 +139,17 @@ thinkorswim 对这个项目唯一的用处是**手工验证**。API 没有模拟
 
 ### 7.1 凭据边界：新增 `schwabctl`，把 `okx` CLI 的那条边界原样保住
 
-`docs/DESIGN.md:79` 的原则是「App 不接触、不存储任何私钥」。嘉信没有官方 CLI，但这条原则可以靠自己写一个 SwiftPM 可执行目标 `schwabctl` 保住：
+**已实现（2026-09-15）**，与预案的差别记在括号里。`docs/DESIGN.md` 的原则是「App 不接触、不存储任何私钥」；嘉信没有官方 CLI，所以自己写了一个——**Rust**（`schwabctl/`，May 拍板：和内核同一套工具链，交易路径上不要多一个运行时；`Scripts/build-schwabctl.sh` 构建，`make.sh install` 装进 `MayStock.app/Contents/MacOS/` 并链接到 `/opt/homebrew/bin`）。
 
-- `schwabctl login`：打印授权 URL 并打开浏览器；你登录嘉信后浏览器会跳到 `https://127.0.0.1:8182/?code=…`（页面打不开是正常的），把地址栏整串粘回终端；CLI 在 30 秒内换 token，refresh token 存 Keychain。每周一次。
-- `schwabctl token`：吐一个 30 分钟的 access token 给 App 用（Streamer 登录需要）。refresh token 永远不出 CLI。
-- `schwabctl quotes / candles / hours / account / orders / fills`：全部 `--json`，和 `TradeBridge.runCLI()`（`Trading/TradeBridge.swift:696-708`）一样的子进程契约。
-- 好处：App Key/Secret/refresh token 只在一个进程里；maystock-lab 用同一个 CLI 拉数据；7 天登录变成一条命令。
+- `schwabctl configure`：隐藏输入 App Key/Secret，经 `/usr/bin/security` 写进登录钥匙串（服务 `com.maystock.schwabctl`）。走系统工具而不是 Security 框架，是为了让重新编译的二进制照样读得到上一版写的项，不弹对话框。
+- `schwabctl login`：打印授权 URL 并打开浏览器；**在 `127.0.0.1:8182` 起一个 TLS 监听**（rcgen 自签回环证书，落在 `~/Library/Application Support/MayStock/schwab/`，浏览器第一次会提示证书不受信任，点继续即可），只绑回环、只接一次、收到带 `code` 的请求就关；回调必须回传登录时生成的随机 `state`，缺失或不符一律拒绝（`--allow-missing-state` 可显式放行并在 stderr 说明）。`--manual` 改为粘贴地址栏 URL。code 换 token 后 refresh token 存钥匙串，7 天时钟从登录起算，刷新不重置。
+- `schwabctl token`：给 App 一个 30 分钟的 access token；快过期自动刷新。refresh token 永远不出 CLI。
+- `schwabctl status`：不联网、不含任何密钥，App 的账户页显示它。
+- `schwabctl accounts / use / account / positions / orders / order / fills / quotes / candles / hours / search`：全部原样透传嘉信的 JSON，Swift 侧 `SchwabWire` 一份解码器同时服务直连路径与子进程路径。
+- `schwabctl place / replace / cancel`：**必须 `--live`**，否则以 `refused` 拒绝——嘉信没有模拟盘可兜底。订单体从 stdin 读嘉信原生 JSON；4xx 视为拒单（`rejected`，终局），5xx/超时视为未知（App 下一轮问）。
+- 失败一律在 stdout 印 `{"error":{"code":…,"message":…}}`：`not_configured` / `not_logged_in` / `refused` / `rejected` / `rate_limited` / `http` / `transport`，`SchwabBridge` 按 code 判定，不解析堆栈。
+
+App 侧：`SchwabVenue: ExchangeVenue`（行情走 `SchwabMarketDataSource`：官方接口，未登录时退 Yahoo 并写日志；模拟盘走 `ShadowBook` 本地撮合；实盘走 `SchwabBridge`），`VenueBooks` 让每家交易所各有一条 `StrategyRunner` 循环、两本台账、权益曲线与心跳，本金按 venue 分池（`strategy.capital`）。
 
 不选 Python（schwab-py）做 helper：仓库是 Swift + Rust，多一种运行时就多一份安装负担。
 
@@ -161,17 +166,17 @@ thinkorswim 对这个项目唯一的用处是**手工验证**。API 没有模拟
 
 ### 7.3 顺序（依赖最少 → 最多）
 
-0. **今天**：你去开发者门户注册并提交两段申请。等审核的两三周正好做 1。（2026-09-08：Trader API – Individual 已提交，Dashboard → Subscriptions 显示 **Pending**；Create App 在审批通过前不可用——表单直接提示 *You do not have access to any Active API products*，产品下拉为空。审批通过后再建 App，回调填 `https://127.0.0.1:8182`。条款要点见 §7.5。）
+0. **今天**：你去开发者门户注册并提交两段申请。等审核的两三周正好做 1。（2026-09-08：Trader API – Individual 已提交，Dashboard → Subscriptions 显示 **Pending**。**2026-09-15：订阅 Approved，App「MayStock」已建（Production；Accounts and Trading Production + Market Data Production；Order Limit 120；回调 `https://127.0.0.1:8182`），状态直接是 Ready For Use，不用再等第二段审批。** App Key/Secret 只有你看，录进 `schwabctl configure`。条款要点见 §7.5。）
 1. ~~内核与 manifest 的通用化（7.2）~~ **已完成（2026-09-08）**，全部离线测试。
 2. ~~`schwabctl login + candles`~~ **行情部分先用 Yahoo 过渡（2026-09-08，见 7.6）**：maystock-lab 与 App 的回测已能取美股历史（日线不限、1H 两年、分钟线两个月）；`schwabctl login` 与嘉信自己的行情等审批。
-3. `SchwabVenue` + 本地影子撮合；再用最小手数上实盘。
+3. ~~`SchwabVenue` + 本地影子撮合~~ **已完成（2026-09-15）**：`ShadowBook`（常规时段按盘口加滑点撮合、扣嘉信费用组件、Reg T 两倍购买力、止损/止盈 OCO、落盘 `shadow-schwab.json`）与 `SchwabVenue`（实盘经 `schwabctl --live`，策略标签本地映射 orderId）。**下一步是你的**：`schwabctl configure` 录入门户上的 App Key/Secret → `schwabctl login` → 账户页看到「已登录」→ 先在模拟盘（影子账户）跑一段，再用最小手数（1 股）解锁实盘。
 4. ~~`MarketDataFeed` 端口 + 菜单栏美股行情~~ **已完成（2026-09-08）**：`MarketFeed` / `MarketDataSource` 端口，`MarketHub` 按 venue 路由；菜单栏、悬浮面板、终端行情页、告警都能看美股。
 
 ### 7.4 已拍板（2026-09-07）
 
 | 决策 | 结论 | 对方案的影响 |
 |---|---|---|
-| 凭据边界 | `schwabctl` 独立子进程 | 7.1 原样执行；`docs/DESIGN.md:79` 的原则改写为「密钥只在 CLI 进程里，App 只拿 30 分钟 access token」 |
+| 凭据边界 | `schwabctl` 独立子进程（2026-09-15 补充：用 Rust 写，和内核一致，保证交易路径的启动速度） | 7.1 已按此实现；`docs/DESIGN.md` 决策 4 改写为「密钥只在 CLI 进程里，App 只拿 30 分钟 access token」 |
 | 落地顺序 | 先通用化内核，再研究台，最后接交易 | 按 7.3 走 |
 | 账户类型 | 保证金账户 | 做空可开（`SELL_SHORT` / `BUY_TO_COVER`），不加已交割资金闸；要处理借券不可得（hard-to-borrow）时的拒单，以及维持保证金约束。PDT 已废止，日内保证金框架下不再计数 |
 

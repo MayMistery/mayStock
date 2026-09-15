@@ -258,7 +258,7 @@ struct PanelRootView: View {
 
     private func footer(_ session: InstrumentSession) -> some View {
         HStack(spacing: 6) {
-            Text("数据源 \(session.venue.marketDataSourceName)").lineLimit(1)
+            Text("数据源 \(appState.hub.sourceName(for: session.venue))").lineLimit(1)
             if let last = session.lastUpdate {
                 Text("· 更新 \(last.formatted(date: .omitted, time: .standard))").numeric()
             }

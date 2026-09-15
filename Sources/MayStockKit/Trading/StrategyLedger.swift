@@ -389,8 +389,13 @@ public final class StrategyLedger {
     /// history, not state.
     public static let maxFills = 5_000
 
-    public init(mode: TradingMode) {
+    /// The venue this book is kept for. Fills say where they happened on
+    /// their own; this is what names the file and labels the page.
+    public let venue: Venue
+
+    public init(mode: TradingMode, venue: Venue = .okx) {
         self.mode = mode
+        self.venue = venue
     }
 
     // MARK: Queries
@@ -657,8 +662,9 @@ public final class StrategyLedger {
         for position in derivativePositions {
             exchangeByInst[position.instId, default: 0] += position.quantity
         }
-        // Spot exposure is the base-currency balance of each traded pair.
-        for (instId, venue) in venueByInst where venue.instrumentType(of: instId) == .spot {
+        // Anything held as a balance rather than a contract — spot coins,
+        // shares — is read off the base-currency line of the account.
+        for (instId, venue) in venueByInst where !venue.instrumentType(of: instId).isDerivative {
             let (base, _) = venue.currencies(of: instId)
             if let balance = spotBalances.first(where: { $0.ccy == base }) {
                 exchangeByInst[instId] = balance.total
@@ -678,12 +684,12 @@ public final class StrategyLedger {
 
 // MARK: - Persistence
 
-/// JSON-backed storage for a ledger, one file per trading mode.
+/// JSON-backed storage for a ledger, one file per venue and trading mode.
 public struct StrategyLedgerStore: Sendable {
     public let fileURL: URL
 
-    public init(directory: URL, mode: TradingMode) {
-        self.fileURL = directory.appendingPathComponent("ledger-\(mode.rawValue).json")
+    public init(directory: URL, mode: TradingMode, venue: Venue = .okx) {
+        self.fileURL = directory.appendingPathComponent("ledger\(venue.stateFileInfix)-\(mode.rawValue).json")
     }
 
     private struct Payload: Codable {

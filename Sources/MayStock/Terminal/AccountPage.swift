@@ -4,9 +4,10 @@ import MayStockKit
 
 /// Every account, one card each: OKX's two environments side by side — which
 /// CLI profile reaches each, whether it does, and the switch between them —
-/// and Schwab's, which for now is where its application stands. Plus the risk
-/// limits and the cost model per venue that the engine and the backtester run
-/// under — every trading-side setting the app has, on one page.
+/// and Schwab's: `schwabctl`, the login it holds, the live account and the
+/// shadow book. Plus the risk limits and the cost model per venue that the
+/// engine and the backtester run under — every trading-side setting the app
+/// has, on one page.
 struct AccountPage: View {
     let appState: AppState
     @State private var feeSyncMessage: String?
@@ -20,11 +21,12 @@ struct AccountPage: View {
         PageScroll {
             VStack(alignment: .leading, spacing: Theme.sectionSpacing) {
                 PageHeader(title: "账户与连接",
-                           subtitle: "OKX 的 API Key 由官方 okx CLI 管理（okx config），MayStock 不接触、不存储任何密钥；嘉信 Trader API 审批中。回测只用公开行情，无需凭证。") {
+                           subtitle: "OKX 的 API Key 由官方 okx CLI 管理（okx config），嘉信的 App Key/Secret 与 token 由 schwabctl 管理；MayStock 不接触、不存储任何密钥。回测只用公开行情，无需凭证。") {
                     Button {
                         appState.reloadProfiles()
                         Task {
                             await appState.detectTradeCLI()
+                            await appState.detectSchwabCLI()
                             await appState.verifyAllConnections()
                         }
                     } label: {
@@ -99,10 +101,11 @@ struct AccountPage: View {
 
     // MARK: Schwab
 
-    /// Where the US-equity side stands. Honest about what exists: quotes flow
-    /// from the interim source, the trading API is still being approved, and
-    /// nothing here holds a key.
+    /// The US-equity side: the tool that holds the credentials, the login it
+    /// has, the live account behind it and the shadow book that stands in
+    /// for a demo account. Nothing here holds a key.
     private var schwabCard: some View {
+        let books = appState.books(for: .schwab)
         let feed = appState.hub.feedState(for: .schwab)
         let feedText: (String, Color) = switch feed {
         case .connected: ("已连接", Theme.up)
@@ -110,25 +113,87 @@ struct AccountPage: View {
         case .connecting: ("连接中", .secondary)
         case .idle: ("自选里没有美股，未启动", .secondary)
         }
+        let status = appState.schwabStatus
         return Card(title: "嘉信证券 · 美股",
-                    subtitle: "Trader API – Individual 申请已提交，等待审批；审批通过后建 App 取 Key，再用 schwabctl 登录") {
-            Button {
-                NSWorkspace.shared.open(URL(string: "https://developer.schwab.com/dashboard")!)
-            } label: {
-                Label("开发者门户", systemImage: "arrow.up.right.square")
+                    subtitle: "App Key/Secret 与 refresh token 只在 schwabctl 进程里；MayStock 只拿 30 分钟的 access token，实盘订单也经它发出") {
+            HStack(spacing: 8) {
+                if appState.isDetectingSchwabCLI {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Button("重新检测") {
+                        Task {
+                            await appState.detectSchwabCLI()
+                            await appState.verifyConnection(appState.tradingMode, venue: .schwab)
+                            await appState.refreshAccount(.schwab)
+                        }
+                    }
+                    .controlSize(.small)
+                }
+                Button {
+                    NSWorkspace.shared.open(URL(string: "https://developer.schwab.com/dashboard")!)
+                } label: {
+                    Label("开发者门户", systemImage: "arrow.up.right.square")
+                }
+                .controlSize(.small)
             }
-            .controlSize(.small)
         } content: {
+            HStack(alignment: .top, spacing: 14) {
+                if let cli = appState.schwabCLI {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.up).font(.system(size: 18))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("schwabctl " + cli.version).font(Theme.Text.bodyMedium)
+                        Text(cli.path).font(Theme.Text.mono).foregroundStyle(.secondary).textSelection(.enabled)
+                    }
+                } else {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Theme.warning).font(.system(size: 18))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("未检测到 schwabctl").font(Theme.Text.bodyMedium)
+                        Text("./Scripts/make.sh install 会把它装进 MayStock.app 并链接到 PATH").font(Theme.Text.mono)
+                            .foregroundStyle(.secondary).textSelection(.enabled)
+                    }
+                }
+                Spacer()
+                VStack(alignment: .trailing, spacing: 4) {
+                    Text("自定义路径（可选）").font(Theme.Text.caption).foregroundStyle(.secondary)
+                    CommitTextField(placeholder: "/Applications/MayStock.app/Contents/MacOS/schwabctl", value: prefs.schwabCLIPath ?? "",
+                                    width: 260, mono: true, alignment: .leading) { appState.setSchwabCLIPath($0) }
+                }
+            }
             VStack(alignment: .leading, spacing: 4) {
-                KeyValueRow(label: "美股行情", value: "\(Venue.schwab.marketDataSourceName) · \(feedText.0)", tint: feedText.1)
-                KeyValueRow(label: "API 申请", value: "审批中 · Dashboard → Subscriptions 显示 Pending", tint: Theme.warning)
-                KeyValueRow(label: "交易", value: "尚未接入：美股清单可以回测，不能下单")
+                KeyValueRow(label: "登录", value: loginText(status).0, tint: loginText(status).1)
+                KeyValueRow(label: "美股行情", value: "\(appState.hub.sourceName(for: .schwab)) · \(feedText.0)", tint: feedText.1)
+                KeyValueRow(label: "模拟盘", value: "本地影子账户：按实时行情在常规交易时段撮合，扣嘉信费率与滑点假设，Reg T 两倍购买力")
+                if let equity = appState.accountEquity(for: .schwab) {
+                    KeyValueRow(label: appState.tradingMode.isDemo ? "影子账户权益" : "账户权益",
+                                value: PriceFormatter.money(equity) + " USD · " + "\(books.accountBalances.count - 1) 项持股")
+                } else if let error = books.accountError {
+                    KeyValueRow(label: "账户", value: error, tint: Theme.warning)
+                }
             }
             .rowStyle()
-            Text("审批通过后：Dashboard → Create App（回调 https://127.0.0.1:8182）→ 等 App 变为 Ready For Use → schwabctl login。"
-                 + "密钥只在 schwabctl 进程里，MayStock 只拿 30 分钟有效的 access token；refresh token 每 7 天重新登录一次。")
+            HStack(spacing: 8) {
+                ForEach(TradingMode.allCases) { mode in
+                    ConnectionChip(appState: appState, mode: mode, venue: .schwab, showsMode: true)
+                }
+                Spacer()
+                Button("重置影子账户") { appState.requestResetShadowBook() }
+                    .controlSize(.small)
+                    .help("清空影子持仓与挂单，现金回到嘉信本金")
+            }
+            Text("每 7 天在终端运行一次 schwabctl login（浏览器会提示自签的回环证书，点「继续访问 127.0.0.1」）；"
+                 + "第一次先 schwabctl configure 录入 App Key/Secret。实盘要先解锁，再逐个策略确认。")
                 .font(Theme.Text.caption).foregroundStyle(.secondary)
         }
+    }
+
+    private func loginText(_ status: SchwabCredentialStatus?) -> (String, Color) {
+        guard let status else { return ("未读取 schwabctl 状态", .secondary) }
+        if status.loggedIn, let expires = status.refreshExpiresAt {
+            let days = max(Int(expires.timeIntervalSinceNow / 86_400), 0)
+            let account = status.accountSuffix.map { " · 账户 …\($0)" } ?? ""
+            return ("已登录 · \(days) 天后过期（\(Format.shortDate(expires))）\(account)", Theme.up)
+        }
+        return (status.blocker ?? "未登录", Theme.warning)
     }
 
     // MARK: Risk
@@ -155,7 +220,7 @@ struct AccountPage: View {
                             let cleaned = text.trimmingCharacters(in: .whitespaces)
                             appState.store.update { $0.strategy.maxOrderNotional = cleaned.isEmpty ? nil : Double(cleaned).map { max($0, 0) } }
                         }
-                        Text(portfolio.quoteCurrency).font(Theme.Text.secondary).foregroundStyle(.secondary)
+                        Text(Venue.allCases.map(\.quoteCurrency).joined(separator: " / ")).font(Theme.Text.secondary).foregroundStyle(.secondary)
                     }
                 }
                 GridRow {
@@ -189,12 +254,15 @@ struct AccountPage: View {
                     .toggleStyle(.switch).controlSize(.small)
                 }
             }
-            if let tripped = appState.runner.protectionTripped {
-                InlineNotice(kind: .warning, title: "熔断生效中", message: tripped)
+            ForEach(Venue.allCases) { venue in
+                let runner = appState.runner(for: venue)
+                if let tripped = runner.protectionTripped {
+                    InlineNotice(kind: .warning, title: "\(venue.displayName)熔断生效中", message: tripped)
+                }
+                Text("\(venue.displayName)账户回撤 " + PriceFormatter.percent(runner.accountDrawdownPct, decimals: 2)
+                     + " · 已持仓名义 " + PriceFormatter.money(runner.committedNotional, decimals: 0) + " " + venue.quoteCurrency)
+                    .font(Theme.Text.caption).foregroundStyle(.tertiary)
             }
-            Text("当前账户回撤 " + PriceFormatter.percent(appState.runner.accountDrawdownPct, decimals: 2)
-                 + " · 已持仓名义 " + PriceFormatter.money(appState.runner.committedNotional, decimals: 0) + " " + portfolio.quoteCurrency)
-                .font(Theme.Text.caption).foregroundStyle(.tertiary)
         }
     }
 
@@ -282,8 +350,8 @@ struct AccountPage: View {
                     }
                 }
                 .controlSize(.small)
-                .disabled(!appState.tradingReady)
-                .help(appState.tradingBlocker ?? "读取 \(appState.tradingMode.displayName)账户的真实费率并覆盖档位表")
+                .disabled(!appState.tradingReady(for: .okx))
+                .help(appState.tradingBlocker(for: .okx) ?? "读取 \(appState.tradingMode.displayName)账户的真实费率并覆盖档位表")
             }
         }
         if let feeSyncMessage {
@@ -468,7 +536,7 @@ private struct EnvironmentCard: View {
         switch status {
         case .connected(let report):
             VStack(alignment: .leading, spacing: 4) {
-                KeyValueRow(label: "账户权益", value: report.totalEquity.map { PriceFormatter.money($0) + " " + appState.runner.quoteCurrency } ?? "未报告")
+                KeyValueRow(label: "账户权益", value: report.totalEquity.map { PriceFormatter.money($0) + " " + Venue.okx.quoteCurrency } ?? "未报告")
                 KeyValueRow(label: "持有币种", value: "\(report.balanceCount) 种")
                 if let account = report.account {
                     KeyValueRow(label: "账户模式", value: account.accountLevelName, tint: account.supportsPerpetuals ? .primary : Theme.warning)

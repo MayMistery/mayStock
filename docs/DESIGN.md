@@ -70,6 +70,7 @@
 │ InstrumentSession: ticker · candles[bar] · book · SparklineBuffer(ring)                     │
 │ AlertEngine: 规则求值(去抖/冷却/自动重挂) → AlertEvent                                        │
 │ TradeBridge: 官方 okx CLI (Agent Trade Kit) 子进程封装, --json / --demo                      │
+│ SchwabBridge: 自研 schwabctl（Rust）子进程封装, --json / --live；SchwabVenue + ShadowBook   │
 │ ConfigStore: 版本化 JSON (v2, 自动迁移 v1, 丢弃 cpu/mem/net 项)                              │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -77,10 +78,11 @@
 **关键决策**
 
 1. **Kit 与 App 分层**：MayStockKit 不依赖 AppKit，可在 Linux/CI 编译测试 —— E2E 驱动 `maystock-e2e` 直接复用同一套引擎，「测试的就是线上跑的代码」。
-2. **行情按交易所走端口**：`MarketHub` 每家交易所各持一个 `MarketFeed`（实时推送）和一个 `MarketDataSource`（历史、元数据、搜索），按自选项的 `venue` 路由，自己不认识任何一家的协议。OKX 是两条共享的 WebSocket（public 与 business 各一条，订阅表由 feed 维护，重连后自动重放）；美股是轮询 Yahoo Finance 的图表接口（交易时段每 3 秒、休市每 60 秒），嘉信审批通过后换成它的行情 API 时页面不用动。`Ticker` 只有一种形状，涨跌的基准（24 小时前 / 昨收）和会话阶段随行情走，界面从上面读标签，不写死「24h」。
+2. **行情按交易所走端口**：`MarketHub` 每家交易所各持一个 `MarketFeed`（实时推送）和一个 `MarketDataSource`（历史、元数据、搜索），按自选项的 `venue` 路由，自己不认识任何一家的协议。OKX 是两条共享的 WebSocket（public 与 business 各一条，订阅表由 feed 维护，重连后自动重放）；美股是轮询嘉信的 `/marketdata/v1/quotes`（所有自选一次批量，交易时段每 3 秒、休市每 60 秒），`schwabctl` 没登录时同一个 feed 自动改读 Yahoo Finance 的图表接口，并以 `MarketFeedEvent.source` 报出当前来源——页脚与账户页显示的是 feed 说的名字，不是 venue 的设计名。`Ticker` 只有一种形状，涨跌的基准（24 小时前 / 昨收）和会话阶段随行情走，界面从上面读标签，不写死「24h」。
 3. **数据正确性**：K 线以 `ts` 为主键 replace-or-append；未确认 K 线（confirm=0）实时刷新；REST 回填与 WS 增量在同一 actor 内合并，无竞态。
-4. **交易走官方 CLI 而非自持密钥**：API Key 由 OKX 官方 `okx` CLI 的 `~/.okx/config.toml` 管理，MayStock 不接触、不存储任何私钥 —— 合规且边界干净。默认 demo（模拟盘），实盘需在「账户与连接」页显式解锁，切换前先验证目标账户并确认，每个策略在实盘启动时再单独确认。
-   模拟盘与实盘是**两个账户、两套密钥**（OKX 对另一环境的 Key 一律回 "APIKey does not match current environment"），所以配置里每个环境各有一个 profile（`trading.demoProfile` / `trading.liveProfile`），`TradeBridge` 按调用的 mode 选 profile；App 只读 `config.toml` 的 profile 名与 `demo` 标记，从不读密钥。
+4. **交易走独立的 CLI 进程而非自持密钥**：密钥只在 CLI 进程里，App 只拿短期凭据。OKX 的 API Key 由官方 `okx` CLI 的 `~/.okx/config.toml` 管理；嘉信的 App Key/Secret 与 OAuth refresh token 由自研的 `schwabctl`（`schwabctl/`，Rust，与内核同一套工具链，随 App 装进 `MayStock.app/Contents/MacOS/`）存在钥匙串里，App 只通过 `schwabctl token` 拿 30 分钟有效的 access token 读行情，订单一律经 `schwabctl place --live` 发出——没有 `--live` 它拒绝发单，因为嘉信没有模拟盘可兜底。MayStock 不接触、不存储任何私钥。默认 demo（模拟盘），实盘需在「账户与连接」页显式解锁，切换前先验证每家交易所的目标账户并确认，每个策略在实盘启动时再单独确认。
+   模拟盘与实盘是**两个账户、两套密钥**（OKX 对另一环境的 Key 一律回 "APIKey does not match current environment"），所以配置里每个环境各有一个 profile（`trading.demoProfile` / `trading.liveProfile`），`TradeBridge` 按调用的 mode 选 profile；App 只读 `config.toml` 的 profile 名与 `demo` 标记，从不读密钥。嘉信的「模拟盘」是本地影子账户（`ShadowBook`）：按实时行情在常规交易时段撮合，盘口加滑点假设、扣嘉信的费用组件、按 Reg T 两倍购买力拒单，落盘在 `shadow-schwab.json`，账本读它和读交易所一模一样。
+6. **每家交易所一套账本、一条交易循环**：`VenueBooks` 按 venue 各持两本台账（demo/live）、权益曲线、心跳与一个 `StrategyRunner`；本金也按 venue 分池（`strategy.capital`，USDT 与 USD 永不相加）。运行器仍是单账户引擎，第二家交易所是多一份 `VenueBooks` 而不是引擎里多一个分支。OKX 的文件名保持原样（`ledger-demo.json`），其他交易所把 venue 写进文件名（`ledger-schwab-demo.json`、`heartbeat-schwab.json`）。
 5. **Swift 6 工具链 + v5 语言模式**：并发注解按 v6 纪律书写（actor/@MainActor/Sendable），语言模式暂锁 v5 保证首编通过，后续可无痛升 v6。
 
 ## 3. 数据面（OKX，已核实 2026-07；美股见 3.1）
@@ -97,7 +99,21 @@
 
 限频遵循：REST candles 20 req/2s，回填分页间隔 ≥120ms；UI 侧节流不影响推送接收。
 
-### 3.1 美股数据面（Yahoo Finance 过渡源，已核实 2026-09）
+### 3.1 美股数据面（嘉信 Trader API 为主，Yahoo Finance 为未登录时的兜底；已核实 2026-09）
+
+嘉信这边（`Sources/MayStockKit/Schwab/`，access token 来自 `schwabctl token`，限频 120 次/分钟）：
+
+| 用途 | 端点 | 说明 |
+|------|------|------|
+| 实时价 | `GET /marketdata/v1/quotes?symbols=A,B&fields=quote,reference,regular,extended` | 所有自选一次批量；`lastPrice`、`closePrice`（昨收）、`openPrice`、日内高低量、买一卖一；阶段由 `/markets` 的时段表判定 |
+| K 线 | `GET /marketdata/v1/pricehistory?symbol=&periodType=&frequencyType=&frequency=&startDate=&endDate=` | 1m/5m/15m 直接取；**没有小时频率**，1H 由 30 分钟 bar 按 09:30 锚定拼成（每天 7 根，最后一根只有半小时）；日线周线用 `daily`/`weekly`；历史按 10 天一窗往回翻到空窗为止 |
+| 交易时段 | `GET /marketdata/v1/markets?markets=equity&date=` | 盘前/常规/盘后三段与是否开市，每个纽约日读一次；读不到时退到 04:00–09:30–16:00–20:00 的标准时段表 |
+| 代码搜索 | `GET /marketdata/v1/instruments?symbol=&projection=symbol-regex|desc-search` | 只保留 EQUITY/ETF |
+| 账户 | `GET /trader/v1/accounts/{hash}?fields=positions` | 现金、`liquidationValue`、持仓（做空为负数），非股票资产只报告不折算 |
+| 订单 | `POST/GET/PUT/DELETE /trader/v1/accounts/{hash}/orders` | 指令按持仓决定（BUY / SELL / SELL_SHORT / BUY_TO_COVER），穿越平仓拆成两单；止损止盈作为 TRIGGER + OCO 子单挂在开仓腿上；嘉信没有客户端订单号，策略标签在本地 `schwab-order-tags.json` 里按 orderId 记 |
+| 成交 | `GET /trader/v1/accounts/{hash}/transactions?types=TRADE` | 每笔 TRADE 一条成交，费用条目合计记为负数 |
+
+Yahoo 这边（`Sources/MayStockKit/Yahoo/`，没有 key 时的过渡源）：
 
 | 用途 | 端点 | 说明 |
 |------|------|------|
@@ -106,7 +122,7 @@
 | 代码搜索 | `GET query2.finance.yahoo.com/v1/finance/search?q=` | 只保留美国交易所的股票与 ETF |
 | 不存在的代码 | `{"chart":{"result":null,"error":{"code":"Not Found",…}}}` | 解成 `MarketDataError.unknownInstrument`，自选校验据此拒绝 |
 
-非官方接口，v7 报价端点已经要 cookie 与 crumb，所以只用 chart。它的存在只在 `Sources/MayStockKit/Yahoo/` 一个目录里。
+非官方接口，v7 报价端点已经要 cookie 与 crumb，所以只用 chart。它的存在只在 `Sources/MayStockKit/Yahoo/` 一个目录里；切换发生在 `SchwabMarketDataSource` / `SchwabMarketFeed` 内部，只有「未登录」这一种失败会退到它，网络错误与限频照实报错，每次切换都写日志。
 
 ## 4. 告警引擎
 

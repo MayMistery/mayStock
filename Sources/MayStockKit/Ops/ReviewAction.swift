@@ -125,8 +125,9 @@ public enum ReviewActuator {
         if !to.strategy.emergencyStop && from.strategy.emergencyStop {
             return "解除了总闸"
         }
-        if to.strategy.totalCapital > from.strategy.totalCapital + 1e-9 {
-            return "提高了本金"
+        for venue in Venue.allCases
+        where to.strategy.totalCapital(for: venue) > from.strategy.totalCapital(for: venue) + 1e-9 {
+            return "提高了\(venue.displayName)本金"
         }
         if let before = from.strategy.maxDrawdownPct {
             if let after = to.strategy.maxDrawdownPct {

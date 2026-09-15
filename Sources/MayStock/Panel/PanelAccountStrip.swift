@@ -13,9 +13,11 @@ struct PanelAccountStrip: View {
     let instId: String
 
     private var mode: TradingMode { appState.tradingMode }
+    /// The venue whose account the strip reports: the instrument's own.
+    private var venue: Venue { appState.venue(of: instId) }
     /// The asset the panel is scoped to, on the instrument's own venue.
     private var panelUnderlying: String {
-        AppState.underlying(instId, venue: appState.venue(of: instId))
+        AppState.underlying(instId, venue: venue)
     }
 
     /// Strategies holding this *underlying*, with their live P&L.
@@ -24,7 +26,7 @@ struct PanelAccountStrip: View {
     /// `BTC-USDT-SWAP` is a BTC position and belongs on the BTC panel, even
     /// though the watchlist tracks spot `BTC-USDT`.
     private var holdings: [StrategyPositionState] {
-        appState.ledger.positions.values
+        appState.ledgers.flatMap { $0.positions.values }
             .filter { AppState.underlying($0.instId, venue: $0.venue) == panelUnderlying && !$0.isFlat }
             .sorted { abs($0.quantity) > abs($1.quantity) }
     }
@@ -32,7 +34,7 @@ struct PanelAccountStrip: View {
     /// Positions the portfolio holds on some *other* underlying, so nothing is
     /// ever silently invisible just because the panel is scoped to one symbol.
     private var elsewhere: [StrategyPositionState] {
-        appState.ledger.positions.values
+        appState.ledgers.flatMap { $0.positions.values }
             .filter { AppState.underlying($0.instId, venue: $0.venue) != panelUnderlying && !$0.isFlat }
             .sorted { $0.instId < $1.instId }
     }
@@ -47,7 +49,7 @@ struct PanelAccountStrip: View {
     var body: some View {
         VStack(spacing: 8) {
             equityRow
-            if appState.openPnL != nil { currentPnLRow }
+            if appState.openPnL(for: venue) != nil { currentPnLRow }
             returnsRow
             notice
             Divider().opacity(0.35)
@@ -68,19 +70,20 @@ struct PanelAccountStrip: View {
                 ModeBadge(mode: mode, size: .small, filled: true)
             }
             .buttonStyle(.plain)
-            .help("\(mode.displayName) · 点击打开账户与连接")
-            if let equity = appState.accountEquity {
+            .help("\(venue.displayName)\(mode.displayName) · 点击打开账户与连接")
+            Text(venue.displayName).font(Theme.Text.caption).foregroundStyle(.secondary)
+            if let equity = appState.accountEquity(for: venue) {
                 Text(PriceFormatter.money(equity))
                     .font(.system(size: 16, weight: .medium, design: .rounded)).numeric()
                     .contentTransition(.numericText())
                     .animation(.snappy(duration: 0.2), value: equity)
-                Text(appState.runner.quoteCurrency).font(Theme.Text.caption).foregroundStyle(.secondary).baselineOffset(-1)
-                if let nonStablePct = appState.nonStableExposurePct {
+                Text(venue.quoteCurrency).font(Theme.Text.caption).foregroundStyle(.secondary).baselineOffset(-1)
+                if let nonStablePct = appState.nonStableExposurePct(for: venue) {
                     Badge(text: "敞口 \(PriceFormatter.decimals(nonStablePct, 0))%", tint: riskTint(nonStablePct), size: .small)
                         .help("现货币种持仓 + 永续名义额，占账户权益的比例。做空同样计入敞口。")
                 }
             } else {
-                Text(appState.accountError ?? appState.tradingBlocker ?? "读取账户权益…")
+                Text(appState.books(for: venue).accountError ?? appState.tradingBlocker(for: venue) ?? "读取账户权益…")
                     .font(Theme.Text.caption).foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.tail)
             }
@@ -110,7 +113,7 @@ struct PanelAccountStrip: View {
     /// Always-available P&L, so the panel never reports nothing merely because
     /// the equity curve is young.
     private var currentPnLRow: some View {
-        let pnl = appState.openPnL ?? 0
+        let pnl = appState.openPnL(for: venue) ?? 0
         return HStack(spacing: 5) {
             Text("账本盈亏").font(Theme.Text.caption).foregroundStyle(.secondary)
             Text(PriceFormatter.signedMoney(pnl, decimals: 2))
@@ -118,7 +121,7 @@ struct PanelAccountStrip: View {
                 .foregroundStyle(Theme.signed(pnl))
                 .contentTransition(.numericText())
                 .animation(.snappy(duration: 0.2), value: pnl)
-            if let pct = appState.openPnLPct {
+            if let pct = appState.openPnLPct(for: venue) {
                 Text("(\(PriceFormatter.signedPercent(pct)))")
                     .font(Theme.Text.captionMedium).numeric()
                     .foregroundStyle(Theme.signed(pnl).opacity(0.75))
@@ -139,7 +142,7 @@ struct PanelAccountStrip: View {
     /// The number is always shown once a single sample exists; the caveats
     /// ride alongside it as a marker and spell themselves out on hover.
     private func cell(_ window: EquityWindow) -> some View {
-        let change = appState.equityChange(window)
+        let change = appState.equityChange(window, venue: venue)
         let pct = change?.changePct
         let tint = Theme.trend((change?.changeQuote ?? 0) >= 0)
 
@@ -172,8 +175,8 @@ struct PanelAccountStrip: View {
 
     private func tooltip(_ window: EquityWindow, _ change: EquityChange?) -> String {
         guard let change else { return "\(window.longLabel)：还没有任何权益采样" }
-        let range = "\(PriceFormatter.money(change.startEquity)) → \(PriceFormatter.money(change.endEquity)) \(appState.runner.quoteCurrency)"
-        let head = "\(window.longLabel)\n\(range)"
+        let range = "\(PriceFormatter.money(change.startEquity)) → \(PriceFormatter.money(change.endEquity)) \(venue.quoteCurrency)"
+        let head = "\(window.longLabel(for: venue))\n\(range)"
         return change.coverageNote.isEmpty ? head : "\(head)\n\(change.coverageNote)"
     }
 

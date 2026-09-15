@@ -26,7 +26,28 @@ extension LabMain {
         let mode = config.strategy.mode
         let policy = policyStore.load()
 
-        let ledger = StrategyLedgerStore(directory: directory, mode: mode).load()
+        // Every venue's books, read side by side: fills and positions carry
+        // their venue, curves and heartbeats are kept per venue.
+        var positions: [String: StrategyPositionState] = [:]
+        var fills: [StrategyFill] = []
+        var heartbeats: [Venue: Date] = [:]
+        var equityByVenue: [Venue: [AccountEquityPoint]] = [:]
+        var strategyEquity: [String: [AccountEquityPoint]] = [:]
+        for venue in Venue.allCases {
+            let ledger = StrategyLedgerStore(directory: directory, mode: mode, venue: venue).load()
+            positions.merge(ledger.positions) { current, _ in current }
+            fills += ledger.fills
+            heartbeats[venue] = HeartbeatStore(directory: directory, venue: venue).load()
+            equityByVenue[venue] = AccountEquityStore(directory: directory, mode: mode, venue: venue).load()
+            strategyEquity.merge(AccountEquityStore(
+                directory: directory, mode: mode, venue: venue, perStrategy: true).loadByStrategy()) { current, _ in current }
+        }
+        // The evidence budget is measured on the book carrying the most
+        // armed capital; the two curves are in different currencies.
+        let primary = Venue.allCases.max { lhs, rhs in
+            config.strategy.allocations(on: lhs).filter(\.running).reduce(0) { $0 + $1.capital }
+                < config.strategy.allocations(on: rhs).filter(\.running).reduce(0) { $0 + $1.capital }
+        } ?? .okx
         // The one input that does not come from our own files. Read-only, and
         // a failure here degrades to "not checked" rather than to "fine" —
         // `bookDrift` says so out loud.
@@ -36,12 +57,12 @@ extension LabMain {
         let snapshot = ReviewSnapshot(
             now: Date(),
             config: config,
-            lastTickAt: HeartbeatStore(directory: directory).load(),
-            accountEquity: AccountEquityStore(directory: directory, mode: mode).load(),
-            strategyEquity: AccountEquityStore(
-                directory: directory, mode: mode, perStrategy: true).loadByStrategy(),
-            positions: ledger.positions,
-            fills: ledger.fills,
+            heartbeats: heartbeats,
+            primaryVenue: primary,
+            equityByVenue: equityByVenue,
+            strategyEquity: strategyEquity,
+            positions: positions,
+            fills: fills.sorted { $0.ts < $1.ts },
             appRunning: isAppRunning(),
             exchangeTotals: exchangeTotals)
 
@@ -91,16 +112,19 @@ extension LabMain {
         Out.rule()
         let portfolio = snapshot.config.strategy
         Out.kv("模式", portfolio.mode.displayName + "（" + portfolio.mode.badge + "）")
-        Out.kv("本金", money(portfolio.totalCapital) + " " + portfolio.quoteCurrency)
-        Out.kv("已分配", String(
-            format: "%@（%.2f×）", money(portfolio.allocatedCapital),
-            portfolio.totalCapital > 0 ? portfolio.allocatedCapital / portfolio.totalCapital : 0))
-        Out.kv("运行中", "\(portfolio.runningCount)/\(portfolio.allocations.count)")
-        if let last = snapshot.lastTickAt {
-            Out.kv("上次轮询", AccountEquityCurve.describe(result.now.timeIntervalSince(last)) + "前")
-        } else {
-            Out.kv("上次轮询", "从未")
+        for venue in Venue.allCases {
+            let total = portfolio.totalCapital(for: venue)
+            let allocated = portfolio.allocatedCapital(on: venue)
+            Out.kv("\(venue.displayName)本金", money(total) + " " + venue.quoteCurrency)
+            Out.kv("\(venue.displayName)已分配", String(
+                format: "%@（%.2f×）", money(allocated), total > 0 ? allocated / total : 0))
+            if let last = snapshot.heartbeats[venue] {
+                Out.kv("\(venue.displayName)上次轮询", AccountEquityCurve.describe(result.now.timeIntervalSince(last)) + "前")
+            } else {
+                Out.kv("\(venue.displayName)上次轮询", "从未")
+            }
         }
+        Out.kv("运行中", "\(portfolio.runningCount)/\(portfolio.allocations.count)")
 
         Out.heading("这一小时告诉了你什么")
         Out.note(result.evidence.headline)

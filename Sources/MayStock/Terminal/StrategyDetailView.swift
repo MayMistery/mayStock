@@ -10,7 +10,9 @@ struct StrategyDetailView: View {
 
     private var report: StrategyBacktestReport? { appState.reports[strategy.id] }
     private var allocation: StrategyAllocation? { appState.store.config.strategy.allocation(for: strategy.id) }
-    private var runtime: StrategyRuntimeState { appState.runner.state(for: strategy.id) }
+    private var runtime: StrategyRuntimeState { appState.runtimeState(for: strategy.id) }
+    private var venue: Venue { strategy.market.venue }
+    private var ledger: StrategyLedger { appState.ledger(for: venue) }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -107,14 +109,14 @@ struct StrategyDetailView: View {
 
                 if let result = report.result(for: selection.backtestWindow) {
                     Card(title: "净值曲线 · \(selection.backtestWindow.displayName)",
-                         subtitle: "\(result.start.formatted(date: .numeric, time: .shortened)) → \(result.end.formatted(date: .numeric, time: .shortened)) · \(result.barCount) 根 \(result.bar.rawValue) · 起始 \(PriceFormatter.money(result.initialCapital, decimals: 0)) \(appState.store.config.strategy.quoteCurrency)") {
+                         subtitle: "\(result.start.formatted(date: .numeric, time: .shortened)) → \(result.end.formatted(date: .numeric, time: .shortened)) · \(result.barCount) 根 \(result.bar.rawValue) · 起始 \(PriceFormatter.money(result.initialCapital, decimals: 0)) \(venue.quoteCurrency)") {
                         HStack(spacing: 8) {
                             legendSwatch(Theme.trend(result.metrics.totalReturnPct >= 0), "策略")
                             legendSwatch(.secondary.opacity(0.45), "买入持有", dashed: true)
                         }
                     } content: {
                         EquityCurveView(result: result).frame(height: 180)
-                        BacktestMetricGrid(result: result, quoteCurrency: appState.store.config.strategy.quoteCurrency)
+                        BacktestMetricGrid(result: result, quoteCurrency: venue.quoteCurrency)
                     }
                     if !result.trades.isEmpty { tradeList(result) }
                 } else {
@@ -176,10 +178,10 @@ struct StrategyDetailView: View {
 
     @ViewBuilder
     private var positionTab: some View {
-        let position = appState.ledger.position(for: strategy.id)
+        let position = ledger.position(for: strategy.id)
         VStack(alignment: .leading, spacing: Theme.sectionSpacing) {
-            if !appState.tradingReady {
-                InlineNotice(kind: .warning, message: (appState.tradingBlocker ?? "交易尚未就绪") + "：回测可用，实际下单需要先配置 okx CLI。",
+            if !appState.tradingReady(for: venue) {
+                InlineNotice(kind: .warning, message: (appState.tradingBlocker(for: venue) ?? "交易尚未就绪") + "：回测可用，实际下单要先在「账户与连接」页接好\(venue.displayName)。",
                              actionTitle: "账户与连接", action: { appState.openTerminal(.account) })
             }
             if let reason = allocation?.haltReason, !(allocation?.running ?? false) {
@@ -229,7 +231,7 @@ struct StrategyDetailView: View {
             reconciliationPanel
             LiveVsBacktestPanel(appState: appState, strategy: strategy)
 
-            let fills = appState.ledger.fills(for: strategy.id, limit: 50)
+            let fills = ledger.fills(for: strategy.id, limit: 50)
             Card(title: "成交明细", subtitle: fills.isEmpty ? "还没有成交记录" : "最近 \(fills.count) 笔") {
                 DataGrid(columns: [
                     GridColumn(title: "时间"), GridColumn(title: "操作"), GridColumn(title: "价格", alignment: .trailing),
@@ -254,8 +256,8 @@ struct StrategyDetailView: View {
     private var reconciliationPanel: some View {
         // The instrument the book actually holds — for an option strategy
         // that is the contract, not the market its signals read.
-        let held = appState.ledger.position(for: strategy.id)?.instId ?? strategy.market.instId
-        let rows = appState.reconciliationIssues.filter { $0.instId == held }
+        let held = ledger.position(for: strategy.id)?.instId ?? strategy.market.instId
+        let rows = appState.reconciliationIssues(on: venue).filter { $0.instId == held }
         if let row = rows.first {
             InlineNotice(kind: .warning, title: "交易所持仓与台账不一致",
                          message: "台账 \(PriceFormatter.plain(row.ledgerQuantity)) · 交易所 \(PriceFormatter.plain(row.exchangeQuantity)) · 未归因 \(PriceFormatter.signedMoney(row.unattributed, decimals: 6))\n差额通常来自手动下单或其它程序；策略只会调整自己台账内的仓位。")
@@ -354,14 +356,14 @@ struct StrategyDetailView: View {
     private var actionBar: some View {
         let portfolio = appState.store.config.strategy
         let capital = allocation?.capital ?? 0
-        let headroom = portfolio.capitalHeadroom(for: strategy.id)
+        let headroom = portfolio.capitalHeadroom(for: strategy.id, on: venue)
         let running = allocation?.running ?? false
 
         return HStack(spacing: 16) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
                     Text("分配预算").font(Theme.Text.heading)
-                    Text("\(PriceFormatter.money(capital, decimals: 0)) \(portfolio.quoteCurrency)")
+                    Text("\(PriceFormatter.money(capital, decimals: 0)) \(venue.quoteCurrency)")
                         .font(Theme.Text.bodyMedium).numeric().foregroundStyle(Theme.accent)
                     Text("· 可用上限 \(PriceFormatter.money(headroom, decimals: 0))")
                         .font(Theme.Text.caption).foregroundStyle(.tertiary).numeric()
@@ -407,7 +409,7 @@ struct StrategyDetailView: View {
         if running {
             Button("结束交易") { appState.stopStrategy(id: strategy.id) }
             Button("平仓") { appState.requestFlatten(strategyId: strategy.id) }
-                .disabled(appState.ledger.position(for: strategy.id)?.isFlat ?? true)
+                .disabled(ledger.position(for: strategy.id)?.isFlat ?? true)
                 .help("市价平掉本策略当前持仓")
         } else {
             Button {
@@ -416,22 +418,16 @@ struct StrategyDetailView: View {
                 Label(appState.tradingMode.isDemo ? "开始交易" : "在实盘开始交易", systemImage: "play.fill")
             }
             .buttonStyle(ProminentButtonStyle(tint: appState.tradingMode.isDemo ? Theme.up : Theme.down))
-            .disabled(capital <= 0 || !appState.tradingReady || appState.store.config.strategy.emergencyStop
-                      || !tradesOnTheAccount)
-            .help(!tradesOnTheAccount ? "\(strategy.market.venue.displayName)的交易尚未接入（API 审批中），这份策略现在只能回测"
-                  : capital <= 0 ? "先分配预算"
+            .disabled(capital <= 0 || !appState.tradingReady(for: venue) || appState.store.config.strategy.emergencyStop)
+            .help(capital <= 0 ? "先分配预算"
                   : appState.store.config.strategy.emergencyStop ? "急停中，先解除急停"
-                  : (appState.tradingReady ? "按 \(strategy.market.bar.rawValue) 收盘评估信号并自动下单" : (appState.tradingBlocker ?? "")))
-            if !(appState.ledger.position(for: strategy.id)?.isFlat ?? true) {
+                  : (appState.tradingReady(for: venue) ? "按 \(strategy.market.bar.rawValue) 收盘评估信号并自动下单" : (appState.tradingBlocker(for: venue) ?? "")))
+            if !(ledger.position(for: strategy.id)?.isFlat ?? true) {
                 Button("平仓") { appState.requestFlatten(strategyId: strategy.id) }
                     .help("策略已停止但仍有持仓：市价平掉")
             }
         }
     }
-
-    /// Whether the account the engine trades through is on this strategy's
-    /// venue. The runner refuses the mismatch too; the button says so first.
-    private var tradesOnTheAccount: Bool { strategy.market.venue == appState.venue.venue }
 
     private var runtimeSummary: String {
         let state = runtime

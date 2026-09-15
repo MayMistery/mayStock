@@ -32,8 +32,12 @@ public enum TradingMode: String, Codable, Sendable, CaseIterable, Identifiable {
 /// One strategy's slice of the portfolio.
 public struct StrategyAllocation: Codable, Sendable, Equatable, Identifiable {
     public var strategyId: String
-    /// Budget in the quote currency. The runner will not build a position
-    /// whose notional exceeds this (times leverage).
+    /// Where the strategy trades, stamped when the budget is first set so
+    /// the portfolio can add budgets up per venue without opening every
+    /// manifest. Budgets written before venues existed are OKX's.
+    public var venue: Venue
+    /// Budget in the venue's quote currency. The runner will not build a
+    /// position whose notional exceeds this (times leverage).
     public var capital: Double
     /// Armed: the runner may act on this strategy's signals.
     public var running: Bool
@@ -47,6 +51,7 @@ public struct StrategyAllocation: Codable, Sendable, Equatable, Identifiable {
 
     public init(
         strategyId: String,
+        venue: Venue = .okx,
         capital: Double = 0,
         running: Bool = false,
         leverageCap: Double? = nil,
@@ -54,6 +59,7 @@ public struct StrategyAllocation: Codable, Sendable, Equatable, Identifiable {
         haltReason: String? = nil
     ) {
         self.strategyId = strategyId
+        self.venue = venue
         self.capital = capital
         self.running = running
         self.leverageCap = leverageCap
@@ -62,12 +68,13 @@ public struct StrategyAllocation: Codable, Sendable, Equatable, Identifiable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case strategyId, capital, running, leverageCap, addedAt, haltReason
+        case strategyId, venue, capital, running, leverageCap, addedAt, haltReason
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         strategyId = try c.decode(String.self, forKey: .strategyId)
+        venue = try c.decodeIfPresent(Venue.self, forKey: .venue) ?? .okx
         capital = try c.decodeIfPresent(Double.self, forKey: .capital) ?? 0
         running = try c.decodeIfPresent(Bool.self, forKey: .running) ?? false
         leverageCap = try c.decodeIfPresent(Double.self, forKey: .leverageCap)
@@ -97,9 +104,11 @@ public struct StoplossGuard: Codable, Sendable, Equatable {
 public struct StrategyPortfolioPrefs: Codable, Sendable, Equatable {
     /// Demo until the user unlocks live in Settings *and* confirms per strategy.
     public var mode: TradingMode
-    /// Total capital the portfolio may commit, in `quoteCurrency`.
-    public var totalCapital: Double
-    public var quoteCurrency: String
+    /// Capital the portfolio may commit on each venue, in that venue's own
+    /// quote currency. Two pots, never one: USDT on OKX and dollars at
+    /// Schwab are different accounts, and a budget on one says nothing
+    /// about what the other can afford.
+    public var capital: [Venue: Double]
     public var allocations: [StrategyAllocation]
     /// Kill switch: stops every strategy regardless of its own state.
     public var emergencyStop: Bool
@@ -116,19 +125,24 @@ public struct StrategyPortfolioPrefs: Codable, Sendable, Equatable {
     /// breaker cannot see four strategies losing 4% each, which is exactly the
     /// day worth stopping. Nil disables it.
     public var maxDrawdownPct: Double?
-    /// Hard ceiling on one order's notional, in `quoteCurrency`. A backstop
-    /// against a sizing bug rather than a strategy setting — nothing legitimate
-    /// should ever reach it. Nil leaves only the equity-share cap.
+    /// Hard ceiling on one order's notional, in the venue's quote currency.
+    /// A backstop against a sizing bug rather than a strategy setting —
+    /// nothing legitimate should ever reach it. Nil leaves only the
+    /// equity-share cap.
     public var maxOrderNotional: Double?
     /// Pause a strategy that keeps getting stopped out. Freqtrade's
     /// StoplossGuard: the strategy may be behaving exactly as designed and
     /// still be wrong about the current market.
     public var stoplossGuard: StoplossGuard?
 
+    /// Every venue's starting pot, for a portfolio that has never been set.
+    public static var defaultCapital: [Venue: Double] {
+        Dictionary(uniqueKeysWithValues: Venue.allCases.map { ($0, $0.defaultPortfolioCapital) })
+    }
+
     public init(
         mode: TradingMode = .demo,
-        totalCapital: Double = 1_000,
-        quoteCurrency: String = "USDT",
+        capital: [Venue: Double] = StrategyPortfolioPrefs.defaultCapital,
         allocations: [StrategyAllocation] = [],
         emergencyStop: Bool = false,
         allowScriptEngines: Bool = false,
@@ -139,8 +153,7 @@ public struct StrategyPortfolioPrefs: Codable, Sendable, Equatable {
         stoplossGuard: StoplossGuard? = StoplossGuard()
     ) {
         self.mode = mode
-        self.totalCapital = totalCapital
-        self.quoteCurrency = quoteCurrency
+        self.capital = capital
         self.allocations = allocations
         self.emergencyStop = emergencyStop
         self.allowScriptEngines = allowScriptEngines
@@ -152,9 +165,11 @@ public struct StrategyPortfolioPrefs: Codable, Sendable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case mode, totalCapital, quoteCurrency, allocations
+        case mode, capital, allocations
         case emergencyStop, allowScriptEngines, backtestCapital, feeSchedules
         case maxDrawdownPct, maxOrderNotional, stoplossGuard
+        /// Before v6 there was one pot, OKX's. Read, never written.
+        case legacyTotalCapital = "totalCapital"
         /// The v3 name: one OKX schedule. Read, never written.
         case legacyFeeSchedule = "feeSchedule"
     }
@@ -162,8 +177,15 @@ public struct StrategyPortfolioPrefs: Codable, Sendable, Equatable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         mode = try c.decodeIfPresent(TradingMode.self, forKey: .mode) ?? .demo
-        totalCapital = try c.decodeIfPresent(Double.self, forKey: .totalCapital) ?? 1_000
-        quoteCurrency = try c.decodeIfPresent(String.self, forKey: .quoteCurrency) ?? "USDT"
+        var pots = Self.defaultCapital
+        if let stored = try c.decodeIfPresent([String: Double].self, forKey: .capital) {
+            for (key, value) in stored {
+                if let venue = Venue(rawValue: key) { pots[venue] = value }
+            }
+        } else if let legacy = try c.decodeIfPresent(Double.self, forKey: .legacyTotalCapital) {
+            pots[.okx] = legacy
+        }
+        capital = pots
         allocations = try c.decodeIfPresent([StrategyAllocation].self, forKey: .allocations) ?? []
         emergencyStop = try c.decodeIfPresent(Bool.self, forKey: .emergencyStop) ?? false
         allowScriptEngines = try c.decodeIfPresent(Bool.self, forKey: .allowScriptEngines) ?? false
@@ -186,13 +208,14 @@ public struct StrategyPortfolioPrefs: Codable, Sendable, Equatable {
             ?? StoplossGuard()
     }
 
-    /// Written by hand because `CodingKeys` carries the legacy read-only key,
-    /// which has no property behind it for the compiler to synthesise from.
+    /// Written by hand because `CodingKeys` carries the legacy read-only keys,
+    /// which have no property behind them for the compiler to synthesise from.
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(mode, forKey: .mode)
-        try c.encode(totalCapital, forKey: .totalCapital)
-        try c.encode(quoteCurrency, forKey: .quoteCurrency)
+        try c.encode(
+            Dictionary(uniqueKeysWithValues: capital.map { ($0.key.rawValue, $0.value) }),
+            forKey: .capital)
         try c.encode(allocations, forKey: .allocations)
         try c.encode(emergencyStop, forKey: .emergencyStop)
         try c.encode(allowScriptEngines, forKey: .allowScriptEngines)
@@ -203,37 +226,69 @@ public struct StrategyPortfolioPrefs: Codable, Sendable, Equatable {
         try c.encodeIfPresent(stoplossGuard, forKey: .stoplossGuard)
     }
 
-    public var allocatedCapital: Double {
-        allocations.reduce(0) { $0 + $1.capital }
+    // MARK: Per-venue arithmetic
+
+    /// The pot on a venue. A venue the file never named starts from its
+    /// default rather than from zero, so a fresh venue can be budgeted at all.
+    public func totalCapital(for venue: Venue) -> Double {
+        capital[venue] ?? venue.defaultPortfolioCapital
     }
 
-    public var unallocatedCapital: Double {
-        totalCapital - allocatedCapital
+    public func allocations(on venue: Venue) -> [StrategyAllocation] {
+        allocations.filter { $0.venue == venue }
+    }
+
+    public func allocatedCapital(on venue: Venue) -> Double {
+        allocations(on: venue).reduce(0) { $0 + $1.capital }
+    }
+
+    public func unallocatedCapital(on venue: Venue) -> Double {
+        totalCapital(for: venue) - allocatedCapital(on: venue)
+    }
+
+    /// Venues with at least one budget, in declaration order — the venues
+    /// a page has something to say about.
+    public var budgetedVenues: [Venue] {
+        Venue.allCases.filter { venue in allocations.contains { $0.venue == venue } }
     }
 
     public var runningCount: Int {
         allocations.filter(\.running).count
     }
 
+    public func runningCount(on venue: Venue) -> Int {
+        allocations(on: venue).filter(\.running).count
+    }
+
     public func allocation(for strategyId: String) -> StrategyAllocation? {
         allocations.first { $0.strategyId == strategyId }
     }
 
-    /// Largest budget `strategyId` could take without over-allocating the
-    /// portfolio — its own capital stays available to itself.
-    public func capitalHeadroom(for strategyId: String) -> Double {
-        let others = allocations.filter { $0.strategyId != strategyId }.reduce(0) { $0 + $1.capital }
-        return Swift.max(totalCapital - others, 0)
+    /// Largest budget `strategyId` could take on `venue` without
+    /// over-allocating that venue's pot — its own capital stays available
+    /// to itself.
+    public func capitalHeadroom(for strategyId: String, on venue: Venue) -> Double {
+        let others = allocations(on: venue)
+            .filter { $0.strategyId != strategyId }
+            .reduce(0) { $0 + $1.capital }
+        return Swift.max(totalCapital(for: venue) - others, 0)
     }
 
-    /// Budgets that add up to more than the pot.
+    /// Budgets on a venue that add up to more than its pot.
     ///
     /// Not cosmetic: `StrategyRunner.workingCapital` sizes every order against
     /// the *budget*, never against the account, so four strategies each holding
     /// a budget of half the account will between them commit twice it.
-    public var isOverAllocated: Bool { allocatedCapital > totalCapital + 1e-6 }
+    public func isOverAllocated(on venue: Venue) -> Bool {
+        allocatedCapital(on: venue) > totalCapital(for: venue) + 1e-6
+    }
 
-    /// Set the portfolio's capital, bringing the budgets down with it.
+    /// Every venue whose budgets exceed its pot.
+    public var overAllocatedVenues: [Venue] {
+        Venue.allCases.filter { isOverAllocated(on: $0) }
+    }
+
+    /// Set a venue's pot, bringing its budgets down with it.
     ///
     /// `setCapital` refuses to over-allocate on the way in, but nothing used to
     /// re-check on the way *down*. Lowering the pot left every budget exactly
@@ -244,24 +299,27 @@ public struct StrategyPortfolioPrefs: Codable, Sendable, Equatable {
     /// Scaled rather than truncated: how the pot is split between strategies is
     /// a decision the user made, and halving the pot should halve each share
     /// rather than starve whichever happens to sort last.
-    public mutating func setTotalCapital(_ amount: Double) {
-        totalCapital = Swift.max(amount, 0)
-        let allocated = allocatedCapital
-        guard allocated > totalCapital, allocated > 0 else { return }
-        let scale = totalCapital / allocated
-        for index in allocations.indices {
+    public mutating func setTotalCapital(_ amount: Double, for venue: Venue) {
+        let pot = Swift.max(amount, 0)
+        capital[venue] = pot
+        let allocated = allocatedCapital(on: venue)
+        guard allocated > pot, allocated > 0 else { return }
+        let scale = pot / allocated
+        for index in allocations.indices where allocations[index].venue == venue {
             allocations[index].capital *= scale
         }
     }
 
     /// Set a budget, refusing to over-allocate: the value is clamped to what
-    /// the portfolio actually has left.
-    public mutating func setCapital(_ amount: Double, for strategyId: String) {
-        let clamped = Swift.min(Swift.max(amount, 0), capitalHeadroom(for: strategyId))
+    /// the venue's pot actually has left. The venue is stamped on the
+    /// allocation the first time, and re-stamped if the strategy moved.
+    public mutating func setCapital(_ amount: Double, for strategyId: String, on venue: Venue) {
+        let clamped = Swift.min(Swift.max(amount, 0), capitalHeadroom(for: strategyId, on: venue))
         if let index = allocations.firstIndex(where: { $0.strategyId == strategyId }) {
             allocations[index].capital = clamped
+            allocations[index].venue = venue
         } else {
-            allocations.append(StrategyAllocation(strategyId: strategyId, capital: clamped))
+            allocations.append(StrategyAllocation(strategyId: strategyId, venue: venue, capital: clamped))
         }
     }
 
@@ -275,16 +333,27 @@ public struct StrategyPortfolioPrefs: Codable, Sendable, Equatable {
         allocations.removeAll { $0.strategyId == strategyId }
     }
 
-    /// Split the whole portfolio evenly across the given strategies.
-    public mutating func distributeEvenly(across strategyIds: [String]) {
+    /// Split a venue's whole pot evenly across the given strategies.
+    public mutating func distributeEvenly(across strategyIds: [String], on venue: Venue) {
         guard !strategyIds.isEmpty else { return }
-        let share = totalCapital / Double(strategyIds.count)
+        let share = totalCapital(for: venue) / Double(strategyIds.count)
         for id in strategyIds {
             if let index = allocations.firstIndex(where: { $0.strategyId == id }) {
                 allocations[index].capital = share
+                allocations[index].venue = venue
             } else {
-                allocations.append(StrategyAllocation(strategyId: id, capital: share))
+                allocations.append(StrategyAllocation(strategyId: id, venue: venue, capital: share))
             }
         }
+    }
+
+    /// The portfolio as one venue's runner sees it: only that venue's pot
+    /// and budgets, so a strategy on the other exchange is never counted
+    /// against this book, nor evaluated by this engine.
+    public func scoped(to venue: Venue) -> StrategyPortfolioPrefs {
+        var copy = self
+        copy.allocations = allocations(on: venue)
+        copy.capital = [venue: totalCapital(for: venue)]
+        return copy
     }
 }

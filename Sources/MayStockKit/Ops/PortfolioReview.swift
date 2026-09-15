@@ -131,8 +131,21 @@ public struct EvidenceBudget: Codable, Sendable, Equatable {
 public struct ReviewSnapshot: Sendable {
     public var now: Date
     public var config: AppConfig
-    public var lastTickAt: Date?
-    public var accountEquity: [AccountEquityPoint]
+    /// When each venue's trading loop last completed a pass. Every venue
+    /// runs its own loop, so a dead Schwab engine is visible even while the
+    /// OKX one is ticking.
+    public var heartbeats: [Venue: Date]
+    /// The book the evidence budget is measured on — the venue carrying the
+    /// largest armed budget. Curves are never mixed across venues, because
+    /// they are in different currencies.
+    public var primaryVenue: Venue
+    /// Each venue's equity curve.
+    public var equityByVenue: [Venue: [AccountEquityPoint]]
+    /// The primary book's curve, by the name the report has always used.
+    public var accountEquity: [AccountEquityPoint] {
+        get { equityByVenue[primaryVenue] ?? [] }
+        set { equityByVenue[primaryVenue] = newValue }
+    }
     public var strategyEquity: [String: [AccountEquityPoint]]
     public var positions: [String: StrategyPositionState]
     public var fills: [StrategyFill]
@@ -148,7 +161,10 @@ public struct ReviewSnapshot: Sendable {
         now: Date = Date(),
         config: AppConfig,
         lastTickAt: Date? = nil,
+        heartbeats: [Venue: Date] = [:],
+        primaryVenue: Venue = .okx,
         accountEquity: [AccountEquityPoint] = [],
+        equityByVenue: [Venue: [AccountEquityPoint]] = [:],
         strategyEquity: [String: [AccountEquityPoint]] = [:],
         positions: [String: StrategyPositionState] = [:],
         fills: [StrategyFill] = [],
@@ -158,13 +174,22 @@ public struct ReviewSnapshot: Sendable {
         self.exchangeTotals = exchangeTotals
         self.now = now
         self.config = config
-        self.lastTickAt = lastTickAt
-        self.accountEquity = accountEquity
+        // `lastTickAt` is the OKX heartbeat by its old name.
+        var beats = heartbeats
+        if let lastTickAt, beats[.okx] == nil { beats[.okx] = lastTickAt }
+        self.heartbeats = beats
+        self.primaryVenue = primaryVenue
+        var curves = equityByVenue
+        if curves[primaryVenue] == nil { curves[primaryVenue] = accountEquity }
+        self.equityByVenue = curves
         self.strategyEquity = strategyEquity
         self.positions = positions
         self.fills = fills
         self.appRunning = appRunning
     }
+
+    /// The OKX heartbeat, by the name the report has always printed.
+    public var lastTickAt: Date? { heartbeats[.okx] }
 }
 
 public struct ReviewResult: Sendable {
@@ -221,17 +246,19 @@ public enum PortfolioReview {
 
     static func liveness(_ s: ReviewSnapshot, _ policy: ReviewPolicy) -> [ReviewFinding] {
         var findings: [ReviewFinding] = []
-        let armed = s.config.strategy.allocations.contains(where: \.running)
-            && !s.config.strategy.emergencyStop
-
-        if armed {
-            if let last = s.lastTickAt {
+        // One loop per venue, judged separately: an OKX engine that is
+        // ticking says nothing about the Schwab one.
+        for venue in Venue.allCases {
+            let armed = s.config.strategy.allocations(on: venue).contains(where: \.running)
+                && !s.config.strategy.emergencyStop
+            guard armed else { continue }
+            if let last = s.heartbeats[venue] {
                 let silence = s.now.timeIntervalSince(last)
                 if silence > policy.heartbeatStaleAfter {
                     findings.append(ReviewFinding(
-                        code: "heartbeat.stale",
+                        code: "heartbeat.stale" + venue.stateFileInfix,
                         severity: .critical,
-                        title: "交易循环已停",
+                        title: "\(venue.displayName)交易循环已停",
                         detail: "距上次完成轮询 \(AccountEquityCurve.describe(silence))，"
                             + "超过 \(AccountEquityCurve.describe(policy.heartbeatStaleAfter)) 的容忍；"
                             + "进程\(s.appRunning ? "还活着但循环没在转" : "已经不在了")。"
@@ -242,17 +269,18 @@ public enum PortfolioReview {
                 }
             } else {
                 findings.append(ReviewFinding(
-                    code: "heartbeat.missing",
+                    code: "heartbeat.missing" + venue.stateFileInfix,
                     severity: .critical,
-                    title: "从未记录过心跳",
-                    detail: "有策略处于运行状态，但引擎从未完成过一次轮询。",
+                    title: "\(venue.displayName)从未记录过心跳",
+                    detail: "有\(venue.displayName)策略处于运行状态，但引擎从未完成过一次轮询。",
                     remedy: "启动 MayStock 并确认策略工作台里显示「运行中」"))
             }
         }
 
         // A hole in the curve is not cosmetic: the chart interpolates across it,
         // so an outage renders as a flat, calm stretch of market.
-        let recent = s.accountEquity.filter { s.now.timeIntervalSince($0.ts) <= 86_400 }
+        for venue in Venue.allCases {
+        let recent = (s.equityByVenue[venue] ?? []).filter { s.now.timeIntervalSince($0.ts) <= 86_400 }
         if recent.count >= 2 {
             var worst: (start: Date, seconds: TimeInterval)?
             for index in 1..<recent.count {
@@ -261,14 +289,15 @@ public enum PortfolioReview {
             }
             if let worst, worst.seconds > policy.equityGapAlarm {
                 findings.append(ReviewFinding(
-                    code: "equity.gap",
+                    code: "equity.gap" + venue.stateFileInfix,
                     severity: .warn,
-                    title: "净值曲线有洞",
+                    title: "\(venue.displayName)净值曲线有洞",
                     detail: "过去 24 小时里最长一段 \(AccountEquityCurve.describe(worst.seconds))"
                         + "没有采样（从 \(Self.clock(worst.start)) 起）。"
                         + "图上这段会画成一条直线，看起来像行情很平，实际是引擎没在跑。",
                     remedy: "多半是笔记本睡眠。要连续记录就让机器保持唤醒，或接受曲线上的洞并按此读图"))
             }
+        }
         }
         return findings
     }
@@ -278,41 +307,47 @@ public enum PortfolioReview {
     static func exposure(_ s: ReviewSnapshot, _ policy: ReviewPolicy) -> [ReviewFinding] {
         var findings: [ReviewFinding] = []
         let portfolio = s.config.strategy
-        let ceiling = portfolio.totalCapital * policy.maxAllocationRatio
+        // Each venue's budgets against its own pot; the two are in
+        // different currencies and never add.
+        for venue in Venue.allCases {
+        let total = portfolio.totalCapital(for: venue)
+        let allocated = portfolio.allocatedCapital(on: venue)
+        let ceiling = total * policy.maxAllocationRatio
 
         // Splitting 79,658 three ways and rounding to cents leaves a cent over.
         // A cent is not over-allocation, and an unattended fixer that reacts to
         // one would rewrite the config every hour forever without ever reaching
         // a state it is happy with. Anything that acts on its own has to have a
         // resting state; the tolerance is what gives this one one.
-        let slack = Swift.max(1.0, portfolio.totalCapital * 0.0005)
+        let slack = Swift.max(1.0, total * 0.0005)
 
-        if portfolio.allocatedCapital > ceiling + slack, portfolio.totalCapital > 0 {
-            let ratio = portfolio.allocatedCapital / portfolio.totalCapital
+        if allocated > ceiling + slack, total > 0 {
+            let ratio = allocated / total
             // Scale every budget down by the same factor: the review has no
             // basis for preferring one strategy over another, and picking a
             // favourite here would be exactly the discretionary re-weighting
             // this design refuses to do on a clock. Aim slightly under the
             // ceiling so rounding on the way back cannot land above it again.
-            let scale = (ceiling - slack / 2) / portfolio.allocatedCapital
-            let actions = portfolio.allocations
+            let scale = (ceiling - slack / 2) / allocated
+            let actions = portfolio.allocations(on: venue)
                 .filter { $0.capital > 0 }
                 .map { allocation in
                     ReviewAction.reduceCapital(
                         strategyId: allocation.strategyId,
                         to: (allocation.capital * scale * 100).rounded(.down) / 100,
-                        reason: String(format: "预算总额 %.2f× 本金，按比例缩回", ratio))
+                        reason: String(format: "%@预算总额 %.2f× 本金，按比例缩回", venue.displayName, ratio))
                 }
             findings.append(ReviewFinding(
-                code: "capital.overallocated",
+                code: "capital.overallocated" + venue.stateFileInfix,
                 severity: .critical,
-                title: "预算之和超过本金",
+                title: "\(venue.displayName)预算之和超过本金",
                 detail: String(
-                    format: "已分配 %.2f，本金 %.2f，%.2f×（容差 %.2f）"
+                    format: "已分配 %.2f，本金 %.2f %@，%.2f×（容差 %.2f）"
                         + " —— 这些预算加起来是账户兑现不了的承诺。",
-                    portfolio.allocatedCapital, portfolio.totalCapital, ratio, slack),
+                    allocated, total, venue.quoteCurrency, ratio, slack),
                 remedy: "按同一比例缩回，不挑策略",
                 actions: actions))
+        }
         }
 
         for allocation in portfolio.allocations
