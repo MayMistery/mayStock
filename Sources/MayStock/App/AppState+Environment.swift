@@ -303,6 +303,16 @@ extension AppState {
     func presentAlert(
         title: String, message: String, style: NSAlert.Style, buttons: [String]
     ) async -> NSApplication.ModalResponse {
+        // Put the hover panel away first. It is a non-activating panel whose
+        // SwiftUI content tracks mouse-moved events, and a modal run loop plus
+        // that tracking crashes the process on the macOS 27 SDK: the hover
+        // dispatch reaches `MainActor.assumeIsolated` off the main executor and
+        // segfaults (`NSHostingView.mouseMoved` → `HoverResponder
+        // .containsGlobalPoints` → `swift_task_isMainExecutorImpl`). It took
+        // two confirmation dialogs with real money on them to find that, and
+        // the panel has nothing to say while a modal is up anyway.
+        panel?.hide()
+
         let alert = NSAlert()
         alert.messageText = title
         alert.informativeText = message

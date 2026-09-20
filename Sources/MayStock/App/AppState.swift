@@ -150,6 +150,9 @@ final class AppState {
     @ObservationIgnored private var statusItems: StatusItemManager?
     @ObservationIgnored private var terminalController: TerminalWindowController?
     @ObservationIgnored private var backtestTasks: [String: Task<Void, Never>] = [:]
+    /// Set by a deep link, read once by the checkup page. See
+    /// `AppState.requestedCheckupInstId`.
+    @ObservationIgnored var pendingCheckupInstId: String?
 
     init(options: LaunchOptions = LaunchOptions()) {
         self.options = options
