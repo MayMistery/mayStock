@@ -309,14 +309,28 @@ public struct ExchangePosition: Sendable, Equatable, Identifiable {
     /// `OPTION`, `MARGIN` — as it spells it. Read rather than inferred from
     /// the id, so a delivery future is not mistaken for spot.
     public let instType: String
+    /// Margin the exchange has locked for this position (`margin`), and the
+    /// maintenance requirement it must stay above (`mmr`).
+    ///
+    /// Both are reported per position and neither was being read, which made
+    /// "how much is tied up here" unanswerable from a position listing alone.
+    public let margin: Double?
+    public let maintenanceMargin: Double?
+    /// The exchange's own health ratio for the position (`mgnRatio`). Higher is
+    /// safer; it is the number the exchange itself would liquidate on.
+    public let marginRatio: Double?
 
     public var id: String { instId + posSide.rawValue }
 
     public init(
         instId: String, posSide: PositionSide, quantity: Double, averagePrice: Double,
         markPrice: Double?, unrealisedPnL: Double, leverage: Double?, liquidationPrice: Double?,
-        notionalUsd: Double? = nil, instType: String = ""
+        notionalUsd: Double? = nil, instType: String = "",
+        margin: Double? = nil, maintenanceMargin: Double? = nil, marginRatio: Double? = nil
     ) {
+        self.margin = margin
+        self.maintenanceMargin = maintenanceMargin
+        self.marginRatio = marginRatio
         self.instId = instId
         self.posSide = posSide
         self.quantity = quantity
@@ -1452,7 +1466,10 @@ public struct TradeBridge: Sendable {
                 leverage: number(dict, "lever"),
                 liquidationPrice: number(dict, "liqPx"),
                 notionalUsd: number(dict, "notionalUsd"),
-                instType: (dict["instType"] as? String) ?? ""))
+                instType: (dict["instType"] as? String) ?? "",
+                margin: number(dict, "margin"),
+                maintenanceMargin: number(dict, "mmr"),
+                marginRatio: number(dict, "mgnRatio")))
         }
         return out
     }

@@ -5,7 +5,7 @@ import MayStockKit
 
 /// The pages of the terminal window, in sidebar order.
 enum TerminalPage: String, CaseIterable, Identifiable {
-    case overview, markets, intelligence, strategies, alerts, account, settings
+    case overview, markets, checkup, intelligence, strategies, alerts, account, settings
 
     var id: String { rawValue }
 
@@ -13,6 +13,7 @@ enum TerminalPage: String, CaseIterable, Identifiable {
         switch self {
         case .overview: return "总览"
         case .markets: return "行情"
+        case .checkup: return "体检"
         case .intelligence: return "情报站"
         case .strategies: return "策略"
         case .alerts: return "告警"
@@ -25,6 +26,7 @@ enum TerminalPage: String, CaseIterable, Identifiable {
         switch self {
         case .overview: return "square.grid.2x2"
         case .markets: return "chart.xyaxis.line"
+        case .checkup: return "stethoscope"
         case .intelligence: return "calendar.badge.clock"
         case .strategies: return "function"
         case .alerts: return "bell"
@@ -138,6 +140,7 @@ struct TerminalDetail: View {
         switch selection.page {
         case .overview: OverviewPage(appState: appState, selection: selection)
         case .markets: MarketsPage(appState: appState, selection: selection)
+        case .checkup: CheckupPage(appState: appState)
         case .intelligence: IntelligencePage(appState: appState)
         case .strategies: StrategiesPage(appState: appState, selection: selection)
         case .alerts: AlertsPage(appState: appState)
