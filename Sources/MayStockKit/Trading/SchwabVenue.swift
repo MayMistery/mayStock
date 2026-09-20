@@ -228,19 +228,41 @@ public struct SchwabVenue: ExchangeVenue {
         case .demo:
             return await shadow.fills(instId: instId)
         case .live:
-            let now = Date()
-            let listing = try await bridge.fills(from: now.addingTimeInterval(-Self.fillsLookback), to: now, symbol: instId)
-            var tagged: [ExchangeFill] = []
-            for fill in listing {
-                var tag: String?
-                if let ordId = fill.ordId { tag = await tags.clOrdId(forOrderId: ordId) }
-                tagged.append(ExchangeFill(
-                    id: fill.id, instId: fill.instId, side: fill.side, posSide: fill.posSide,
-                    price: fill.price, size: fill.size, fee: fill.fee, feeCcy: fill.feeCcy,
-                    ordId: fill.ordId, clOrdId: tag, ts: fill.ts))
-            }
-            return tagged
+            return try await taggedFills(instId: instId)
         }
+    }
+
+    /// Everything the account has traded lately, tagged and untagged, newest
+    /// first — the listing 「最近成交」 reads.
+    ///
+    /// One book, not several: Schwab files every equity execution in one
+    /// transactions listing, so there is no family to fan out over and nothing
+    /// to report as unreadable.
+    public func fillListing(mode: TradingMode) async throws -> ExchangeFillListing {
+        switch mode {
+        case .demo:
+            return await shadow.fillListing()
+        case .live:
+            return ExchangeFillListing(fills: try await taggedFills(instId: nil))
+        }
+    }
+
+    /// The live transactions listing with each row's strategy tag attached.
+    private func taggedFills(instId: String?) async throws -> [ExchangeFill] {
+        let now = Date()
+        let listing = try await bridge.fills(
+            from: now.addingTimeInterval(-Self.fillsLookback), to: now, symbol: instId)
+        var tagged: [ExchangeFill] = []
+        for fill in listing {
+            var tag: String?
+            if let ordId = fill.ordId { tag = await tags.clOrdId(forOrderId: ordId) }
+            tagged.append(ExchangeFill(
+                id: fill.id, instId: fill.instId, side: fill.side, posSide: fill.posSide,
+                price: fill.price, size: fill.size, fee: fill.fee, feeCcy: fill.feeCcy,
+                ordId: fill.ordId, clOrdId: tag, ts: fill.ts,
+                billId: fill.billId, tradeId: fill.tradeId, pnl: fill.pnl))
+        }
+        return tagged
     }
 
     public func positions(mode: TradingMode, instType: InstrumentType) async throws -> [ExchangePosition] {

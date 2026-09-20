@@ -1915,11 +1915,10 @@ struct AccountScopedRunnerTests {
         #expect(runner.exposureIsComplete)
     }
 
-    @Test("交易所不报名义额时按张数 × 合约面值 × 标记价估值")
-    func exposureFallsBackToContractsTimesMark() async {
+    @Test("交易所不报名义额时，敞口标记为不完整，而不是用报价币的标记价冒充美元")
+    func exposureRefusesToPriceWhatTheExchangeWouldNot() async {
         let host = FakeHost()
         host.fake.equity = 1_000
-        // FakeVenue's meta: 0.01 base units per contract; mark 100.
         host.fake.positionsResult = .success([
             exchangeSwap("BTC-USDT-SWAP", contracts: 10, notionalUsd: nil),
         ])
@@ -1927,8 +1926,14 @@ struct AccountScopedRunnerTests {
 
         await runner.sampleEquityNow()
 
-        #expect(abs(runner.nonStableExposure - 10 * 0.01 * 100) < 1e-9)
-        #expect(runner.exposureIsComplete)
+        // 张数 × 合约面值 × 标记价 = 10 × 0.01 × 100 —— 但那个标记价来自
+        // `-USDT` 盘口，算出来是 USDT 不是美元。实测 USDT 报 0.99962，
+        // 拿它当美元加进组合就是在把两种单位相加。交易所自己都没给
+        // notionalUsd，这里宁可少算并说出来。
+        #expect(runner.nonStableExposure == 0)
+        #expect(!runner.exposureIsComplete)
+        // 说不出美元就不许出比率，否则分子分母不同币种。
+        #expect(runner.exposureCurrency == AccountSnapshot.usdCode)
     }
 
     @Test("持仓读取失败时敞口标记为不完整，而不是悄悄变小")

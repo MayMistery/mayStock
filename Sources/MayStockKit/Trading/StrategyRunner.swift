@@ -88,6 +88,10 @@ public final class StrategyRunner {
     /// was computed from. Sampled on the tick so the menu bar always has a
     /// figure, whether or not any strategy is armed.
     public private(set) var accountEquity: Double?
+    /// What `accountEquity` is denominated in. Usually the venue's declared
+    /// equity currency; the venue's quote currency when the venue reported no
+    /// total and the balances were priced here instead.
+    public private(set) var accountEquityCurrency: String = AccountSnapshot.usdCode
     /// The reading `accountEquity` came from, kept whole so callers that need
     /// the venue's own USD total — the cross-venue view — read the same
     /// sample the balance lines came from rather than a second, later one.
@@ -95,11 +99,22 @@ public final class StrategyRunner {
     public var accountBalances: [AccountBalance] { accountSnapshot?.balances ?? [] }
     public private(set) var lastEquitySampleAt: Date?
     /// Absolute market value of everything that is not a stablecoin: spot coin
-    /// holdings plus the notional of every open derivative position.
+    /// holdings plus the notional of every open derivative position, in
+    /// `exposureCurrency`.
     ///
     /// Shorts count as exposure, not as a credit — being short 4 ETH is 4 ETH
     /// of price risk. Netting the two would report a hedged book as flat.
     public private(set) var nonStableExposure: Double = 0
+    /// What `nonStableExposure` is denominated in, for the same reason
+    /// `AccountSnapshot.equityCurrency` exists: a risk figure that does not
+    /// say its unit gets added to one in another unit.
+    ///
+    /// This is the *exchange's* valuation currency, not the venue's quote
+    /// currency. OKX states `notionalUsd` and `eqUsd` on every position and
+    /// balance, so its exposure is dollars even though its book quotes in
+    /// USDT — `usdPx` read 0.99963 on the live account, which is the size of
+    /// the error that pricing through a `-USDT` pair would have introduced.
+    public private(set) var exposureCurrency: String = AccountSnapshot.usdCode
     /// False when some position the exchange holds could not be listed or
     /// valued, so `nonStableExposure` is a floor rather than the figure. The
     /// badge says so; a risk number that quietly shrinks on a failed read is
@@ -121,9 +136,11 @@ public final class StrategyRunner {
     ]
 
     /// Non-stable exposure as a share of account equity, or nil until both are
-    /// known.
+    /// known — or when the two are not in the same currency, which would make
+    /// the ratio a number with no meaning rather than a slightly wrong one.
     public var nonStableExposurePct: Double? {
-        guard let equity = accountEquity, equity > 0 else { return nil }
+        guard let equity = accountEquity, equity > 0,
+              accountEquityCurrency == exposureCurrency else { return nil }
         return nonStableExposure / equity * 100
     }
 
@@ -710,7 +727,7 @@ public final class StrategyRunner {
                 instId: instId, instType: host.venue.venue.instrumentType(of: instId)),
             host: host) else { return 0 }
 
-        let recorded = host.ledger.recordedFillIds
+        let recorded = host.ledger.bookedIdentities
         let known = host.runnableStrategies.map(\.id)
         // Nothing older than our last recorded fill: that is history already
         // accounted for, and adopting it would double-count.
@@ -721,12 +738,21 @@ public final class StrategyRunner {
         // for the mark-priced correction below rather than booked at a guess.
         let indexPrices = await indexPrices(for: fills, host: host)
 
+        // Which of these are new is asked once for the whole listing. Asking
+        // per row would be a kernel crossing per row, and — more to the point
+        // — the question is not "is this id in a set" but "has this
+        // *execution* been booked", which several ids answer for one fill.
+        let candidates = fills
+            .sorted(by: { $0.ts < $1.ts })
+            .filter {
+                $0.ts > since
+                    && OrderTag.resolveStrategy($0.clOrdId, among: known) == nil
+                    && $0.side.sign * wanted > 0
+            }
+        let unbooked = recorded.unbooked(candidates.map(\.kernelRecord))
+
         var adopted = 0.0
-        for fill in fills.sorted(by: { $0.ts < $1.ts })
-        where fill.ts > since
-            && !recorded.contains(fill.id)
-            && OrderTag.resolveStrategy(fill.clOrdId, among: known) == nil
-            && fill.side.sign * wanted > 0 {
+        for (fill, isNew) in zip(candidates, unbooked) where isNew {
             guard adopted < limit else { break }
             let index = host.venue.venue.optionUnderlying(of: fill.instId).flatMap { indexPrices[$0] }
             guard let adoptedFill = StrategyFill(
@@ -861,6 +887,13 @@ public final class StrategyRunner {
         guard let equity = snapshot.totalEquity ?? (pricedEverything ? total : nil),
               equity > 0 else { return }
         accountEquity = equity
+        // Which of the two branches above produced it decides the unit. The
+        // venue's own total comes with the venue's declared currency; the
+        // locally priced fallback is marks from the venue's quote pair, so it
+        // is quote currency — USDT on OKX — and saying otherwise would make
+        // the ratio below silently wrong rather than absent.
+        accountEquityCurrency = snapshot.totalEquity != nil
+            ? snapshot.equityCurrency : host.venue.venue.quoteCurrency
         let measured = await measureNonStableExposure(snapshot: snapshot, host: host)
         nonStableExposure = measured.exposure
         exposureIsComplete = measured.complete
@@ -892,7 +925,15 @@ public final class StrategyRunner {
 
     private var lastStrategyEquitySampleAt: Date?
 
-    /// Market value of every non-stablecoin holding and derivative position.
+    /// Market value of every non-stablecoin holding and derivative position,
+    /// in dollars as the exchange itself states them.
+    ///
+    /// Every figure here is the venue's own USD valuation — `eqUsd` on a
+    /// balance, `notionalUsd` on a position — never a re-pricing through the
+    /// venue's quote pair. On OKX that pair is `-USDT`, so the old arithmetic
+    /// produced a USDT figure that was then divided by a USD equity and added
+    /// to Schwab's dollars. A holding the venue would not value is counted as
+    /// missing rather than valued by this app's own guess.
     private func measureNonStableExposure(
         snapshot: AccountSnapshot, host: StrategyRunnerHost
     ) async -> (exposure: Double, complete: Bool) {
@@ -903,12 +944,12 @@ public final class StrategyRunner {
         // as much price risk as a long, so the count is taken absolute.
         for balance in snapshot.balances where balance.total != 0 {
             guard !Self.stableCurrencies.contains(balance.ccy.uppercased()) else { continue }
-            let instId = host.venue.venue.spotInstId(base: balance.ccy)
-            var price = marks[instId]
-            if price == nil { price = try? await host.venue.lastPrice(instId: instId, mode: host.portfolio.mode) }
-            guard let price, price > 0 else { continue }
-            marks[instId] = price
-            exposure += abs(balance.total) * price
+            guard let valuation = balance.valuationUsd else {
+                complete = false
+                Log.warn("runner: \(balance.ccy) 交易所未给 USD 估值，敞口按已知部分计算")
+                continue
+            }
+            exposure += abs(valuation)
         }
 
         // Derivative positions as the *exchange* holds them, not as the ledger
@@ -937,13 +978,22 @@ public final class StrategyRunner {
         return (exposure, complete)
     }
 
-    /// What one exchange-held derivative position puts at risk, in the quote
-    /// currency; nil when the venue gave nothing to value it with.
+    /// What one exchange-held derivative position puts at risk, in dollars;
+    /// nil when the venue gave nothing to value it in dollars with.
     ///
     /// A linear contract carries its notional, which the exchange states
-    /// outright. An option carries the premium currently on the books — what
-    /// is lost if it goes to zero — not the notional it controls, so it is
-    /// valued at the venue's mark the way the ledger values its own.
+    /// outright and states in USD. An option carries the premium currently on
+    /// the books — what is lost if it goes to zero — not the notional it
+    /// controls, so it is valued at the venue's mark the way the ledger values
+    /// its own; that mark is `mark × indexPrice`, and the index is quoted
+    /// against USD (`BTC-USD`), so the product is dollars.
+    ///
+    /// The old last-resort branch — contracts × contract value × mark — is
+    /// gone rather than kept as a fallback: on OKX that mark is a `-USDT`
+    /// price, so the branch answered in the wrong currency exactly when the
+    /// exchange had declined to state a USD figure. A position nobody will
+    /// value in dollars now marks the reading incomplete, which the badge
+    /// already shows, instead of contributing a number in another unit.
     private func priceRisk(
         of position: ExchangePosition, host: StrategyRunnerHost
     ) async -> Double? {
@@ -957,14 +1007,7 @@ public final class StrategyRunner {
             else { return nil }
             return abs(position.quantity) * contractValue * premium
         }
-        if let notional = position.notionalUsd { return abs(notional) }
-        guard let meta = try? await host.venue.instrumentMeta(instId: position.instId, mode: mode),
-              let contractValue = meta.contractValue else { return nil }
-        var mark = position.markPrice ?? 0
-        if mark <= 0 { mark = (try? await host.venue.lastPrice(instId: position.instId, mode: mode)) ?? 0 }
-        if mark <= 0 { mark = position.averagePrice }
-        guard mark > 0 else { return nil }
-        return abs(position.quantity) * contractValue * mark
+        return position.notionalUsd.map(abs)
     }
 
     // MARK: Per-strategy evaluation
@@ -1360,6 +1403,7 @@ public final class StrategyRunner {
         }
         measuredAccount = mode
         accountEquity = nil
+        accountEquityCurrency = AccountSnapshot.usdCode
         accountSnapshot = nil
         lastEquitySampleAt = nil
         nonStableExposure = 0

@@ -733,10 +733,14 @@ struct OpenOrderParsingTests {
         #expect(order.clOrdId == "MSemaTrend1a2b3c")
     }
 
-    @Test("每个可用模块的两本簿都会被问到，读不到的簿按名字报出来而不是当成空")
-    func everyBookIsAskedAndFailuresAreNamed() async throws {
+    @Test("每个声明存在的簿都会被问到，不存在的簿不问，读不到的簿按名字报出来而不是当成空")
+    func everyDeclaredBookIsAskedAndFailuresAreNamed() async throws {
         // A stub that answers every listing with the same open algo order —
         // enough to prove each book is asked, and that the listing is one list.
+        // 期权策略委托在交易所根本不存在：实测 `okx option algo orders
+        // --ordType <k>` 对全部 7 种 kind 都回 HTTP 400 Parameter instType
+        // error，而 `okx swap algo orders` 7 种全都能答。这里让桩照样回 400，
+        // 用来证明我们**压根没问**，而不是问了之后把错误咽下去。
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("maystock-stub-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -760,16 +764,34 @@ struct OpenOrderParsingTests {
         let listing = try await bridge.openOrders(mode: .demo)
 
         let calls = try String(contentsOf: log, encoding: .utf8).split(separator: "\n").map(String.init)
-        let books = Set(InstrumentType.allCases.compactMap(\.cliModule))
-            .flatMap { ["\($0) orders", "\($0) algo orders"] }
-        for book in books {
-            #expect(calls.contains { $0.contains(book) }, "\(book) was never asked")
+        // 遍历声明而不是点名今天这几个模块：将来新增一种 instrument type，
+        // 它的簿当天就被这条断言覆盖。
+        var algoBooks = 0
+        for instType in InstrumentType.allCases {
+            guard let module = instType.cliModule else {
+                #expect(!calls.contains { $0.contains("\(instType.rawValue.lowercased()) orders") },
+                        "\(instType) 没有 CLI 模块，不该被问")
+                continue
+            }
+            #expect(calls.contains { $0.contains("\(module) orders") },
+                    "\(module) orders was never asked")
+            let askedAlgo = calls.contains { $0.contains("\(module) algo orders") }
+            if instType.hasAlgoBook {
+                #expect(askedAlgo, "\(module) algo orders was never asked")
+                algoBooks += 1
+            } else {
+                #expect(!askedAlgo, "\(module) 没有策略委托簿，问了就会拿到 400")
+            }
         }
-        #expect(listing.unavailable == ["期权策略委托"])
-        // The fixture is an algo-book record (it carries an algoId, no ordId),
-        // so it is an order only when read as an algo book: one per algo book
-        // that answered — spot's and swap's — and none from the order books.
-        #expect(listing.orders.count == 2)
+
+        // 没有任何簿读失败：不存在的簿不问，就没有东西可失败。这正是修复
+        // 「挂单不完整」的判据——以前这里会稳定多出一条「期权策略委托」。
+        #expect(listing.unavailable.isEmpty)
+        #expect(algoBooks > 1, "桩要能同时喂给多本策略委托簿，去重才有东西可去")
+        // 每本答话的策略委托簿都回同一条 fixture，而同一个 algoId 只能在列表里
+        // 出现一次——去重按 id，不按「问了几次」。普通委托簿一条都不贡献：
+        // fixture 只有 algoId 没有 ordId。
+        #expect(listing.orders.count == 1)
         #expect(listing.orders.allSatisfy { $0.book == .algo && $0.id == "3902370090634240000" })
     }
 }

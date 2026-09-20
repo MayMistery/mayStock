@@ -193,6 +193,13 @@ public actor ShadowBook {
         }
     }
 
+    /// Everything the simulated account has filled, newest first, plus the
+    /// families a simulated book has nothing to read — which is none: there
+    /// is one book here and it is in memory.
+    public func fillListing() -> ExchangeFillListing {
+        ExchangeFillListing(fills: fills(instId: nil).sorted { $0.ts > $1.ts })
+    }
+
     /// The runner's reading of every non-protective order carrying the tag.
     public func status(clOrdId: String) -> VenueOrderStatus {
         let orders = state.orders.filter { $0.clOrdId == clOrdId && !$0.protective }

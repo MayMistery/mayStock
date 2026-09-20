@@ -219,8 +219,9 @@ private func withKernelCandles<T>(
 }
 
 /// Run a kernel call that returns an owned string, converting a null result
-/// into the error the kernel wrote out.
-private func callReturningString(
+/// into the error the kernel wrote out. Shared by every `Kernel/` mirror, so
+/// the freeing and the null-means-read-error convention are written once.
+func callReturningString(
     _ call: (UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> UnsafeMutablePointer<CChar>?
 ) throws -> String {
     var error: UnsafeMutablePointer<CChar>?
@@ -231,7 +232,7 @@ private func callReturningString(
     return String(cString: result)
 }
 
-private func encodeJSON<T: Encodable>(_ value: T) throws -> String {
+func encodeJSON<T: Encodable>(_ value: T) throws -> String {
     do {
         let data = try JSONEncoder().encode(value)
         guard let text = String(data: data, encoding: .utf8) else {

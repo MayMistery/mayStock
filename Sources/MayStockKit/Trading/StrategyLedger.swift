@@ -17,8 +17,54 @@ public enum PositionEffect: String, Codable, Sendable, CaseIterable {
     case flip
 }
 
-public struct StrategyFill: Codable, Sendable, Equatable, Identifiable {
-    public let id: String
+// MARK: - What a fill's money is denominated in
+/// One fill's price, fee and realised P&L, all three expressed in the venue's
+/// quote currency.
+///
+/// The conversion is here and only here. A fill arrives in whatever the venue
+/// stamps on it — a spot pair in its quote coin, a perpetual in the book's
+/// currency, an option in the settlement coin per unit of underlying — and
+/// every figure derived from it (a booked P&L, a 净益 column, a reconciliation
+/// total) is only comparable across instruments once they are all in one
+/// currency. Writing this arithmetic at each call site is how a screen ends up
+/// adding an ETH premium to a USDT one, which is the mistake
+/// `Venue.settlementCurrency` exists to make impossible.
+///
+/// Nil when an option fill cannot be converted — no index price was stamped on
+/// it and the caller has no current reading — because there is no honest number
+/// to book and a guess would be worse than the wait.
+public struct FillMoney: Sendable, Equatable {
+    /// Per unit of underlying, in quote currency.
+    public let price: Double
+    /// Positive cost, in quote currency.
+    public let feeQuote: Double
+    /// What the venue says this fill realised, in quote currency, or nil when
+    /// it says nothing or says naught.
+    public let realisedQuote: Double?
+
+    public init?(_ fill: ExchangeFill, venue: Venue, indexPrice: Double? = nil) {
+        let (base, _) = venue.currencies(of: fill.instId)
+        let feeMagnitude = abs(fill.fee)
+        if venue.instrumentType(of: fill.instId) == .option {
+            guard let index = fill.indexPrice ?? indexPrice, index > 0 else { return nil }
+            // The premium arrives in the coin (`fillPx`), with the venue's own
+            // dollar reading beside it (`fillPxUsd`); the index is the fallback
+            // for a fill it did not stamp.
+            price = fill.priceUsd.map { $0 > 0 ? $0 : fill.price * index } ?? fill.price * index
+            feeQuote = fill.feeCcy == base ? feeMagnitude * index : feeMagnitude
+            // The venue's realised figure is stamped in the same coin.
+            realisedQuote = fill.pnl.map { fill.feeCcy == base ? $0 * index : $0 }
+            return
+        }
+        price = fill.price
+        feeQuote = fill.feeCcy == base ? feeMagnitude * fill.price : feeMagnitude
+        realisedQuote = fill.pnl
+    }
+}
+
+// MARK: - Records
+
+public struct StrategyFill: Codable, Sendable, Equatable, Identifiable {    public let id: String
     public let strategyId: String
     public let instId: String
     /// Where the fill happened. Decides how `instId` is read and what
@@ -82,23 +128,10 @@ public struct StrategyFill: Codable, Sendable, Equatable, Identifiable {
         exchange fill: ExchangeFill, strategyId: String, mode: TradingMode, venue: Venue,
         indexPrice: Double? = nil
     ) {
-        let (base, _) = venue.currencies(of: fill.instId)
-        let feeMagnitude = abs(fill.fee)
-        if venue.instrumentType(of: fill.instId) == .option {
-            guard let index = fill.indexPrice ?? indexPrice, index > 0 else { return nil }
-            let premiumQuote = fill.priceUsd.map { $0 > 0 ? $0 : fill.price * index }
-                ?? fill.price * index
-            let feeQuote = fill.feeCcy == base ? feeMagnitude * index : feeMagnitude
-            self.init(
-                id: fill.id, strategyId: strategyId, instId: fill.instId, side: fill.side,
-                price: premiumQuote, quantity: abs(fill.size), feeQuote: feeQuote,
-                ts: fill.ts, clOrdId: fill.clOrdId, mode: mode)
-            return
-        }
-        let inQuote = fill.feeCcy == base ? feeMagnitude * fill.price : feeMagnitude
+        guard let money = FillMoney(fill, venue: venue, indexPrice: indexPrice) else { return nil }
         self.init(
             id: fill.id, strategyId: strategyId, instId: fill.instId, side: fill.side,
-            price: fill.price, quantity: abs(fill.size), feeQuote: inQuote,
+            price: money.price, quantity: abs(fill.size), feeQuote: money.feeQuote,
             ts: fill.ts, clOrdId: fill.clOrdId, mode: mode, venue: venue)
     }
 
@@ -131,6 +164,18 @@ public struct StrategyFill: Codable, Sendable, Equatable, Identifiable {
     /// nothing. The fee is this fill's alone — the opener's fee was already
     /// shown against the opener.
     public var netRealisedQuote: Double? { realisedQuote.map { $0 - feeQuote } }
+
+    /// This fill as the kernel's identity rule reads it.
+    ///
+    /// A ledger row keeps the venue's id in `id`, which for a fill ingested
+    /// off an exchange listing is its trade id — exactly what the rule
+    /// qualifies by instrument. A row synthesised (an adoption, a funding
+    /// correction) has no trade id at all, so `id` falls through to the
+    /// rule's last resort and stays itself.
+    public var kernelRecord: KernelFillRecord {
+        KernelFillRecord(
+            id: id, instId: instId, tradeId: id, ts: ts, side: side, leg: nil)
+    }
 
     /// The action in position terms — 开/加/平/反手 crossed with 多/空 — which
     /// is what the fill *did*, where the raw side is only what was sent. Falls
@@ -382,6 +427,12 @@ public struct LedgerReconciliation: Sendable, Equatable, Identifiable {
 @Observable
 @MainActor
 public final class StrategyLedger {
+    /// Oldest first, always. Every append comes from `record`, which is fed by
+    /// `ingest` in timestamp order or by the runner as fills land, so this is
+    /// append-ordered by construction — and callers rely on it: 「最近成交」
+    /// takes `suffix(limit)` as the newest rows, which is only the newest rows
+    /// if the array is chronological. Asserted in the tests rather than left
+    /// as a comment nobody can check.
     public private(set) var fills: [StrategyFill] = []
     public private(set) var positions: [String: StrategyPositionState] = [:]
     /// Base units per contract, per instrument, learned from exchange metadata.
@@ -423,14 +474,29 @@ public final class StrategyLedger {
         positions.values.filter { $0.instId == instId }.reduce(0) { $0 + $1.quantity }
     }
 
-    /// Every fill already on the book, so a caller adopting fills the exchange
-    /// executed on its own can tell which ones are genuinely new.
-    public var recordedFillIds: Set<String> { Set(fills.map(\.id)) }
+    /// One fill is a hundred rows a tick, and the rule crosses the FFI, so the
+    /// index is kept rather than rebuilt: `record` adds to it, `replace`
+    /// re-derives it from the book it was handed. Rebuilding it per fill would
+    /// be a kernel round trip per row and a quadratic replay.
+    private var identityIndex = KernelIdentities()
+
+    /// Every execution already accounted for on this book, keyed the kernel's
+    /// way, so a caller adopting fills the exchange executed on its own can
+    /// tell which ones are genuinely new.
+    ///
+    /// The keys are the kernel's, not the exchange's raw ids, and that is what
+    /// makes the answer independent of which build wrote the row. The exchange
+    /// names one execution both `4294122652` (its trade counter) and
+    /// `3931253135398440960` (its bill id); a book written before this app
+    /// read bill ids carries only the first, and today's listing of the same
+    /// fill carries both. Compared by name they are two fills; compared by
+    /// overlap they are one, which is what they are.
+    public var bookedIdentities: KernelIdentities { identityIndex }
 
     /// Funding settlements already booked, by the exchange's bill id.
     ///
     /// Persisted with the rest of the book, and that is not a detail. Fills are
-    /// deduplicated against `recordedFillIds`, which is *derived* from the fills
+    /// deduplicated against `bookedIdentities`, which is *derived* from the fills
     /// on disk and so survives a restart for free. This set had no such backing
     /// — it lived only in memory — while the exchange keeps serving the same
     /// bills for days. Every relaunch therefore re-booked every settlement still
@@ -480,7 +546,12 @@ public final class StrategyLedger {
     }
 
     public func record(_ fill: StrategyFill) {
-        guard !fills.contains(where: { $0.id == fill.id }) else { return }
+        // Keyed by the kernel's rule rather than by `id`, so a fill offered
+        // twice under two of its names — a trade id by one listing, a bill id
+        // by the next — is still one fill. A book that tested `id` equality
+        // re-booked every execution the first time a listing changed which
+        // field it read.
+        guard !bookedIdentities.holds(fill.kernelRecord) else { return }
         var state = positions[fill.strategyId] ?? StrategyPositionState(
             strategyId: fill.strategyId, instId: fill.instId, venue: fill.venue)
         if state.instId != fill.instId {
@@ -522,6 +593,16 @@ public final class StrategyLedger {
         var stamped = fill
         (stamped.positionEffect, stamped.realisedQuote) = state.apply(fill)
         fills.append(stamped)
+        identityIndex.insert([stamped.kernelRecord])
+        // The index is not pruned with the rows. It answers "has this
+        // execution been booked", and the positions it protects are
+        // cumulative, so dropping a key that aged out of the row cap would let
+        // a fill still inside the exchange's window be replayed onto a
+        // position that already counted it. The two are bounded differently on
+        // purpose: rows are history and capped at `maxFills`, keys are the
+        // double-counting guard. The guard is only as long-lived as the rows,
+        // though — `replace` re-derives it from the book it loads, so a
+        // restart starts with the keys of whatever the file still holds.
         if fills.count > Self.maxFills { fills.removeFirst(fills.count - Self.maxFills) }
         positions[fill.strategyId] = state
         onChanged?()
@@ -546,12 +627,21 @@ public final class StrategyLedger {
         indexPrices: [String: Double] = [:], contractSizes: [String: Double] = [:]
     ) -> Int {
         for (instId, size) in contractSizes { setContractSize(size, forInstId: instId) }
-        let existing = Set(fills.map(\.id))
+        // What is new, the tag, and the index price all resolve before a fill
+        // is offered to `record` — one batch call for the whole listing rather
+        // than one per row, and so that a fill already on the book is dropped
+        // *before* anything is logged about it. A duplicate that has nothing
+        // to say about its own conversion would otherwise warn on every tick
+        // for as long as the exchange kept listing it.
+        let candidates: [(fill: ExchangeFill, strategyId: String)] = exchangeFills
+            .sorted(by: { $0.ts < $1.ts })
+            .compactMap { fill in
+                OrderTag.resolveStrategy(fill.clOrdId, among: knownStrategyIds)
+                    .map { (fill, $0) }
+            }
+        let unbooked = bookedIdentities.unbooked(candidates.map(\.fill.kernelRecord))
         var added = 0
-        for fill in exchangeFills.sorted(by: { $0.ts < $1.ts }) {
-            guard !existing.contains(fill.id),
-                  let strategyId = OrderTag.resolveStrategy(fill.clOrdId, among: knownStrategyIds)
-            else { continue }
+        for ((fill, strategyId), isNew) in zip(candidates, unbooked) where isNew {
             let index = venue.optionUnderlying(of: fill.instId).flatMap { indexPrices[$0] }
             guard let booked = StrategyFill(
                 exchange: fill, strategyId: strategyId, mode: mode, venue: venue,
@@ -582,6 +672,9 @@ public final class StrategyLedger {
         fills = newFills
         positions = newPositions
         recordedFundingIds = fundingIds
+        // Re-derived from the book just loaded, never carried over: an index
+        // that survived a `replace` would describe a book this one replaced.
+        identityIndex = KernelIdentities.of(newFills.map(\.kernelRecord))
         // A loaded ledger already knows its multipliers — the positions carry
         // them — but the lookup table starts empty, and until instrument
         // metadata arrived a swap fill would book P&L at multiplier 1. Learn

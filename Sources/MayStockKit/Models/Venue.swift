@@ -32,6 +32,21 @@ public enum Venue: String, Codable, Sendable, CaseIterable, Identifiable, Hashab
         }
     }
 
+    /// What a **position** in `instId` settles in — the currency its P&L,
+    /// margin and premium are paid in, which is not the same as the currency
+    /// the instrument is quoted in.
+    ///
+    /// `quoteCurrency` answers "what does this venue's *book* run on"; this
+    /// answers "what is *this instrument's* money", and a total that adds
+    /// figures across instruments must ask the second question. The rule
+    /// itself lives in the kernel (`Venue::settlement_currency`, with the
+    /// measurement that justifies it) because the kernel is the side that
+    /// sizes positions against the answer, and a rule spelled on both sides
+    /// of the FFI is a rule that will eventually be spelled two ways.
+    public func settlementCurrency(of instId: String) -> String {
+        TradingKernel.settlementCurrency(venue: self, instId: instId)
+    }
+
     /// The instrument types this venue trades.
     public var instrumentTypes: [InstrumentType] {
         switch self {

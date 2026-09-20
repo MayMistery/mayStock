@@ -238,6 +238,11 @@ public struct AccountSnapshot: Sendable, Equatable {
     /// quite dollars and call the result a portfolio.
     public let equityCurrency: String
 
+    /// The currency every cross-venue total is stated in. Named once so the
+    /// several places that ask "can this be added up" compare against the
+    /// same spelling rather than four string literals.
+    public static let usdCode = "USD"
+
     public init(balances: [AccountBalance], totalEquity: Double?, equityCurrency: String) {
         self.balances = balances
         self.totalEquity = totalEquity
@@ -246,6 +251,23 @@ public struct AccountSnapshot: Sendable, Equatable {
 
     public func balance(of ccy: String) -> AccountBalance? {
         balances.first { $0.ccy == ccy }
+    }
+
+    /// The venue's own rate from `currency` into USD, taken from this very
+    /// reading — `eqUsd / eq` on the currency's own line.
+    ///
+    /// This is not a peg and not a constant: OKX prices USDT at 0.99963 on the
+    /// live account and 0.99962 on demo, and publishes both. Reading the rate
+    /// out of the same snapshot the figure came from means the conversion is
+    /// exactly as fresh as the number it converts. Nil when the venue said
+    /// nothing about that currency, which is a reason to leave a figure out of
+    /// a total rather than to guess at it.
+    public func usdRate(for currency: String) -> Double? {
+        if currency == Self.usdCode { return 1 }
+        guard let line = balance(of: currency), line.total != 0,
+              let valuation = line.valuationUsd else { return nil }
+        let rate = valuation / line.total
+        return rate > 0 ? rate : nil
     }
 }
 
@@ -311,12 +333,30 @@ public struct ExchangePosition: Sendable, Equatable, Identifiable {
     public let quantity: Double
     public let averagePrice: Double
     public let markPrice: Double?
+    /// Unrealised profit, in `settlementCurrency` — **not** necessarily USD.
+    /// Use `unrealisedPnLUsd` for anything that adds this to another account.
     public let unrealisedPnL: Double
     public let leverage: Double?
     public let liquidationPrice: Double?
     /// The exchange's own statement of what the position controls, in USD
     /// (`notionalUsd`). Nil when the venue does not report one.
     public let notionalUsd: Double?
+    /// What this position settles in, as the venue states it (`ccy`), and the
+    /// venue's own rate from that into USD at the moment of the reading
+    /// (`usdPx`).
+    ///
+    /// Both live on the position rather than on the venue because that is
+    /// where the exchange puts them: OKX's USDT swaps settle in USDT while its
+    /// coin-margined instruments settle in the coin, on the same account. A
+    /// venue-level currency would be right today and wrong the first time an
+    /// inverse or a BTC-settled option is opened, which is the same defect
+    /// this field exists to close.
+    ///
+    /// Measured against the venue's own arithmetic on both accounts:
+    /// `|pos| × ctVal × markPx × usdPx == notionalUsd` to six decimals, with
+    /// `usdPx` reading 0.99962 — so this rate is published, not a peg.
+    public let settlementCurrency: String?
+    public let usdRate: Double?
     /// The family the exchange files the position under — `SWAP`, `FUTURES`,
     /// `OPTION`, `MARGIN` — as it spells it. Read rather than inferred from
     /// the id, so a delivery future is not mistaken for spot.
@@ -338,7 +378,8 @@ public struct ExchangePosition: Sendable, Equatable, Identifiable {
         instId: String, posSide: PositionSide, quantity: Double, averagePrice: Double,
         markPrice: Double?, unrealisedPnL: Double, leverage: Double?, liquidationPrice: Double?,
         notionalUsd: Double? = nil, instType: String = "",
-        margin: Double? = nil, maintenanceMargin: Double? = nil, marginRatio: Double? = nil
+        margin: Double? = nil, maintenanceMargin: Double? = nil, marginRatio: Double? = nil,
+        settlementCurrency: String? = nil, usdRate: Double? = nil
     ) {
         self.margin = margin
         self.maintenanceMargin = maintenanceMargin
@@ -353,6 +394,29 @@ public struct ExchangePosition: Sendable, Equatable, Identifiable {
         self.liquidationPrice = liquidationPrice
         self.notionalUsd = notionalUsd
         self.instType = instType
+        self.settlementCurrency = settlementCurrency
+        self.usdRate = usdRate
+    }
+
+    /// `unrealisedPnL` in dollars, or nil when the venue gave nothing to
+    /// convert it with.
+    ///
+    /// Nil rather than the raw figure: a caller adding this to another
+    /// account's dollars must be able to tell "no profit stated" from
+    /// "profit stated in something else", and returning the unconverted
+    /// number would make those two identical at the call site.
+    public var unrealisedPnLUsd: Double? {
+        if let currency = settlementCurrency, currency == AccountSnapshot.usdCode {
+            return unrealisedPnL
+        }
+        if settlementCurrency == nil && usdRate == nil {
+            // A venue that quotes and settles in dollars and says neither —
+            // Schwab. Its own currency is the portfolio currency, so there is
+            // nothing to convert and nothing to be unsure about.
+            return unrealisedPnL
+        }
+        guard let rate = usdRate, rate > 0 else { return nil }
+        return unrealisedPnL * rate
     }
 
     public var isOption: Bool { instType == "OPTION" }
@@ -528,12 +592,28 @@ public struct ExchangeFill: Sendable, Equatable, Identifiable {
     /// Option fills only: the underlying index at execution (`fillIdxPx`),
     /// which converts a coin-denominated premium or fee into quote currency.
     public let indexPrice: Double?
+    /// The venue's own ledger-line id, where it stamps one. The strongest
+    /// identity a fill can carry — see the kernel's `fills` module — and the
+    /// reason a row placed outside this app can still be recognised as one
+    /// the ledger already booked.
+    public let billId: String?
+    /// The venue's per-instrument execution counter (`tradeId`), where it
+    /// stamps one. Distinct from `id`, which falls back to a synthesised
+    /// `ordId-timestamp` when the venue gives neither.
+    public let tradeId: String?
+    /// What the venue says the fill realised, in the instrument's settlement
+    /// currency, or nil where it says nothing. An opener realises nothing; a
+    /// closer on OKX carries `fillPnl`. This is the only realised figure
+    /// available for a fill no strategy booked, and without it an untagged
+    /// row has to show a blank where the money went.
+    public let pnl: Double?
 
     public init(
         id: String, instId: String, side: OrderSide, posSide: PositionSide?,
         price: Double, size: Double, fee: Double, feeCcy: String?,
         ordId: String?, clOrdId: String?, ts: Date,
-        priceUsd: Double? = nil, indexPrice: Double? = nil
+        priceUsd: Double? = nil, indexPrice: Double? = nil,
+        billId: String? = nil, tradeId: String? = nil, pnl: Double? = nil
     ) {
         self.id = id
         self.instId = instId
@@ -548,6 +628,33 @@ public struct ExchangeFill: Sendable, Equatable, Identifiable {
         self.ts = ts
         self.priceUsd = priceUsd
         self.indexPrice = indexPrice
+        self.billId = billId
+        self.tradeId = tradeId
+        self.pnl = pnl
+    }
+
+    /// This fill as the kernel's identity rule reads it. Prices, fees and
+    /// currencies stay here: the rule has no use for them, and shipping them
+    /// across the FFI to have them handed back would be pure cost.
+    public var kernelRecord: KernelFillRecord {
+        KernelFillRecord(
+            id: id, instId: instId, tradeId: tradeId, billId: billId,
+            ts: ts, side: side, leg: posSide)
+    }
+}
+
+/// What a whole-account fill read could and could not reach.
+///
+/// The same shape as `OpenOrderListing` and for the same reason: a book that
+/// could not be read must be named, because an empty list in its place reads
+/// as "nothing traded" — which on this account was the visible bug.
+public struct ExchangeFillListing: Sendable, Equatable {
+    public var fills: [ExchangeFill]
+    public var unavailable: [String]
+
+    public init(fills: [ExchangeFill] = [], unavailable: [String] = []) {
+        self.fills = fills
+        self.unavailable = unavailable
     }
 }
 
@@ -1000,6 +1107,68 @@ public struct TradeBridge: Sendable {
         if let instId { args += ["--instId", instId] }
         let output = try await runCLI(args, mode: mode)
         return Self.parseFills(json: output)
+    }
+
+    /// Everything the account has filled lately, whichever family and whoever
+    /// placed it, newest first.
+    ///
+    /// One call per family, because the listing endpoint takes one `instType`
+    /// and has no "all" — the same reason `openOrders` fans out. The
+    /// difference is what the caller learns: an order book that could not be
+    /// read hides what is armed, while a fill book that could not be read
+    /// hides what *happened*, which is how 「最近成交」 came to read "nothing
+    /// traded" on an account that traded all week. So an unreadable family is
+    /// named in `unavailable` rather than quietly contributing nothing.
+    ///
+    /// Named `fillListing` rather than a second `fills` because the per-family
+    /// reader above already defaults both of its first arguments, and two
+    /// overloads that both answer to `fills(mode:)` would be a coin toss.
+    public func fillListing(mode: TradingMode, perFamily limit: Int = 100) async throws -> ExchangeFillListing {
+        var requests: [(label: String, arguments: [String])] = []
+        for instType in InstrumentType.allCases {
+            guard let module = instType.cliModule else { continue }
+            requests.append((
+                label: instType.displayName,
+                arguments: [module, "fills", "--limit", String(limit)]))
+        }
+
+        let results = await withTaskGroup(
+            of: (label: String, fills: [ExchangeFill]?, error: Error?).self
+        ) { group in
+            for request in requests {
+                group.addTask {
+                    do {
+                        let output = try await runCLI(request.arguments, mode: mode)
+                        return (request.label, Self.parseFills(json: output), nil)
+                    } catch {
+                        return (request.label, nil, error)
+                    }
+                }
+            }
+            var out: [(label: String, fills: [ExchangeFill]?, error: Error?)] = []
+            for await result in group { out.append(result) }
+            return out
+        }
+
+        var listing = ExchangeFillListing()
+        var firstError: Error?
+        for result in results {
+            if let fills = result.fills {
+                listing.fills += fills
+            } else {
+                firstError = firstError ?? result.error
+                listing.unavailable.append(result.label)
+                Log.warn("bridge: 读取\(result.label)成交失败：\(result.error.map(String.init(describing:)) ?? "未知")")
+            }
+        }
+        if listing.unavailable.count == requests.count, let firstError { throw firstError }
+        // One execution is one row whatever family it is filed under; the
+        // kernel's identity rule is what decides that, and it is asked
+        // elsewhere rather than re-derived here. What belongs here is only
+        // the ordering the page reads top-down.
+        listing.fills.sort { $0.ts > $1.ts }
+        listing.unavailable.sort()
+        return listing
     }
 
     /// Funding settlements charged on perpetual positions.
@@ -1583,7 +1752,9 @@ public struct TradeBridge: Sendable {
                 instType: (dict["instType"] as? String) ?? "",
                 margin: number(dict, "margin"),
                 maintenanceMargin: number(dict, "mmr"),
-                marginRatio: number(dict, "mgnRatio")))
+                marginRatio: number(dict, "mgnRatio"),
+                settlementCurrency: (dict["ccy"] as? String).flatMap { $0.isEmpty ? nil : $0 },
+                usdRate: number(dict, "usdPx")))
         }
         return out
     }
@@ -1595,9 +1766,11 @@ public struct TradeBridge: Sendable {
                   let sideRaw = dict["side"] as? String, let side = OrderSide(rawValue: sideRaw),
                   let price = number(dict, "fillPx"), let size = number(dict, "fillSz"),
                   let ms = number(dict, "ts") else { return }
-            let tradeId = (dict["tradeId"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-            let ordId = (dict["ordId"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-            let clOrdId = (dict["clOrdId"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            let text = { (key: String) -> String? in
+                (dict[key] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            }
+            let tradeId = text("tradeId")
+            let ordId = text("ordId")
             out.append(ExchangeFill(
                 id: tradeId ?? "\(ordId ?? instId)-\(Int(ms))",
                 instId: instId,
@@ -1608,12 +1781,18 @@ public struct TradeBridge: Sendable {
                 fee: number(dict, "fee") ?? 0,
                 feeCcy: dict["feeCcy"] as? String,
                 ordId: ordId,
-                clOrdId: clOrdId,
+                clOrdId: text("clOrdId"),
                 ts: Date(timeIntervalSince1970: ms / 1000),
                 // Stamped on option fills only; empty strings elsewhere, which
                 // `number` already reads as absent.
                 priceUsd: number(dict, "fillPxUsd"),
-                indexPrice: number(dict, "fillIdxPx")))
+                indexPrice: number(dict, "fillIdxPx"),
+                // The venue's own line id and its realised figure. Both are
+                // stamped on every family, and both are what lets a fill this
+                // app never placed still be identified and priced.
+                billId: text("billId"),
+                tradeId: tradeId,
+                pnl: number(dict, "fillPnl")))
         }
         return out.sorted { $0.ts < $1.ts }
     }
