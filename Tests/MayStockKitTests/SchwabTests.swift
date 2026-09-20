@@ -575,6 +575,78 @@ struct PortfolioPerVenueTests {
     }
 }
 
+// MARK: - Settlement currency
+
+/// 一个持仓的计价币种由**合约**决定，不由 venue 决定。
+///
+/// 这组断言的依据是交易所自己的 instrument 清单实测：`settleCcy` 对 482 个
+/// SWAP 与 1412 个 OPTION 全部符合下面这条规则，0 例外；现货那 1411 个 pair
+/// 里有 275 个以裸 USD 计价，还有 EUR / TRY / SGD / AUD / AED / BRL，所以
+/// 「OKX 就是 USDT」本身也是错的。
+@Suite("持仓的计价币种来自合约，不来自 venue")
+struct SettlementCurrencyTests {
+    @Test("线性、反向、期权、现货、美股各自结算在什么币种上")
+    func settlementFollowsTheInstrument() {
+        #expect(Venue.okx.settlementCurrency(of: "BTC-USDT-SWAP") == "USDT")
+        #expect(Venue.okx.settlementCurrency(of: "ETH-USDT-SWAP") == "USDT")
+        // 反向合约：以美元标价，用币结算、用币做保证金。
+        #expect(Venue.okx.settlementCurrency(of: "BTC-USD-SWAP") == "BTC")
+        // 期权权利金付的是币，不是美元。
+        #expect(Venue.okx.settlementCurrency(of: "BTC-USD-260921-71000-C") == "BTC")
+        #expect(Venue.okx.settlementCurrency(of: "ETH-USD-260921-3000-P") == "ETH")
+        // 现货结算在计价腿上，而它未必是 USDT。
+        #expect(Venue.okx.settlementCurrency(of: "BTC-USDT") == "USDT")
+        #expect(Venue.okx.settlementCurrency(of: "BTC-USDC") == "USDC")
+        #expect(Venue.okx.settlementCurrency(of: "BTC-EUR") == "EUR")
+        #expect(Venue.schwab.settlementCurrency(of: "AAPL") == "USD")
+    }
+
+    @Test("venue 的记账币种和合约的结算币种是两件事")
+    func venueCurrencyIsNotInstrumentCurrency() {
+        // 这正是旧代码把 USDT 当美元加进组合的那个洞：venue 说 USDT，
+        // 而账户里同时可能躺着一个用 BTC 结算的期权。
+        #expect(Venue.okx.quoteCurrency == "USDT")
+        #expect(Venue.okx.settlementCurrency(of: "BTC-USD-260921-71000-C") != Venue.okx.quoteCurrency)
+    }
+
+    @Test("交易所报了 usdPx 才能折算成美元，没报就说不知道")
+    func positionStatesItsOwnRate() {
+        func position(ccy: String?, rate: Double?, upl: Double) -> ExchangePosition {
+            ExchangePosition(
+                instId: "BTC-USDT-SWAP", posSide: .long, quantity: 1, averagePrice: 100,
+                markPrice: 100, unrealisedPnL: upl, leverage: nil, liquidationPrice: nil,
+                settlementCurrency: ccy, usdRate: rate)
+        }
+        // 实测 usdPx = 0.99962：USDT 不是 1 美元，差的是真金白银。
+        let usdt = position(ccy: "USDT", rate: 0.99962, upl: 289.27422)
+        #expect(usdt.unrealisedPnLUsd != nil)
+        #expect(abs((usdt.unrealisedPnLUsd ?? 0) - 289.27422 * 0.99962) < 1e-9)
+        #expect(usdt.unrealisedPnLUsd != usdt.unrealisedPnL, "0.99962 ≠ 1")
+        // 本来就是美元，不用换。
+        #expect(position(ccy: "USD", rate: nil, upl: 12).unrealisedPnLUsd == 12)
+        // 说了是别的币种、却没给汇率：只能说不知道，不能按面值混进美元总额。
+        #expect(position(ccy: "BTC", rate: nil, upl: 0.5).unrealisedPnLUsd == nil)
+        // 嘉信这种本币即组合币种、两个字段都不报的，照常可加。
+        #expect(position(ccy: nil, rate: nil, upl: 7).unrealisedPnLUsd == 7)
+    }
+
+    @Test("快照里的汇率来自这次读数本身，读不到就返回 nil")
+    func snapshotRateComesFromTheReading() {
+        let snapshot = AccountSnapshot(
+            balances: [
+                AccountBalance(ccy: "USDT", available: 100, total: 100, valuationUsd: 99.962),
+                AccountBalance(ccy: "ETH", available: 1, total: 1, valuationUsd: 2_575.23),
+                AccountBalance(ccy: "DOGE", available: 5, total: 5, valuationUsd: nil),
+            ],
+            totalEquity: 2_675.192, equityCurrency: AccountSnapshot.usdCode)
+        #expect(snapshot.usdRate(for: "USD") == 1)
+        #expect(abs((snapshot.usdRate(for: "USDT") ?? 0) - 0.99962) < 1e-9)
+        #expect(abs((snapshot.usdRate(for: "ETH") ?? 0) - 2_575.23) < 1e-9)
+        #expect(snapshot.usdRate(for: "DOGE") == nil, "交易所没估值，就没有汇率可用")
+        #expect(snapshot.usdRate(for: "SHIB") == nil, "余额里根本没有这条线")
+    }
+}
+
 // MARK: - Hub source names
 
 private actor NamedFeed: MarketFeed {

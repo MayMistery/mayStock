@@ -156,5 +156,5 @@ public struct CombinedPortfolio: Sendable, Equatable {
         })
     }
 
-    private static let usdCode = "USD"
+    private static let usdCode = AccountSnapshot.usdCode
 }

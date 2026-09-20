@@ -369,18 +369,39 @@ final class AppState {
         })
     }
 
-    /// Ledger profit across every account. Nil only when no account has a
-    /// book at all — one venue having nothing to report must not blank the
-    /// other's figure, so a nil from a single venue counts as zero here and
-    /// the account list above says which venues were readable.
-    var combinedOpenPnL: Double? {
-        let figures = Venue.allCases.compactMap { openPnL(for: $0) }
-        return figures.isEmpty ? nil : figures.reduce(0, +)
+    /// Ledger profit across every account, in dollars.
+    ///
+    /// Per-venue P&L is booked in whatever the position settles in — USDT on
+    /// OKX's USDT swaps — so it is converted at the rate the venue published
+    /// in the same reading before being added to Schwab's dollars. Measured on
+    /// both live accounts, USDT settled at 0.99962, so this is a real
+    /// difference rather than a rounding.
+    ///
+    /// Nil only when no account has a book at all. A venue whose rate is
+    /// unknown is left out rather than added at par, and `combinedPnLIsComplete`
+    /// says so next to the number.
+    var combinedOpenPnL: Double? { combinedInUsd { self.openPnLUsd(for: $0) } }
+
+    /// Exchange-marked unrealised profit across every account, in dollars.
+    var combinedExchangeUnrealisedPnL: Double? {
+        combinedInUsd { self.exchangeUnrealisedPnLUsd(for: $0) }
     }
 
-    /// Exchange-marked unrealised profit across every account.
-    var combinedExchangeUnrealisedPnL: Double? {
-        let figures = Venue.allCases.compactMap { exchangeUnrealisedPnL(for: $0) }
+    /// False when any venue held a figure that could not be stated in dollars,
+    /// so the totals above are a subtotal. Shown, not swallowed: a P&L missing
+    /// one venue's positions looks exactly like a smaller P&L otherwise.
+    var combinedPnLIsComplete: Bool {
+        Venue.allCases.allSatisfy { venue in
+            books(for: venue).exchangePositions.allSatisfy { $0.unrealisedPnLUsd != nil }
+                && (openPnL(for: venue) == nil || openPnLUsd(for: venue) != nil)
+        }
+    }
+
+    /// Add a per-venue figure that is already in dollars. Nil in, skipped; all
+    /// nil, nil out — one venue having nothing to report must not blank the
+    /// other's figure, but nor may it read as a zero contribution.
+    private func combinedInUsd(_ figure: (Venue) -> Double?) -> Double? {
+        let figures = Venue.allCases.compactMap(figure)
         return figures.isEmpty ? nil : figures.reduce(0, +)
     }
 
@@ -388,14 +409,22 @@ final class AppState {
     /// combined equity.
     ///
     /// `isComplete` is false as soon as any venue could not value everything
-    /// it holds, or any account is missing from the total — in either case
-    /// the percentage is a floor, and the caller marks it as one.
+    /// it holds, any account is missing from the total, or any venue reports
+    /// its exposure in something other than dollars — in each case the
+    /// percentage is a floor, and the caller marks it as one. A venue that
+    /// cannot state dollars is left out of the sum rather than added into it:
+    /// the whole point of `exposureCurrency` is that this addition is only
+    /// valid between figures that agree on the unit.
     var combinedExposure: (usd: Double, pct: Double?, isComplete: Bool) {
         let portfolio = combinedPortfolio
         var exposure = 0.0
         var complete = portfolio.isComplete
         for venue in Venue.allCases {
             let runner = runner(for: venue)
+            guard runner.exposureCurrency == AccountSnapshot.usdCode else {
+                complete = false
+                continue
+            }
             exposure += runner.nonStableExposure
             if !runner.exposureIsComplete { complete = false }
         }
@@ -414,23 +443,81 @@ final class AppState {
     }
 
     /// Unrealised profit on every position a venue holds — whoever opened
-    /// it — at the venue's own mark. Nil until the account has been read.
+    /// it — at the venue's own mark, in the venue's own settlement currency.
+    /// Nil until the account has been read.
+    ///
+    /// This is the per-venue page's figure, shown beside that venue's other
+    /// numbers and therefore correct in its own terms. Cross-venue callers
+    /// want `exchangeUnrealisedPnLUsd`.
     func exchangeUnrealisedPnL(for venue: Venue) -> Double? {
         let books = books(for: venue)
         guard books.accountRefreshedAt != nil else { return nil }
         return books.exchangePositions.reduce(0) { $0 + $1.unrealisedPnL }
     }
 
+    /// The same figure in dollars, or nil when some position could not be
+    /// stated in dollars at all.
+    ///
+    /// All-or-nothing on purpose: a partial sum is a number that looks like an
+    /// answer while being a floor, and the one thing worse than a missing P&L
+    /// is a confidently wrong one.
+    func exchangeUnrealisedPnLUsd(for venue: Venue) -> Double? {
+        let books = books(for: venue)
+        guard books.accountRefreshedAt != nil else { return nil }
+        var total = 0.0
+        for position in books.exchangePositions {
+            guard let usd = position.unrealisedPnLUsd else { return nil }
+            total += usd
+        }
+        return total
+    }
+
     /// Live profit on everything a venue's book currently holds, plus
-    /// whatever has already been realised, net of fees and funding.
+    /// whatever has already been realised, net of fees and funding — each
+    /// position in its own settlement currency, summed as the per-venue page
+    /// shows it.
     ///
     /// This needs no equity history at all — position, average price and mark
     /// are all available the moment a position exists.
     func openPnL(for venue: Venue) -> Double? {
+        sumOpenPnL(for: venue) { figure, _ in figure }
+    }
+
+    /// The same profit in dollars, converting each position at the venue's own
+    /// published rate for what that position settles in. Nil when any of them
+    /// could not be converted.
+    ///
+    /// An OKX book can hold a USDT swap and a BTC-settled option at once, so
+    /// the conversion is per position rather than per venue: one rate for the
+    /// whole account would be right for the first and wrong for the second.
+    func openPnLUsd(for venue: Venue) -> Double? {
+        let snapshot = books(for: venue).accountSnapshot
+        return sumOpenPnL(for: venue) { figure, instId in
+            let currency = venue.settlementCurrency(of: instId)
+            if currency == AccountSnapshot.usdCode { return figure }
+            guard let rate = snapshot?.usdRate(for: currency) else { return nil }
+            return figure * rate
+        }
+    }
+
+    /// Walk a venue's non-flat ledger positions, mark each, and let `convert`
+    /// decide what unit the result is in. Nil when the book is empty, or when
+    /// `convert` refuses any position — the two totals above differ only in
+    /// that closure, so they cannot drift apart in which positions they count.
+    private func sumOpenPnL(
+        for venue: Venue, convert: (Double, String) -> Double?
+    ) -> Double? {
         let runner = runner(for: venue)
         let positions = ledger(for: venue).positions.values.filter { !$0.isFlat || $0.realisedPnL != 0 }
         guard !positions.isEmpty else { return nil }
-        return positions.reduce(0) { $0 + $1.netPnL(mark: runner.mark(for: $1.instId) ?? mark(for: $1.instId)) }
+        var total = 0.0
+        for position in positions {
+            let marked = position.netPnL(
+                mark: runner.mark(for: position.instId) ?? mark(for: position.instId))
+            guard let value = convert(marked, position.instId) else { return nil }
+            total += value
+        }
+        return total
     }
 
     /// The same profit as a share of the capital actually committed to it.
@@ -565,6 +652,31 @@ final class AppState {
             books.openOrders = []
             books.openOrdersNote = nil
             books.openOrdersError = String(describing: error)
+        }
+        // What the venue has filled lately, whoever placed it. Its own block,
+        // for the same reason the order book has one: a refused fill read must
+        // not blank the equity and positions that were read fine — and, read
+        // the other way, a blank fill list must not be allowed to read as
+        // "nothing traded" when the book could not be reached at all.
+        do {
+            switch venue {
+            case .okx:
+                let listing = try await tradeBridge.fillListing(mode: mode)
+                books.exchangeFills = listing.fills
+                books.exchangeFillsNote = listing.unavailable.isEmpty
+                    ? nil : "未能读取：" + listing.unavailable.joined(separator: "、") + "的成交。这些簿上的成交，这里不会显示。"
+            case .schwab:
+                let listing = try await (exchange as? SchwabVenue)?.fillListing(mode: mode)
+                    ?? ExchangeFillListing()
+                books.exchangeFills = listing.fills
+                books.exchangeFillsNote = listing.unavailable.isEmpty
+                    ? nil : "未能读取：" + listing.unavailable.joined(separator: "、") + "的成交。"
+            }
+            books.exchangeFillsError = nil
+        } catch {
+            books.exchangeFills = []
+            books.exchangeFillsNote = nil
+            books.exchangeFillsError = String(describing: error)
         }
         switch venue.periodFigure {
         case .exchangeBills:

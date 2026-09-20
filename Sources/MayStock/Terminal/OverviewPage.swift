@@ -648,22 +648,48 @@ struct OverviewPage: View {
     }
 
     private var fillsCard: some View {
-        Card(title: "最近成交", subtitle: "\(venue.displayName)\(mode.displayName) · 最近 12 笔") {
+        let rows = appState.recentFillRows(limit: 12, on: venue)
+        return Card(title: "最近成交",
+                    subtitle: fillsSubtitle(rows)) {
             EmptyView()
         } content: {
             DataGrid(columns: [
                 GridColumn(title: "时间"), GridColumn(title: "策略"), GridColumn(title: "操作"),
                 GridColumn(title: "价格", alignment: .trailing), GridColumn(title: "数量", alignment: .trailing),
                 GridColumn(title: "净益", alignment: .trailing),
-            ], rows: appState.recentFills(limit: 12, on: venue), emptyText: "还没有成交记录") { fill in
+            ], rows: rows, emptyText: fillsEmptyText) { fill in
                 GridText(Format.stamp(fill.ts), tint: .secondary, mono: true, fit: true)
-                GridText(appState.strategy(id: fill.strategyId)?.name ?? fill.strategyId)
-                GridText(fill.actionLabel, tint: Theme.trend(fill.side == .buy), weight: .medium, fit: true)
+                if let strategyId = fill.strategyId {
+                    GridText(appState.strategy(id: strategyId)?.name ?? strategyId)
+                } else {
+                    // Somebody else's trade — shown, never attributed to a
+                    // strategy that did not place it.
+                    GridText("外部", tint: .secondary)
+                }
+                GridText(fill.action, tint: Theme.trend(fill.side == .buy), weight: .medium, fit: true)
                 GridText(PriceFormatter.auto(fill.price), mono: true, alignment: .trailing)
                 GridText(PriceFormatter.plain(fill.quantity), mono: true, alignment: .trailing)
                 GridText(fill.netRealisedQuote.map { PriceFormatter.signedMoney($0) } ?? "—",
                          tint: fill.netRealisedQuote.map(Theme.signed) ?? .secondary, mono: true, alignment: .trailing)
             }
         }
+    }
+
+    /// What the fills card can honestly say about itself: how many rows it has
+    /// of how many the account traded, and — when a book could not be read —
+    /// that the list is short for a reason rather than because nothing
+    /// happened. An empty table on a busy account was the visible bug; this is
+    /// the sentence that stops it recurring silently.
+    private func fillsSubtitle(_ rows: [FillRow]) -> String {
+        let external = rows.filter(\.isExternal).count
+        var text = "\(venue.displayName)\(mode.displayName) · 最近 \(rows.count) 笔"
+        if external > 0 { text += "，其中 \(external) 笔非本应用下单" }
+        return text
+    }
+
+    private var fillsEmptyText: String {
+        if let error = books.exchangeFillsError { return "读取成交失败：\(error)" }
+        if let note = books.exchangeFillsNote { return note }
+        return "还没有成交记录"
     }
 }

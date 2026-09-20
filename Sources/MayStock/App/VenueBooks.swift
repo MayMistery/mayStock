@@ -44,6 +44,25 @@ final class VenueBooks {
     /// Books the listing could not read, in words; nil when it read them all.
     var openOrdersNote: String?
     var openOrdersError: String?
+    /// Everything the venue has filled on this account lately, whoever placed
+    /// it — newest first.
+    ///
+    /// Kept beside the local ledger's fills rather than derived from them: the
+    /// ledger only knows the orders MayStock itself sent, and it can only
+    /// attribute those it tagged. Everything else on the account — placed by
+    /// hand, by the exchange's own CLI, or by another program — is real
+    /// trading the account did, and a 「最近成交」 panel fed only by the
+    /// ledger reads "nothing traded" on an account that traded all week. That
+    /// is the same class of mistake as showing an external position as if it
+    /// did not exist, and it is the mistake this field exists to stop.
+    ///
+    /// No count appears here on purpose. The window rolls — three readings of
+    /// the same account on three days gave 58, 63 and 59 fills — so any number
+    /// written into this comment is wrong within a day.
+    var exchangeFills: [ExchangeFill] = []
+    /// Fill books that could not be read, in words; nil when all were read.
+    var exchangeFillsNote: String?
+    var exchangeFillsError: String?
     /// The venue's own ledger of the active account, as last read, where the
     /// venue keeps one — see `Venue.periodFigure`.
     var exchangeBills: ExchangeBillListing?

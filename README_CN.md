@@ -33,7 +33,8 @@
   是凭据边界：`schwabctl configure` 把 App Key/Secret 存进钥匙串，`schwabctl login` 在
   `127.0.0.1:8182` 起一个回环 HTTPS 监听走完 OAuth 并保存 7 天有效的 refresh token，
   App 只拿 30 分钟的 access token，实盘订单一律经 `schwabctl place --live` 发出。
-  嘉信没有模拟盘，模拟盘是本地影子账户：常规交易时段按实时盘口撮合，扣嘉信费用、
+  嘉信的 paperMoney 只能在 thinkorswim 里手动用、不对 API 开放，所以模拟盘是本地影子
+  账户：常规交易时段按实时盘口撮合，扣嘉信费用、
   配置的滑点与 Reg T 购买力。每家交易所各有自己的台账、权益曲线、心跳、本金池与交易循环。
 - **触发通知**：价格上/下穿（带迟滞防抖）、当日涨跌幅（OKX 按 24 小时、美股按昨收）、N 分钟波动；系统通知 +
   可选提示音 + 可选 shell hook（注入环境变量，可直接串官方 `okx` CLI 实现「触价下单」）。

@@ -233,6 +233,9 @@ extension AppState {
             books.openOrders = []
             books.openOrdersNote = nil
             books.openOrdersError = nil
+            books.exchangeFills = []
+            books.exchangeFillsNote = nil
+            books.exchangeFillsError = nil
             books.exchangeBills = nil
             books.billsError = nil
             books.accountError = nil
@@ -294,7 +297,7 @@ extension AppState {
                 + (report.profile.map { "，\($0)" } ?? "") + "。")
         }
         if mode == .demo, venues.contains(.schwab) {
-            lines.append("嘉信没有模拟盘：模拟盘下的美股订单由 MayStock 本地影子账户按实时行情撮合。")
+            lines.append("嘉信的 paperMoney 模拟盘只能在 thinkorswim 里手动用、不对 API 开放，所以模拟盘下的美股订单由 MayStock 本地影子账户按实时行情撮合。")
         }
         lines.append(mode.isDemo
                      ? "模拟盘的订单不会动用真实资金。"

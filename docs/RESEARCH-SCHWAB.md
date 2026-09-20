@@ -1,6 +1,6 @@
 # 研究记录：接入嘉信（Charles Schwab）做美股量化
 
-**结论先行：要额外申请，但不要钱。** 申请走嘉信开发者门户，两段人工审核，快则几天、慢则两三周；API 本身免费，美股线上交易 0 佣金。真正的代价不在钱，在两处：嘉信没有模拟盘、OAuth 每 7 天要人肉重新登录一次；以及 MayStock 现在整套「7×24、加密对命名、百分比手续费」的假设都要打开重写。thinkorswim 不是第二条路：它是同一个账户的另一个前端，没有自己的 API，thinkScript 不能自动下单。
+**结论先行：要额外申请，但不要钱。** 申请走嘉信开发者门户，两段人工审核，快则几天、慢则两三周；API 本身免费，美股线上交易 0 佣金。真正的代价不在钱，在两处：嘉信的 paperMoney 不对 API 开放（等于没有可编程的模拟盘）、OAuth 每 7 天要人肉重新登录一次；以及 MayStock 现在整套「7×24、加密对命名、百分比手续费」的假设都要打开重写。thinkorswim 不是第二条路：它是同一个账户的另一个前端，没有自己的 API，thinkScript 不能自动下单。
 
 **日期**：2026-09-07 ｜ **口径**：只看 Trader API – Individual（自己账户自己用），不看机构/合作方产品
 
@@ -117,7 +117,7 @@ thinkorswim 对这个项目唯一的用处是**手工验证**。API 没有模拟
 | 6 | `StrategyMarket` 加 venue / 资产类别；`InstrumentType` 加股票 | `Strategy/StrategyManifest.swift:5-49, 52-62`；manifest `currentSchema = 1`（`:394`）需 bump 并给迁移路径 |
 | 7 | 非比例费用模型 | `Trading/OKXFeeSchedule.swift:188-196` 只有 spot/swap × maker/taker 四个分支，表达不了「0 佣金 + 卖出监管费 + 期权每张费」；且 `Models/StrategyPortfolio.swift:113` 把 `OKXFeeSchedule` 类型写进了持久化配置 |
 | 8 | 订单归因的替代方案 | 无 clOrdId，只能在下单返回时把 `orderId → strategyId` 落盘；下单与落盘之间崩溃的订单进已有的「未归因」桶 |
-| 9 | 影子撮合（本地纸面交易） | 嘉信无模拟盘，`TradingMode.demo`（`Models/StrategyPortfolio.swift:8-27`）在嘉信上要重新定义 |
+| 9 | 影子撮合（本地纸面交易） | 嘉信的 paperMoney 不对 API 开放，`TradingMode.demo`（`Models/StrategyPortfolio.swift:8-27`）在嘉信上要重新定义 |
 
 ### 6.3 会被打破的假设
 
@@ -146,7 +146,7 @@ thinkorswim 对这个项目唯一的用处是**手工验证**。API 没有模拟
 - `schwabctl token`：给 App 一个 30 分钟的 access token；快过期自动刷新。refresh token 永远不出 CLI。
 - `schwabctl status`：不联网、不含任何密钥，App 的账户页显示它。
 - `schwabctl accounts / use / account / positions / orders / order / fills / quotes / candles / hours / search`：全部原样透传嘉信的 JSON，Swift 侧 `SchwabWire` 一份解码器同时服务直连路径与子进程路径。
-- `schwabctl place / replace / cancel`：**必须 `--live`**，否则以 `refused` 拒绝——嘉信没有模拟盘可兜底。订单体从 stdin 读嘉信原生 JSON；4xx 视为拒单（`rejected`，终局），5xx/超时视为未知（App 下一轮问）。
+- `schwabctl place / replace / cancel`：**必须 `--live`**，否则以 `refused` 拒绝——嘉信的 paperMoney 不对 API 开放，没有可兜底的模拟盘。订单体从 stdin 读嘉信原生 JSON；4xx 视为拒单（`rejected`，终局），5xx/超时视为未知（App 下一轮问）。
 - 失败一律在 stdout 印 `{"error":{"code":…,"message":…}}`：`not_configured` / `not_logged_in` / `refused` / `rejected` / `rate_limited` / `http` / `transport`，`SchwabBridge` 按 code 判定，不解析堆栈。
 
 App 侧：`SchwabVenue: ExchangeVenue`（行情走 `SchwabMarketDataSource`：官方接口，未登录时退 Yahoo 并写日志；模拟盘走 `ShadowBook` 本地撮合；实盘走 `SchwabBridge`），`VenueBooks` 让每家交易所各有一条 `StrategyRunner` 循环、两本台账、权益曲线与心跳，本金按 venue 分池（`strategy.capital`）。

@@ -169,7 +169,7 @@ struct AccountPage: View {
             VStack(alignment: .leading, spacing: 4) {
                 KeyValueRow(label: "登录", value: loginText(status).0, tint: loginText(status).1)
                 KeyValueRow(label: "美股行情", value: "\(appState.hub.sourceName(for: .schwab)) · \(feedText.0)", tint: feedText.1)
-                KeyValueRow(label: "模拟盘", value: "本地影子账户：按实时行情在常规交易时段撮合，扣嘉信费率与滑点假设，Reg T 两倍购买力")
+                KeyValueRow(label: "模拟盘", value: "嘉信有 paperMoney，但只在 thinkorswim 里手动用、不对 API 开放；这里用本地影子账户：按实时行情在常规交易时段撮合，扣嘉信费率与滑点假设，Reg T 两倍购买力")
                 if let equity = appState.accountEquity(for: .schwab) {
                     KeyValueRow(label: appState.tradingMode.isDemo ? "影子账户权益" : "账户权益",
                                 value: PriceFormatter.money(equity) + " USD · " + "\(books.accountBalances.count - 1) 项持股")

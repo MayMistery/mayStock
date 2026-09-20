@@ -82,14 +82,42 @@ extension AppState {
         return "外部"
     }
 
-    /// The most recent fills across every strategy, newest first — on one
-    /// venue, or across all of them.
-    func recentFills(limit: Int, on venue: Venue? = nil) -> [StrategyFill] {
-        let venues = venue.map { [$0] } ?? Venue.allCases
-        return venues.flatMap { ledger(for: $0).fills.suffix(limit) }
-            .sorted { $0.ts > $1.ts }
-            .prefix(limit)
-            .map { $0 }
+    /// The most recent fills on one venue, ours and everybody else's, newest
+    /// first — what 「最近成交」 shows.
+    ///
+    /// The ledger's fills alone were not enough and that is the bug this
+    /// answers: the ledger only knows the orders this app placed *and tagged*,
+    /// so an account traded by hand, or by an untagged path, showed an empty
+    /// table no matter how much it had traded. The venue's own listing knows
+    /// every execution but keeps only a rolling window of them. The union is
+    /// both, with the ledger's copy winning wherever the two describe the same
+    /// execution — the rule for that lives in the kernel.
+    ///
+    /// One venue, never several. A row carries a price and a realised figure in
+    /// its own book's currency, and OKX settles in USDT while Schwab settles in
+    /// dollars; a list mixing the two would be a table whose 净益 column has no
+    /// unit. The combined scope shows the accounts side by side for the same
+    /// reason and never adds the two columns together.
+    ///
+    /// The venue's window is read from the last account refresh rather than
+    /// fetched here: this is called from a view's body, and a network call
+    /// inside a body is a call per redraw.
+    ///
+    /// Each side is trimmed to `limit` *before* the merge, which is not an
+    /// approximation. A fill in the union's top `limit` has at most `limit - 1`
+    /// fills newer than it in the union, hence at most that many newer in its
+    /// own book, so it is always inside its own book's top `limit`. Trimming
+    /// first bounds the JSON the kernel is handed — a book holds up to
+    /// `StrategyLedger.maxFills` rows — without changing a single row of the
+    /// answer.
+    func recentFillRows(limit: Int, on venue: Venue) -> [FillRow] {
+        let books = books(for: venue)
+        return TradingKernel.fillRows(
+            ledger: Array(ledger(for: venue).fills.suffix(limit)),
+            venue: Array(books.exchangeFills.prefix(limit)),
+            on: venue)
+        .prefix(limit)
+        .map { $0 }
     }
 
     /// The asset an instrument is exposure to, whatever family it is, on the

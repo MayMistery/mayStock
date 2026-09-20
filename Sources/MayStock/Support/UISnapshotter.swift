@@ -89,14 +89,19 @@ final class UISnapshotter {
             try await pause()
             try capture(terminal, name: "terminal-strategies-\(tab.rawValue)")
         }
-        // The overview is one venue's book at a time; every other venue gets
-        // its own frame so a change to the Schwab side can be looked at.
-        for venue in Venue.allCases where venue != selection.overviewVenue {
+        // Every venue's own book, whichever one the terminal happened to open
+        // on. The loop used to skip the selected venue, on the reasoning that
+        // its frame was already written — but the selection opens on the
+        // *combined* scope, so `overviewVenue` reads as OKX while no
+        // per-venue frame for OKX has been drawn at all. The account with the
+        // most to show was the one never rendered.
+        for venue in Venue.allCases {
             selection.page = .overview
-            selection.overviewVenue = venue
+            selection.overviewScope = .venue(venue)
             try await pause()
             try capture(terminal, name: "terminal-overview-\(venue.rawValue)")
         }
+        selection.overviewScope = .combined
         terminalWindow.orderOut(nil)
     }
 

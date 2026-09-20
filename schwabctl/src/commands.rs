@@ -264,7 +264,7 @@ fn require_live(cli: &Cli) -> Result<(), Error> {
     if cli.live {
         Ok(())
     } else {
-        Err(Error::Refused("schwabctl 只在 --live 下发送或撤销订单；嘉信没有模拟盘，模拟盘由 MayStock 本地撮合".into()))
+        Err(Error::Refused("schwabctl 只在 --live 下发送或撤销订单；嘉信的 paperMoney 不对 API 开放，模拟盘由 MayStock 本地撮合".into()))
     }
 }
 
