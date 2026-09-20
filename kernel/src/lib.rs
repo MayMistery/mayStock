@@ -18,6 +18,7 @@ pub mod decide;
 pub mod expr;
 pub mod fees;
 pub mod ffi;
+pub mod fills;
 pub mod guard;
 pub mod optimize;
 pub mod options;

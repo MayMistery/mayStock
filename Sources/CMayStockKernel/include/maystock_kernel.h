@@ -196,6 +196,33 @@ char *ms_evaluate_expression(const char *source,
                              const char *external_json,
                              char **error_out);
 
+/* Every key each fill record carries, strongest first: a JSON array of arrays,
+ * one per record, in the order given. Input is a JSON array of fill records
+ * {id, instId, tradeId?, billId?, tsMs, side?, leg?}.
+ *
+ * Both questions a caller has are in this one answer. Naming a row takes the
+ * first key; asking "have I already booked this execution?" unions every key
+ * and tests membership. That difference is not cosmetic: the exchange names
+ * one execution both by its trade counter and by its bill id, and a row
+ * written before this app read bill ids carries only the first while today's
+ * listing of the same fill carries both — naming alone would call them two.
+ * The rule lives in the kernel so the two sides cannot spell it differently.
+ * Caller frees. */
+char *ms_fill_keys(const char *records_json, char **error_out);
+
+/* Union the app's ledger with the venue's own fill history, newest first.
+ * Request JSON carries both books as {"ledger":[…],"venue":[…]}; the result
+ * names each surviving row's source and index plus how many venue rows the
+ * ledger already had. Caller frees. */
+char *ms_fill_merge(const char *request_json, char **error_out);
+
+/* What a position in `inst_id` settles in on `venue` — the currency its P&L,
+ * margin and premium are paid in, which on OKX is not always the currency the
+ * book runs on. Returns a bare string, not JSON. Caller frees. */
+char *ms_settlement_currency(const char *venue,
+                             const char *inst_id,
+                             char **error_out);
+
 #ifdef __cplusplus
 }
 #endif

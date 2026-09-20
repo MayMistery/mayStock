@@ -23,7 +23,8 @@ use std::ptr;
 use crate::backtest::{self, BacktestConfig};
 use crate::candle::Candle;
 use crate::decide::{self, Direction};
-use crate::strategy::{CompiledStrategy, InstrumentType, Manifest, Market};
+use crate::fills::{self, FillMergeRequest, FillRecord};
+use crate::strategy::{CompiledStrategy, InstrumentType, Manifest, Market, Venue};
 
 /// Opaque handle to a compiled strategy.
 pub struct MSStrategy {
@@ -931,6 +932,80 @@ pub unsafe extern "C" fn ms_instrument_policy(
     })
 }
 
+// MARK: - Fills
+
+/// Every key each fill record carries, strongest first: a JSON array of
+/// arrays, one per record, in the order given — see [`crate::fills::keys`].
+///
+/// This is the whole identity rule handed over in one call, because both
+/// questions a caller has are in it. A book that wants to *name* a row takes
+/// the first key; a book that wants to know whether it has *already seen* an
+/// execution unions every key and tests membership. Key overlap is what makes
+/// that second question answerable across builds: the exchange names one
+/// execution both `4294122652` (its trade counter) and `3931253135398440960`
+/// (its bill id), and a row written before this app read bill ids carries only
+/// the first while today's listing of the same fill carries both.
+///
+/// Swift asks rather than spelling the keys itself: a trade id is only an
+/// identity once qualified by its instrument (an option's is a per-instrument
+/// counter), and a rule written on both sides of the FFI is a rule that will
+/// eventually be written two different ways.
+#[no_mangle]
+pub unsafe extern "C" fn ms_fill_keys(
+    records_json: *const c_char,
+    error_out: *mut *mut c_char,
+) -> *mut c_char {
+    guarded(error_out, ptr::null_mut(), || {
+        let text = borrow_str(records_json).ok_or("fill records were null or not UTF-8")?;
+        let records: Vec<FillRecord> =
+            serde_json::from_str(text).map_err(|e| format!("成交记录无法解析：{e}"))?;
+        let keys: Vec<Vec<String>> = records.iter().map(fills::keys).collect();
+        serde_json::to_string(&keys)
+            .map(to_c_string)
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Union the app's ledger with the venue's own fill history, newest first, as
+/// JSON — see [`crate::fills::FillMerge`]. The input carries both books:
+/// `{"ledger":[…],"venue":[…]}`.
+#[no_mangle]
+pub unsafe extern "C" fn ms_fill_merge(
+    request_json: *const c_char,
+    error_out: *mut *mut c_char,
+) -> *mut c_char {
+    guarded(error_out, ptr::null_mut(), || {
+        let text = borrow_str(request_json).ok_or("fill books were null or not UTF-8")?;
+        let request: FillMergeRequest =
+            serde_json::from_str(text).map_err(|e| format!("成交簿无法解析：{e}"))?;
+        serde_json::to_string(&fills::merge(&request))
+            .map(to_c_string)
+            .map_err(|e| e.to_string())
+    })
+}
+
+// MARK: - Venue
+
+/// What a position in `inst_id` settles in on `venue` — the currency its P&L,
+/// margin and premium are paid in, which on OKX is not always the currency
+/// the book runs on. Returned as a bare string, not JSON. `venue` is the
+/// manifest spelling: `okx`, `schwab`.
+#[no_mangle]
+pub unsafe extern "C" fn ms_settlement_currency(
+    venue: *const c_char,
+    inst_id: *const c_char,
+    error_out: *mut *mut c_char,
+) -> *mut c_char {
+    guarded(error_out, ptr::null_mut(), || {
+        let venue_text = borrow_str(venue).ok_or("venue was null or not UTF-8")?;
+        let inst = borrow_str(inst_id).ok_or("instrument id was null or not UTF-8")?;
+        let parsed: Venue =
+            serde_json::from_value(serde_json::Value::String(venue_text.to_string()))
+                .map_err(|_| format!("未知的交易所：{venue_text}"))?;
+        Ok(to_c_string(parsed.settlement_currency(inst)))
+    })
+}
+
 #[cfg(test)]
 mod market_ffi_tests {
     use super::*;
@@ -1008,6 +1083,90 @@ mod market_ffi_tests {
         let bond = CString::new("BOND").unwrap();
         let json = unsafe { ms_instrument_policy(bond.as_ptr(), &mut error) };
         assert!(json.is_null());
+        assert!(!error.is_null());
+        unsafe { ms_string_free(error) };
+    }
+
+    fn read_string(pointer: *mut c_char) -> String {
+        let text = unsafe { CStr::from_ptr(pointer).to_string_lossy().into_owned() };
+        unsafe { ms_string_free(pointer) };
+        text
+    }
+
+    #[test]
+    fn fill_keys_cross_the_boundary_with_the_strongest_first() {
+        let mut error: *mut c_char = ptr::null_mut();
+        let records = CString::new(
+            r#"[{"id":"32","instId":"ETH-USD-260919-2610-C","tsMs":1},
+                {"id":"32","instId":"ETH-USD-260919-2625-C","tsMs":2},
+                {"id":"4294122652","instId":"ETH-USDT-SWAP","tradeId":"4294122652",
+                 "billId":"3931253135398440960","tsMs":3}]"#,
+        )
+        .unwrap();
+        let json = unsafe { ms_fill_keys(records.as_ptr(), &mut error) };
+        assert!(error.is_null());
+        let keys: Vec<Vec<String>> = serde_json::from_str(&read_string(json)).unwrap();
+        assert_eq!(keys.len(), 3, "one key set per record");
+        assert_ne!(keys[0][0], keys[1][0], "one counter, two instruments, two fills");
+        // Strongest first: the bill id, and the trade id it also carries.
+        assert_eq!(
+            keys[2],
+            vec![
+                "bill:3931253135398440960".to_string(),
+                "trade:ETH-USDT-SWAP|4294122652".to_string(),
+            ]
+        );
+
+        let broken = CString::new("{").unwrap();
+        assert!(unsafe { ms_fill_keys(broken.as_ptr(), &mut error) }.is_null());
+        assert!(!error.is_null());
+        unsafe { ms_string_free(error) };
+    }
+
+    #[test]
+    fn the_merge_crosses_the_boundary_and_says_what_it_matched() {
+        let mut error: *mut c_char = ptr::null_mut();
+        let request = CString::new(
+            r#"{"ledger":[{"id":"4319032649","instId":"ETH-USDT-SWAP","tsMs":10}],
+                "venue":[{"id":"4319032649","instId":"ETH-USDT-SWAP","tradeId":"4319032649",
+                          "billId":"b1","tsMs":10,"side":"buy","leg":"short"},
+                         {"id":"9","instId":"BTC-USDT","tradeId":"9","tsMs":90,"side":"buy","leg":"net"}]}"#,
+        )
+        .unwrap();
+        let json = unsafe { ms_fill_merge(request.as_ptr(), &mut error) };
+        assert!(error.is_null());
+        let value: serde_json::Value = serde_json::from_str(&read_string(json)).unwrap();
+        assert_eq!(value["matched"], 1);
+        let rows = value["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["source"], "venue", "newest first");
+        assert_eq!(rows[1]["source"], "ledger");
+        assert!(rows[0]["legEffect"].is_null(), "a net book cannot say");
+    }
+
+    #[test]
+    fn settlement_currency_is_the_kernels_answer_for_every_shape() {
+        let mut error: *mut c_char = ptr::null_mut();
+        let okx = CString::new("okx").unwrap();
+        let schwab = CString::new("schwab").unwrap();
+        for (inst, expected) in [
+            ("BTC-USDT-SWAP", "USDT"),
+            ("BTC-USD-SWAP", "BTC"),
+            ("BTC-USD-260921-71000-C", "BTC"),
+            ("ETH-EUR", "EUR"),
+            ("BTC", "USDT"),
+        ] {
+            let id = CString::new(inst).unwrap();
+            let answer = unsafe { ms_settlement_currency(okx.as_ptr(), id.as_ptr(), &mut error) };
+            assert!(error.is_null());
+            assert_eq!(read_string(answer), expected, "{inst}");
+        }
+        let aapl = CString::new("AAPL").unwrap();
+        let answer = unsafe { ms_settlement_currency(schwab.as_ptr(), aapl.as_ptr(), &mut error) };
+        assert_eq!(read_string(answer), "USD");
+
+        let nasdaq = CString::new("nasdaq").unwrap();
+        assert!(unsafe { ms_settlement_currency(nasdaq.as_ptr(), aapl.as_ptr(), &mut error) }.is_null());
         assert!(!error.is_null());
         unsafe { ms_string_free(error) };
     }
