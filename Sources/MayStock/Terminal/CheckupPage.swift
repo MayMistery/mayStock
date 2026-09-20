@@ -59,7 +59,8 @@ struct CheckupPage: View {
                 // whatever is held.
                 let requested = appState.requestedCheckupInstId
                 let created = CheckupModel(
-                    venue: appState.venue, mode: appState.tradingMode,
+                    venue: appState.exchangeVenue(for: appState.venue(of: Self.fallbackInstId)),
+                    mode: appState.tradingMode,
                     instId: requested ?? Self.fallbackInstId,
                     followsHeldPosition: requested == nil)
                 appState.pendingCheckupInstId = nil
@@ -184,9 +185,9 @@ struct CheckupPage: View {
                             StatTile(
                                 label: "标记价", value: PriceFormatter.plain(risk.markPrice),
                                 caption: "保证金 \(PriceFormatter.money(exposure.margin))",
-                                help: risk.maintenanceMargin.map {
-                                    "维持保证金 \(PriceFormatter.money($0))"
-                                })
+                                help: risk.maintenanceMargin.map { value in
+                                    "维持保证金 \(PriceFormatter.money(value))"
+                                } ?? nil)
                         }
                     }
                     if let ratio = risk.marginRatio {

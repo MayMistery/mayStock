@@ -30,6 +30,16 @@ extension AppState {
     /// on-disk record covers the same ground across restarts.
     private static var answeredNonces: Set<String> = []
 
+    /// The venue that owns an instrument's orders.
+    ///
+    /// Not the account's configured venue: an ETH option belongs to OKX even
+    /// when Schwab is the venue in focus, and sending it anywhere else would
+    /// be a request to the wrong exchange. The app already resolves this for
+    /// every other instrument-aware path; orders go through the same rule.
+    private func orderVenue(for instId: String) -> any ExchangeVenue {
+        exchangeVenue(for: venue(of: instId))
+    }
+
     private var pendingOrders: PendingOrderStore {
         PendingOrderStore(directory: PendingOrderStore.defaultDirectory())
     }
@@ -294,7 +304,7 @@ extension AppState {
                 约 \(PriceFormatter.money(step.estimatedCostQuote))）
                 """)
             do {
-                let result = try await venue.place(
+                let result = try await orderVenue(for: step.instId).place(
                     SettlementFunding.spotOrder(for: step),
                     mode: intent.mode, liveUnlocked: liveTradingUnlocked)
                 Log.warn("order-intent: 第 1 步成交 nonce=\(intent.nonce) ordId=\(result.ordId)")
@@ -319,7 +329,7 @@ extension AppState {
             // fill, and proceeding on the assumption it filled whole would put
             // the option leg back into the error this step was meant to avoid.
             if let shortfall = await Self.remainingShortfall(
-                venue: venue, mode: intent.mode, step: step, intent: intent,
+                venue: orderVenue(for: step.instId), mode: intent.mode, step: step, intent: intent,
                 limit: limit, context: context) {
                 store.resolve(intent.nonce)
                 Log.warn("""
@@ -359,7 +369,7 @@ extension AppState {
             """)
 
         do {
-            let result = try await venue.place(
+            let result = try await orderVenue(for: intent.instId).place(
                 order, mode: intent.mode, liveUnlocked: liveTradingUnlocked)
             store.resolve(intent.nonce)
             Log.warn("order-intent: 成交回执 nonce=\(intent.nonce) ordId=\(result.ordId)")
@@ -421,12 +431,12 @@ extension AppState {
 
     private func gatherContext(for intent: PendingOrderIntent) async -> Context {
         var context = Context()
-        context.accountConfig = try? await venue.accountTradingConfig(mode: intent.mode)
-        context.snapshot = try? await venue.accountSnapshot(mode: intent.mode)
+        context.accountConfig = try? await orderVenue(for: intent.instId).accountTradingConfig(mode: intent.mode)
+        context.snapshot = try? await orderVenue(for: intent.instId).accountSnapshot(mode: intent.mode)
 
         if intent.instType == .option {
             do {
-                let quote = try await venue.optionQuote(instId: intent.instId, mode: intent.mode)
+                let quote = try await orderVenue(for: intent.instId).optionQuote(instId: intent.instId, mode: intent.mode)
                 context.bid = quote.bid
                 context.ask = quote.ask
                 context.mark = quote.mark
@@ -439,12 +449,12 @@ extension AppState {
             // The contract's own specification decides the tick and how much
             // underlying a contract covers. Guessing either would misprice the
             // order or misstate the premium.
-            if let meta = try? await venue.instrumentMeta(instId: intent.instId, mode: intent.mode) {
+            if let meta = try? await orderVenue(for: intent.instId).instrumentMeta(instId: intent.instId, mode: intent.mode) {
                 if meta.tickSize > 0 { context.tickSize = meta.tickSize }
                 context.contractValue = meta.contractValue
             }
             let underlying = Self.underlying(of: intent.instId)
-            if let chain = try? await venue.optionChain(underlying: underlying, mode: intent.mode),
+            if let chain = try? await orderVenue(for: intent.instId).optionChain(underlying: underlying, mode: intent.mode),
                let contract = chain.first(where: { $0.instId == intent.instId }) {
                 context.contractValue = contract.contractValue
                 context.settleCurrency = contract.settleCurrency
@@ -452,7 +462,7 @@ extension AppState {
             }
         } else {
             do {
-                let last = try await venue.lastPrice(instId: intent.instId, mode: intent.mode)
+                let last = try await orderVenue(for: intent.instId).lastPrice(instId: intent.instId, mode: intent.mode)
                 context.bid = last
                 context.ask = last
                 context.mark = last
@@ -461,7 +471,7 @@ extension AppState {
                 Log.warn("order-intent: 无法取得 \(intent.instId) 的实时价格：\(reason)")
                 context.failure = reason
             }
-            if let meta = try? await venue.instrumentMeta(instId: intent.instId, mode: intent.mode),
+            if let meta = try? await orderVenue(for: intent.instId).instrumentMeta(instId: intent.instId, mode: intent.mode),
                meta.tickSize > 0 {
                 context.tickSize = meta.tickSize
             }
@@ -470,8 +480,8 @@ extension AppState {
         // What a spot leg would need, if one turns out to be required.
         if let coin = context.settleCurrency,
            let spot = SettlementFunding.spotMarket(for: coin) {
-            context.spotPrice = try? await venue.lastPrice(instId: spot, mode: intent.mode)
-            if let meta = try? await venue.instrumentMeta(instId: spot, mode: intent.mode) {
+            context.spotPrice = try? await orderVenue(for: spot).lastPrice(instId: spot, mode: intent.mode)
+            if let meta = try? await orderVenue(for: spot).instrumentMeta(instId: spot, mode: intent.mode) {
                 context.spotLotSize = meta.lotSize
                 context.spotMinSize = meta.minSize
             }
