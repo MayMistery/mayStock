@@ -88,7 +88,11 @@ public final class StrategyRunner {
     /// was computed from. Sampled on the tick so the menu bar always has a
     /// figure, whether or not any strategy is armed.
     public private(set) var accountEquity: Double?
-    public private(set) var accountBalances: [AccountBalance] = []
+    /// The reading `accountEquity` came from, kept whole so callers that need
+    /// the venue's own USD total — the cross-venue view — read the same
+    /// sample the balance lines came from rather than a second, later one.
+    public private(set) var accountSnapshot: AccountSnapshot?
+    public var accountBalances: [AccountBalance] { accountSnapshot?.balances ?? [] }
     public private(set) var lastEquitySampleAt: Date?
     /// Absolute market value of everything that is not a stablecoin: spot coin
     /// holdings plus the notional of every open derivative position.
@@ -826,7 +830,7 @@ public final class StrategyRunner {
         guard let snapshot = try? await host.venue.accountSnapshot(mode: host.portfolio.mode)
         else { return }
         lastEquitySampleAt = now
-        accountBalances = snapshot.balances
+        accountSnapshot = snapshot
 
         var total = 0.0
         var pricedEverything = true
@@ -1356,7 +1360,7 @@ public final class StrategyRunner {
         }
         measuredAccount = mode
         accountEquity = nil
-        accountBalances = []
+        accountSnapshot = nil
         lastEquitySampleAt = nil
         nonStableExposure = 0
         exposureIsComplete = true

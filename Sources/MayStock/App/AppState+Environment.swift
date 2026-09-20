@@ -228,7 +228,7 @@ extension AppState {
         Log.warn("mode: switched to \(mode.rawValue); disarmed \(armed.isEmpty ? "nothing" : armed.joined(separator: ", "))")
         for venue in Venue.allCases {
             let books = books(for: venue)
-            books.accountBalances = []
+            books.accountSnapshot = nil
             books.exchangePositions = []
             books.openOrders = []
             books.openOrdersNote = nil

@@ -126,7 +126,7 @@ final class FakeVenue: ExchangeVenue, @unchecked Sendable {
             await withCheckedContinuation { wedged = $0 }
         }
         if let accountSnapshotFailure { throw accountSnapshotFailure }
-        return AccountSnapshot(balances: balances, totalEquity: equity)
+        return AccountSnapshot(balances: balances, totalEquity: equity, equityCurrency: "USD")
     }
 
     func releaseWedge() {

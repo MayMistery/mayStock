@@ -27,7 +27,13 @@ final class VenueBooks {
     private(set) var lastCompletedTickAt: Date?
 
     // The latest reading of the venue's account, as the UI shows it.
-    var accountBalances: [AccountBalance] = []
+    /// The whole reading, not just its balance lines: the aggregate view needs
+    /// the venue's own `totalEquity` — the one figure that is already in USD
+    /// and already counts what no balance line carries (a derivative's
+    /// unrealised P&L) — and deriving the lines from here keeps the two from
+    /// describing different moments.
+    var accountSnapshot: AccountSnapshot?
+    var accountBalances: [AccountBalance] { accountSnapshot?.balances ?? [] }
     var exchangePositions: [ExchangePosition] = []
     var accountError: String?
     var accountRefreshedAt: Date?
@@ -95,7 +101,7 @@ final class VenueBooks {
 
     func didSampleEquity(_ equity: Double, mode: TradingMode, at ts: Date) {
         equityCurve(for: mode).record(equity: equity, at: ts)
-        accountBalances = runner.accountBalances
+        accountSnapshot = runner.accountSnapshot
         accountRefreshedAt = ts
     }
 

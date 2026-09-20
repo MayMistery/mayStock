@@ -52,6 +52,24 @@ public enum InstrumentType: String, Codable, Sendable, CaseIterable {
     /// Only perpetuals settle funding.
     public var settlesFunding: Bool { self == .swap }
 
+    /// Whether the exchange keeps an algo-order book for this family.
+    ///
+    /// False is a fact about the exchange, not a failure to read it: OKX
+    /// refuses `option algo orders` with "Parameter instType error" for
+    /// *every* order kind — measured across all seven on 2026-09-20 — because
+    /// options have no algo book to list. The distinction matters on screen:
+    /// a book that cannot be read has to be reported, since a stop may be
+    /// armed there and invisible; a book that does not exist has nothing to
+    /// report, and warning about it teaches the reader to ignore warnings.
+    public var hasAlgoBook: Bool {
+        switch self {
+        case .spot, .swap: return true
+        // Options: refused by the exchange, see above. Stocks never reach the
+        // OKX bridge — Schwab lists its own working orders instead.
+        case .option, .stock: return false
+        }
+    }
+
     /// Base units per contract when the exchange has nothing to say.
     ///
     /// Anything sized in its own base unit — a coin, a share — is one-for-one

@@ -357,6 +357,52 @@ final class AppState {
     /// that venue's runner.
     func accountEquity(for venue: Venue) -> Double? { runner(for: venue).accountEquity }
 
+    /// Every account added up, in dollars, from the same readings the
+    /// per-venue pages show. Accounts that could not be read are named in the
+    /// result rather than dropped, so the total is never quietly a subtotal.
+    var combinedPortfolio: CombinedPortfolio {
+        CombinedPortfolio.combine(Venue.allCases.map { venue in
+            let books = books(for: venue)
+            return CombinedPortfolio.Reading(
+                venue: venue, snapshot: books.accountSnapshot,
+                error: books.accountError, readAt: books.accountRefreshedAt)
+        })
+    }
+
+    /// Ledger profit across every account. Nil only when no account has a
+    /// book at all — one venue having nothing to report must not blank the
+    /// other's figure, so a nil from a single venue counts as zero here and
+    /// the account list above says which venues were readable.
+    var combinedOpenPnL: Double? {
+        let figures = Venue.allCases.compactMap { openPnL(for: $0) }
+        return figures.isEmpty ? nil : figures.reduce(0, +)
+    }
+
+    /// Exchange-marked unrealised profit across every account.
+    var combinedExchangeUnrealisedPnL: Double? {
+        let figures = Venue.allCases.compactMap { exchangeUnrealisedPnL(for: $0) }
+        return figures.isEmpty ? nil : figures.reduce(0, +)
+    }
+
+    /// Price risk across every account, in dollars, and as a share of the
+    /// combined equity.
+    ///
+    /// `isComplete` is false as soon as any venue could not value everything
+    /// it holds, or any account is missing from the total — in either case
+    /// the percentage is a floor, and the caller marks it as one.
+    var combinedExposure: (usd: Double, pct: Double?, isComplete: Bool) {
+        let portfolio = combinedPortfolio
+        var exposure = 0.0
+        var complete = portfolio.isComplete
+        for venue in Venue.allCases {
+            let runner = runner(for: venue)
+            exposure += runner.nonStableExposure
+            if !runner.exposureIsComplete { complete = false }
+        }
+        let pct = portfolio.totalUsd.flatMap { $0 > 0 ? exposure / $0 * 100 : nil }
+        return (exposure, pct, complete)
+    }
+
     /// Share of a venue's equity exposed to non-stablecoin price risk.
     func nonStableExposurePct(for venue: Venue) -> Double? { runner(for: venue).nonStableExposurePct }
 
@@ -475,7 +521,7 @@ final class AppState {
             if schwabCLI == nil { await detectSchwabCLI() } else { schwabStatus = try? await schwabBridge.status() }
         }
         guard tradingReady(for: venue) else {
-            books.accountBalances = []
+            books.accountSnapshot = nil
             books.exchangePositions = []
             books.accountError = tradingBlocker(for: venue)
             return
@@ -483,7 +529,7 @@ final class AppState {
         let exchange = exchangeVenue(for: venue)
         let mode = tradingMode
         do {
-            books.accountBalances = try await exchange.accountSnapshot(mode: mode).balances
+            books.accountSnapshot = try await exchange.accountSnapshot(mode: mode)
             // Every position the venue holds, whatever family: the unfiltered
             // derivative listing, plus each family that is held as a
             // position rather than as a balance but is not a contract — a

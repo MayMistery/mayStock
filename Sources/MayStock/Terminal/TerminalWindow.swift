@@ -48,9 +48,43 @@ final class TerminalSelection {
     var detailTab: StrategyDetailTab = .backtest
     /// Window of the account equity chart on the overview.
     var equityWindow: EquityWindow = .day1
-    /// Which venue's book the overview is showing. Two accounts in two
-    /// currencies never share a tile.
-    var overviewVenue: Venue = .okx
+    /// Which book the overview is showing: one account, or every account
+    /// added up. Two accounts in two currencies never share a tile, so the
+    /// aggregate is its own scope rather than a third venue.
+    var overviewScope: OverviewScope = .combined
+    /// The venue the overview falls back to, and returns to, when the scope
+    /// is a single account.
+    var overviewVenue: Venue {
+        get { if case .venue(let venue) = overviewScope { return venue } else { return .okx } }
+        set { overviewScope = .venue(newValue) }
+    }
+}
+
+/// What the overview page is showing.
+enum OverviewScope: Hashable, Identifiable {
+    /// Every account, added up in dollars.
+    case combined
+    /// One account, in its own currency.
+    case venue(Venue)
+
+    var id: String {
+        switch self {
+        case .combined: return "combined"
+        case .venue(let venue): return venue.rawValue
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .combined: return "全部"
+        case .venue(let venue): return venue.displayName
+        }
+    }
+
+    /// Every scope the picker offers: the aggregate first, because it is the
+    /// question "what am I worth" and the per-account pages are the
+    /// follow-ups.
+    static var allCases: [OverviewScope] { [.combined] + Venue.allCases.map(OverviewScope.venue) }
 }
 
 /// Owns the terminal window — created lazily, reused, and never changing the

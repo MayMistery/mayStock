@@ -8,8 +8,10 @@ struct OverviewPage: View {
     @Bindable var selection: TerminalSelection
 
     private var mode: TradingMode { appState.tradingMode }
-    /// The venue on show. Every figure on this page is one account's, in
-    /// that account's currency; the picker in the header switches books.
+    /// What the page is showing: every account added up, or one account's
+    /// book. Each per-account figure is in that account's currency, which is
+    /// why the two are different pages rather than one page with a filter.
+    private var scope: OverviewScope { selection.overviewScope }
     private var venue: Venue { selection.overviewVenue }
     private var books: VenueBooks { appState.books(for: venue) }
 
@@ -19,17 +21,37 @@ struct OverviewPage: View {
             .onAppear { appState.refreshAccountIfStale(maxAge: 60) }
     }
 
+    @ViewBuilder
     private var pageBody: some View {
+        switch scope {
+        case .combined: combinedBody
+        case .venue: venueBody
+        }
+    }
+
+    /// The picker, shared by both scopes so switching never moves it.
+    private var scopePicker: some View {
+        PillSegments(
+            segments: OverviewScope.allCases.map { option in
+                PillSegments<OverviewScope>.Segment(
+                    value: option, title: option.title,
+                    help: {
+                        switch option {
+                        case .combined: return "全部账户合计（USD）"
+                        case .venue(let venue): return "\(venue.displayName)账户（\(venue.quoteCurrency)）"
+                        }
+                    }())
+            },
+            selection: scope,
+            onSelect: { selection.overviewScope = $0 })
+    }
+
+    private var venueBody: some View {
         PageScroll {
             VStack(alignment: .leading, spacing: Theme.sectionSpacing) {
                 PageHeader(title: "总览",
                            subtitle: "\(venue.displayName)\(mode.displayName)账户 · 账户读数 " + Format.relative(books.accountRefreshedAt)) {
-                    PillSegments(
-                        segments: Venue.allCases.map {
-                            PillSegments<Venue>.Segment(value: $0, title: $0.displayName, help: "\($0.displayName)账户（\($0.quoteCurrency)）")
-                        },
-                        selection: venue,
-                        onSelect: { selection.overviewVenue = $0 })
+                    scopePicker
                     Button {
                         Task { await appState.refreshAccount(venue) }
                     } label: {
@@ -56,6 +78,188 @@ struct OverviewPage: View {
                 }
             }
             .padding(Theme.pagePadding)
+        }
+    }
+
+    // MARK: Combined scope
+
+    /// Every account at once: the one total, what each account contributes,
+    /// and — side by side — the holdings and open orders of both books.
+    ///
+    /// Nothing here is denominated in a venue's quote currency. A figure that
+    /// cannot be stated in dollars is not shown as a number at all; it is
+    /// named in the coverage note under the total.
+    private var combinedBody: some View {
+        let portfolio = appState.combinedPortfolio
+        return PageScroll {
+            VStack(alignment: .leading, spacing: Theme.sectionSpacing) {
+                PageHeader(title: "总览",
+                           subtitle: "全部账户\(mode.displayName) · 账户读数 " + Format.relative(portfolio.oldestReadAt)) {
+                    scopePicker
+                    Button {
+                        Task { await appState.refreshAccount() }
+                    } label: {
+                        Label("刷新账户", systemImage: "arrow.clockwise")
+                    }
+                    .controlSize(.small)
+                    .disabled(Venue.allCases.contains { appState.books(for: $0).isRefreshingAccount })
+                }
+
+                combinedNotices(portfolio)
+                combinedStats(portfolio)
+                combinedSharesCard(portfolio)
+
+                HStack(alignment: .top, spacing: Theme.sectionSpacing) {
+                    ForEach(Venue.allCases) { venue in
+                        venueColumn(venue).frame(maxWidth: .infinity)
+                    }
+                }
+            }
+            .padding(Theme.pagePadding)
+        }
+    }
+
+    @ViewBuilder
+    private func combinedNotices(_ portfolio: CombinedPortfolio) -> some View {
+        let engine = appState.engineNotices
+        if !engine.isEmpty || !portfolio.missing.isEmpty {
+            VStack(spacing: 8) {
+                ForEach(Array(engine.enumerated()), id: \.offset) { _, notice in
+                    InlineNotice(kind: notice.kind == .heartbeat ? .danger : .warning,
+                                 title: title(for: notice.kind), message: notice.text,
+                                 actionTitle: notice.kind == .emergencyStop ? "解除急停" : nil,
+                                 action: notice.kind == .emergencyStop ? { appState.clearEmergencyStop() } : nil)
+                }
+                // A total that silently leaves an account out is worse than no
+                // total, so the omission gets the same weight as an error.
+                ForEach(portfolio.missing) { share in
+                    InlineNotice(kind: .warning,
+                                 title: "合计未计入\(share.venue.displayName)",
+                                 message: (share.absence?.text ?? "原因不明")
+                                     + "。下面的合计是这一部分之外的，实际总额只会更高。",
+                                 actionTitle: "账户与连接", action: { appState.openTerminal(.account) })
+                }
+            }
+        }
+    }
+
+    private func combinedStats(_ portfolio: CombinedPortfolio) -> some View {
+        let exposure = appState.combinedExposure
+        return HStack(spacing: Theme.itemSpacing) {
+            StatTile(label: "全部账户权益 · USD",
+                     value: Format.money(portfolio.totalUsd),
+                     caption: portfolio.isComplete
+                         ? "\(portfolio.shares.count) 个账户合计"
+                         : (portfolio.coverageNote.isEmpty ? "等待账户读数" : portfolio.coverageNote),
+                     captionTint: portfolio.isComplete ? .secondary : Theme.warning,
+                     help: portfolio.isComplete
+                         ? "每个账户各自报告的权益，折合美元后相加。OKX 的 totalEq 本身就是美元口径（逐币种 eqUsd 之和），不是 USDT 面值。"
+                         : "只统计了读到的账户，读不到的列在上方提示里。")
+            StatTile(label: "账本盈亏 · 已实现 + 浮动",
+                     value: Format.signedMoney(appState.combinedOpenPnL),
+                     tint: appState.combinedOpenPnL.map(Theme.signed) ?? .secondary,
+                     caption: "全部账户台账合计",
+                     help: "每个账户台账上每个策略的已实现盈亏加浮动盈亏之和。两个账户都以美元计价，可直接相加。")
+            StatTile(label: "浮动盈亏 · 交易所标记",
+                     value: Format.signedMoney(appState.combinedExchangeUnrealisedPnL),
+                     tint: appState.combinedExchangeUnrealisedPnL.map(Theme.signed) ?? .secondary,
+                     caption: "\(Venue.allCases.reduce(0) { $0 + appState.books(for: $1).exchangePositions.count }) 个持仓",
+                     help: "两个交易所对全部持仓按标记价算出的未实现盈亏之和。")
+            StatTile(label: "风险敞口 · USD",
+                     value: Format.money(exposure.usd, decimals: 0),
+                     caption: exposure.pct.map {
+                         "占全部权益 \(PriceFormatter.decimals($0, 1))%" + (exposure.isComplete ? "" : "*")
+                     } ?? "等待引擎采样",
+                     captionTint: combinedRiskTint(exposure.pct),
+                     help: exposure.isComplete
+                         ? "两个账户的非稳定币持仓与持股，加上全部衍生品名义额，占全部账户权益的比例。"
+                         : "* 有持仓未能读到或无法估值，实际敞口只会更高。")
+        }
+    }
+
+    private func combinedRiskTint(_ pct: Double?) -> Color {
+        switch pct ?? 0 {
+        case ..<25: return .secondary
+        case ..<75: return Theme.warning
+        default: return Theme.down
+        }
+    }
+
+    /// What each account brings to the total — the answer to "where is my
+    /// money", which the per-account pages cannot give.
+    private func combinedSharesCard(_ portfolio: CombinedPortfolio) -> some View {
+        Card(title: "账户构成",
+             subtitle: portfolio.isComplete
+                 ? "各账户权益折美元 · 按占比排序"
+                 : "各账户权益折美元 · " + portfolio.coverageNote) {
+            EmptyView()
+        } content: {
+            DataGrid(columns: [
+                GridColumn(title: "账户"), GridColumn(title: "本币权益", alignment: .trailing),
+                GridColumn(title: "计价"), GridColumn(title: "折合 USD", alignment: .trailing),
+                GridColumn(title: "占比", alignment: .trailing), GridColumn(title: "读数"),
+            ], rows: portfolio.shares.sorted { ($0.usdEquity ?? -1) > ($1.usdEquity ?? -1) },
+               emptyText: "读取账户后显示") { share in
+                GridText(share.venue.displayName, weight: .medium, fit: true)
+                GridText(Format.money(share.nativeEquity), mono: true, alignment: .trailing)
+                GridText(share.nativeCurrency, tint: .secondary, fit: true)
+                GridText(Format.money(share.usdEquity), mono: true, alignment: .trailing)
+                GridText(share.usdEquity.flatMap { usd in
+                    portfolio.totalUsd.flatMap { $0 > 0 ? PriceFormatter.decimals(usd / $0 * 100, 1) + "%" : nil }
+                } ?? "—", mono: true, alignment: .trailing)
+                GridText(share.absence?.text ?? Format.relative(share.readAt),
+                         tint: share.isIncluded ? .secondary : Theme.warning, fit: true)
+            }
+        }
+    }
+
+    /// One account's holdings and resting orders, stacked, for the
+    /// side-by-side comparison the aggregate scope exists to make possible.
+    private func venueColumn(_ venue: Venue) -> some View {
+        let books = appState.books(for: venue)
+        let equity = appState.accountEquity(for: venue)
+        return Card(title: venue.displayName,
+                    subtitle: equity.map { PriceFormatter.money($0) + " " + venue.quoteCurrency }
+                        ?? (appState.tradingBlocker(for: venue) ?? "等待账户读数")) {
+            Button("单独看") { selection.overviewScope = .venue(venue) }.controlSize(.small)
+        } content: {
+            let positions = appState.openPositions(on: venue)
+            let external = appState.externalPositions(on: venue)
+            DataGrid(columns: [
+                GridColumn(title: "标的"), GridColumn(title: "方向"),
+                GridColumn(title: "数量", alignment: .trailing),
+                GridColumn(title: "盈亏", alignment: .trailing),
+            ], rows: positions, emptyText: books.accountError ?? "空仓") { position in
+                let mark = appState.mark(for: position.instId)
+                let pnl = position.netPnL(mark: mark)
+                GridText(position.instId, mono: true, weight: .medium, fit: true)
+                GridText(position.direction?.displayName ?? "—",
+                         tint: Theme.trend(position.quantity > 0), weight: .semibold, fit: true)
+                GridText(PriceFormatter.plain(abs(position.baseQuantity)), mono: true, alignment: .trailing)
+                GridText(PriceFormatter.signedMoney(pnl), tint: Theme.signed(pnl), mono: true, alignment: .trailing)
+            }
+            if !external.isEmpty {
+                Text("交易所持仓 · 非 MayStock 策略开仓")
+                    .font(Theme.Text.caption).foregroundStyle(.secondary).padding(.top, 6)
+                DataGrid(columns: [
+                    GridColumn(title: "标的"), GridColumn(title: "方向"),
+                    GridColumn(title: "名义额", alignment: .trailing),
+                    GridColumn(title: "未实现", alignment: .trailing),
+                ], rows: external) { position in
+                    GridText(position.instId, mono: true, weight: .medium, fit: true)
+                    GridText(position.quantity > 0 ? "多" : "空",
+                             tint: Theme.trend(position.quantity > 0), weight: .semibold, fit: true)
+                    GridText(position.notionalUsd.map { PriceFormatter.money($0, decimals: 0) } ?? "—",
+                             mono: true, alignment: .trailing)
+                    GridText(PriceFormatter.signedMoney(position.unrealisedPnL),
+                             tint: Theme.signed(position.unrealisedPnL), mono: true, alignment: .trailing)
+                }
+            }
+            if let note = books.openOrdersNote ?? books.openOrdersError {
+                Text(note).font(Theme.Text.caption).foregroundStyle(Theme.warning).padding(.top, 6)
+            }
+            Text("挂单 \(books.openOrders.count) 笔")
+                .font(Theme.Text.caption).foregroundStyle(.secondary).padding(.top, 6)
         }
     }
 

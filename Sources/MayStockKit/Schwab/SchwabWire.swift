@@ -155,7 +155,11 @@ public struct SchwabAccount: Sendable, Equatable {
     }
 
     public var snapshot: AccountSnapshot {
-        AccountSnapshot(balances: balances, totalEquity: equity)
+        AccountSnapshot(
+            balances: balances, totalEquity: equity,
+            // Schwab reports a US brokerage account; every figure on the wire
+            // is dollars.
+            equityCurrency: "USD")
     }
 
     /// Shares held in `symbol`, signed.

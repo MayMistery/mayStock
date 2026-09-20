@@ -222,14 +222,26 @@ public struct AccountBalance: Sendable, Equatable, Identifiable {
 /// it is worth.
 public struct AccountSnapshot: Sendable, Equatable {
     public let balances: [AccountBalance]
-    /// Exchange-reported total equity, in the account's valuation currency.
-    /// Nil when the CLI does not report one — callers then value the balances
-    /// themselves rather than inventing a number.
+    /// Exchange-reported total equity, in `equityCurrency`. Nil when the venue
+    /// does not report one — callers then value the balances themselves rather
+    /// than inventing a number.
     public let totalEquity: Double?
+    /// What `totalEquity` is denominated in, stated by the venue that produced
+    /// it rather than inferred from `Venue.quoteCurrency`.
+    ///
+    /// The two are not the same thing and assuming so is wrong on OKX: the
+    /// book quotes in USDT, but `totalEq` is dollars — measured on the live
+    /// account, `sum(details[].eqUsd) == totalEq` to the last reported digit
+    /// while the USDT line alone reads `eq 65153.446` against
+    /// `eqUsd 65127.385`. Summing that against Schwab as if both were the
+    /// venue's quote currency would add dollars to something that is not
+    /// quite dollars and call the result a portfolio.
+    public let equityCurrency: String
 
-    public init(balances: [AccountBalance], totalEquity: Double?) {
+    public init(balances: [AccountBalance], totalEquity: Double?, equityCurrency: String) {
         self.balances = balances
         self.totalEquity = totalEquity
+        self.equityCurrency = equityCurrency
     }
 
     public func balance(of ccy: String) -> AccountBalance? {
@@ -369,6 +381,36 @@ public struct ExchangeOpenOrder: Sendable, Equatable, Identifiable {
         case order, algo
 
         public var displayName: String { self == .order ? "普通委托" : "策略委托" }
+    }
+
+    /// The kinds of algo order OKX keeps, each in its own list.
+    ///
+    /// This is an enum and not a `String` default because the listing
+    /// endpoint takes exactly one kind per call and has no "all": asking
+    /// without one is refused (`51000 Parameter ordType error`), and asking
+    /// with the CLI's default returns `conditional` alone. So the only way to
+    /// see the whole algo book is to ask for every case here — which is what
+    /// makes the set a *declaration*: add a kind the exchange grows and the
+    /// listing covers it the same day, with no call site to update.
+    ///
+    /// Measured against CLI 1.4.1 on 2026-09-20: every case below is accepted
+    /// by `spot`, `swap` and `futures`; an unknown word is rejected outright,
+    /// which is how this list was checked rather than assumed.
+    public enum AlgoKind: String, Sendable, CaseIterable {
+        case conditional, oco, trigger, moveOrderStop = "move_order_stop"
+        case chase, iceberg, twap
+
+        public var displayName: String {
+            switch self {
+            case .conditional: return "止盈止损"
+            case .oco: return "OCO"
+            case .trigger: return "计划委托"
+            case .moveOrderStop: return "移动止损"
+            case .chase: return "追单"
+            case .iceberg: return "冰山"
+            case .twap: return "TWAP"
+            }
+        }
     }
 
     /// `ordId`, or `algoId` for the algo book.
@@ -858,16 +900,29 @@ public struct TradeBridge: Sendable {
 
     /// `okx account balance-all` — trading + funding balances with valuation.
     /// Falls back to `account balance` on CLI versions without the aggregate.
+    ///
+    /// `--no-aggregate` is not a preference: the server-side aggregate trims
+    /// each currency down to `{availEq, ccy, currencyId, eq, frozenBal, upl}`,
+    /// dropping the `eqUsd` that every USD figure on the account is built
+    /// from — measured against CLI 1.4.1, where the aggregate's details carry
+    /// 6 keys and the fallback's carry 49. Paying ~500ms instead of ~90ms
+    /// buys per-currency USD valuation; the account is read every 300s.
     public func accountSnapshot(mode: TradingMode) async throws -> AccountSnapshot {
         let output: String
-        if let aggregate = try? await runCLI(["account", "balance-all"], mode: mode) {
-            output = aggregate
+        if let perCurrency = try? await runCLI(
+            ["account", "balance-all", "--no-aggregate", "--valuationCcy", "USD"], mode: mode) {
+            output = perCurrency
         } else {
             output = try await runCLI(["account", "balance"], mode: mode)
         }
         return AccountSnapshot(
             balances: Self.parseBalances(json: output),
-            totalEquity: Self.parseTotalEquity(json: output))
+            totalEquity: Self.parseTotalEquity(json: output),
+            // Both figures the parse can return are dollars: `totalEq` is
+            // OKX's own USD equity, and `totalBal` is the valuation block,
+            // which is why `--valuationCcy USD` is passed above rather than
+            // left to default to the account's USDT.
+            equityCurrency: "USD")
     }
 
     public func balances(mode: TradingMode) async throws -> [AccountBalance] {
@@ -1175,33 +1230,85 @@ public struct TradeBridge: Sendable {
     // MARK: Open orders
 
     /// Every order the exchange is holding open on this account: the normal
-    /// book and the algo book of each family the CLI has a module for.
+    /// book, plus every kind of algo order, for each family the CLI has a
+    /// module for.
     ///
-    /// A book that cannot be listed is reported by name rather than skipped.
-    /// The CLI's option algo listing, for one, is refused by the exchange
-    /// ("Parameter instType error"), and an empty list in its place would
-    /// read as "nothing armed" on an account that may well have a stop there.
-    /// Only when no book at all could be read is the failure an error.
+    /// Why one call per algo kind rather than one per family: the listing
+    /// endpoint takes exactly one `ordType` and has no "all". Asking without
+    /// one is refused, and the CLI's own default is `conditional` — so the
+    /// version of this that asked once per family was not reading the algo
+    /// book, it was reading one seventh of it, and a trailing stop or a
+    /// planned order sat on the exchange invisible to every screen here.
+    /// `AlgoKind.allCases` is the fix and the guard: a kind added there is
+    /// listed from that moment, with nothing to remember to update.
+    ///
+    /// Books are asked for concurrently. Serially this is 22 invocations at
+    /// roughly 0.6s apiece, which would put the account refresh past the
+    /// runner's tick; the exchange's own rate limit, not this loop, is what
+    /// should bound it.
+    ///
+    /// A book that *could not be read* is named in `unavailable`, because an
+    /// empty list in its place would read as "nothing armed". A book that
+    /// *does not exist* — see `InstrumentType.hasAlgoBook` — is not asked for
+    /// and not reported: there is nothing there to miss. Only when every book
+    /// that was asked for failed is the whole listing an error.
     public func openOrders(mode: TradingMode) async throws -> OpenOrderListing {
-        var listing = OpenOrderListing()
-        var firstError: Error?
-        var attempted = 0
+        struct Request: Sendable {
+            let label: String
+            let book: ExchangeOpenOrder.Book
+            let arguments: [String]
+        }
+        var requests: [Request] = []
         for instType in InstrumentType.allCases {
             guard let module = instType.cliModule else { continue }
-            for book in ExchangeOpenOrder.Book.allCases {
-                attempted += 1
-                let arguments = book == .order ? [module, "orders"] : [module, "algo", "orders"]
-                do {
-                    let output = try await runCLI(arguments, mode: mode)
-                    listing.orders += Self.parseOpenOrders(json: output, book: book)
-                } catch {
-                    firstError = firstError ?? error
-                    listing.unavailable.append("\(instType.displayName)\(book.displayName)")
-                    Log.warn("bridge: 读取\(instType.displayName)\(book.displayName)失败：\(error)")
-                }
+            requests.append(Request(
+                label: "\(instType.displayName)\(ExchangeOpenOrder.Book.order.displayName)",
+                book: .order, arguments: [module, "orders"]))
+            guard instType.hasAlgoBook else { continue }
+            for kind in ExchangeOpenOrder.AlgoKind.allCases {
+                requests.append(Request(
+                    label: "\(instType.displayName)\(kind.displayName)",
+                    book: .algo, arguments: [module, "algo", "orders", "--ordType", kind.rawValue]))
             }
         }
-        if listing.unavailable.count == attempted, let firstError { throw firstError }
+
+        let results = await withTaskGroup(
+            of: (label: String, orders: [ExchangeOpenOrder]?, error: Error?).self
+        ) { group in
+            for request in requests {
+                group.addTask {
+                    do {
+                        let output = try await runCLI(request.arguments, mode: mode)
+                        return (request.label, Self.parseOpenOrders(json: output, book: request.book), nil)
+                    } catch {
+                        return (request.label, nil, error)
+                    }
+                }
+            }
+            var out: [(label: String, orders: [ExchangeOpenOrder]?, error: Error?)] = []
+            for await result in group { out.append(result) }
+            return out
+        }
+
+        var listing = OpenOrderListing()
+        var firstError: Error?
+        for result in results {
+            if let orders = result.orders {
+                listing.orders += orders
+            } else {
+                firstError = firstError ?? result.error
+                listing.unavailable.append(result.label)
+                Log.warn("bridge: 读取\(result.label)失败：\(result.error.map(String.init(describing:)) ?? "未知")")
+            }
+        }
+        if listing.unavailable.count == requests.count, let firstError { throw firstError }
+        // The same order can only come back once — one kind per call, and the
+        // normal and algo books are disjoint — but ids are what the UI keys
+        // rows by, so a duplicate would corrupt the list rather than lengthen
+        // it. Cheap insurance against a CLI that someday widens a filter.
+        var seen = Set<String>()
+        listing.orders = listing.orders.filter { seen.insert($0.id).inserted }
+        listing.unavailable.sort()
         listing.orders.sort { ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast) }
         return listing
     }

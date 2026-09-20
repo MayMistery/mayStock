@@ -177,7 +177,11 @@ public actor ShadowBook {
                 valuationUsd: mark.map { $0 * position.quantity }))
             if let mark { equity += mark * position.quantity } else { priced = false }
         }
-        return AccountSnapshot(balances: balances, totalEquity: priced ? equity : nil)
+        return AccountSnapshot(
+            balances: balances, totalEquity: priced ? equity : nil,
+            // The book's cash is the venue's quote currency by construction,
+            // and every holding is valued in it.
+            equityCurrency: venue.quoteCurrency)
     }
 
     public func fills(instId: String?) -> [ExchangeFill] {
