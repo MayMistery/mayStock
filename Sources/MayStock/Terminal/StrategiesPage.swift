@@ -64,27 +64,34 @@ private struct PortfolioBar: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("策略组合").font(Theme.Text.title)
                     Text("运行中 \(portfolio.runningCount)/\(appState.strategies.count) · "
-                         + "已分配 \(PriceFormatter.money(portfolio.allocatedCapital, decimals: 0)) · "
-                         + "未分配 \(PriceFormatter.money(portfolio.unallocatedCapital, decimals: 0)) \(portfolio.quoteCurrency)")
+                         + Venue.allCases.map { venue in
+                             "\(venue.displayName) 已分配 \(PriceFormatter.money(portfolio.allocatedCapital(on: venue), decimals: 0))"
+                             + " / \(PriceFormatter.money(portfolio.totalCapital(for: venue), decimals: 0)) \(venue.quoteCurrency)"
+                         }.joined(separator: " · "))
                         .font(Theme.Text.secondary).numeric()
-                        .foregroundStyle(portfolio.isOverAllocated ? Theme.down : .secondary)
+                        .foregroundStyle(portfolio.overAllocatedVenues.isEmpty ? .secondary : Theme.down)
                     diversificationLine
                 }
                 Spacer()
-                figure("本金 · \(portfolio.quoteCurrency)") {
-                    CommitTextField(placeholder: "0", value: PriceFormatter.plain(portfolio.totalCapital), width: 96) { text in
-                        if let value = Double(text) { appState.setTotalCapital(value) }
-                    }
-                }
-                figure("合计盈亏") {
-                    let pnl = appState.portfolioNetPnL
-                    HStack(spacing: 5) {
-                        Text(PriceFormatter.signedMoney(pnl)).font(Theme.Text.number).numeric()
-                        if let pct = appState.portfolioReturnPct {
-                            Text("(\(PriceFormatter.signedPercent(pct)))").font(Theme.Text.captionMedium).numeric()
+                // One pot per venue: the two are different accounts in
+                // different currencies, and a single field would have to
+                // pretend otherwise.
+                ForEach(Venue.allCases) { venue in
+                    figure("\(venue.displayName)本金 · \(venue.quoteCurrency)") {
+                        CommitTextField(placeholder: "0", value: PriceFormatter.plain(portfolio.totalCapital(for: venue)), width: 96) { text in
+                            if let value = Double(text) { appState.setTotalCapital(value, for: venue) }
                         }
                     }
-                    .foregroundStyle(Theme.signed(pnl))
+                    figure("\(venue.displayName)盈亏") {
+                        let pnl = appState.portfolioNetPnL(on: venue)
+                        HStack(spacing: 5) {
+                            Text(PriceFormatter.signedMoney(pnl)).font(Theme.Text.number).numeric()
+                            if let pct = appState.portfolioReturnPct(on: venue) {
+                                Text("(\(PriceFormatter.signedPercent(pct)))").font(Theme.Text.captionMedium).numeric()
+                            }
+                        }
+                        .foregroundStyle(Theme.signed(pnl))
+                    }
                 }
                 Button {
                     appState.runAllBacktests()
@@ -94,11 +101,12 @@ private struct PortfolioBar: View {
                 .controlSize(.small)
                 .help("重新回测全部策略（只用公开行情）")
             }
-            if portfolio.isOverAllocated {
-                let excess = portfolio.allocatedCapital - portfolio.totalCapital
-                let multiple = portfolio.allocatedCapital / max(portfolio.totalCapital, 1)
-                InlineNotice(kind: .danger, title: "预算超配",
-                             message: "策略预算合计超出本金 \(PriceFormatter.money(excess, decimals: 0)) \(portfolio.quoteCurrency)——下单按各自预算定量，不看账户余额，全部满仓会下到本金的 \(PriceFormatter.decimals(multiple, 1)) 倍。改上面的本金即可按比例缩回。")
+            ForEach(portfolio.overAllocatedVenues) { venue in
+                let allocated = portfolio.allocatedCapital(on: venue)
+                let total = portfolio.totalCapital(for: venue)
+                let multiple = allocated / max(total, 1)
+                InlineNotice(kind: .danger, title: "\(venue.displayName)预算超配",
+                             message: "策略预算合计超出本金 \(PriceFormatter.money(allocated - total, decimals: 0)) \(venue.quoteCurrency)——下单按各自预算定量，不看账户余额，全部满仓会下到本金的 \(PriceFormatter.decimals(multiple, 1)) 倍。改上面的本金即可按比例缩回。")
             }
         }
         .padding(.horizontal, Theme.pagePadding)
@@ -268,8 +276,8 @@ private struct StrategyRow: View {
     let isSelected: Bool
 
     private var allocation: StrategyAllocation? { appState.store.config.strategy.allocation(for: strategy.id) }
-    private var state: StrategyRuntimeState { appState.runner.state(for: strategy.id) }
-    private var position: StrategyPositionState? { appState.ledger.position(for: strategy.id) }
+    private var state: StrategyRuntimeState { appState.runtimeState(for: strategy.id) }
+    private var position: StrategyPositionState? { appState.ledger(forStrategy: strategy.id)?.position(for: strategy.id) }
 
     var body: some View {
         HStack(alignment: .top, spacing: 9) {

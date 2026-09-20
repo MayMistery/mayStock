@@ -510,8 +510,8 @@ final class DemoOptionHost: StrategyRunnerHost {
     var halts: [String] = []
 
     init(strategy: CompiledStrategy, capital: Double, venue: any ExchangeVenue) {
-        var portfolio = StrategyPortfolioPrefs(mode: .demo, totalCapital: capital)
-        portfolio.setCapital(capital, for: strategy.id)
+        var portfolio = StrategyPortfolioPrefs(mode: .demo, capital: [.okx: capital])
+        portfolio.setCapital(capital, for: strategy.id, on: .okx)
         portfolio.setRunning(true, for: strategy.id)
         self.portfolio = portfolio
         self.runnableStrategies = [strategy]

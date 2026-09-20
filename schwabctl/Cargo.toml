@@ -1,0 +1,37 @@
+[package]
+name = "schwabctl"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Credential boundary and transport for MayStock's Charles Schwab venue."
+license = "MIT"
+
+[[bin]]
+name = "schwabctl"
+path = "src/main.rs"
+
+[dependencies]
+# Blocking HTTPS over rustls: a CLI that makes one request per invocation has
+# no use for an async runtime, and a smaller binary starts faster — which is
+# the whole point of putting the trading path in a native tool.
+ureq = { version = "2.10", default-features = false, features = ["tls", "json"] }
+# The loopback listener needs a certificate the browser will negotiate with;
+# rcgen mints a self-signed one for 127.0.0.1 without touching OpenSSL.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+ring = "0.17"
+rpassword = "7"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+base64 = "0.22"
+url = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+# See kernel/Cargo.toml: stripping breaks the toolchain's own proc-macro
+# dylibs on this macOS; there is nothing to gain from it here either.
+strip = "none"

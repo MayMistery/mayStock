@@ -457,37 +457,37 @@ struct StrategyLedgerTests {
 @Suite("Portfolio allocation")
 struct PortfolioAllocationTests {
     @Test func allocationsCannotExceedTotalCapital() {
-        var portfolio = StrategyPortfolioPrefs(totalCapital: 1_000)
-        portfolio.setCapital(700, for: "a")
-        portfolio.setCapital(900, for: "b")   // only 300 left
+        var portfolio = StrategyPortfolioPrefs(capital: [.okx: 1_000])
+        portfolio.setCapital(700, for: "a", on: .okx)
+        portfolio.setCapital(900, for: "b", on: .okx)   // only 300 left
         #expect(portfolio.allocation(for: "b")?.capital == 300)
-        #expect(portfolio.allocatedCapital == 1_000)
-        #expect(portfolio.unallocatedCapital == 0)
+        #expect(portfolio.allocatedCapital(on: .okx) == 1_000)
+        #expect(portfolio.unallocatedCapital(on: .okx) == 0)
     }
 
     @Test func headroomExcludesTheStrategysOwnBudget() {
-        var portfolio = StrategyPortfolioPrefs(totalCapital: 1_000)
-        portfolio.setCapital(400, for: "a")
-        portfolio.setCapital(200, for: "b")
-        #expect(portfolio.capitalHeadroom(for: "a") == 800, "a may grow into everything b left")
+        var portfolio = StrategyPortfolioPrefs(capital: [.okx: 1_000])
+        portfolio.setCapital(400, for: "a", on: .okx)
+        portfolio.setCapital(200, for: "b", on: .okx)
+        #expect(portfolio.capitalHeadroom(for: "a", on: .okx) == 800, "a may grow into everything b left")
     }
 
     @Test func negativeAllocationsClampToZero() {
-        var portfolio = StrategyPortfolioPrefs(totalCapital: 1_000)
-        portfolio.setCapital(-50, for: "a")
+        var portfolio = StrategyPortfolioPrefs(capital: [.okx: 1_000])
+        portfolio.setCapital(-50, for: "a", on: .okx)
         #expect(portfolio.allocation(for: "a")?.capital == 0)
     }
 
     @Test func evenDistributionSplitsTheWholePortfolio() {
-        var portfolio = StrategyPortfolioPrefs(totalCapital: 900)
-        portfolio.distributeEvenly(across: ["a", "b", "c"])
-        #expect(portfolio.allocatedCapital == 900)
+        var portfolio = StrategyPortfolioPrefs(capital: [.okx: 900])
+        portfolio.distributeEvenly(across: ["a", "b", "c"], on: .okx)
+        #expect(portfolio.allocatedCapital(on: .okx) == 900)
         #expect(portfolio.allocation(for: "b")?.capital == 300)
     }
 
     @Test func startingClearsAPreviousHaltReason() {
-        var portfolio = StrategyPortfolioPrefs(totalCapital: 100)
-        portfolio.setCapital(100, for: "a")
+        var portfolio = StrategyPortfolioPrefs(capital: [.okx: 100])
+        portfolio.setCapital(100, for: "a", on: .okx)
         portfolio.allocations[0].haltReason = "日内亏损熔断"
         portfolio.setRunning(true, for: "a")
         #expect(portfolio.allocation(for: "a")?.haltReason == nil)

@@ -12,6 +12,8 @@ struct AccountEquityChartView: View {
     /// The live figure, so the right edge is now rather than the last sample.
     var latest: Double? = nil
     var now = Date()
+    /// Whose book: decides the clock the calendar windows anchor on.
+    var venue: Venue = .okx
 
     @State private var hover: CGPoint? = nil
 
@@ -19,7 +21,7 @@ struct AccountEquityChartView: View {
         VStack(spacing: 6) {
             ChartLegendRow(items: legend)
             GeometryReader { geo in
-                let domain = Domain(points: points, window: window, latest: latest, now: now, size: geo.size)
+                let domain = Domain(points: points, window: window, latest: latest, now: now, venue: venue, size: geo.size)
                 ZStack {
                     if let domain {
                         Canvas(rendersAsynchronously: false) { context, size in
@@ -59,8 +61,8 @@ struct AccountEquityChartView: View {
         let reference: Double
         let last: AccountEquityPoint
 
-        init?(points: [AccountEquityPoint], window: EquityWindow, latest: Double?, now: Date, size: CGSize) {
-            let anchor = window.anchor(now: now)
+        init?(points: [AccountEquityPoint], window: EquityWindow, latest: Double?, now: Date, venue: Venue, size: CGSize) {
+            let anchor = window.anchor(now: now, venue: venue)
             // One sample before the anchor keeps the left edge honest: the
             // curve starts where the window does, not at the first sample in it.
             var inWindow = points.filter { $0.ts >= anchor }
@@ -110,7 +112,7 @@ struct AccountEquityChartView: View {
     // MARK: Legend
 
     private var legend: [ChartLegendItem] {
-        guard let domain = Domain(points: points, window: window, latest: latest, now: now,
+        guard let domain = Domain(points: points, window: window, latest: latest, now: now, venue: venue,
                                   size: CGSize(width: 600, height: 200)) else { return [] }
         let probe = hover.flatMap { $0.x < domain.geometry.plotWidth ? domain.sample(nearX: $0.x) : nil }
         let point = probe ?? domain.last

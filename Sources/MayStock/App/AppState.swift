@@ -74,6 +74,12 @@ struct LaunchOptions: Sendable {
 }
 
 /// Composition root: config ⇄ market hub ⇄ alerts ⇄ strategies ⇄ status items ⇄ panel ⇄ terminal.
+///
+/// Trading state is kept per venue in `VenueBooks`: OKX and Schwab are two
+/// accounts in two currencies, each with its own ledger, curve, heartbeat
+/// and runner. What is shared is the config, the strategy library and the
+/// trading mode — demo or live applies to every venue at once, and on
+/// Schwab "demo" is the local shadow book.
 @Observable
 @MainActor
 final class AppState {
@@ -100,52 +106,36 @@ final class AppState {
     private(set) var brokenStrategies: [BrokenStrategy] = []
     private(set) var reports: [String: StrategyBacktestReport] = [:]
     private(set) var backtestPhase: [String: BacktestPhase] = [:]
-    var accountBalances: [AccountBalance] = []
-    var exchangePositions: [ExchangePosition] = []
-    var accountError: String?
-    var accountRefreshedAt: Date?
-    /// Everything the exchange is holding open on the active account, whoever
-    /// placed it. Kept apart from `accountError`: a refused order book must
-    /// not blank the equity and positions that were read fine.
-    var openOrders: [ExchangeOpenOrder] = []
-    /// Books the listing could not read, in words; nil when it read them all.
-    var openOrdersNote: String?
-    var openOrdersError: String?
-    /// The exchange's own ledger of the active account, as last read. What
-    /// the window figures are summed from — see `BilledPnL`.
-    var exchangeBills: ExchangeBillListing?
-    var billsError: String?
-    var isRefreshingAccount = false
-    /// The account is re-read on a clock, not only on a button: positions
-    /// opened by hand, stops firing and bills settling all happen on the
-    /// exchange with no word to this app.
-    static let accountRefreshInterval: TimeInterval = 300
-    private var accountRefreshLoop: Task<Void, Never>?
-    private var lastLoggedAccountError: String?
     var cliInfo: CLIInfo?
     var isDetectingCLI = false
+    /// `schwabctl`, and what it says about the login. Read at launch and on
+    /// every account-page refresh; never holds a secret.
+    var schwabCLI: CLIInfo?
+    var schwabStatus: SchwabCredentialStatus?
+    var isDetectingSchwabCLI = false
 
     // MARK: Environments
 
     /// The CLI's profiles, re-read whenever the account page asks.
     var profileCatalog: OKXProfileCatalog
-    /// One connection verdict per environment.
-    var connections: [TradingMode: VenueConnectionStatus] = [:]
 
-    let demoLedger = StrategyLedger(mode: .demo)
-    let liveLedger = StrategyLedger(mode: .live)
-    let heartbeatStore: HeartbeatStore
-    /// When the engine last finished a full tick. Nil until the first one.
-    private(set) var lastCompletedTickAt: Date?
-    let demoEquity = AccountEquityCurve(mode: .demo)
-    let liveEquity = AccountEquityCurve(mode: .live)
-    /// One curve per strategy, so a single-strategy backtest has something
-    /// like-for-like to be compared against. The account curve mixes every
-    /// strategy together and cannot answer "did *this* one track its test".
-    var demoStrategyEquity: [String: AccountEquityCurve] = [:]
-    var liveStrategyEquity: [String: AccountEquityCurve] = [:]
+    /// The one-off data sources, shared by the hub, the backtester and the
+    /// Schwab venue so a token minted for one is a token minted for all.
+    @ObservationIgnored let marketSources: MarketDataSources
+    /// Thirty-minute Schwab tokens, from `schwabctl`.
+    @ObservationIgnored let schwabTokens: SchwabCLITokenSource
+    /// Schwab's demo account: there is none, so this is it.
+    @ObservationIgnored let shadowBook: ShadowBook
+    /// The strategy tags Schwab orders cannot carry, kept on our side.
+    @ObservationIgnored let schwabTags: SchwabOrderTags
 
-    @ObservationIgnored private(set) var runner: StrategyRunner!
+    @ObservationIgnored private var venueBooks: [Venue: VenueBooks] = [:]
+    /// Every venue's account is re-read on a clock, not only on a button:
+    /// positions opened by hand, stops firing and bills settling all happen
+    /// on the exchange with no word to this app.
+    static let accountRefreshInterval: TimeInterval = 300
+    @ObservationIgnored private var accountRefreshLoop: Task<Void, Never>?
+    @ObservationIgnored private var lastLoggedAccountError: [Venue: String] = [:]
     @ObservationIgnored private(set) var panel: HoverPanelController!
     @ObservationIgnored private var statusItems: StatusItemManager?
     @ObservationIgnored private var terminalController: TerminalWindowController?
@@ -158,33 +148,47 @@ final class AppState {
         self.options = options
         dataDirectory = options.dataDirectory
         store = ConfigStore(directory: options.dataDirectory)
-        hub = MarketHub.standard()
+        let trading = store.config.trading
+        schwabTokens = SchwabCLITokenSource(bridge: SchwabBridge(prefs: trading))
+        let yahoo = YahooFinanceClient()
+        marketSources = MarketDataSources(
+            yahoo: yahoo,
+            schwab: SchwabMarketDataSource(schwab: SchwabRESTClient(tokens: schwabTokens), yahoo: yahoo),
+            trading: trading)
+        hub = MarketHub.standard(sources: marketSources)
         alerts = AlertEngine()
         notifications = NotificationService()
         intelligence = IntelligenceCenter(directory: options.dataDirectory, snapshotMode: options.isSnapshot)
         strategyStore = StrategyStore(directory: options.dataDirectory.appendingPathComponent("Strategies"))
-        heartbeatStore = HeartbeatStore(directory: options.dataDirectory)
         profileCatalog = OKXProfileCatalog.load()
+        shadowBook = ShadowBook(
+            venue: .schwab,
+            fileURL: options.dataDirectory.appendingPathComponent("shadow-schwab.json"),
+            startingCash: store.config.strategy.totalCapital(for: .schwab))
+        schwabTags = SchwabOrderTags(fileURL: options.dataDirectory.appendingPathComponent("schwab-order-tags.json"))
 
         panel = HoverPanelController(appState: self)
         // A render pass must not put a second set of items in the menu bar.
         statusItems = options.isSnapshot ? nil : StatusItemManager(appState: self)
-        runner = StrategyRunner(host: self)
+        for venue in Venue.allCases {
+            venueBooks[venue] = VenueBooks(venue: venue, dataDirectory: options.dataDirectory, app: self)
+        }
 
         wire()
-        loadLedgers()
         reloadStrategies()
         applyConfig()
         Task {
             await detectTradeCLI()
-            // The active account is checked at launch so the overview can say
-            // whether the engine will even be able to read the book — and then
-            // read, so what it holds is on screen before anyone asks.
-            _ = await verifyConnection(tradingMode)
+            await detectSchwabCLI()
+            // Every venue's active account is checked at launch so the
+            // overview can say whether each engine will be able to read its
+            // book — and then read, so what it holds is on screen before
+            // anyone asks.
+            for venue in Venue.allCases { _ = await verifyConnection(tradingMode, venue: venue) }
             await refreshAccount()
         }
         if !options.isSnapshot {
-            runner.start()
+            runners.forEach { $0.start() }
             startAccountRefreshLoop()
         }
         intelligence.start(watchlist: { [weak self] in
@@ -230,11 +234,6 @@ final class AppState {
                 self.store.scheduleSave()
             }
         }
-
-        demoLedger.onChanged = { [weak self] in self?.saveLedger(.demo) }
-        liveLedger.onChanged = { [weak self] in self?.saveLedger(.live) }
-        demoEquity.onChanged = { [weak self] in self?.saveEquity(.demo) }
-        liveEquity.onChanged = { [weak self] in self?.saveEquity(.live) }
     }
 
     /// The venue an instrument belongs to: its live session's, else its
@@ -266,26 +265,59 @@ final class AppState {
     /// Built from the settings every time, so a profile edited on the account
     /// page is what the very next CLI call runs under.
     var tradeBridge: TradeBridge { TradeBridge(prefs: store.config.trading) }
+    var schwabBridge: SchwabBridge { SchwabBridge(prefs: store.config.trading) }
 
-    /// The exchange the runner trades through.
-    ///
-    /// Built here rather than injected from outside only because OKX is the one
-    /// venue this app ships with. Everything downstream names `ExchangeVenue`,
-    /// so a second exchange is a new conformance plus a choice made at this
-    /// single line.
-    var venue: any ExchangeVenue { OKXVenue(bridge: tradeBridge) }
+    /// The exchange a venue's runner trades through, built from the current
+    /// settings on every access. Everything downstream names `ExchangeVenue`;
+    /// this switch is the one place a venue is bound to its adapter.
+    func exchangeVenue(for venue: Venue) -> any ExchangeVenue {
+        switch venue {
+        case .okx:
+            return OKXVenue(bridge: tradeBridge)
+        case .schwab:
+            return SchwabVenue(
+                data: marketSources.schwab, bridge: schwabBridge, shadow: shadowBook, tags: schwabTags,
+                economics: ShadowBook.Economics(schedule: store.config.strategy.feeSchedules.schwab))
+        }
+    }
 
     var tradingMode: TradingMode { store.config.strategy.mode }
     var liveTradingUnlocked: Bool { store.config.trading.liveTradingUnlocked }
-    var ledger: StrategyLedger { ledger(for: tradingMode) }
-    func ledger(for mode: TradingMode) -> StrategyLedger { mode == .demo ? demoLedger : liveLedger }
-    var equityCurve: AccountEquityCurve { equityCurve(for: tradingMode) }
-    func equityCurve(for mode: TradingMode) -> AccountEquityCurve { mode == .demo ? demoEquity : liveEquity }
-    var strategyEquityCurves: [String: AccountEquityCurve] {
-        tradingMode == .demo ? demoStrategyEquity : liveStrategyEquity
+
+    // MARK: Per-venue lookups
+
+    func books(for venue: Venue) -> VenueBooks {
+        // Built for every declared venue in `init`; a venue without books
+        // would be an enum case the initialiser does not know, which the
+        // loop over `allCases` rules out.
+        venueBooks[venue]!
     }
+
+    var runners: [StrategyRunner] { Venue.allCases.map { books(for: $0).runner } }
+    func runner(for venue: Venue) -> StrategyRunner { books(for: venue).runner }
+    func runner(forStrategy id: String) -> StrategyRunner? {
+        venue(ofStrategy: id).map(runner(for:))
+    }
+    /// The runtime state of a strategy, from whichever engine trades it.
+    func runtimeState(for strategyId: String) -> StrategyRuntimeState {
+        runner(forStrategy: strategyId)?.state(for: strategyId) ?? StrategyRuntimeState()
+    }
+
+    func venue(ofStrategy id: String) -> Venue? {
+        strategy(id: id)?.market.venue
+            ?? store.config.strategy.allocation(for: id)?.venue
+    }
+
+    func ledger(for venue: Venue, mode: TradingMode) -> StrategyLedger { books(for: venue).ledger(for: mode) }
+    func ledger(for venue: Venue) -> StrategyLedger { ledger(for: venue, mode: tradingMode) }
+    func ledger(forStrategy id: String) -> StrategyLedger? { venue(ofStrategy: id).map(ledger(for:)) }
+    /// Every venue's active-mode ledger, in declaration order.
+    var ledgers: [StrategyLedger] { Venue.allCases.map(ledger(for:)) }
+
+    func equityCurve(for venue: Venue) -> AccountEquityCurve { books(for: venue).equityCurve(for: tradingMode) }
     func strategyEquity(_ strategyId: String) -> AccountEquityCurve? {
-        strategyEquityCurves[strategyId]
+        guard let venue = venue(ofStrategy: strategyId) else { return nil }
+        return books(for: venue).strategyEquityCurves(for: tradingMode)[strategyId]
     }
 
     /// How many independent bets the allocated book actually holds.
@@ -294,10 +326,11 @@ final class AppState {
     /// common grid — correlating series of different lengths would compare
     /// different periods and report whatever the misalignment happened to
     /// produce. Nil until at least two strategies have enough history.
+    /// Returns are dimensionless, so curves in different currencies compare.
     var portfolioDiversification: KernelDiversification? {
         let curves = store.config.strategy.allocations
             .compactMap { allocation -> (name: String, points: [AccountEquityPoint])? in
-                guard let curve = strategyEquityCurves[allocation.strategyId],
+                guard let curve = strategyEquity(allocation.strategyId),
                       curve.points.count >= 9 else { return nil }
                 return (allocation.strategyId, curve.points)
             }
@@ -318,41 +351,47 @@ final class AppState {
         return try? TradingKernel.diversification(series)
     }
 
-    /// Live account equity in USDT, sampled by the runner.
-    var accountEquity: Double? { runner.accountEquity }
+    // MARK: Account figures, per venue
 
-    /// What the exchange's bills say the account realised over a window.
-    /// Nil until the ledger has been read.
-    func billedPnL(_ window: EquityWindow) -> BilledPnL? {
-        exchangeBills.map { BilledPnL.over(window, listing: $0) }
+    /// Live account equity on a venue, in its quote currency, sampled by
+    /// that venue's runner.
+    func accountEquity(for venue: Venue) -> Double? { runner(for: venue).accountEquity }
+
+    /// Share of a venue's equity exposed to non-stablecoin price risk.
+    func nonStableExposurePct(for venue: Venue) -> Double? { runner(for: venue).nonStableExposurePct }
+
+    /// What the exchange's bills say a venue's account realised over a
+    /// window. Nil until the ledger has been read, and on a venue that
+    /// publishes no bill ledger — see `Venue.periodFigure`.
+    func billedPnL(_ window: EquityWindow, venue: Venue) -> BilledPnL? {
+        books(for: venue).exchangeBills.map { BilledPnL.over(window, listing: $0) }
     }
 
-    /// Unrealised profit on every position the exchange holds — whoever
-    /// opened it — at the exchange's own mark. Nil until the account has
-    /// been read.
-    var exchangeUnrealisedPnL: Double? {
-        guard accountRefreshedAt != nil else { return nil }
-        return exchangePositions.reduce(0) { $0 + $1.unrealisedPnL }
+    /// Unrealised profit on every position a venue holds — whoever opened
+    /// it — at the venue's own mark. Nil until the account has been read.
+    func exchangeUnrealisedPnL(for venue: Venue) -> Double? {
+        let books = books(for: venue)
+        guard books.accountRefreshedAt != nil else { return nil }
+        return books.exchangePositions.reduce(0) { $0 + $1.unrealisedPnL }
     }
 
-    /// Share of equity exposed to non-stablecoin price risk.
-    var nonStableExposurePct: Double? { runner.nonStableExposurePct }
-
-    /// Live profit on everything the book currently holds, plus whatever has
-    /// already been realised, net of fees and funding.
+    /// Live profit on everything a venue's book currently holds, plus
+    /// whatever has already been realised, net of fees and funding.
     ///
     /// This needs no equity history at all — position, average price and mark
     /// are all available the moment a position exists.
-    var openPnL: Double? {
-        let positions = ledger.positions.values.filter { !$0.isFlat || $0.realisedPnL != 0 }
+    func openPnL(for venue: Venue) -> Double? {
+        let runner = runner(for: venue)
+        let positions = ledger(for: venue).positions.values.filter { !$0.isFlat || $0.realisedPnL != 0 }
         guard !positions.isEmpty else { return nil }
-        return positions.reduce(0) { $0 + $1.netPnL(mark: runner.mark(for: $1.instId)) }
+        return positions.reduce(0) { $0 + $1.netPnL(mark: runner.mark(for: $1.instId) ?? mark(for: $1.instId)) }
     }
 
     /// The same profit as a share of the capital actually committed to it.
-    var openPnLPct: Double? {
-        guard let pnl = openPnL else { return nil }
-        let committed = store.config.strategy.allocations
+    func openPnLPct(for venue: Venue) -> Double? {
+        guard let pnl = openPnL(for: venue) else { return nil }
+        let ledger = ledger(for: venue)
+        let committed = store.config.strategy.allocations(on: venue)
             .filter { ledger.position(for: $0.strategyId)?.isFlat == false }
             .reduce(0) { $0 + $1.capital }
         guard committed > 0 else { return nil }
@@ -361,9 +400,11 @@ final class AppState {
 
     /// Trailing return for the panel, endpoint pinned to the live equity rather
     /// than the last stored sample.
-    func equityChange(_ window: EquityWindow) -> EquityChange? {
-        equityCurve.change(over: window, latest: accountEquity)
+    func equityChange(_ window: EquityWindow, venue: Venue) -> EquityChange? {
+        equityCurve(for: venue).change(over: window, latest: accountEquity(for: venue))
     }
+
+    // MARK: Readiness
 
     func detectTradeCLI() async {
         isDetectingCLI = true
@@ -371,82 +412,140 @@ final class AppState {
         cliInfo = await tradeBridge.detectCLI()
     }
 
-    /// True once the CLI exists *and* the active environment has a profile to
-    /// run under — without both, nothing authenticated works, not even demo.
-    var tradingReady: Bool { cliInfo != nil && credentialsConfigured(for: tradingMode) }
+    func detectSchwabCLI() async {
+        isDetectingSchwabCLI = true
+        defer { isDetectingSchwabCLI = false }
+        let bridge = schwabBridge
+        schwabCLI = await bridge.detectCLI()
+        schwabStatus = schwabCLI == nil ? nil : (try? await bridge.status())
+    }
 
-    /// Why trading is not ready, in words. Nil when it is.
-    var tradingBlocker: String? {
-        if cliInfo == nil { return "未检测到 okx CLI" }
-        if !profileCatalog.fileExists { return "okx CLI 尚未配置 API Key（运行 okx config）" }
-        if !credentialsConfigured(for: tradingMode) {
-            return "\(tradingMode.displayName)没有可用的 profile（账户与连接页配置）"
+    /// True once a venue's tool exists *and* the active environment can be
+    /// reached through it. On OKX that is the CLI plus a profile; on Schwab
+    /// it is `schwabctl`, and for the live account a login that has not
+    /// expired — the shadow book needs neither.
+    func tradingReady(for venue: Venue) -> Bool { tradingBlocker(for: venue) == nil }
+
+    /// Why trading on a venue is not ready, in words. Nil when it is.
+    func tradingBlocker(for venue: Venue) -> String? {
+        switch venue {
+        case .okx:
+            if cliInfo == nil { return "未检测到 okx CLI" }
+            if !profileCatalog.fileExists { return "okx CLI 尚未配置 API Key（运行 okx config）" }
+            if !credentialsConfigured(for: tradingMode) {
+                return "\(tradingMode.displayName)没有可用的 profile（账户与连接页配置）"
+            }
+            return nil
+        case .schwab:
+            if schwabCLI == nil { return SchwabBridgeError.cliNotFound.description }
+            guard tradingMode == .live else { return nil }
+            guard let status = schwabStatus else { return "还没有读到 schwabctl 的状态，先在账户页重新检测" }
+            return status.blocker
         }
-        return nil
+    }
+
+    /// Every venue that has a strategy, and is not ready. Nil when all are.
+    var tradingBlockers: [(venue: Venue, reason: String)] {
+        Venue.allCases.compactMap { venue in
+            guard strategies.contains(where: { $0.market.venue == venue }),
+                  let reason = tradingBlocker(for: venue) else { return nil }
+            return (venue, reason)
+        }
     }
 
     func refreshAccount() async {
-        guard !isRefreshingAccount else { return }
-        isRefreshingAccount = true
-        defer { isRefreshingAccount = false }
+        for venue in Venue.allCases { await refreshAccount(venue) }
+    }
+
+    func refreshAccount(_ venue: Venue) async {
+        let books = books(for: venue)
+        guard !books.isRefreshingAccount else { return }
+        books.isRefreshingAccount = true
+        defer { books.isRefreshingAccount = false }
         // A refresh asked for before launch-time detection has finished must
         // not report "no CLI" for a CLI that is there.
-        if cliInfo == nil { await detectTradeCLI() }
-        reloadProfilesIfChanged()
-        guard tradingReady else {
-            accountBalances = []
-            exchangePositions = []
-            accountError = tradingBlocker
+        switch venue {
+        case .okx:
+            if cliInfo == nil { await detectTradeCLI() }
+            reloadProfilesIfChanged()
+        case .schwab:
+            // The login can change under a running app — `schwabctl login`
+            // in a terminal — so the status is re-read on every refresh. It
+            // is a local read, no network.
+            if schwabCLI == nil { await detectSchwabCLI() } else { schwabStatus = try? await schwabBridge.status() }
+        }
+        guard tradingReady(for: venue) else {
+            books.accountBalances = []
+            books.exchangePositions = []
+            books.accountError = tradingBlocker(for: venue)
             return
         }
-        let bridge = tradeBridge
+        let exchange = exchangeVenue(for: venue)
         let mode = tradingMode
         do {
-            accountBalances = try await bridge.balances(mode: mode)
-            // Every position the exchange holds, whatever family, so the
-            // reconciliation panel can judge an option leg as well as a
-            // perpetual one and a delivery future is not invisible. A failed
-            // listing is an error on screen, not an empty list that reads as
-            // "nothing held".
-            exchangePositions = try await bridge.allPositions(mode: mode)
-            accountError = nil
-            accountRefreshedAt = Date()
+            books.accountBalances = try await exchange.accountSnapshot(mode: mode).balances
+            // Every position the venue holds, whatever family: the unfiltered
+            // derivative listing, plus each family that is held as a
+            // position rather than as a balance but is not a contract — a
+            // share count. A failed listing is an error on screen, not an
+            // empty list that reads as "nothing held".
+            var positions = try await exchange.allPositions(mode: mode)
+            for instType in venue.instrumentTypes where !instType.isDerivative && instType != .spot {
+                positions += try await exchange.positions(mode: mode, instType: instType)
+            }
+            books.exchangePositions = positions
+            books.accountError = nil
+            books.accountRefreshedAt = Date()
         } catch {
-            accountError = String(describing: error)
+            books.accountError = String(describing: error)
             return
         }
+        // What the venue is holding open, and its own ledger where it keeps
+        // one. Kept apart from `accountError`: a refused order book must not
+        // blank the equity and positions that were read fine.
         do {
-            let listing = try await bridge.openOrders(mode: mode)
-            openOrders = listing.orders
-            openOrdersNote = listing.unavailable.isEmpty
-                ? nil : "未能读取：" + listing.unavailable.joined(separator: "、") + "。这些簿上若有挂单，这里不会显示。"
-            openOrdersError = nil
+            switch venue {
+            case .okx:
+                let listing = try await tradeBridge.openOrders(mode: mode)
+                books.openOrders = listing.orders
+                books.openOrdersNote = listing.unavailable.isEmpty
+                    ? nil : "未能读取：" + listing.unavailable.joined(separator: "、") + "。这些簿上若有挂单，这里不会显示。"
+            case .schwab:
+                books.openOrders = try await (exchange as? SchwabVenue)?.openOrders(mode: mode) ?? []
+                books.openOrdersNote = nil
+            }
+            books.openOrdersError = nil
         } catch {
-            openOrders = []
-            openOrdersNote = nil
-            openOrdersError = String(describing: error)
+            books.openOrders = []
+            books.openOrdersNote = nil
+            books.openOrdersError = String(describing: error)
         }
-        do {
-            exchangeBills = try await bridge.bills(mode: mode)
-            billsError = nil
-        } catch {
-            exchangeBills = nil
-            billsError = String(describing: error)
+        switch venue.periodFigure {
+        case .exchangeBills:
+            do {
+                books.exchangeBills = try await tradeBridge.bills(mode: mode)
+                books.billsError = nil
+            } catch {
+                books.exchangeBills = nil
+                books.billsError = String(describing: error)
+            }
+        case .equityCurve:
+            books.exchangeBills = nil
+            books.billsError = nil
         }
         // Equity is the runner's figure — marked with the same prices the
         // engine trades on — so a refresh asks it to sample, rather than
         // computing a second, slightly different number here.
-        await runner.sampleEquityNow()
+        await books.runner.sampleEquityNow()
     }
 
-    /// Pull this account's real fee rates into the schedule the backtester uses.
-    /// Returns the failure, if any, in words.
+    /// Pull the OKX account's real fee rates into the schedule the backtester
+    /// uses. Returns the failure, if any, in words. Only OKX has a CLI to
+    /// ask; every other venue's schedule is a published table.
     func syncFeeRates() async -> String? {
-        guard tradingReady else { return tradingBlocker }
+        guard tradingReady(for: .okx) else { return tradingBlocker(for: .okx) }
         let bridge = tradeBridge
         let mode = tradingMode
-        // Only OKX has a CLI to ask; every other venue's schedule is a
-        // published table that a sync would have nothing to say about.
         var schedule = store.config.strategy.feeSchedules.okx
         var failures: [String] = []
         let families = Venue.okx.instrumentTypes
@@ -464,6 +563,13 @@ final class AppState {
         return failures.isEmpty ? nil : failures.joined(separator: "\n")
     }
 
+    /// Start the shadow account over with the venue's configured capital.
+    func resetShadowBook() async {
+        let cash = store.config.strategy.totalCapital(for: .schwab)
+        await shadowBook.reset(cash: cash)
+        await refreshAccount(.schwab)
+    }
+
     // MARK: Strategy library
 
     func reloadStrategies() {
@@ -471,7 +577,7 @@ final class AppState {
         let loaded = strategyStore.loadCompiled()
         strategies = loaded.ready
         brokenStrategies = loaded.broken
-        runner.reloadKernel()
+        runners.forEach { $0.reloadKernel() }
 
         // Drop allocations whose strategy file is *gone*, so budget isn't held
         // hostage by something that can no longer trade. A file that is still
@@ -484,6 +590,21 @@ final class AppState {
             Log.warn("strategies: dropping budgets for missing files \(stale.map(\.strategyId))")
             store.update { config in
                 config.strategy.allocations.removeAll { !known.contains($0.strategyId) }
+            }
+        }
+        // A budget stamped with a venue the manifest no longer names would be
+        // counted against the wrong pot. Re-stamped, and said.
+        let moved = store.config.strategy.allocations.filter { allocation in
+            guard let strategy = strategies.first(where: { $0.id == allocation.strategyId }) else { return false }
+            return strategy.market.venue != allocation.venue
+        }
+        if !moved.isEmpty {
+            Log.warn("strategies: re-stamping venue on budgets \(moved.map(\.strategyId))")
+            store.update { config in
+                for allocation in moved {
+                    guard let strategy = strategies.first(where: { $0.id == allocation.strategyId }) else { continue }
+                    config.strategy.setCapital(allocation.capital, for: allocation.strategyId, on: strategy.market.venue)
+                }
             }
         }
     }
@@ -510,20 +631,21 @@ final class AppState {
     /// the library, and the reason is shown.
     @discardableResult
     func deleteStrategy(id: String) async -> Bool {
-        await runner.flatten(strategyId: id)
-        if let position = ledger.position(for: id), !position.isFlat {
+        await runner(forStrategy: id)?.flatten(strategyId: id)
+        if let ledger = ledger(forStrategy: id), let position = ledger.position(for: id), !position.isFlat {
             let name = strategy(id: id)?.name ?? id
             notifications.post(
                 title: "未能移除 · \(name)",
                 body: "仍持有 \(PriceFormatter.plain(abs(position.quantity))) 张 \(position.instId)，"
-                    + "平仓未成交：" + (runner.state(for: id).message ?? "见运行状态"),
+                    + "平仓未成交：" + (runtimeState(for: id).message ?? "见运行状态"),
                 sound: true)
             return false
         }
+        let ledger = ledger(forStrategy: id)
         try? strategyStore.delete(id: id)
         store.update { $0.strategy.remove(strategyId: id) }
         reports[id] = nil
-        ledger.clearPosition(strategyId: id)
+        ledger?.clearPosition(strategyId: id)
         reloadStrategies()
         return true
     }
@@ -545,6 +667,7 @@ final class AppState {
         // The fee schedule the user configured, not the library default: a
         // setting the backtester never read was a promise the app did not keep.
         let feeSchedules = store.config.strategy.feeSchedules
+        let sources = marketSources
         backtestPhase[strategyId] = .fetchingCandles(loaded: 0, target: 0)
 
         // Strong self is intentional: the task is finite, and AppState is the
@@ -555,7 +678,7 @@ final class AppState {
                 self.backtestPhase[strategyId] = nil
             }
             do {
-                let report = try await BacktestRunner(feeSchedules: feeSchedules).run(
+                let report = try await BacktestRunner(sources: sources, feeSchedules: feeSchedules).run(
                     strategy: strategy, capital: capital,
                     onPhase: { phase in
                         Task { @MainActor in self.backtestPhase[strategyId] = phase }
@@ -575,14 +698,16 @@ final class AppState {
 
     // MARK: Portfolio control
 
+    /// Set a strategy's budget on the venue its manifest names.
     func setCapital(_ amount: Double, for strategyId: String) {
-        store.update { $0.strategy.setCapital(amount, for: strategyId) }
+        guard let venue = venue(ofStrategy: strategyId) else { return }
+        store.update { $0.strategy.setCapital(amount, for: strategyId, on: venue) }
     }
 
-    func setTotalCapital(_ amount: Double) {
+    func setTotalCapital(_ amount: Double, for venue: Venue) {
         // Not a plain assignment: the budgets are sized against this number and
         // must come down with it. See `StrategyPortfolio.setTotalCapital`.
-        store.update { $0.strategy.setTotalCapital(amount) }
+        store.update { $0.strategy.setTotalCapital(amount, for: venue) }
     }
 
     /// Arm a strategy. The live-account confirmation lives in
@@ -593,14 +718,14 @@ final class AppState {
             $0.strategy.emergencyStop = false
             $0.strategy.setRunning(true, for: id)
         }
-        Task { await runner.tick() }
+        if let runner = runner(forStrategy: id) { Task { await runner.tick() } }
     }
 
     func stopStrategy(id: String) {
         store.update { $0.strategy.setRunning(false, for: id) }
     }
 
-    /// Stop every strategy and flatten open positions.
+    /// Stop every strategy on every venue and flatten open positions.
     ///
     /// The notification reports what actually happened, after it happened. It
     /// used to announce "持仓已市价平掉" before a single order had been sent,
@@ -614,13 +739,13 @@ final class AppState {
             }
         }
         Task {
-            await runner.emergencyStop()
-            let remaining = ledger.activePositions
+            for runner in runners { await runner.emergencyStop() }
+            let remaining = ledgers.flatMap(\.activePositions)
             if remaining.isEmpty {
                 notifications.post(title: "已急停", body: "所有策略已停止，持仓已市价平掉。", sound: true)
             } else {
                 let held = remaining.map {
-                    "\($0.instId) \(PriceFormatter.plain(abs($0.quantity))) 张"
+                    "\($0.venue.displayName) \($0.instId) \(PriceFormatter.plain(abs($0.quantity)))"
                 }.joined(separator: "，")
                 notifications.post(
                     title: "已急停，但仍有持仓未平",
@@ -633,56 +758,17 @@ final class AppState {
         store.update { $0.strategy.emergencyStop = false }
     }
 
-    // MARK: Ledger persistence
-
-    private func ledgerStore(_ mode: TradingMode) -> StrategyLedgerStore {
-        StrategyLedgerStore(directory: dataDirectory, mode: mode)
-    }
-
-    private func loadLedgers() {
-        for (mode, ledger) in [(TradingMode.demo, demoLedger), (.live, liveLedger)] {
-            let payload = ledgerStore(mode).load()
-            ledger.replace(
-                fills: payload.fills, positions: payload.positions,
-                fundingIds: payload.fundingIds)
-        }
-        for (mode, curve) in [(TradingMode.demo, demoEquity), (.live, liveEquity)] {
-            curve.replace(points: equityStore(mode).load())
-        }
-        for mode in TradingMode.allCases {
-            var curves: [String: AccountEquityCurve] = [:]
-            for (strategyId, points) in strategyEquityStore(mode).loadByStrategy() {
-                let curve = AccountEquityCurve(mode: mode)
-                curve.replace(points: points)
-                curve.onChanged = { [weak self] in self?.saveStrategyEquity(mode) }
-                curves[strategyId] = curve
+    /// A venue's runner halted a strategy: disarm it, keep the reason, tell
+    /// the user.
+    func strategyDidHalt(strategyId: String, reason: String) {
+        store.update { config in
+            if let index = config.strategy.allocations.firstIndex(where: { $0.strategyId == strategyId }) {
+                config.strategy.allocations[index].running = false
+                config.strategy.allocations[index].haltReason = reason
             }
-            if mode == .demo { demoStrategyEquity = curves } else { liveStrategyEquity = curves }
         }
-    }
-
-    private func saveLedger(_ mode: TradingMode) {
-        let ledger = ledger(for: mode)
-        try? ledgerStore(mode).save(
-            fills: ledger.fills, positions: ledger.positions,
-            fundingIds: ledger.recordedFundingIds)
-    }
-
-    private func equityStore(_ mode: TradingMode) -> AccountEquityStore {
-        AccountEquityStore(directory: dataDirectory, mode: mode)
-    }
-
-    private func saveEquity(_ mode: TradingMode) {
-        try? equityStore(mode).save(equityCurve(for: mode).points)
-    }
-
-    private func strategyEquityStore(_ mode: TradingMode) -> AccountEquityStore {
-        AccountEquityStore(directory: dataDirectory, mode: mode, perStrategy: true)
-    }
-
-    private func saveStrategyEquity(_ mode: TradingMode) {
-        let curves = mode == .demo ? demoStrategyEquity : liveStrategyEquity
-        try? strategyEquityStore(mode).save(byStrategy: curves.mapValues(\.points))
+        let name = strategy(id: strategyId)?.name ?? strategyId
+        notifications.post(title: "策略已停止 · \(name)", body: reason, sound: true)
     }
 
     // MARK: Shell hooks
@@ -715,18 +801,19 @@ final class AppState {
 
     // MARK: Account freshness
 
-    /// Re-read the account when what is on screen is older than `maxAge`.
+    /// Re-read every venue whose reading is older than `maxAge`.
     ///
     /// Every surface that shows account figures asks here on appearing, so
     /// which door the user came through — the intelligence page at launch,
     /// the sidebar, the hover panel — never decides whether the figures are
-    /// there. They used to be read only when the overview was opened from
-    /// outside the window or its button pressed: launched onto the
-    /// intelligence page and switching to the overview showed an empty book.
+    /// there.
     func refreshAccountIfStale(maxAge: TimeInterval) {
-        if isRefreshingAccount { return }
-        if let at = accountRefreshedAt, Date().timeIntervalSince(at) < maxAge { return }
-        Task { await refreshAccount() }
+        for venue in Venue.allCases {
+            let books = books(for: venue)
+            if books.isRefreshingAccount { continue }
+            if let at = books.accountRefreshedAt, Date().timeIntervalSince(at) < maxAge { continue }
+            Task { await refreshAccount(venue) }
+        }
     }
 
     func startAccountRefreshLoop() {
@@ -737,12 +824,16 @@ final class AppState {
                 guard !Task.isCancelled, let self else { return }
                 await self.refreshAccount()
                 // A refresh that keeps failing is on screen as a notice; the
-                // log gets it once per distinct failure, not once per tick.
-                if let error = self.accountError, error != self.lastLoggedAccountError {
-                    self.lastLoggedAccountError = error
-                    Log.warn("account: 定时刷新失败：\(error)")
-                } else if self.accountError == nil {
-                    self.lastLoggedAccountError = nil
+                // log gets it once per distinct failure per venue, not once
+                // per tick.
+                for venue in Venue.allCases {
+                    let error = self.books(for: venue).accountError
+                    if let error, error != self.lastLoggedAccountError[venue] {
+                        self.lastLoggedAccountError[venue] = error
+                        Log.warn("account: \(venue.displayName)定时刷新失败：\(error)")
+                    } else if error == nil {
+                        self.lastLoggedAccountError[venue] = nil
+                    }
                 }
             }
         }
@@ -756,7 +847,7 @@ final class AppState {
             .applicationName: "MayStock",
             .applicationVersion: AppInfo.version,
             .credits: NSAttributedString(
-                string: "菜单栏行情终端 · 低频量化工作台 · 行情 " + Venue.allCases.map(\.marketDataSourceName).joined(separator: " / "),
+                string: "菜单栏行情终端 · 低频量化工作台 · 行情 " + Venue.allCases.map { hub.sourceName(for: $0) }.joined(separator: " / "),
                 attributes: [.font: NSFont.systemFont(ofSize: 11)]),
         ])
     }
@@ -766,84 +857,6 @@ enum AppInfo {
     static let version: String = {
         (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "2.2"
     }()
-}
-
-// MARK: - Strategy runner host
-
-extension AppState: StrategyRunnerHost {
-    var portfolio: StrategyPortfolioPrefs { store.config.strategy }
-    var runnableStrategies: [CompiledStrategy] { strategies }
-
-    func runnerDidChange() {
-        // The runner mutates observable state directly; this hook exists for
-        // side effects that must not run inside the tick loop.
-        saveLedger(tradingMode)
-    }
-
-    func runnerDidCompleteTick(at ts: Date) {
-        lastCompletedTickAt = ts
-        // Written to disk, not just held in memory: the question this answers
-        // is "was this app trading while I was not watching", and an in-memory
-        // value cannot answer it after a crash or a restart.
-        heartbeatStore.record(ts)
-    }
-
-    /// How long the trading loop has been silent, or nil when it has never run.
-    ///
-    /// Read from disk at launch, so a restart reports the gap it was away for
-    /// rather than starting the clock fresh — the gap is the whole point.
-    var heartbeatSilence: TimeInterval? {
-        guard let last = lastCompletedTickAt ?? heartbeatStore.load() else { return nil }
-        return Date().timeIntervalSince(last)
-    }
-
-    /// Set when the engine should be trading and demonstrably is not.
-    ///
-    /// A process that is alive but has stopped doing its job is the failure
-    /// mode that goes unnoticed: nothing errors, the panel keeps showing the
-    /// last numbers it had, and the account simply stops being managed.
-    var heartbeatWarning: String? {
-        guard store.config.strategy.allocations.contains(where: \.running),
-              !store.config.strategy.emergencyStop,
-              let silence = heartbeatSilence,
-              silence > StrategyRunner.heartbeatTimeout else { return nil }
-        let minutes = Int(silence / 60)
-        return "交易循环已 \(minutes) 分钟没有完成一次轮询，仓位当前无人管理"
-    }
-
-    func runnerDidSampleEquity(_ equity: Double, at ts: Date) {
-        // The curve is per mode; the runner only ever samples the active one.
-        equityCurve.record(equity: equity, at: ts)
-        accountBalances = runner.accountBalances
-        accountRefreshedAt = ts
-    }
-
-    func runnerDidSampleStrategyEquity(
-        _ strategyId: String, equity: Double, basis: Double, at ts: Date
-    ) {
-        let mode = tradingMode
-        let curve: AccountEquityCurve
-        if let existing = strategyEquityCurves[strategyId] {
-            curve = existing
-        } else {
-            curve = AccountEquityCurve(mode: mode)
-            curve.onChanged = { [weak self] in self?.saveStrategyEquity(mode) }
-            if mode == .demo { demoStrategyEquity[strategyId] = curve }
-            else { liveStrategyEquity[strategyId] = curve }
-        }
-        curve.record(equity: equity, at: ts, basis: basis)
-    }
-
-    func runnerDidHalt(strategyId: String, reason: String) {
-        store.update { config in
-            if let index = config.strategy.allocations.firstIndex(where: { $0.strategyId == strategyId }) {
-                config.strategy.allocations[index].running = false
-                config.strategy.allocations[index].haltReason = reason
-            }
-        }
-        let name = strategy(id: strategyId)?.name ?? strategyId
-        notifications.post(title: "策略已停止 · \(name)", body: reason, sound: true)
-    }
 }
 
 /// SMAppService needs a real bundle; guard so `swift run` (no bundle) works.

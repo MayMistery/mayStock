@@ -89,6 +89,14 @@ final class UISnapshotter {
             try await pause()
             try capture(terminal, name: "terminal-strategies-\(tab.rawValue)")
         }
+        // The overview is one venue's book at a time; every other venue gets
+        // its own frame so a change to the Schwab side can be looked at.
+        for venue in Venue.allCases where venue != selection.overviewVenue {
+            selection.page = .overview
+            selection.overviewVenue = venue
+            try await pause()
+            try capture(terminal, name: "terminal-overview-\(venue.rawValue)")
+        }
         terminalWindow.orderOut(nil)
     }
 

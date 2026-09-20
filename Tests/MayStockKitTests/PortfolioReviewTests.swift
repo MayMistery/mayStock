@@ -22,7 +22,7 @@ private func config(
 ) -> AppConfig {
     var config = AppConfig.default
     config.strategy.mode = mode
-    config.strategy.totalCapital = totalCapital
+    config.strategy.capital[.okx] = totalCapital
     config.strategy.allocations = allocations
     config.strategy.emergencyStop = emergencyStop
     config.strategy.feeSchedules.okx.slippageBps = 1
@@ -109,7 +109,7 @@ struct ReviewActuatorTests {
         #expect(ReviewActuator.derisksViolation(from: base, to: unlocked)?.contains("实盘") == true)
 
         var richer = base
-        richer.strategy.totalCapital *= 2
+        richer.strategy.capital[.okx] = richer.strategy.totalCapital(for: .okx) * 2
         #expect(ReviewActuator.derisksViolation(from: base, to: richer)?.contains("本金") == true)
 
         var loosened = base
@@ -317,7 +317,7 @@ struct PortfolioReviewChecksTests {
 
         let outcome = ReviewActuator.apply(first.actions, to: start)
         #expect(outcome.applied.count == 2)
-        #expect(outcome.config.strategy.allocatedCapital <= 100_000)
+        #expect(outcome.config.strategy.allocatedCapital(on: .okx) <= 100_000)
 
         // The whole point: a second pass over the state we just wrote must be
         // quiet, or the hourly job rewrites the config forever.

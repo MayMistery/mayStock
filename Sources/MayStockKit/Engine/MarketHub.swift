@@ -18,6 +18,8 @@ public final class MarketHub {
     public private(set) var sessions: [String: InstrumentSession] = [:]
     /// Each venue's feed health, once its feed has reported anything.
     public private(set) var feedStates: [Venue: FeedState] = [:]
+    /// What each venue's feed is actually reading from, once it has said.
+    public private(set) var sourceNames: [Venue: String] = [:]
 
     /// Called on every ticker update — alert evaluation hooks in here.
     public var onTick: ((InstrumentSession, Ticker) -> Void)?
@@ -40,11 +42,16 @@ public final class MarketHub {
     }
 
     /// The feeds and sources the app ships with, one pair per venue.
-    public static func standard() -> MarketHub {
-        let sources = MarketDataSources()
-        return MarketHub(
-            feeds: [OKXMarketFeed(), YahooMarketFeed(client: sources.yahoo)],
-            sources: [sources.okx, sources.yahoo])
+    public static func standard(sources: MarketDataSources = MarketDataSources()) -> MarketHub {
+        MarketHub(
+            feeds: [OKXMarketFeed(), SchwabMarketFeed(schwab: sources.schwab.schwab, yahoo: sources.yahoo)],
+            sources: [sources.okx, sources.schwab])
+    }
+
+    /// Where a venue's prices are coming from right now: the feed's own
+    /// word when it has spoken, the venue's designed source until then.
+    public func sourceName(for venue: Venue) -> String {
+        sourceNames[venue] ?? venue.marketDataSourceName
     }
 
     public func source(for venue: Venue) -> (any MarketDataSource)? {
@@ -205,6 +212,8 @@ public final class MarketHub {
         case .book(let book):
             guard let session = sessions[book.instId], session.venue == venue else { return }
             session.apply(book: book)
+        case .source(let name):
+            sourceNames[venue] = name
         }
     }
 }

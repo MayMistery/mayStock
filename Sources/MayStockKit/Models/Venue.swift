@@ -173,7 +173,52 @@ public enum Venue: String, Codable, Sendable, CaseIterable, Identifiable, Hashab
     public var marketDataSourceName: String {
         switch self {
         case .okx: return "OKX 公共行情"
-        case .schwab: return "Yahoo Finance（嘉信审批期间的过渡源）"
+        case .schwab: return "嘉信官方行情（未登录时 Yahoo Finance）"
+        }
+    }
+
+    /// The clock the venue's *book* keeps — what "today" means for the
+    /// equity curve's windows. OKX settles against a Singapore-hours desk;
+    /// a US account's day is New York's.
+    public var accountingTimeZone: TimeZone {
+        switch self {
+        case .okx: return TimeZone(identifier: "Asia/Singapore")!
+        case .schwab: return TimeZone(identifier: "America/New_York")!
+        }
+    }
+
+    /// How this venue's files are named in the state directory. OKX keeps
+    /// the bare names the app has always written — `ledger-demo.json` — so
+    /// a book recorded before there was a second venue stays readable; every
+    /// other venue is spelled into the name.
+    public var stateFileInfix: String {
+        self == .okx ? "" : "-" + rawValue
+    }
+
+    /// What a window's result on this venue is measured from.
+    public enum PeriodFigure: Sendable, Equatable {
+        /// The exchange's own bill ledger — the one period figure it vouches
+        /// for, on a venue that publishes neither period P&L nor an equity
+        /// history.
+        case exchangeBills
+        /// This app's equity curve, on a venue whose account it values at
+        /// the venue's own liquidation value — or whose demo book is exact.
+        case equityCurve
+    }
+
+    public var periodFigure: PeriodFigure {
+        switch self {
+        case .okx: return .exchangeBills
+        case .schwab: return .equityCurve
+        }
+    }
+
+    /// The capital a fresh portfolio starts with on this venue, in its
+    /// quote currency. Only a starting point for the settings page.
+    public var defaultPortfolioCapital: Double {
+        switch self {
+        case .okx: return 1_000
+        case .schwab: return 10_000
         }
     }
 

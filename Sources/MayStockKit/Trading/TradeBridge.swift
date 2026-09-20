@@ -521,9 +521,15 @@ public enum TradeError: Error, CustomStringConvertible, Sendable {
     /// routing bug rather than a market condition. Named here so it reads as
     /// one, instead of as an opaque CLI usage error.
     case unsupportedInstrument(InstrumentType)
+    /// A venue saw the order and refused it — the definite verdict every
+    /// adapter reports the same way, so the runner needs one rule to read
+    /// "nothing is in flight" off a failure.
+    case rejected(venue: String, reason: String)
 
     public var description: String {
         switch self {
+        case .rejected(let venue, let reason):
+            return "\(venue)拒绝了订单：\(reason)"
         case .cliNotFound:
             return "未找到官方 okx CLI。安装：npm install -g @okx_ai/okx-trade-cli"
         case .cliFailed(let code, let stderr):
@@ -547,6 +553,7 @@ public enum TradeError: Error, CustomStringConvertible, Sendable {
     /// code says something definite: the exchange saw the order and refused it.
     /// Only the second kind may be treated as "this did not happen".
     public var exchangeRejection: String? {
+        if case .rejected(let venue, let reason) = self { return "\(venue)：\(reason)" }
         guard case .cliFailed(let exitCode, let stderr) = self, exitCode > 0,
               let code = Self.okxCode(in: stderr) else { return nil }
         let words = Self.okxMessage(in: stderr)
