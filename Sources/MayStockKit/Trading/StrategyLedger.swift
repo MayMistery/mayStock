@@ -171,14 +171,15 @@ public struct StrategyFill: Codable, Sendable, Equatable, Identifiable {    publ
 
     /// This fill as the kernel's identity rule reads it.
     ///
-    /// A ledger row keeps the venue's id in `id`, which for a fill ingested
-    /// off an exchange listing is its trade id — exactly what the rule
-    /// qualifies by instrument. A row synthesised (an adoption, a funding
-    /// correction) has no trade id at all, so `id` falls through to the
-    /// rule's last resort and stays itself.
+    /// A ledger row stores one id, whatever the venue gave it: an ingested
+    /// fill keeps its exchange trade id (the field the rule qualifies by
+    /// instrument), a shadow or synthetic fill keeps the id it was made with.
+    /// It goes in the record's `id` slot only — the kernel turns both a trade
+    /// id and a synthesised id into the same `trade:inst|id` key, so claiming
+    /// `tradeId` for a row that is not really a venue trade would be lying
+    /// about the key's provenance for no change in the key itself.
     public var kernelRecord: KernelFillRecord {
-        KernelFillRecord(
-            id: id, instId: instId, tradeId: id, ts: ts, side: side, leg: nil)
+        KernelFillRecord(id: id, instId: instId, ts: ts, side: side, leg: nil)
     }
 
     /// The action in position terms — 开/加/平/反手 crossed with 多/空 — which

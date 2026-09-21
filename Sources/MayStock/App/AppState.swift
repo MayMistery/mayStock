@@ -608,8 +608,17 @@ final class AppState {
             if schwabCLI == nil { await detectSchwabCLI() } else { schwabStatus = try? await schwabBridge.status() }
         }
         guard tradingReady(for: venue) else {
+            // Nothing on this account may be read, so nothing read from it may
+            // stay on screen — otherwise a logout leaves the previous account's
+            // orders and fills looking current.
             books.accountSnapshot = nil
             books.exchangePositions = []
+            books.openOrders = []
+            books.openOrdersNote = nil
+            books.openOrdersError = nil
+            books.exchangeFills = []
+            books.exchangeFillsNote = nil
+            books.exchangeFillsError = nil
             books.accountError = tradingBlocker(for: venue)
             return
         }
