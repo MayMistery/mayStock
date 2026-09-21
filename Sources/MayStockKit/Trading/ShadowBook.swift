@@ -193,11 +193,11 @@ public actor ShadowBook {
         }
     }
 
-    /// Everything the simulated account has filled, newest first, plus the
-    /// families a simulated book has nothing to read — which is none: there
-    /// is one book here and it is in memory.
+    /// Everything the simulated account has filled — newest first, the listing
+    /// type's own invariant. There is one book here and it is in memory, so
+    /// nothing can be unreadable.
     public func fillListing() -> ExchangeFillListing {
-        ExchangeFillListing(fills: fills(instId: nil).sorted { $0.ts > $1.ts })
+        ExchangeFillListing(fills: fills(instId: nil))
     }
 
     /// The runner's reading of every non-protective order carrying the tag.

@@ -248,6 +248,7 @@ public struct SchwabVenue: ExchangeVenue {
     }
 
     /// The live transactions listing with each row's strategy tag attached.
+    /// Newest-first is the listing type's own invariant.
     private func taggedFills(instId: String?) async throws -> [ExchangeFill] {
         let now = Date()
         let listing = try await bridge.fills(

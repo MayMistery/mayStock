@@ -7,7 +7,7 @@ import CMayStockKernel
 /// own record. Coarser than `PositionEffect` on purpose: telling an opener
 /// from an add needs a position book, and a fill read straight off the venue
 /// has none.
-public enum KernelLegEffect: String, Decodable, Sendable, CaseIterable {
+public enum KernelLegEffect: String, Decodable, Sendable {
     case increase, decrease
 
     /// Crossed with the leg, this is the 开/平 half of a Chinese action label.
@@ -15,7 +15,7 @@ public enum KernelLegEffect: String, Decodable, Sendable, CaseIterable {
 }
 
 /// Which of the two books a merged row came from.
-public enum KernelFillSource: String, Decodable, Sendable, CaseIterable {
+public enum KernelFillSource: String, Decodable, Sendable {
     case ledger, venue
 }
 
@@ -236,10 +236,10 @@ extension FillRow {
             side: fill.side, price: money.price, quantity: abs(fill.size),
             feeQuote: money.feeQuote, strategyId: nil,
             action: action,
-            // Only a fill that reduced a leg realised anything; the venue's
-            // own zero on an opener says the same thing, so both are read the
-            // same way here — a stamp of zero is no realised figure.
-            realisedQuote: legEffect == .decrease ? money.realisedQuote : nil,
+            // `FillMoney` has already turned an opener's stamped-zero into nil
+            // and converted a coin figure into quote currency, so this is
+            // simply "what the venue says this fill banked", or nothing.
+            realisedQuote: money.realisedQuote,
             isExternal: true)
     }
 }
@@ -285,7 +285,6 @@ extension TradingKernel {
     }
 }
 
-// MARK: - Identity index
 /// The executions a book already holds, keyed the kernel's way.
 ///
 /// Not a `Set<String>` of identities. A record carries *several* names — the
@@ -297,45 +296,44 @@ extension TradingKernel {
 /// read before. That is exactly the failure this exists to prevent — a
 /// re-listing of a week of fills the ledger had already booked, counted twice.
 ///
-/// Every method here takes or returns whole batches, so a caller holding a
-/// listing pays one kernel round trip for it rather than one per row.
-public struct KernelIdentities: Sendable, Equatable {
+/// The kernel is asked in one batch per listing, never one row at a time.
+public struct KernelIdentities: Sendable {
     private var keys: Set<String>
 
-    public init(keys: Set<String> = []) { self.keys = keys }
+    public init() { keys = [] }
 
-    /// Index the given records.
+    /// Index the given records' keys.
     public static func of(_ records: [KernelFillRecord]) -> KernelIdentities {
-        guard !records.isEmpty,
-              let sets = try? TradingKernel.fillKeys(records) else { return KernelIdentities() }
-        return KernelIdentities(keys: Set(sets.joined()))
+        KernelIdentities(keys: Self.keySets(records).flatMap { $0 })
     }
 
-    /// For each record, whether this book has **not** seen it. One kernel call
-    /// for the whole batch; the comparison itself is local.
+    /// For each record, whether this book has **not** seen it.
+    ///
+    /// When the rule cannot be asked, every row reads as already seen — the
+    /// direction that loses a fill rather than double-counting one. A row the
+    /// rule refused is retried on the next tick; a doubled position never
+    /// un-doubles, so the conservative answer is the safe one.
     public func unbooked(_ records: [KernelFillRecord]) -> [Bool] {
-        guard !records.isEmpty else { return [] }
-        guard let sets = try? TradingKernel.fillKeys(records) else {
-            // The rule could not be asked. Answering "not seen" would re-book
-            // everything it was asked about, so it answers "seen" — the
-            // direction that loses a fill rather than double-counting one, and
-            // the caller logs the reason either way.
-            return Array(repeating: false, count: records.count)
-        }
-        return sets.map { set in !set.contains { keys.contains($0) } }
+        Self.keySets(records).map { set in !set.contains { keys.contains($0) } }
     }
 
-    /// Whether this book has seen one execution. A batch of one, for the
-    /// single-record callers; the work is in the kernel call, not the count.
+    /// Whether this book has seen one execution.
     public func holds(_ record: KernelFillRecord) -> Bool {
         !(unbooked([record]).first ?? false)
     }
 
+    /// Index records the book is about to keep.
     public mutating func insert(_ records: [KernelFillRecord]) {
-        guard !records.isEmpty,
-              let sets = try? TradingKernel.fillKeys(records) else { return }
-        keys.formUnion(sets.joined())
+        keys.formUnion(Self.keySets(records).flatMap { $0 })
     }
 
-    public var isEmpty: Bool { keys.isEmpty }
+    /// One kernel round trip for the whole batch; a kernel failure is an empty
+    /// key set, which the callers above read conservatively.
+    private static func keySets(_ records: [KernelFillRecord]) -> [[String]] {
+        guard !records.isEmpty,
+              let sets = try? TradingKernel.fillKeys(records) else { return [] }
+        return sets
+    }
+
+    private init(keys: [String]) { self.keys = Set(keys) }
 }

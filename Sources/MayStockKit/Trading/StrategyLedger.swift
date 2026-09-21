@@ -38,8 +38,9 @@ public struct FillMoney: Sendable, Equatable {
     public let price: Double
     /// Positive cost, in quote currency.
     public let feeQuote: Double
-    /// What the venue says this fill realised, in quote currency, or nil when
-    /// it says nothing or says naught.
+    /// What the venue says this fill realised, in quote currency. Nil when it
+    /// says nothing, or naught — an opener is stamped zero and realises no
+    /// money, and a dash in the P&L column reads more honestly than "+0".
     public let realisedQuote: Double?
 
     public init?(_ fill: ExchangeFill, venue: Venue, indexPrice: Double? = nil) {
@@ -53,13 +54,16 @@ public struct FillMoney: Sendable, Equatable {
             price = fill.priceUsd.map { $0 > 0 ? $0 : fill.price * index } ?? fill.price * index
             feeQuote = fill.feeCcy == base ? feeMagnitude * index : feeMagnitude
             // The venue's realised figure is stamped in the same coin.
-            realisedQuote = fill.pnl.map { fill.feeCcy == base ? $0 * index : $0 }
+            realisedQuote = fill.pnl.flatMap(Self.nonZero)
+                .map { fill.feeCcy == base ? $0 * index : $0 }
             return
         }
         price = fill.price
         feeQuote = fill.feeCcy == base ? feeMagnitude * fill.price : feeMagnitude
-        realisedQuote = fill.pnl
+        realisedQuote = fill.pnl.flatMap(Self.nonZero)
     }
+
+    private static func nonZero(_ value: Double) -> Double? { value == 0 ? nil : value }
 }
 
 // MARK: - Records
@@ -545,13 +549,20 @@ public final class StrategyLedger {
         if changed { onChanged?() }
     }
 
+    /// Book one fill, skipping any execution the index already holds.
     public func record(_ fill: StrategyFill) {
-        // Keyed by the kernel's rule rather than by `id`, so a fill offered
-        // twice under two of its names — a trade id by one listing, a bill id
-        // by the next — is still one fill. A book that tested `id` equality
-        // re-booked every execution the first time a listing changed which
-        // field it read.
         guard !bookedIdentities.holds(fill.kernelRecord) else { return }
+        book(fill)
+    }
+
+    /// Apply a fill already judged new to the position.
+    ///
+    /// The judgement lives with the caller: `record` and `ingest` both resolve
+    /// "have I seen this execution?" in one batch before getting here, so this
+    /// does not ask the kernel again per fill. `apply`'s other two refusal
+    /// reasons — a flat-book instrument move, an unknown multiplier — remain
+    /// here; they concern the position, not the fill's identity.
+    private func book(_ fill: StrategyFill) {
         var state = positions[fill.strategyId] ?? StrategyPositionState(
             strategyId: fill.strategyId, instId: fill.instId, venue: fill.venue)
         if state.instId != fill.instId {
@@ -628,11 +639,11 @@ public final class StrategyLedger {
     ) -> Int {
         for (instId, size) in contractSizes { setContractSize(size, forInstId: instId) }
         // What is new, the tag, and the index price all resolve before a fill
-        // is offered to `record` — one batch call for the whole listing rather
-        // than one per row, and so that a fill already on the book is dropped
-        // *before* anything is logged about it. A duplicate that has nothing
-        // to say about its own conversion would otherwise warn on every tick
-        // for as long as the exchange kept listing it.
+        // is offered to the position — one batch identity call for the whole
+        // listing rather than one per fill, and so that a fill already on the
+        // book is dropped *before* anything is logged about it. A duplicate
+        // that has nothing to say about its own conversion would otherwise
+        // warn on every tick for as long as the exchange kept listing it.
         let candidates: [(fill: ExchangeFill, strategyId: String)] = exchangeFills
             .sorted(by: { $0.ts < $1.ts })
             .compactMap { fill in
@@ -650,8 +661,11 @@ public final class StrategyLedger {
                          + "本轮未入账，下轮重试")
                 continue
             }
+            // Identity is already settled above; `book`'s remaining refusals —
+            // a flat-book move, an unknown multiplier — are the only things
+            // that can leave the count unchanged, and they log their wait.
             let before = fills.count
-            record(booked)
+            book(booked)
             if fills.count > before { added += 1 }
         }
         return added

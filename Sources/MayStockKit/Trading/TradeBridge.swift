@@ -648,12 +648,16 @@ public struct ExchangeFill: Sendable, Equatable, Identifiable {
 /// The same shape as `OpenOrderListing` and for the same reason: a book that
 /// could not be read must be named, because an empty list in its place reads
 /// as "nothing traded" — which on this account was the visible bug.
+///
+/// `fills` is newest first by construction — the order the overview trims with
+/// `prefix`. A venue's wire returns fills oldest first, so the ordering is
+/// enforced here once, at the type, rather than relied on at every call site.
 public struct ExchangeFillListing: Sendable, Equatable {
     public var fills: [ExchangeFill]
     public var unavailable: [String]
 
     public init(fills: [ExchangeFill] = [], unavailable: [String] = []) {
-        self.fills = fills
+        self.fills = fills.sorted { $0.ts > $1.ts }
         self.unavailable = unavailable
     }
 }
@@ -1164,9 +1168,8 @@ public struct TradeBridge: Sendable {
         if listing.unavailable.count == requests.count, let firstError { throw firstError }
         // One execution is one row whatever family it is filed under; the
         // kernel's identity rule is what decides that, and it is asked
-        // elsewhere rather than re-derived here. What belongs here is only
-        // the ordering the page reads top-down.
-        listing.fills.sort { $0.ts > $1.ts }
+        // elsewhere rather than re-derived here. Newest-first is the listing
+        // type's own invariant.
         listing.unavailable.sort()
         return listing
     }

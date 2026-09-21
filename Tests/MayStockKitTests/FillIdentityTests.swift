@@ -263,4 +263,26 @@ struct FillRowTests {
             fee: -0.1, feeCcy: "USDT", ordId: nil, clOrdId: nil, ts: Date())
         #expect(FillRow(spot, venue: .okx, legEffect: nil) != nil)
     }
+
+    /// A listing is newest first whatever order its fills arrive in.
+    ///
+    /// The overview trims with `prefix(limit)`; if a venue handed the listing
+    /// back oldest first — which is the order the wires naturally return — the
+    /// table would show the oldest twelve fills as "recent". The order is the
+    /// listing type's own invariant, so it is asserted for an input that is
+    /// deliberately oldest first.
+    @Test func aListingIsNewestFirstHoweverTheFillsArrived() {
+        let now = Date()
+        func fill(_ id: String, _ offset: TimeInterval) -> ExchangeFill {
+            ExchangeFill(
+                id: id, instId: "ETH-USDT", side: .buy, posSide: nil, price: 100, size: 1,
+                fee: 0, feeCcy: "USDT", ordId: nil, clOrdId: nil,
+                ts: now.addingTimeInterval(offset))
+        }
+        let oldestFirst = [fill("old", -300), fill("mid", -200), fill("new", -100)]
+        let listing = ExchangeFillListing(fills: oldestFirst)
+        #expect(listing.fills.map(\.id) == ["new", "mid", "old"])
+        #expect(Array(listing.fills.prefix(2)).map(\.id) == ["new", "mid"],
+                "prefix is the recent slice, not the oldest")
+    }
 }
