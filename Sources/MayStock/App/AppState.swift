@@ -108,6 +108,10 @@ final class AppState {
     private(set) var backtestPhase: [String: BacktestPhase] = [:]
     var cliInfo: CLIInfo?
     var isDetectingCLI = false
+    /// How far this machine's clock sits from the exchange's, in seconds;
+    /// positive when the local clock runs ahead. Nil until first measured.
+    /// See `clockDriftWarning` for why it is worth knowing.
+    private(set) var clockOffset: TimeInterval?
     /// `schwabctl`, and what it says about the login. Read at launch and on
     /// every account-page refresh; never holds a secret.
     var schwabCLI: CLIInfo?
@@ -983,6 +987,27 @@ final class AppState {
         }
     }
 
+    /// Read the exchange's clock and remember how far this one is from it.
+    ///
+    /// Public data, no credentials, one request. Measured on the account
+    /// refresh rather than every tick because a clock drifts slowly, and a
+    /// reading per tick would cost a request every twenty seconds to watch a
+    /// number that moves over hours. A failed read leaves the last answer
+    /// standing rather than clearing it: not being able to ask is not evidence
+    /// that the clock is fine.
+    func measureClockOffset() async {
+        guard let reading = try? await OKXRESTClient().clockOffset() else { return }
+        let previous = clockOffset
+        clockOffset = reading.offset
+        let drifted = abs(reading.offset) >= Self.clockDriftTolerance
+        let wasDrifted = previous.map { abs($0) >= Self.clockDriftTolerance } ?? false
+        if drifted != wasDrifted {
+            Log.warn("clock: 本机与交易所相差 \(PriceFormatter.decimals(reading.offset, 3)) 秒"
+                     + "（往返 \(PriceFormatter.decimals(reading.roundTrip, 3)) 秒）"
+                     + (drifted ? " —— 超过容差，已在总览提示" : " —— 已回到容差内"))
+        }
+    }
+
     func startAccountRefreshLoop() {
         accountRefreshLoop?.cancel()
         accountRefreshLoop = Task { [weak self] in
@@ -1002,6 +1027,7 @@ final class AppState {
                         self.lastLoggedAccountError[venue] = nil
                     }
                 }
+                await self.measureClockOffset()
             }
         }
     }

@@ -132,6 +132,28 @@ extension AppState {
         "\(venue.rawValue):\(venue.currencies(of: instId).base)"
     }
 
+    /// Set when this machine's clock has drifted far enough from the
+    /// exchange's to matter, in words. Nil when it is close, or unmeasured.
+    ///
+    /// A drifted clock is the rare degradation that hides rather than shows.
+    /// Its loud half is harmless: a signed request outside the venue's window
+    /// is refused, and the refusal says so. Its quiet half is not — the kernel
+    /// judges whether the latest bar is stale by comparing it against this
+    /// clock, so a clock running slow makes an out-of-date bar look current,
+    /// and the strategy trades on it believing it is fresh. Nothing errors.
+    var clockDriftWarning: String? {
+        guard let offset = clockOffset, abs(offset) >= Self.clockDriftTolerance else { return nil }
+        let seconds = PriceFormatter.decimals(abs(offset), 1)
+        return "本机时钟比交易所\(offset > 0 ? "快" : "慢") \(seconds) 秒。"
+            + "下单签名可能被拒；更要紧的是引擎用本机时钟判断行情是否过期，"
+            + "时钟慢会把过期的 K 线当成最新的。请检查系统的时间同步。"
+    }
+
+    /// Beyond this the clock is worth saying something about. Far below the
+    /// window a venue refuses a signature in, so the warning arrives while it
+    /// is still only a warning.
+    static let clockDriftTolerance: TimeInterval = 5
+
     /// Set when a venue's engine should be trading and demonstrably is not.
     ///
     /// A process that is alive but has stopped doing its job is the failure
@@ -157,6 +179,7 @@ extension AppState {
         if store.config.strategy.emergencyStop {
             notices.append((.emergencyStop, "急停已触发：所有策略停止，解除后才能重新开始交易。"))
         }
+        if let drift = clockDriftWarning { notices.append((.clockDrift, drift)) }
         for venue in Venue.allCases {
             let runner = runner(for: venue)
             if let over = runner.overCommitted { notices.append((.overCommitted, "\(venue.displayName)：" + over)) }
@@ -175,5 +198,7 @@ extension AppState {
         return notices
     }
 
-    enum EngineNoticeKind { case heartbeat, emergencyStop, overCommitted, protection, overAllocated }
+    enum EngineNoticeKind {
+        case heartbeat, emergencyStop, overCommitted, protection, overAllocated, clockDrift
+    }
 }

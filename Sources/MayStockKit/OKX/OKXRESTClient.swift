@@ -342,6 +342,49 @@ public struct OKXRESTClient: Sendable {
         return mark
     }
 
+    struct ServerTimeRow: Decodable {
+        let ts: String
+    }
+
+    /// The offset implied by one round trip, measured at its midpoint.
+    ///
+    /// Taking the midpoint rather than either end is what bounds the reading's
+    /// own error: the reply was produced somewhere inside the trip, so the
+    /// midpoint is wrong by at most half of it — which is why the round trip
+    /// is returned alongside, as the reading's error bar. Comparing against
+    /// the moment the reply *arrived* would charge the whole latency to the
+    /// clock and report drift on a slow network.
+    static func clockOffset(
+        serverMilliseconds: Double, sent: Date, received: Date
+    ) -> (offset: TimeInterval, roundTrip: TimeInterval) {
+        let roundTrip = received.timeIntervalSince(sent)
+        let midpoint = sent.addingTimeInterval(roundTrip / 2)
+        let server = Date(timeIntervalSince1970: serverMilliseconds / 1000)
+        return (midpoint.timeIntervalSince(server), roundTrip)
+    }
+
+    /// How far this machine's clock sits from the exchange's, in seconds —
+    /// positive when the local clock runs ahead. Measured at the midpoint of
+    /// the round trip, so the reading's own error is bounded by the latency
+    /// it reports alongside it.
+    ///
+    /// Worth asking because a drifted clock is an invisible degradation, and
+    /// the two things it breaks fail in opposite directions. A signed request
+    /// outside the venue's window is simply refused, which is loud. But the
+    /// kernel decides whether the latest bar is stale by comparing it against
+    /// *this* clock: run slow, and a bar that is long out of date still looks
+    /// fresh, so the strategy trades on it believing it is current.
+    public func clockOffset() async throws -> (offset: TimeInterval, roundTrip: TimeInterval) {
+        let sent = Date()
+        let rows = try await get(ServerTimeRow.self, path: "api/v5/public/time", query: [:])
+        let received = Date()
+        guard let row = rows.first, let milliseconds = Double(row.ts) else {
+            throw OKXError.decoding("public/time")
+        }
+        return Self.clockOffset(
+            serverMilliseconds: milliseconds, sent: sent, received: received)
+    }
+
     private struct IndexTickerRow: Decodable {
         let instId: String
         let idxPx: String

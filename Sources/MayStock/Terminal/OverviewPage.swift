@@ -301,6 +301,7 @@ struct OverviewPage: View {
         case .overCommitted: return "持仓超出账户可支撑"
         case .protection: return "保护性熔断已触发"
         case .overAllocated: return "预算超配"
+        case .clockDrift: return "本机时钟与交易所不一致"
         }
     }
 
