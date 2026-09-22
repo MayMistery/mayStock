@@ -366,7 +366,15 @@ public struct PendingOrderIntent: Sendable, Equatable, Codable {
         guard let priceBasis else { return .marketOrder }
         switch priceBasis {
         case .absolute(let price):
-            return .price(price)
+            // Snapped like any other limit. A price typed into a URL is no
+            // more likely to sit on the tick than a computed one — `0.02153`
+            // against a `0.0001` tick is simply refused — and this function
+            // promises above that its result is on the tick. The direction is
+            // the same one the relative branch uses: crossing the book, so
+            // rounding never lands on the wrong side of what was authorised.
+            let snapped = StrategyRunner.snapToTick(
+                price, tick: tick, roundingUp: side == .buy)
+            return .price(snapped > 0 ? snapped : price)
         case .relative(let anchor, let slipPct, let capUSD):
             guard let reference = anchor.value(bid: bid, ask: ask, mark: mark),
                   reference > 0

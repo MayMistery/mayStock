@@ -274,6 +274,30 @@ struct PendingOrderIntentTests {
         #expect(intent.statedLimitPrice == nil)
     }
 
+    /// A price typed into a URL is no more likely to sit on the tick than a
+    /// computed one, and the exchange refuses one that does not — so the
+    /// absolute basis is snapped like every other limit, crossing the book in
+    /// the same direction so rounding never lands on the wrong side of what
+    /// was authorised.
+    @Test("URL 里写死的限价也要对齐到 tick")
+    func anAbsoluteLimitIsSnappedToTheTick() throws {
+        let buy = try PendingOrderIntent.parse(url(
+            "instId=ETH-USD-260919-2600-C&instType=OPTION&side=buy&kind=ioc"
+            + "&size=73&mode=live&nonce=abs-1&limitPrice=0.006653"))
+        #expect(buy.resolveLimit(
+            bid: 0.006, ask: 0.0065, mark: 0.00625, tick: tick,
+            contractValue: contractValue, indexPrice: 2604) == .price(0.0067),
+            "买单向上对齐，够得着卖一")
+
+        let sell = try PendingOrderIntent.parse(url(
+            "instId=ETH-USD-260919-2600-C&instType=OPTION&side=sell&kind=ioc"
+            + "&size=73&mode=live&nonce=abs-2&limitPrice=0.005827"))
+        #expect(sell.resolveLimit(
+            bid: 0.006, ask: 0.0065, mark: 0.00625, tick: tick,
+            contractValue: contractValue, indexPrice: 2604) == .price(0.0058),
+            "卖单向下对齐")
+    }
+
     @Test("a buy crosses up from the ask and snaps up")
     func buyCrossesUpFromAsk() throws {
         let intent = try relative("ask", slip: "3")
