@@ -46,6 +46,23 @@ struct OrderTagTests {
         let second = OrderTag.make(strategyId: "s", at: now, nonce: 2)
         #expect(first != second)
     }
+
+    /// Ids minted in one millisecond must all differ, without being asked to.
+    ///
+    /// The nonce used to be drawn at random from 1,296 values, so two orders
+    /// in the same millisecond collided about once in 1,296 — and FIX says a
+    /// venue may answer a duplicate client order id by ignoring the order
+    /// outright, with no reject to notice it by. Counted instead of drawn, a
+    /// full millisecond's worth is distinct.
+    @Test("同一毫秒内连续下单的 clOrdId 互不相同")
+    func tagsMintedInOneMillisecondAreAllDistinct() {
+        let now = Date()
+        // A run well short of the counter's 1,296-wide cycle, so a test running
+        // alongside this one cannot push it round into itself.
+        let ids = (0..<300).map { _ in OrderTag.make(strategyId: "s", at: now) }
+        #expect(Set(ids).count == ids.count, "同毫秒内不该有两个一样的 clOrdId")
+        #expect(ids.allSatisfy { $0.count <= 32 }, "OKX 的长度上限")
+    }
 }
 
 // MARK: - Position accounting

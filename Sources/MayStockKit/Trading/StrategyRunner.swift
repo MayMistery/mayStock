@@ -1867,8 +1867,12 @@ public final class StrategyRunner {
         let premiumQuotePerUnit = ask * quote.indexPrice
         let perContract = premiumQuotePerUnit * contract.contractValue
         let lot = contract.lotSize > 0 ? contract.lotSize : 1
+        // Floored onto the lot grid with the same 1e-9 `snapToTick` and
+        // `exchangeSize` carry: a budget that buys a whole number of lots does
+        // not divide back into them exactly in binary, and flooring the raw
+        // ratio drops a lot the account could afford.
         let contracts = perContract > 0
-            ? (plan.premiumBudget / perContract / lot).rounded(.down) * lot : 0
+            ? ((plan.premiumBudget / perContract / lot) + 1e-9).rounded(.down) * lot : 0
         guard contracts >= Swift.max(contract.minSize, lot), contracts > 0 else {
             update(strategy.id) {
                 $0.message = "权利金预算 \(PriceFormatter.money(plan.premiumBudget)) 买不起一张 "

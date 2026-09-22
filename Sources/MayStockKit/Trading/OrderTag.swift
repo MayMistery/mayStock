@@ -34,14 +34,38 @@ public enum OrderTag {
     }
 
     /// Build a client order ID for `strategyId`.
+    ///
+    /// The nonce counts rather than rolls dice. Two orders inside one
+    /// millisecond used to draw independently from 1,296 values, so they
+    /// collided about once in 1,296 — and FIX is explicit that a venue may
+    /// answer a duplicate client order id by *ignoring the order*, with no
+    /// reject to notice. A counter cannot collide at all until it wraps, and
+    /// it wraps only after 1,296 orders in the same millisecond.
+    ///
+    /// Across a restart the counter starts over, but the millisecond stamp has
+    /// moved on, so the pair stays unique. The stamp is what carries
+    /// uniqueness across days and sessions, which is what FIX asks of an id
+    /// that may outlive a trading day on the book.
     public static func make(
-        strategyId: String, at date: Date = Date(), nonce: UInt16 = UInt16.random(in: 0..<1_296)
+        strategyId: String, at date: Date = Date(), nonce: UInt16? = nil
     ) -> String {
         let milliseconds = UInt64(Swift.max(date.timeIntervalSince1970, 0) * 1000)
         let stamp = base36String(milliseconds, width: 8)
-        let suffix = base36String(UInt64(nonce % 1_296), width: 2)
+        let suffix = base36String(nonce.map { UInt64($0) % 1_296 } ?? nextNonce(), width: 2)
         return namespace + hash(strategyId: strategyId) + stamp + suffix
     }
+
+    /// Monotonic within the process, wrapping at the two base-36 digits the
+    /// id has room for.
+    private static func nextNonce() -> UInt64 {
+        nonceLock.lock()
+        defer { nonceLock.unlock() }
+        nonceCounter = (nonceCounter + 1) % 1_296
+        return nonceCounter
+    }
+
+    private static let nonceLock = NSLock()
+    nonisolated(unsafe) private static var nonceCounter: UInt64 = 0
 
     /// The strategy digest inside a client order ID, or nil when the ID did not
     /// come from MayStock.
