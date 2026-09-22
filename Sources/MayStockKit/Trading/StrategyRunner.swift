@@ -1507,17 +1507,86 @@ public final class StrategyRunner {
         // An order that shrinks a derivative position says so, and the
         // exchange then refuses to let it overshoot into the opposite side.
         let heldBase = host.ledger.position(for: strategy.id)?.baseQuantity ?? 0
-        let reduces = market.instType.isDerivative && abs(heldBase) > 1e-12
+        let opposes = market.instType.isDerivative && abs(heldBase) > 1e-12
             && (baseDelta > 0) != (heldBase > 0)
-            && abs(baseDelta) <= abs(heldBase) + 1e-12
+        let reduces = opposes && abs(baseDelta) <= abs(heldBase) + 1e-12
+
+        // A reversal is two trades, and on a hedge-mode account it has to be
+        // sent as two orders.
+        //
+        // The kernel hands over one crossing delta — `target − held`, which on
+        // a flip is about twice the position — and says so deliberately
+        // (`guard::reduces_exposure`: an overshoot "closes one position and
+        // opens another"). But OKX in `long_short_mode` names a leg on every
+        // order, and `sell` + `posSide: long` means *close the long*: one order
+        // cannot also open the short, and asking to close twice what is held is
+        // simply refused. The reversal then never happens, the retry sends the
+        // same impossible shape, and the strategy ends up failed while still
+        // holding the position its signal has turned against.
+        //
+        // So the held leg is closed first, reduce-only, and what follows opens
+        // the new one — the same split `SchwabVenue.specs` already makes for
+        // equities. Net-mode accounts name no leg and may cross in one order,
+        // so they keep the single order they have always sent.
+        var openingDelta = baseDelta
+        if opposes, !reduces, let heldLeg = posSide, heldLeg != .net {
+            let closeSize = meta?.exchangeSize(forBaseQuantity: abs(heldBase))
+                ?? abs(heldBase) / contractSize
+            guard closeSize > 0 else {
+                update(strategy.id) { $0.message = "持仓量低于交易所最小下单量，无法先平后反手" }
+                return
+            }
+            let close = OrderRequest(
+                instId: market.instId, instType: market.instType,
+                side: baseDelta > 0 ? .buy : .sell, kind: .market,
+                size: closeSize, sizeUnit: .base,
+                posSide: heldLeg, reduceOnly: true,
+                clOrdId: OrderTag.make(strategyId: strategy.id))
+            Log.warn("""
+                runner: 反手 \(strategy.id) \(market.instId) 先平 \(closeSize) 张\
+                （\(heldLeg.rawValue) 腿），再开 \(abs(heldBase + baseDelta)) 币
+                """)
+            switch await placeOrTrack(close, strategy: strategy, host: host, reason: reason) {
+            case .accepted:
+                break
+            case .cancelled:
+                return
+            case .unconfirmed:
+                // The close may or may not have landed. Opening the other leg
+                // now could leave both open at once, which is the one outcome
+                // worse than being late: the next tick re-decides from a
+                // position the exchange has by then confirmed.
+                update(strategy.id) { $0.message = "反手的平仓腿结果未确认，暂不开新仓，下轮重来" }
+                return
+            case .rejected(let why):
+                update(strategy.id) {
+                    $0.status = .failed
+                    $0.message = "反手的平仓腿被拒绝：\(why)"
+                }
+                return
+            }
+            // What is left to do is the opening half — the target itself, now
+            // that the book is flat.
+            openingDelta = heldBase + baseDelta
+            posSide = await positionSide(forLeg: openingDelta, host: host)
+        }
+
+        let openingSize = openingDelta == baseDelta
+            ? size
+            : (meta?.exchangeSize(forBaseQuantity: abs(openingDelta))
+                ?? abs(openingDelta) / contractSize)
+        guard openingSize > 0 else {
+            update(strategy.id) { $0.message = "调整量低于交易所最小下单量，本次跳过" }
+            return
+        }
 
         func request(withProtection: Bool) -> OrderRequest {
             OrderRequest(
                 instId: market.instId,
                 instType: market.instType,
-                side: baseDelta > 0 ? .buy : .sell,
+                side: openingDelta > 0 ? .buy : .sell,
                 kind: .market,
-                size: size,
+                size: openingSize,
                 sizeUnit: .base,
                 posSide: posSide,
                 reduceOnly: reduces,

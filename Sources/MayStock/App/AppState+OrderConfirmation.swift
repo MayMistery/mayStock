@@ -120,7 +120,15 @@ extension AppState {
 
     private func confirmAndPlace(_ intent: PendingOrderIntent, restored: Bool = false) async {
         let store = pendingOrders
-        if Self.answeredNonces.contains(intent.nonce) {
+        // Checking and claiming have to be the same step. Between this point
+        // and the order going out sit `gatherContext`'s network calls and the
+        // confirmation sheet — `beginSheetModal` suspends rather than blocks —
+        // and each delivery of the URL runs in its own Task. A check that only
+        // read the set let a second delivery of the same nonce walk straight
+        // past it, put up a second identical dialog, and send a second order.
+        // Both statements run on the main actor with nothing awaited between
+        // them, so together they are atomic.
+        guard Self.answeredNonces.insert(intent.nonce).inserted else {
             Log.warn("order-intent: 丢弃重复的 nonce \(intent.nonce)（\(intent.instId)）")
             return
         }
@@ -290,10 +298,9 @@ extension AppState {
             }
         }
 
-        // Claim the nonce before anything goes out: if a call throws
-        // ambiguously, the order may still have landed, and a retry is the one
-        // thing that must not happen automatically.
-        Self.answeredNonces.insert(intent.nonce)
+        // The nonce was claimed at the gate, before the dialog; what is marked
+        // here is that the order is *going out*, so a process that dies now is
+        // restored as interrupted and never retried automatically.
         store.markStarted(intent.nonce)
 
         // Step 1: buy the settlement coin, if the account is short of it.

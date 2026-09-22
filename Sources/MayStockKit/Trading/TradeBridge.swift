@@ -938,9 +938,9 @@ public struct TradeBridge: Sendable {
                     "--instId", order.instId,
                     "--side", order.side.rawValue,
                     "--ordType", order.kind.rawValue,
-                    "--sz", PriceFormatter.plain(order.size)]
+                    "--sz", PriceFormatter.wire(order.size)]
         if order.kind.isPriced, let price = order.limitPrice {
-            args += ["--px", PriceFormatter.plain(price)]
+            args += ["--px", PriceFormatter.wire(price)]
         }
         if let tradeMode = order.tradeMode {
             args += ["--tdMode", tradeMode]
@@ -959,10 +959,10 @@ public struct TradeBridge: Sendable {
         // `-1` is OKX's "fill at market once triggered". A limit exit could sit
         // unfilled through the move it was meant to escape.
         if let stop = order.stopTriggerPrice, stop > 0 {
-            args += ["--slTriggerPx", PriceFormatter.plain(stop), "--slOrdPx", "-1"]
+            args += ["--slTriggerPx", PriceFormatter.wire(stop), "--slOrdPx", "-1"]
         }
         if let target = order.takeProfitTriggerPrice, target > 0 {
-            args += ["--tpTriggerPx", PriceFormatter.plain(target), "--tpOrdPx", "-1"]
+            args += ["--tpTriggerPx", PriceFormatter.wire(target), "--tpOrdPx", "-1"]
         }
         if let clOrdId = order.clOrdId {
             args += ["--clOrdId", clOrdId]
@@ -1569,7 +1569,7 @@ public struct TradeBridge: Sendable {
         if mode == .live && !liveUnlocked { throw TradeError.liveTradingLocked }
         _ = try await runCLI(
             [try Self.module(for: instType), "algo", "amend", "--instId", instId, "--algoId", algoId,
-             "--newSlTriggerPx", PriceFormatter.plain(stopPrice), "--newSlOrdPx", "-1"],
+             "--newSlTriggerPx", PriceFormatter.wire(stopPrice), "--newSlOrdPx", "-1"],
             mode: mode)
     }
 
@@ -1582,9 +1582,9 @@ public struct TradeBridge: Sendable {
         // The order that closes a long is a sell, and vice versa.
         let side: OrderSide = posSide == .short ? .buy : .sell
         var args = [try Self.module(for: instType), "algo", "place", "--instId", instId,
-                    "--side", side.rawValue, "--sz", PriceFormatter.plain(size),
+                    "--side", side.rawValue, "--sz", PriceFormatter.wire(size),
                     "--ordType", "conditional",
-                    "--slTriggerPx", PriceFormatter.plain(stopPrice),
+                    "--slTriggerPx", PriceFormatter.wire(stopPrice),
                     "--slOrdPx", "-1", "--reduceOnly"]
         if let posSide, instType.usesPositionSide { args += ["--posSide", posSide.rawValue] }
         _ = try await runCLI(args, mode: mode)

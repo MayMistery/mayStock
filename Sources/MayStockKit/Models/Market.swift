@@ -452,10 +452,19 @@ public struct InstrumentMeta: Sendable, Equatable {
 
     /// Convert a base-currency quantity into the units the exchange expects,
     /// rounded down to a whole lot. Returns 0 when the result is below `minSize`.
+    ///
+    /// The lot count is nudged by the same `1e-9` `StrategyRunner.snapToTick`
+    /// uses, and for the same reason: a quantity that came *back* from whole
+    /// lots does not divide cleanly into them again. `29 × 0.01` is `0.29`,
+    /// and `0.29 / 0.01` is `28.999999999999996`, so flooring sends 28
+    /// contracts and leaves one open — on a flatten or an emergency stop, one
+    /// lot of unwanted exposure whose protective order was sized for the whole
+    /// position. Across multipliers 0.001 … 100 and the first 2,000 contract
+    /// counts, 238 counts floor a lot short without the nudge and none with it.
     public func exchangeSize(forBaseQuantity quantity: Double) -> Double {
         let raw = quantity / (contractValue ?? 1)
         let step = lotSize > 0 ? lotSize : 0
-        let rounded = step > 0 ? (raw / step).rounded(.down) * step : raw
+        let rounded = step > 0 ? ((raw / step) + 1e-9).rounded(.down) * step : raw
         guard rounded >= minSize, rounded > 0 else { return 0 }
         // Trim binary noise so "0.30000000000000004" never reaches the CLI.
         return (rounded * 1e10).rounded() / 1e10

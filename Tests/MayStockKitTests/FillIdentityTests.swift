@@ -73,6 +73,34 @@ struct FillIdentityTests {
         #expect(ledger.fills.count == 2)
     }
 
+    /// One execution listed twice *inside the same batch* is still one fill.
+    ///
+    /// This is the case a batch-computed verdict gets wrong: a pre-filter that
+    /// asks "which of these hundred rows are new?" before booking any of them
+    /// calls both copies new, and the position counts the fill twice — a
+    /// doubled position that no later read can undo. So the identity guard has
+    /// to sit per fill, against the index as it stands at that moment, and a
+    /// batch pre-filter may only ever skip work ahead of it.
+    @Test func oneExecutionListedTwiceInOneBatchIsBookedOnce() throws {
+        let ledger = StrategyLedger(mode: .demo)
+        let clOrdId = OrderTag.make(strategyId: "s")
+        let sizes = ["ETH-USDT-SWAP": 0.1]
+        let fill = exchange("ETH-USDT-SWAP", tradeId: "9", billId: "b9", clOrdId: clOrdId)
+
+        // The very same execution, twice in one listing.
+        #expect(ledger.ingest([fill, fill], knownStrategyIds: ["s"], venue: .okx, contractSizes: sizes) == 1)
+        #expect(ledger.fills.count == 1)
+        #expect(ledger.position(for: "s")?.quantity == 1, "a doubled position is unrecoverable")
+
+        // And the same execution spelled two different ways in one listing —
+        // one row naming it by trade id, the next also carrying the bill id.
+        let ledger2 = StrategyLedger(mode: .demo)
+        let bare = exchange("ETH-USDT-SWAP", tradeId: "7", billId: nil, clOrdId: clOrdId)
+        let named = exchange("ETH-USDT-SWAP", tradeId: "7", billId: "b7", clOrdId: clOrdId)
+        #expect(ledger2.ingest([bare, named], knownStrategyIds: ["s"], venue: .okx, contractSizes: sizes) == 1)
+        #expect(ledger2.position(for: "s")?.quantity == 1)
+    }
+
     /// The same listing read by a build that now stamps bill ids where it used
     /// to read only trade ids. The rows on disk carry one name, the listing
     /// carries both, and they are the same fills — so nothing is re-booked.
@@ -262,6 +290,94 @@ struct FillRowTests {
             id: "2", instId: "ETH-USDT", side: .buy, posSide: nil, price: 2_500, size: 1,
             fee: -0.1, feeCcy: "USDT", ordId: nil, clOrdId: nil, ts: Date())
         #expect(FillRow(spot, venue: .okx, legEffect: nil) != nil)
+    }
+
+    /// What needs converting is decided by the instrument's **settlement
+    /// currency**, not by the currency the fee happens to be charged in.
+    ///
+    /// Measured on the live account: two expired ETH options settled with `pnl`
+    /// −0.0013 and −0.0444 under `ccy: ETH`, so OKX stamps realised P&L in the
+    /// settlement coin. Keying the conversion off `feeCcy` got spot, linear
+    /// swaps and options right by coincidence and an inverse swap wrong — it
+    /// settles in BTC but took the non-option branch, and its P&L went into a
+    /// USDT column unconverted. Each family is walked here so the rule cannot
+    /// regress to a proxy field again.
+    @Test func theSettlementCurrencyDecidesWhatIsConverted() throws {
+        let ts = Date()
+        func fill(
+            _ instId: String, price: Double, fee: Double, feeCcy: String,
+            pnl: Double?, index: Double? = nil, priceUsd: Double? = nil
+        ) -> ExchangeFill {
+            ExchangeFill(
+                id: "x", instId: instId, side: .sell, posSide: .long, price: price, size: 1,
+                fee: fee, feeCcy: feeCcy, ordId: nil, clOrdId: nil, ts: ts,
+                priceUsd: priceUsd, indexPrice: index, billId: nil, tradeId: "x", pnl: pnl)
+        }
+
+        // Linear swap: settles USDT, the book's own currency. Nothing converts.
+        let linear = try #require(FillMoney(
+            fill("ETH-USDT-SWAP", price: 2_600, fee: -1.3, feeCcy: "USDT", pnl: 98.22),
+            venue: .okx))
+        #expect(linear.price == 2_600)
+        #expect(linear.feeQuote == 1.3)
+        #expect(linear.realisedQuote == 98.22, "already in the book's currency")
+
+        // Spot buy: settles USDT, but the fee arrives in the base coin.
+        let spot = try #require(FillMoney(
+            fill("ETH-USDT", price: 2_600, fee: -0.001, feeCcy: "ETH", pnl: nil), venue: .okx))
+        #expect(abs(spot.feeQuote - 0.001 * 2_600) < 1e-9, "base-coin fee priced by the fill")
+
+        // Option: settles ETH. Premium, fee and P&L are all in ETH.
+        let option = try #require(FillMoney(
+            fill("ETH-USD-260919-2610-C", price: 0.006, fee: -0.00195, feeCcy: "ETH",
+                 pnl: -0.0443631259902969, index: 2_613.13, priceUsd: 15.67878),
+            venue: .okx))
+        #expect(abs(option.price - 15.67878) < 1e-9, "the venue's own dollar premium")
+        #expect(abs(option.feeQuote - 0.00195 * 2_613.13) < 1e-6)
+        #expect(abs((option.realisedQuote ?? 0) - (-0.0443631259902969 * 2_613.13)) < 1e-6,
+                "the live expiry's ETH P&L, converted")
+
+        // Inverse swap: settles BTC, so fee and P&L convert — but it is quoted
+        // in dollars already, and multiplying that by the index would be out by
+        // the index. This is the case the old rule got wrong.
+        let inverse = try #require(FillMoney(
+            fill("BTC-USD-SWAP", price: 80_000, fee: -0.0001, feeCcy: "BTC",
+                 pnl: 0.002, index: 80_000),
+            venue: .okx))
+        #expect(inverse.price == 80_000, "an inverse swap's price is already in dollars")
+        #expect(abs(inverse.feeQuote - 0.0001 * 80_000) < 1e-9)
+        #expect(abs((inverse.realisedQuote ?? 0) - 0.002 * 80_000) < 1e-9,
+                "0.002 BTC is 160 dollars, not 0.002")
+
+        // Settled in a coin with no rate anywhere: refused, never guessed.
+        #expect(FillMoney(
+            fill("BTC-USD-SWAP", price: 80_000, fee: -0.0001, feeCcy: "BTC", pnl: 0.002),
+            venue: .okx) == nil)
+
+        // A maker rebate is money in, not a cost. OKX files a charge negative
+        // and a rebate positive, and the exchange side of the reconciliation
+        // keeps that sign (`row.fees -= bill.fee`); taking the magnitude here
+        // booked the rebate as a charge, so the two sides disagreed by twice
+        // it and the book read low by the same amount.
+        let rebated = try #require(FillMoney(
+            fill("ETH-USDT-SWAP", price: 2_600, fee: 30, feeCcy: "USDT", pnl: nil), venue: .okx))
+        #expect(rebated.feeQuote == -30, "返佣是收入，不是成本")
+
+        // A pair quoted in another stablecoin settles in USDC, which differs
+        // from a USDT book but is not a coin and has no index to convert by.
+        // Asking "does it settle in something other than the book's currency?"
+        // sends it down the rate path and refuses it — and a fill that never
+        // books leaves the ledger flat while the position is real, so the
+        // runner opens it again on the next tick, and again after that. The
+        // question has to be "does it settle in its own base coin?".
+        let stable = try #require(FillMoney(
+            fill("BTC-USDC", price: 60_000, fee: -6, feeCcy: "USDC", pnl: nil), venue: .okx),
+            "a USDC pair must still book")
+        #expect(stable.price == 60_000)
+        #expect(stable.feeQuote == 6)
+        #expect(FillMoney(
+            fill("ETH-BTC", price: 0.032, fee: -0.00003, feeCcy: "BTC", pnl: nil),
+            venue: .okx) != nil, "a coin-quoted pair settles in its quote leg, not its base")
     }
 
     /// A listing is newest first whatever order its fills arrive in.

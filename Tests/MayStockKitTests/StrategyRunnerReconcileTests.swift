@@ -1986,3 +1986,81 @@ struct AccountScopedRunnerTests {
         #expect(runner.protectionTripped != nil)
     }
 }
+
+// MARK: - Reversing a hedge-mode position
+
+/// A signal that flips while a position is open is *two* trades on an OKX
+/// `long_short_mode` account, and the live account runs in exactly that mode.
+///
+/// The kernel hands the runner one crossing delta — `target − held`, about
+/// twice the position — and `guard::reduces_exposure` documents that as
+/// deliberate: the overshoot "closes one position and opens another". But
+/// every hedge-mode order names a leg, and `sell` + `posSide: long` means
+/// *close the long*. Sent as one order it asks to close twice what is held,
+/// which the exchange refuses; the retry sends the same impossible shape, and
+/// the strategy ends up failed while still holding the position its signal has
+/// turned against.
+@Suite("对冲模式反手拆成两腿")
+@MainActor
+struct HedgeReversalTests {
+    private func swapStrategy(_ signals: String) throws -> CompiledStrategy {
+        let json = """
+        {"schema":1,"id":"alpha","name":"alpha",
+         "market":{"instId":"BTC-USDT-SWAP","instType":"SWAP","bar":"1H"},
+         "signals":\(signals),
+         "sizing":{"mode":"equityPct","value":10}}
+        """
+        return try JSONDecoder().decode(StrategyManifest.self, from: Data(json.utf8)).compile()
+    }
+
+    private func reversingHost(positionMode: AccountTradingConfig.PositionMode) throws -> FakeHost {
+        let host = FakeHost()
+        // Long 10 contracts, and a signal that now wants short.
+        seedLongPosition(host, strategyId: "alpha", contracts: 10)
+        host.runnableStrategies = [try swapStrategy(#"{"shortEntry":"close > 0"}"#)]
+        host.portfolio.capital[.okx] = 20_000
+        host.portfolio.setCapital(10_000, for: "alpha", on: .okx)
+        host.portfolio.setRunning(true, for: "alpha")
+        host.fake.equity = 20_000
+        host.fake.price = 80_000
+        host.fake.candlesResult = (0..<200).map { index in
+            let ts = (Date().timeIntervalSince1970 / 3_600).rounded(.down) * 3_600
+                - Double(200 - index) * 3_600
+            return Candle(ts: Date(timeIntervalSince1970: ts), open: 80_000, high: 80_080,
+                          low: 79_920, close: 80_010, volume: 5, confirmed: true)
+        }
+        host.fake.positionsResult = .success([exchangePosition(contracts: 10)])
+        host.fake.accountConfig = AccountTradingConfig(
+            positionMode: positionMode, accountLevel: 3)
+        return host
+    }
+
+    @Test("先发只减仓的平多腿，再发开空腿，成交总量与净模式一致")
+    func aReversalClosesTheHeldLegFirst() async throws {
+        let hedged = try reversingHost(positionMode: .longShort)
+        await runner(for: hedged).tick()
+
+        #expect(hedged.fake.placed.count == 2, "一笔订单开不了另一条腿")
+        let close = try #require(hedged.fake.placed.first)
+        #expect(close.side == .sell)
+        #expect(close.posSide == .long, "平的是现在持有的那条腿")
+        #expect(close.reduceOnly, "只减仓，交易所不会让它穿到反向")
+        #expect(close.size == 10, "持有多少平多少，不是 delta 的两倍")
+
+        let open = try #require(hedged.fake.placed.last)
+        #expect(open.side == .sell)
+        #expect(open.posSide == .short, "开的是新的那条腿")
+        #expect(!open.reduceOnly)
+        #expect(open.size > 0, "反手的开仓腿真的发出去了")
+
+        // 净持仓模式允许一笔穿过零点，所以它就是同一笔交易的另一种写法：
+        // 两条腿加起来必须等于那一笔的量，否则拆分改变了交易本身。
+        let net = try reversingHost(positionMode: .net)
+        await runner(for: net).tick()
+        #expect(net.fake.placed.count == 1, "净模式不该被拆开")
+        let single = try #require(net.fake.placed.first)
+        #expect(single.posSide == .net)
+        #expect(abs(single.size - (close.size + open.size)) < 1e-9,
+                "拆成两腿不能改变成交总量")
+    }
+}

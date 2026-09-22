@@ -468,6 +468,24 @@ struct TradeBridgeOptionTests {
         #expect(args.contains("--posSide") && args.contains("long"))
     }
 
+    @Test("下单数量按原样上线，不被显示用的格式化器涨上去")
+    func orderSizeReachesTheWireExactly() async throws {
+        let stub = try makeStubCLI(stdout: #"{"code":"0","data":[{"ordId":"9","sCode":"0"}]}"#)
+        defer { try? FileManager.default.removeItem(at: stub.dir) }
+        // A spot lot is 1e-8 on BTC, so eight decimals are a legal size. The
+        // display formatter stops at six and rounds half-up getting there,
+        // which turns this into "0.012346" — larger than the balance it was
+        // checked against, and no longer a whole lot.
+        let order = OrderRequest(
+            instId: "BTC-USDT", instType: .spot, side: .sell, kind: .limit,
+            size: 0.01234567, sizeUnit: .base, limitPrice: 64_769.12345678)
+        _ = try await stub.bridge.place(order, mode: .demo)
+        let args = recordedArgs(stub.argsFile)
+        #expect(args.contains("0.01234567"), "the size the caller computed, unrounded")
+        #expect(!args.contains("0.012346"), "never rounded up at the wire")
+        #expect(args.contains("64769.12345678"))
+    }
+
     @Test("期权成交带上美元价和指数价")
     func optionFillStampsAreRead() {
         let json = """

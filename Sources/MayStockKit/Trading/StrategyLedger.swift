@@ -1,7 +1,7 @@
 import Foundation
 import Observation
 
-// MARK: - Records
+// MARK: - What a fill did
 
 /// What one fill did to the position it landed on. Side alone cannot say: for
 /// a short book a sell *opens* and a buy *closes*, and a table labelled
@@ -18,6 +18,7 @@ public enum PositionEffect: String, Codable, Sendable, CaseIterable {
 }
 
 // MARK: - What a fill's money is denominated in
+
 /// One fill's price, fee and realised P&L, all three expressed in the venue's
 /// quote currency.
 ///
@@ -30,37 +31,77 @@ public enum PositionEffect: String, Codable, Sendable, CaseIterable {
 /// adding an ETH premium to a USDT one, which is the mistake
 /// `Venue.settlementCurrency` exists to make impossible.
 ///
-/// Nil when an option fill cannot be converted — no index price was stamped on
-/// it and the caller has no current reading — because there is no honest number
-/// to book and a guess would be worse than the wait.
+/// Nil when a fill cannot be converted — it settles in a coin and no rate to
+/// the book's currency is available — because there is no honest number to book
+/// and a guess would be worse than the wait.
 public struct FillMoney: Sendable, Equatable {
     /// Per unit of underlying, in quote currency.
     public let price: Double
-    /// Positive cost, in quote currency.
+    /// The fill's fee as a **cost** in quote currency: positive when charged,
+    /// negative when the venue paid a maker rebate.
+    ///
+    /// The sign is carried, not flattened. OKX files a charge negative and a
+    /// rebate positive — stated on `ExchangeFill.fee`, modelled in
+    /// `OKXFeeSchedule` ("a genuine rebate stays negative"), and preserved on
+    /// the exchange side of the reconciliation by `row.fees -= bill.fee`.
+    /// Taking the magnitude here booked a rebate as if it were a charge, so
+    /// the two sides of that reconciliation disagreed by twice the rebate and
+    /// the book read low by the same amount.
     public let feeQuote: Double
     /// What the venue says this fill realised, in quote currency. Nil when it
     /// says nothing, or naught — an opener is stamped zero and realises no
     /// money, and a dash in the P&L column reads more honestly than "+0".
     public let realisedQuote: Double?
 
+    /// What decides whether anything needs converting is whether the
+    /// instrument **settles in its own base coin** — the kernel's settlement
+    /// currency compared against the pair's base, not against the book's.
+    ///
+    /// Measured on the live account (2026-09-21): two expired ETH options
+    /// settled with `pnl` of −0.0013 and −0.0444 and `ccy: ETH` — OKX stamps an
+    /// option's realised P&L in the settlement coin, so a figure copied
+    /// straight into a USDT column is out by the index, about 2,600×. An
+    /// inverse swap (`BTC-USD-SWAP`) settles BTC the same way.
+    ///
+    /// Comparing against the book's currency instead looks equivalent and is
+    /// not: `BTC-USDC` settles USDC, which differs from a USDT book but is not
+    /// a coin — there is no index to convert it by, so every such fill would be
+    /// refused and never booked at all. The two stablecoins are treated as the
+    /// same money here, which is the approximation this app already makes
+    /// everywhere; a base-coin settlement is the case that genuinely needs a
+    /// rate, and it is the only one taken down that path.
     public init?(_ fill: ExchangeFill, venue: Venue, indexPrice: Double? = nil) {
         let (base, _) = venue.currencies(of: fill.instId)
-        let feeMagnitude = abs(fill.fee)
-        if venue.instrumentType(of: fill.instId) == .option {
-            guard let index = fill.indexPrice ?? indexPrice, index > 0 else { return nil }
-            // The premium arrives in the coin (`fillPx`), with the venue's own
-            // dollar reading beside it (`fillPxUsd`); the index is the fallback
-            // for a fill it did not stamp.
-            price = fill.priceUsd.map { $0 > 0 ? $0 : fill.price * index } ?? fill.price * index
-            feeQuote = fill.feeCcy == base ? feeMagnitude * index : feeMagnitude
-            // The venue's realised figure is stamped in the same coin.
+        let settles = venue.settlementCurrency(of: fill.instId)
+        // Cost, sign carried: a charge arrives negative, a rebate positive.
+        let feeCost = -fill.fee
+
+        guard settles == base else {
+            // Settled in the quote leg — USDT, USDC, USD — which the book reads
+            // as its own money. Price and P&L are already in it; only a spot
+            // buy's fee arrives in the base coin, priced by the fill.
+            price = fill.price
+            feeQuote = fill.feeCcy == base ? feeCost * fill.price : feeCost
             realisedQuote = fill.pnl.flatMap(Self.nonZero)
-                .map { fill.feeCcy == base ? $0 * index : $0 }
             return
         }
-        price = fill.price
-        feeQuote = fill.feeCcy == base ? feeMagnitude * fill.price : feeMagnitude
-        realisedQuote = fill.pnl.flatMap(Self.nonZero)
+
+        // Settled in a coin: the fee and the realised P&L are in that coin, and
+        // converting needs its rate against the book's currency — the index the
+        // exchange stamped on the fill, or the caller's current reading.
+        guard let rate = fill.indexPrice ?? indexPrice, rate > 0 else { return nil }
+        feeQuote = fill.feeCcy == settles ? feeCost * rate : feeCost
+        realisedQuote = fill.pnl.flatMap(Self.nonZero).map { $0 * rate }
+        // The *price* is a separate question from the money, and only an option
+        // answers it differently: OKX quotes a premium in the settlement coin
+        // per unit of underlying, and stamps its own dollar reading beside it.
+        // An inverse swap settles in the coin too but is quoted in dollars
+        // already — multiplying that by the index would be out by the index.
+        if venue.instrumentType(of: fill.instId) == .option {
+            price = fill.priceUsd.map { $0 > 0 ? $0 : fill.price * rate } ?? fill.price * rate
+        } else {
+            price = fill.price
+        }
     }
 
     private static func nonZero(_ value: Double) -> Double? { value == 0 ? nil : value }
@@ -68,7 +109,8 @@ public struct FillMoney: Sendable, Equatable {
 
 // MARK: - Records
 
-public struct StrategyFill: Codable, Sendable, Equatable, Identifiable {    public let id: String
+public struct StrategyFill: Codable, Sendable, Equatable, Identifiable {
+    public let id: String
     public let strategyId: String
     public let instId: String
     /// Where the fill happened. Decides how `instId` is read and what
@@ -79,7 +121,8 @@ public struct StrategyFill: Codable, Sendable, Equatable, Identifiable {    publ
     public let price: Double
     /// Base units, always positive; `side` carries the direction.
     public let quantity: Double
-    /// Fee as a positive cost in the quote currency.
+    /// Fee as a cost in the quote currency — negative when the venue paid a
+    /// maker rebate. See `FillMoney.feeQuote` for why the sign is carried.
     public let feeQuote: Double
     public let ts: Date
     public let clOrdId: String?
@@ -550,20 +593,22 @@ public final class StrategyLedger {
         if changed { onChanged?() }
     }
 
-    /// Book one fill, skipping any execution the index already holds.
+    /// Book one fill against its strategy's position.
+    ///
+    /// The identity guard is here, per fill, and it is checked against the
+    /// index *as it stands now* — not against a verdict computed earlier for a
+    /// whole batch. That distinction is the whole guard: two records of one
+    /// execution inside a single listing would both pass a batch verdict taken
+    /// before either was booked, and the position would count the fill twice.
+    /// A batch pre-filter may still run ahead of this (see `ingest`) to keep
+    /// already-booked rows from logging, but it can only ever skip work — it
+    /// cannot be what makes the booking safe.
+    ///
+    /// The cost is one kernel round trip per fill that is actually new, which
+    /// is nearly always none: a listing the book has already seen is filtered
+    /// out upstream and never reaches here.
     public func record(_ fill: StrategyFill) {
         guard !bookedIdentities.holds(fill.kernelRecord) else { return }
-        book(fill)
-    }
-
-    /// Apply a fill already judged new to the position.
-    ///
-    /// The judgement lives with the caller: `record` and `ingest` both resolve
-    /// "have I seen this execution?" in one batch before getting here, so this
-    /// does not ask the kernel again per fill. `apply`'s other two refusal
-    /// reasons — a flat-book instrument move, an unknown multiplier — remain
-    /// here; they concern the position, not the fill's identity.
-    private func book(_ fill: StrategyFill) {
         var state = positions[fill.strategyId] ?? StrategyPositionState(
             strategyId: fill.strategyId, instId: fill.instId, venue: fill.venue)
         if state.instId != fill.instId {
@@ -658,15 +703,18 @@ public final class StrategyLedger {
             guard let booked = StrategyFill(
                 exchange: fill, strategyId: strategyId, mode: mode, venue: venue,
                 indexPrice: index) else {
-                Log.warn("ledger: 期权成交 \(fill.id)（\(fill.instId)）没有可用的指数价，"
-                         + "本轮未入账，下轮重试")
+                Log.warn("ledger: 成交 \(fill.id)（\(fill.instId)）以 "
+                         + "\(venue.settlementCurrency(of: fill.instId)) 结算，"
+                         + "没有可用的汇率换算成 \(venue.quoteCurrency)，本轮未入账，下轮重试")
                 continue
             }
-            // Identity is already settled above; `book`'s remaining refusals —
-            // a flat-book move, an unknown multiplier — are the only things
-            // that can leave the count unchanged, and they log their wait.
+            // `record` re-checks identity against the live index. The batch
+            // verdict above only spared us the work and the log noise for rows
+            // already on the book; it cannot stand in for the per-fill guard,
+            // because two records of one execution in this same listing would
+            // both have been called new by it.
             let before = fills.count
-            book(booked)
+            record(booked)
             if fills.count > before { added += 1 }
         }
         return added
@@ -701,37 +749,71 @@ public final class StrategyLedger {
         // effect (every fill gets one, unlike the realised amount, which is
         // legitimately nil on openers); give them both by the same replay a
         // rebuild uses.
-        if fills.contains(where: { $0.positionEffect == nil }) {
-            restamp(from: replay().stampsById)
+        if fills.contains(where: { $0.positionEffect == nil }), let replayed = replay() {
+            restamp(from: replayed.stamps)
         }
     }
 
     /// Replay the stored fills chronologically through `apply` — the one place
     /// the accounting rule lives — yielding the rebuilt positions and each
-    /// fill's stamps.
+    /// fill's stamps, aligned to `fills` by index.
+    ///
+    /// Stamps come back as an array rather than a dictionary keyed by fill id,
+    /// because a fill id is not unique: OKX numbers trades *per instrument*, so
+    /// a roll from one option contract to the next can hand two fills the same
+    /// id, and the second would overwrite the first's stamps — relabelling a
+    /// closing fill worth real money as an opener worth nothing. `restamp`
+    /// walks the same array, so an index is exact and needs no rule at all.
+    ///
+    /// Nil when the history cannot be replayed honestly. `record` refuses to
+    /// book a derivative fill at a guessed multiplier — a BTC option booked at
+    /// 1 instead of 0.01 realises a hundred times its true P&L — and a replay
+    /// that quietly did what `record` refuses would write exactly that number
+    /// to disk on the next launch.
     private func replay() -> (
         positions: [String: StrategyPositionState],
-        stampsById: [String: (effect: PositionEffect, realisedQuote: Double?)]
-    ) {
+        stamps: [(effect: PositionEffect, realisedQuote: Double?)?]
+    )? {
         var rebuilt: [String: StrategyPositionState] = [:]
-        var stampsById: [String: (effect: PositionEffect, realisedQuote: Double?)] = [:]
-        for fill in fills.sorted(by: { $0.ts < $1.ts }) {
+        var stamps = [(effect: PositionEffect, realisedQuote: Double?)?](
+            repeating: nil, count: fills.count)
+        // Chronological, but carrying each fill's place in the stored array so
+        // the stamps can be handed back in that order.
+        for index in fills.indices.sorted(by: { fills[$0].ts < fills[$1].ts }) {
+            let fill = fills[index]
             var state = rebuilt[fill.strategyId] ?? StrategyPositionState(
                 strategyId: fill.strategyId, instId: fill.instId, venue: fill.venue)
+            // A strategy that rolled from one contract to the next has fills on
+            // both. The position follows it from flat, exactly as `record`
+            // moves it; without this the whole history is applied to the first
+            // instrument ever traded, and priced by its multiplier.
+            if state.instId != fill.instId {
+                guard state.isFlat else {
+                    Log.warn("ledger: \(fill.strategyId) 的历史里 \(state.instId) 未平就出现了 "
+                             + "\(fill.instId) 的成交，无法重放，保持现有仓位")
+                    return nil
+                }
+                state.instId = fill.instId
+                state.contractSize = nil
+            }
             state.contractSize = contractSizes[fill.instId] ?? state.contractSize
-            stampsById[fill.id] = state.apply(fill)
+            guard state.contractSizeIsKnown else {
+                Log.warn("ledger: \(fill.instId) 的合约面值未知，无法重放这段历史"
+                         + "（按 1 计会把已实现盈亏放大到面值的倒数倍），保持现状")
+                return nil
+            }
+            stamps[index] = state.apply(fill)
             rebuilt[fill.strategyId] = state
         }
-        return (rebuilt, stampsById)
+        return (rebuilt, stamps)
     }
 
-    private func restamp(
-        from stampsById: [String: (effect: PositionEffect, realisedQuote: Double?)]
-    ) {
+    private func restamp(from stamps: [(effect: PositionEffect, realisedQuote: Double?)?]) {
+        guard stamps.count == fills.count else { return }
         for index in fills.indices {
-            let stamps = stampsById[fills[index].id]
-            fills[index].positionEffect = stamps?.effect
-            fills[index].realisedQuote = stamps?.realisedQuote
+            guard let stamp = stamps[index] else { continue }
+            fills[index].positionEffect = stamp.effect
+            fills[index].realisedQuote = stamp.realisedQuote
         }
     }
 
@@ -742,17 +824,23 @@ public final class StrategyLedger {
     /// fills, it is settled money booked against `recordedFundingIds`, and
     /// those ids survive the rebuild. Dropping it here would have deleted a
     /// real cost while leaving the ids that stop it ever being booked again.
-    public func rebuildPositions() {
-        let replayed = replay()
+    ///
+    /// A history the replay cannot price is left exactly as it is: a rebuild
+    /// that cannot be done honestly is worse than no rebuild, because the
+    /// numbers it writes look like a repair.
+    @discardableResult
+    public func rebuildPositions() -> Bool {
+        guard let replayed = replay() else { return false }
         var rebuilt = replayed.positions
         // The replay also restamps each fill, so fills recorded before the
         // stamps existed pick them up on the same pass.
-        restamp(from: replayed.stampsById)
+        restamp(from: replayed.stamps)
         for (key, funding) in positions.compactMapValues(\.fundingPaid) {
             rebuilt[key]?.fundingPaid = funding
         }
         positions = rebuilt
         onChanged?()
+        return true
     }
 
     // MARK: Reconciliation

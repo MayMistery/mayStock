@@ -239,6 +239,84 @@ struct FillRealisationStampTests {
         #expect(after.elementsEqual(stampedBefore, by: ==))
     }
 
+    /// A fill id is unique per instrument, not per account, so a replay must
+    /// not key anything by it.
+    ///
+    /// OKX numbers trades with a per-instrument counter — the codebase says so
+    /// itself where it explains why a trade id needs its instrument to become
+    /// an identity — so an option strategy rolling from one contract to the
+    /// next can hold two fills numbered the same. Keyed by that id, the second
+    /// fill's stamps overwrite the first's, and a closing fill worth real money
+    /// comes back labelled as an opener worth nothing.
+    @Test("换月时同号成交各自盖各自的章")
+    func aRollWithRepeatedTradeIdsKeepsEachFillsOwnStamps() {
+        let old = "BTC-USD-260908-70000-C"
+        let new = "BTC-USD-260915-72000-C"
+        let ledger = StrategyLedger(mode: .demo)
+        ledger.setContractSize(0.01, forInstId: old)
+        ledger.setContractSize(0.01, forInstId: new)
+
+        func fill(_ id: String, _ instId: String, _ side: OrderSide, _ price: Double,
+                  _ at: Double) -> StrategyFill {
+            StrategyFill(
+                id: id, strategyId: "s", instId: instId, side: side, price: price,
+                quantity: 10, feeQuote: 0, ts: Date(timeIntervalSince1970: at),
+                clOrdId: nil, mode: .demo)
+        }
+        // Open the near contract, close it at a profit, then open the next one
+        // — and the exchange happens to number two of these the same.
+        let history = [
+            fill("31", old, .buy, 1_000, 1_000),
+            fill("32", old, .sell, 2_240, 2_000),
+            fill("32", new, .buy, 1_500, 3_000),
+        ]
+        ledger.replace(fills: history, positions: [:])
+
+        let closing = ledger.fills[1]
+        #expect(closing.positionEffect == .close, "平仓就是平仓，不该被后一笔的章盖掉")
+        #expect(abs((closing.realisedQuote ?? 0) - (2_240 - 1_000) * 10 * 0.01) < 1e-9)
+        #expect(ledger.fills[2].positionEffect == .open, "换月后的第一笔是开仓")
+        #expect(ledger.fills[2].realisedQuote == nil)
+
+        // `replace` only fills in missing stamps — the persisted positions are
+        // what it trusts. A rebuild is what re-derives them, and there the
+        // position has to follow the roll instead of staying on the contract
+        // the strategy first ever traded, whose multiplier would price it.
+        #expect(ledger.rebuildPositions())
+        #expect(ledger.position(for: "s")?.instId == new)
+        #expect(ledger.position(for: "s")?.quantity == 10, "换月后持有的是新合约")
+    }
+
+    /// A history whose multiplier nobody knows is left alone, not rebuilt at 1.
+    ///
+    /// `record` refuses to book a derivative fill at a guessed multiplier
+    /// because `apply` scales the realised stamp once and nothing later can
+    /// take it back. A replay that quietly did what `record` refuses would
+    /// write that number to disk on the next launch — a BTC option booked at 1
+    /// instead of 0.01 realises a hundred times its true P&L.
+    @Test("面值未知时拒绝重放，而不是按 1 算")
+    func aHistoryWithAnUnknownMultiplierIsNotRebuiltAtOne() {
+        let ledger = StrategyLedger(mode: .demo)
+        let inst = "BTC-USD-260915-72000-C"
+        let history = [
+            StrategyFill(id: "1", strategyId: "s", instId: inst, side: .buy, price: 1_000,
+                         quantity: 10, feeQuote: 0, ts: Date(timeIntervalSince1970: 1_000),
+                         clOrdId: nil, mode: .demo),
+            StrategyFill(id: "2", strategyId: "s", instId: inst, side: .sell, price: 2_000,
+                         quantity: 10, feeQuote: 0, ts: Date(timeIntervalSince1970: 2_000),
+                         clOrdId: nil, mode: .demo),
+        ]
+        ledger.replace(fills: history, positions: [:])
+        #expect(ledger.fills.allSatisfy { $0.positionEffect == nil },
+                "没有面值就没有诚实的数字可盖")
+        #expect(ledger.rebuildPositions() == false, "重建也要拒绝，并说自己拒绝了")
+
+        // Once the multiplier is known the same history replays cleanly.
+        ledger.setContractSize(0.01, forInstId: inst)
+        #expect(ledger.rebuildPositions())
+        #expect(abs((ledger.fills[1].realisedQuote ?? 0) - (2_000 - 1_000) * 10 * 0.01) < 1e-9)
+    }
+
     /// The load path, not just the explicit rebuild: a ledger written before
     /// the stamp existed gets its stamps the moment it is read back, using the
     /// multipliers the persisted positions already carry.
@@ -697,6 +775,30 @@ struct PositionSizingUnitTests {
 
         let contracts = meta.exchangeSize(forBaseQuantity: abs(state.baseQuantity))
         #expect(abs(contracts - 11.65) < 1e-9)
+    }
+
+    /// Every contract count must survive the round trip, not just a lucky one.
+    ///
+    /// `baseQuantity` multiplies contracts by the multiplier and `exchangeSize`
+    /// divides them back, and binary floating point does not promise the two
+    /// cancel: `29 × 0.01` is `0.29`, but `0.29 / 0.01` is
+    /// `28.999999999999996`, which floors to 28. A flatten sized that way
+    /// leaves one contract open — unwanted exposure whose protective order was
+    /// sized for the whole position, and after an emergency stop nothing
+    /// retries. Walked across the multipliers OKX actually lists rather than
+    /// asserted on one value, because one value is exactly what passed before.
+    @Test func everyContractCountSurvivesTheRoundTrip() {
+        for multiplier in [0.001, 0.01, 0.1, 1.0, 10.0, 100.0] {
+            let meta = InstrumentMeta(
+                instId: "X-USDT-SWAP", tickSize: 0.1, lotSize: 1,
+                minSize: 1, contractValue: multiplier)
+            for contracts in stride(from: 1.0, through: 600.0, by: 1.0) {
+                let base = meta.baseQuantity(forExchangeSize: contracts)
+                let back = meta.exchangeSize(forBaseQuantity: base)
+                #expect(back == contracts,
+                        "\(contracts) contracts of \(multiplier) came back as \(back)")
+            }
+        }
     }
 
     @Test func spotNeedsNoConversion() {

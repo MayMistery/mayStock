@@ -40,6 +40,28 @@ public enum PriceFormatter {
         return s
     }
 
+    /// A number as the exchange must read it.
+    ///
+    /// Deliberately not `plain`, which is for a human: that one stops at six
+    /// decimals and rounds half-up getting there. A size reaches the wire
+    /// already floored to a legal lot by `InstrumentMeta.exchangeSize`, and
+    /// rounding it back *up* undoes exactly that — `0.01234567` leaves as
+    /// `"0.012346"`, which is larger than the balance it was checked against
+    /// and no longer a whole lot, so a full-balance sell is refused outright.
+    /// Anything below `5e-7` formats as `"0"`: an order for nothing.
+    ///
+    /// Ten decimals clears the finest lot and tick OKX lists (`1e-8`) while
+    /// still truncating binary noise — `0.30000000000000004` leaves as `"0.3"`.
+    public static func wire(_ value: Double) -> String {
+        if value == value.rounded(), abs(value) < 1e15 {
+            return String(Int(value))
+        }
+        var s = String(format: "%.10f", value)
+        while s.hasSuffix("0") { s.removeLast() }
+        if s.hasSuffix(".") { s.removeLast() }
+        return s
+    }
+
     /// Signed percent: 1.234 → "+1.23%".
     public static func signedPercent(_ value: Double) -> String {
         String(format: "%@%.2f%%", value >= 0 ? "+" : "", value)

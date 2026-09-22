@@ -180,11 +180,37 @@ extension TradingKernel {
     /// Asked of the kernel because a total that adds figures across
     /// instruments is only as honest as this answer, and the kernel is the
     /// side that sizes positions against it.
+    ///
+    /// Memoised, the way `KernelInstrumentPolicy` is, because the answer is a
+    /// pure function of the two arguments and this sits on a path a view body
+    /// reaches: every fill row converts its money through here, so an uncached
+    /// call would be one FFI crossing per row per redraw.
     public static func settlementCurrency(venue: Venue, instId: String) -> String {
-        (try? callReturningString { error in
+        let key = venue.rawValue + ":" + instId
+        SettlementCache.lock.lock()
+        let known = SettlementCache.answers[key]
+        SettlementCache.lock.unlock()
+        if let known { return known }
+
+        let answer = (try? callReturningString { error in
             ms_settlement_currency(venue.rawValue, instId, error)
         }) ?? venue.quoteCurrency
+        SettlementCache.lock.lock()
+        SettlementCache.answers[key] = answer
+        SettlementCache.lock.unlock()
+        return answer
     }
+}
+
+/// One instrument's settlement currency, remembered.
+///
+/// Locked rather than actor-bound, following `Log`: the answer is wanted from
+/// the trading loop and from a view body alike, and it is a pure function of
+/// its key, so the only thing needing serialisation is the dictionary. Two
+/// callers racing on a cold key both ask the kernel and write the same string.
+private enum SettlementCache {
+    static let lock = NSLock()
+    nonisolated(unsafe) static var answers: [String: String] = [:]
 }
 
 // MARK: - Building the rows
