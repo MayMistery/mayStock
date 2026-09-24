@@ -143,9 +143,17 @@ public struct SchwabVenue: ExchangeVenue {
             let held = try await bridge.account().held(order.instId)
             var ids: [String] = []
             for spec in Self.specs(for: order, held: held) {
-                let id = try await bridge.place(spec, liveUnlocked: liveUnlocked)
-                ids.append(id)
-                if let tag = order.clOrdId { await tags.record(clOrdId: tag, orderId: id, instId: order.instId) }
+                do {
+                    let id = try await bridge.place(spec, liveUnlocked: liveUnlocked)
+                    ids.append(id)
+                    if let tag = order.clOrdId { await tags.record(clOrdId: tag, orderId: id, instId: order.instId) }
+                } catch where !ids.isEmpty {
+                    // A leg is already on the book, so this order is not one
+                    // where nothing happened, whatever the next leg's failure
+                    // says. It is looked up by its tag like any unknown.
+                    throw TradeError.unconfirmed(
+                        "已下 \(ids.count) 腿（\(ids.joined(separator: ","))），下一腿失败：\(error)")
+                }
             }
             return OrderResult(ordId: ids.last ?? "", clOrdId: order.clOrdId, raw: ids.joined(separator: ","))
         }
@@ -379,6 +387,76 @@ public struct SchwabVenue: ExchangeVenue {
                 symbol: instId, instruction: SchwabOrderSpec.closingInstruction(forLong: held >= 0),
                 quantity: size, orderType: "STOP", stopPrice: stopPrice, duration: "GOOD_TILL_CANCEL")
             _ = try await bridge.place(spec, liveUnlocked: liveUnlocked)
+        }
+    }
+
+    // MARK: Closing by hand
+
+    /// Schwab's channel carries a quote, not depth: a one-level book, read
+    /// every second while the ticket is open.
+    public func closeBook(instId: String, instType: InstrumentType, mode: TradingMode) async throws -> any CloseBookFeed {
+        guard instType == .stock else { throw TradeError.unsupportedInstrument(instType) }
+        let meta = try await data.instrumentMeta(instId: instId) ?? SchwabMarketDataSource.equityMeta(instId)
+        let data = self.data
+        return QuoteBook(instId: instId, spec: .shares(meta)) { try await data.ticker(instId: instId) }
+    }
+
+    /// The actions a close plan can produce for shares — a market or limit
+    /// order, a stop, a cancel — sent the way this channel already sends
+    /// them. Anything else is refused here by name: the kernel's declaration
+    /// for Schwab offers nothing else, so reaching this is a routing bug.
+    public func execute(_ action: TradeAction, mode: TradingMode, liveUnlocked: Bool) async throws -> String {
+        switch action {
+        case .place(let spec):
+            guard spec.instType == .stock else { throw TradeError.unsupportedInstrument(spec.instType) }
+            let kind: OrderKind
+            switch spec.kind {
+            case .market: kind = .market
+            case .limit: kind = .limit
+            case .ioc: kind = .ioc
+            case .postOnly, .fok: throw TradeError.refused("嘉信通道不支持\(spec.kind.displayName)单")
+            }
+            let order = OrderRequest(
+                instId: spec.instId, instType: .stock, side: spec.side, kind: kind, size: spec.size,
+                sizeUnit: .base, limitPrice: spec.price, reduceOnly: spec.reduceOnly, clOrdId: spec.clientId)
+            return try await place(order, mode: mode, liveUnlocked: liveUnlocked).ordId
+        case .placeAlgo(let algo):
+            guard case .protection(nil, let stop?) = algo.kind else {
+                throw TradeError.refused("嘉信通道只挂止损单")
+            }
+            // Schwab returns a stop's id in a header this channel does not
+            // surface; the ticket re-reads the working orders to show it.
+            try await placeProtectiveOrder(
+                instId: algo.instId, instType: algo.instType, posSide: nil,
+                size: algo.size, stopPrice: stop, mode: mode, liveUnlocked: liveUnlocked)
+            return ""
+        case .cancel(_, let id), .cancelAlgo(_, let id):
+            try await cancel(id: id, mode: mode, liveUnlocked: liveUnlocked)
+            return id
+        case .amendStop, .precheck:
+            throw TradeError.refused("嘉信通道没有这个操作")
+        }
+    }
+
+    public func workingOrders(
+        instId: String, instType: InstrumentType, mode: TradingMode
+    ) async throws -> OpenOrderListing {
+        OpenOrderListing(orders: try await openOrders(mode: mode).filter { $0.instId == instId })
+    }
+
+    public func cancelWorkingOrder(
+        _ order: ExchangeOpenOrder, instType: InstrumentType,
+        mode: TradingMode, liveUnlocked: Bool
+    ) async throws {
+        try await cancel(id: order.id, mode: mode, liveUnlocked: liveUnlocked)
+    }
+
+    private func cancel(id: String, mode: TradingMode, liveUnlocked: Bool) async throws {
+        switch mode {
+        case .demo:
+            await shadow.cancel(id: id)
+        case .live:
+            try await bridge.cancel(id: id, liveUnlocked: liveUnlocked)
         }
     }
 }

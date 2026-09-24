@@ -92,19 +92,54 @@ public struct SchwabBridge: Sendable {
     /// account on Schwab for a mistake to land in.
     public func place(_ spec: SchwabOrderSpec, liveUnlocked: Bool) async throws -> String {
         guard liveUnlocked else { throw TradeError.liveTradingLocked }
-        let data = try await run(["place", "--body", "-"], stdin: spec.bodyData, live: true)
-        return try Self.orderId(in: data)
+        return try Self.orderId(in: try await acting(["place", "--body", "-"], stdin: spec.bodyData))
     }
 
     public func replace(id: String, with spec: SchwabOrderSpec, liveUnlocked: Bool) async throws -> String {
         guard liveUnlocked else { throw TradeError.liveTradingLocked }
-        let data = try await run(["replace", "--id", id, "--body", "-"], stdin: spec.bodyData, live: true)
-        return try Self.orderId(in: data)
+        return try Self.orderId(in: try await acting(["replace", "--id", id, "--body", "-"], stdin: spec.bodyData))
     }
 
     public func cancel(id: String, liveUnlocked: Bool) async throws {
         guard liveUnlocked else { throw TradeError.liveTradingLocked }
-        _ = try await run(["cancel", "--id", id], live: true)
+        _ = try await acting(["cancel", "--id", id])
+    }
+
+    /// A call that acts on the account, its failure said as what it means
+    /// for the order (`orderFailure`).
+    private func acting(_ arguments: [String], stdin: Data? = nil) async throws -> Data {
+        do {
+            return try await run(arguments, stdin: stdin, live: true)
+        } catch {
+            throw Self.orderFailure(error)
+        }
+    }
+
+    /// What a failed order call means, in the terms every screen and the
+    /// runner read (`TradeError.standing`): Schwab never acted when the CLI
+    /// never started or the request was rate-limited; it refused when the
+    /// login is gone or it answered 4xx; anything else — a timeout, a 5xx, a
+    /// transport failure — leaves the order unknown, to be looked up, never
+    /// sent again blind.
+    static func orderFailure(_ error: Error) -> TradeError {
+        switch error {
+        case let trade as TradeError:
+            return trade
+        case SchwabBridgeError.cliNotFound:
+            return .notDelivered(SchwabBridgeError.cliNotFound.description)
+        case SchwabBridgeError.notLaunched(let detail):
+            return .notDelivered("schwabctl 没能启动：\(detail)")
+        case SchwabAPIError.rateLimited:
+            return .notDelivered("嘉信限频（HTTP 429），没有受理这笔请求")
+        case SchwabAPIError.loggedOut(let reason):
+            return .refused("嘉信未登录：\(reason)")
+        case SchwabAPIError.unauthorised:
+            return .refused("嘉信拒绝了访问令牌")
+        case SchwabAPIError.http(let status, let body) where (400..<500).contains(status) && status != 408:
+            return .rejected(venue: Venue.schwab.displayName, reason: "HTTP \(status)：\(body)")
+        default:
+            return .unconfirmed(String(describing: error))
+        }
     }
 
     public func fills(from: Date, to: Date, symbol: String? = nil) async throws -> [ExchangeFill] {
@@ -120,10 +155,12 @@ public struct SchwabBridge: Sendable {
 
     // MARK: Plumbing
 
+    /// The id of an order Schwab took. An answer without one is an order
+    /// that may exist under an id nobody has.
     static func orderId(in data: Data) throws -> String {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let id = object["orderId"] as? String, !id.isEmpty else {
-            throw SchwabBridgeError.badOutput(String(data: data, encoding: .utf8) ?? "")
+            throw TradeError.unconfirmed("嘉信的回复里没有订单号：\((String(data: data, encoding: .utf8) ?? "").prefix(200))")
         }
         return id
     }
@@ -161,7 +198,7 @@ public struct SchwabBridge: Sendable {
             throw SchwabBridgeError.cliFailed(
                 exitCode: -1, detail: "schwabctl 超过 \(Int(seconds)) 秒未返回，已终止：" + ([executable] + arguments).joined(separator: " "))
         } catch Subprocess.Failure.couldNotLaunch(let detail) {
-            throw SchwabBridgeError.cliFailed(exitCode: -1, detail: detail)
+            throw SchwabBridgeError.notLaunched(detail)
         }
         guard outcome.exitCode == 0 else {
             throw Self.failure(exitCode: outcome.exitCode, stdout: outcome.stdout, stderr: outcome.stderrText)
@@ -207,6 +244,8 @@ public struct SchwabBridge: Sendable {
 
 public enum SchwabBridgeError: Error, CustomStringConvertible, Sendable, Equatable {
     case cliNotFound
+    /// The process never started: nothing it would have sent was sent.
+    case notLaunched(String)
     case cliFailed(exitCode: Int32, detail: String)
     case badOutput(String)
 
@@ -214,6 +253,8 @@ public enum SchwabBridgeError: Error, CustomStringConvertible, Sendable, Equatab
         switch self {
         case .cliNotFound:
             return "未找到 schwabctl（随 MayStock 安装在 /Applications/MayStock.app/Contents/MacOS/，或运行 ./Scripts/make.sh install）"
+        case .notLaunched(let detail):
+            return "schwabctl 没能启动：\(detail)"
         case .cliFailed(let code, let detail):
             return "schwabctl 退出码 \(code)：\(detail.trimmingCharacters(in: .whitespacesAndNewlines))"
         case .badOutput(let raw):

@@ -1276,6 +1276,7 @@ pub unsafe extern "C" fn ms_okx_account_document(kind: *const c_char, json: *con
                         "unrealisedPnl": r.unrealised_pnl, "leverage": r.leverage, "liquidationPrice": r.liquidation_price,
                         "notionalUsd": r.notional_usd, "margin": r.margin, "maintenanceMargin": r.maintenance_margin,
                         "marginRatio": r.margin_ratio, "settlementCurrency": r.settlement_currency, "usdRate": r.usd_rate,
+                        "marginMode": r.margin_mode,
                     }))
                     .collect(),
             ),
@@ -1290,4 +1291,166 @@ pub unsafe extern "C" fn ms_okx_account_document(kind: *const c_char, json: *con
         };
         Ok(to_c_string(out.to_string()))
     })
+}
+
+// MARK: - Trading
+//
+// Every call goes through `trade::shared()`, the process's one client:
+// opened on first use and kept, so every order after the first rides a warm
+// connection, and paced together with the live layer's signed reads.
+
+/// Sign and send one action (`trade::TradeRequest` as JSON). Blocks until
+/// the exchange answers or the request times out. Always returns a
+/// `trade::Reply` as JSON — a refusal, a timeout or a transport failure are
+/// replies, not errors. Caller frees.
+#[no_mangle]
+pub unsafe extern "C" fn ms_trade_send(request_json: *const c_char) -> *mut c_char {
+    let local = crate::trade::Sent::local;
+    let reply = catch_unwind(AssertUnwindSafe(|| {
+        let Some(text) = borrow_str(request_json) else {
+            return local(crate::trade::Reply::Refused { code: crate::trade::RefusalCode::Spec, reason: "请求不是 UTF-8".into() });
+        };
+        let request: crate::trade::TradeRequest = match serde_json::from_str(text) {
+            Ok(request) => request,
+            Err(e) => return local(crate::trade::Reply::Refused { code: crate::trade::RefusalCode::Spec, reason: format!("请求解析失败：{e}") }),
+        };
+        match crate::trade::shared() {
+            Ok(client) => client.send(&request),
+            Err(reason) => local(crate::trade::Reply::NotDelivered { reason }),
+        }
+    }))
+    // A panic in the middle of a send may have come after the request left:
+    // its outcome is unknown, never "refused".
+    .unwrap_or_else(|_| local(crate::trade::Reply::Unconfirmed { reason: "内核在发送途中出错".into(), elapsed_ms: 0 }));
+    to_c_string(serde_json::to_string(&reply).unwrap_or_default())
+}
+
+/// One signed read for the trading path (`trade::ReadRequest` as JSON).
+/// Returns a `trade::ReadReply` as JSON. Caller frees.
+#[no_mangle]
+pub unsafe extern "C" fn ms_trade_read(request_json: *const c_char) -> *mut c_char {
+    let local = crate::trade::Answered::local;
+    let reply = catch_unwind(AssertUnwindSafe(|| {
+        let Some(text) = borrow_str(request_json) else {
+            return local(crate::trade::ReadReply::Failed { reason: "请求不是 UTF-8".into() });
+        };
+        let request: crate::trade::ReadRequest = match serde_json::from_str(text) {
+            Ok(request) => request,
+            Err(e) => return local(crate::trade::ReadReply::Failed { reason: format!("请求解析失败：{e}") }),
+        };
+        match crate::trade::shared() {
+            Ok(client) => client.read(&request),
+            Err(reason) => local(crate::trade::ReadReply::Failed { reason }),
+        }
+    }))
+    .unwrap_or_else(|_| local(crate::trade::ReadReply::Failed { reason: "内核异常".into() }));
+    to_c_string(serde_json::to_string(&reply).unwrap_or_default())
+}
+
+/// The request an action becomes (`{endpoint, method, path, body}`), for
+/// showing before it is sent. Caller frees.
+#[no_mangle]
+pub unsafe extern "C" fn ms_trade_describe(action_json: *const c_char, error_out: *mut *mut c_char) -> *mut c_char {
+    guarded(error_out, ptr::null_mut(), || {
+        let text = borrow_str(action_json).ok_or("动作不是 UTF-8")?;
+        let action: crate::trade::wire::Action = serde_json::from_str(text).map_err(|e| format!("动作解析失败：{e}"))?;
+        let wire = crate::trade::describe(&action)?;
+        Ok(to_c_string(serde_json::to_string(&wire).map_err(|e| e.to_string())?))
+    })
+}
+
+/// Open the trading connection ahead of the first order. Returns the round
+/// trip in milliseconds, or -1 with `error_out` set.
+#[no_mangle]
+pub unsafe extern "C" fn ms_trade_warm(error_out: *mut *mut c_char) -> i64 {
+    guarded(error_out, -1, || Ok(crate::trade::shared()?.warm()? as i64))
+}
+
+// MARK: - Closing by hand
+
+/// What a venue can do to close a holding of a family, as JSON. `venue` is
+/// `okx` or `schwab`; `family` is `SWAP`, `SPOT`, `OPTION` or `STOCK`.
+#[no_mangle]
+pub unsafe extern "C" fn ms_close_capabilities(venue: *const c_char, family: *const c_char, error_out: *mut *mut c_char) -> *mut c_char {
+    guarded(error_out, ptr::null_mut(), || {
+        let venue: crate::trade::close::Venue = serde_json::from_value(serde_json::Value::String(borrow_str(venue).ok_or("venue 不是 UTF-8")?.to_string()))
+            .map_err(|_| "不认识的交易所".to_string())?;
+        let family: crate::trade::wire::Family = serde_json::from_value(serde_json::Value::String(borrow_str(family).ok_or("family 不是 UTF-8")?.to_string()))
+            .map_err(|_| "不认识的品种".to_string())?;
+        let capabilities = crate::trade::close::capabilities(venue, family);
+        Ok(to_c_string(serde_json::to_string(&capabilities).map_err(|e| e.to_string())?))
+    })
+}
+
+/// Plan a close (`trade::close::PlanInput`) against a book (the document
+/// `ms_book_snapshot` returns, or the same shape built from a quote). The
+/// plan as JSON, or null with `error_out` set to why it cannot be done.
+#[no_mangle]
+pub unsafe extern "C" fn ms_close_plan(input_json: *const c_char, book_json: *const c_char, error_out: *mut *mut c_char) -> *mut c_char {
+    guarded(error_out, ptr::null_mut(), || {
+        let input: crate::trade::close::PlanInput = serde_json::from_str(borrow_str(input_json).ok_or("输入不是 UTF-8")?)
+            .map_err(|e| format!("平仓输入解析失败：{e}"))?;
+        let book: crate::trade::close::BookView = serde_json::from_str(borrow_str(book_json).ok_or("盘口不是 UTF-8")?)
+            .map_err(|e| format!("盘口解析失败：{e}"))?;
+        let plan = crate::trade::close::plan(&input, &book).map_err(|e| e.to_string())?;
+        Ok(to_c_string(serde_json::to_string(&plan).map_err(|e| e.to_string())?))
+    })
+}
+
+// MARK: - Order book
+
+/// Opaque handle to one instrument's live book.
+pub struct MSBook {
+    engine: Option<crate::live::book::BookEngine>,
+}
+
+/// Start a book (`{"instId","instType","mode","network"}`). Null with
+/// `error_out` set on failure; release with `ms_book_stop`.
+#[no_mangle]
+pub unsafe extern "C" fn ms_book_start(config_json: *const c_char, error_out: *mut *mut c_char) -> *mut MSBook {
+    guarded(error_out, ptr::null_mut(), || {
+        let config: crate::live::book::BookConfig = serde_json::from_str(borrow_str(config_json).ok_or("盘口配置不是 UTF-8")?)
+            .map_err(|e| format!("盘口配置解析失败：{e}"))?;
+        let engine = crate::live::book::BookEngine::start(config)?;
+        Ok(Box::into_raw(Box::new(MSBook { engine: Some(engine) })))
+    })
+}
+
+/// The latest book document if newer than `since_seq`, else null.
+#[no_mangle]
+pub unsafe extern "C" fn ms_book_snapshot(handle: *const MSBook, since_seq: u64, seq_out: *mut u64) -> *mut c_char {
+    guarded(ptr::null_mut(), ptr::null_mut(), || {
+        let book = handle.as_ref().and_then(|h| h.engine.as_ref()).ok_or("盘口句柄无效")?;
+        match book.snapshot(since_seq) {
+            Some((seq, json)) => {
+                if !seq_out.is_null() {
+                    *seq_out = seq;
+                }
+                Ok(to_c_string(json.as_ref().clone()))
+            }
+            None => Ok(ptr::null_mut()),
+        }
+    })
+}
+
+/// Feed a recorded frame to an offline book (tests, the UI snapshotter).
+#[no_mangle]
+pub unsafe extern "C" fn ms_book_ingest(handle: *mut MSBook, frame: *const c_char, error_out: *mut *mut c_char) -> i32 {
+    guarded(error_out, 0, || {
+        let book = handle.as_ref().and_then(|h| h.engine.as_ref()).ok_or("盘口句柄无效")?;
+        book.ingest(borrow_str(frame).ok_or("帧不是 UTF-8")?)?;
+        Ok(1)
+    })
+}
+
+/// Stop the book and release the handle. Null is a no-op.
+#[no_mangle]
+pub unsafe extern "C" fn ms_book_stop(handle: *mut MSBook) {
+    if handle.is_null() {
+        return;
+    }
+    let mut boxed = Box::from_raw(handle);
+    if let Some(engine) = boxed.engine.take() {
+        engine.stop();
+    }
 }

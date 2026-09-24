@@ -42,7 +42,11 @@ libm = "0.2"
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
+# Unwind, so every FFI entry's `catch_unwind` (`ffi::guarded`) can turn a
+# panic into an error string. With "abort" that guard compiled to nothing and
+# any panic took down the app — which holds the exchange session and, since
+# orders moved into the kernel, sends them.
+panic = "unwind"
 # Never strip. The release profile's default (`strip = "debuginfo"`) runs the
 # system `strip` over every artifact — including the proc-macro dylibs
 # (serde_derive) that rustc itself must dlopen to compile the next crate — and

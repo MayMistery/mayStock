@@ -56,19 +56,16 @@ struct FeeScheduleTests {
         #expect(!schedule.syncedFromAccount)
     }
 
-    @Test func okxSignConventionIsInverted() {
-        // OKX reports a charge as a negative fraction: -0.001 == 10 bps out.
-        let json = #"{"code":"0","data":[{"level":"Lv1","taker":"-0.001","maker":"-0.0008"}]}"#
-        let rates = TradeBridge.parseFeeRates(json: json, instType: .spot)
-        #expect(rates?.takerBps == 10)
-        #expect(rates?.makerBps == 8)
-    }
-
-    @Test func genuineRebatesStayNegative() {
-        let json = #"{"code":"0","data":[{"taker":"-0.00015","maker":"0.00002"}]}"#
-        let rates = TradeBridge.parseFeeRates(json: json, instType: .spot)
-        #expect(abs((rates?.takerBps ?? 0) - 1.5) < 1e-9)
-        #expect((rates?.makerBps ?? 0) < 0, "a positive OKX maker value is a rebate")
+    @Test func kernelRatesBecomeBasisPoints() {
+        // The kernel reads OKX's sign (a charge is negative there) and hands
+        // back fractions positive when charged; the schedule keeps basis
+        // points. The sign itself is pinned in the kernel's own tests.
+        let rates = AccountFeeRates(instType: .spot, rates: FeeRates(maker: 0.0008, taker: 0.001))
+        #expect(abs(rates.takerBps - 10) < 1e-9)
+        #expect(abs(rates.makerBps - 8) < 1e-9)
+        let rebate = AccountFeeRates(instType: .spot, rates: FeeRates(maker: -0.00002, taker: 0.00015))
+        #expect(abs(rebate.takerBps - 1.5) < 1e-9)
+        #expect(rebate.makerBps < 0, "a rebate stays negative")
     }
 
     @Test func manifestCostsWinOverTheAccountTier() throws {

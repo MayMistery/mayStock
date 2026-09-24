@@ -20,13 +20,14 @@
 //!   down exactly the path live frames take — the whole pipeline is testable.
 //!
 //! Read-only by construction: no frame this module can build places, amends
-//! or cancels an order. Orders still go through the CLI and the app's
-//! confirmation dialog.
+//! or cancels an order. Orders are [`crate::trade`]'s, and only after a person
+//! confirms them in the app.
 
+pub mod book;
 mod binance;
 mod deribit;
-mod net;
-mod okx;
+pub(crate) mod net;
+pub(crate) mod okx;
 mod rest;
 mod schwab;
 mod socket;
@@ -96,6 +97,8 @@ pub enum Feed {
     OkxPublic,
     OkxPrivate,
     OkxStops,
+    /// One instrument's order book, for the close ticket (`book`).
+    OkxBook,
     Deribit,
     BinanceStream,
     Schwab,
@@ -113,6 +116,7 @@ impl Feed {
             Feed::OkxPublic => "okx.public",
             Feed::OkxPrivate => "okx.private",
             Feed::OkxStops => "okx.stops",
+            Feed::OkxBook => "okx.book",
             Feed::Deribit => "deribit",
             Feed::BinanceStream => "binance.stream",
             Feed::Schwab => "schwab",
@@ -130,6 +134,7 @@ impl Feed {
             Feed::OkxPublic => "OKX 行情推送",
             Feed::OkxPrivate => "OKX 账户推送（只读）",
             Feed::OkxStops => "OKX 条件单（只读）",
+            Feed::OkxBook => "OKX 盘口推送",
             Feed::Deribit => "Deribit 波动率曲面推送",
             Feed::BinanceStream => "Binance 标记价推送",
             Feed::Schwab => "嘉信报价推送",
@@ -156,6 +161,9 @@ impl Feed {
             // Stops change only when someone acts; every two seconds keeps the
             // list current without holding up the private socket's channels.
             Feed::OkxStops => Duration::from_secs(2),
+            // `books` every 100 ms while the book moves; a quiet demo book
+            // can sit for seconds.
+            Feed::OkxBook => Duration::from_secs(2),
             // The whole mark surface about once a second, a heartbeat every ten.
             Feed::Deribit => Duration::from_secs(2),
             // `@markPrice@1s`.
@@ -335,7 +343,7 @@ async fn supervise(
 
     if config.network {
         spawn_fixed(&mut tasks, &updates_tx, http.clone(), &config, &state);
-        spawn_account(&mut tasks, &updates_tx, http.clone(), &mut state, &config);
+        spawn_account(&mut tasks, &updates_tx, &mut state, &config);
         spawn_base(&mut tasks, &updates_tx, http.clone(), &state);
         spawn_instrument(&mut tasks, &updates_tx, http.clone(), &state);
     } else {
@@ -366,7 +374,7 @@ async fn supervise(
                         if next.mode != previous.mode || next.okx_profile != previous.okx_profile
                             || next.okx_config_path != previous.okx_config_path {
                             Tasks::abort(&mut tasks.account);
-                            spawn_account(&mut tasks, &updates_tx, http.clone(), &mut state, &next);
+                            spawn_account(&mut tasks, &updates_tx, &mut state, &next);
                         }
                         if next.schwabctl_path != previous.schwabctl_path || !previous.network {
                             Tasks::abort(&mut tasks.fixed);
@@ -457,7 +465,7 @@ fn spawn_fixed(tasks: &mut Tasks, updates: &mpsc::Sender<Update>, http: Option<r
     }
 }
 
-fn spawn_account(tasks: &mut Tasks, updates: &mpsc::Sender<Update>, http: Option<reqwest::Client>, state: &mut State, config: &LiveConfig) {
+fn spawn_account(tasks: &mut Tasks, updates: &mpsc::Sender<Update>, state: &mut State, config: &LiveConfig) {
     let Some(path) = config.okx_config_path.as_deref().filter(|p| !p.is_empty()) else {
         state.private_off("没有 OKX CLI 配置文件路径");
         return;
@@ -476,9 +484,13 @@ fn spawn_account(tasks: &mut Tasks, updates: &mpsc::Sender<Update>, http: Option
                 ));
                 return;
             }
-            if let Some(http) = http {
-                tasks.account.push(tokio::spawn(rest::okx_stops(http, updates.clone(), credentials.clone())).abort_handle());
-            }
+            let access = crate::trade::Access {
+                mode: config.mode.clone(),
+                live_unlocked: false,
+                config_path: path.to_string(),
+                profile: config.okx_profile.clone(),
+            };
+            tasks.account.push(tokio::spawn(rest::okx_stops(updates.clone(), access)).abort_handle());
             let dialect = okx::PrivateDialect::new(credentials, demo);
             tasks.account.push(tokio::spawn(socket::run(dialect, updates.clone())).abort_handle());
         }

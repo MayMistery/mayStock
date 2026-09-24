@@ -79,7 +79,7 @@ struct CheckupPage: View {
                 // Each card reads only its own section of the snapshot, so a
                 // tick in one redraws that card and nothing else.
                 FeedsCard(model: model)
-                RiskCard(model: model)
+                RiskCard(model: model, appState: appState)
                 ProbabilityCard(model: model)
                 GravityCard(model: model)
                 StructureCard(model: model)
@@ -219,6 +219,7 @@ private struct FeedsCard: View {
 
 private struct RiskCard: View {
     let model: CheckupModel
+    let appState: AppState
 
     var body: some View {
         if let risk = model.risk {
@@ -230,6 +231,12 @@ private struct RiskCard: View {
                 HStack(spacing: 6) {
                     Text(CheckupText.source(risk.source)).font(Theme.Text.caption).foregroundStyle(.secondary)
                     if let ms = risk.positionsMs { AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: 10_000) }
+                    if let position = risk.position {
+                        CloseHoldingButton(
+                            appState: appState,
+                            request: appState.closeTicket(instId: position.instId, isLong: !position.isShort, on: .okx),
+                            title: "平仓 / 止盈止损")
+                    }
                 }
             } content: {
                 VStack(alignment: .leading, spacing: 10) {

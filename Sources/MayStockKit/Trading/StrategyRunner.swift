@@ -1558,6 +1558,9 @@ public final class StrategyRunner {
                 // position the exchange has by then confirmed.
                 update(strategy.id) { $0.message = "反手的平仓腿结果未确认，暂不开新仓，下轮重来" }
                 return
+            case .notDelivered(let why):
+                update(strategy.id) { $0.message = "反手的平仓腿没有送达（\(why)），下轮重来" }
+                return
             case .rejected(let why):
                 update(strategy.id) {
                     $0.status = .failed
@@ -1606,8 +1609,16 @@ public final class StrategyRunner {
             目标变动 \(baseDelta) 币，现持 \
             \(host.ledger.position(for: strategy.id)?.quantity ?? 0) 张）理由：\(reason)
             """)
-        guard case .rejected(let rejection) = await placeOrTrack(
-            order, strategy: strategy, host: host, reason: reason) else { return }
+        let rejection: String
+        switch await placeOrTrack(order, strategy: strategy, host: host, reason: reason) {
+        case .accepted, .unconfirmed, .cancelled:
+            return
+        case .notDelivered(let why):
+            update(strategy.id) { $0.message = "下单没有送达（\(why)），下轮重试" }
+            return
+        case .rejected(let why):
+            rejection = why
+        }
 
         // The exchange refused it outright, so nothing is in flight.
         //
@@ -1643,6 +1654,8 @@ public final class StrategyRunner {
             break
         case .cancelled:
             return
+        case .notDelivered(let why):
+            update(strategy.id) { $0.message = "交易所拒绝附加止损（\(rejection)），去掉止损重试时没有送达（\(why)），下轮重来" }
         case .rejected(let again):
             update(strategy.id) {
                 $0.status = .failed
@@ -1659,7 +1672,12 @@ public final class StrategyRunner {
         /// The call failed without a verdict from the exchange; the order is
         /// being tracked and will be resolved by asking.
         case unconfirmed
-        /// The exchange saw the order and refused it — final, nothing in flight.
+        /// The exchange certainly did not act on it (`TradeError.notDelivered`):
+        /// nothing is in flight, and the same order can be tried on the next
+        /// tick.
+        case notDelivered(String)
+        /// Refused — by the exchange, or here before it was sent. Final,
+        /// nothing in flight.
         case rejected(String)
     }
 
@@ -1683,7 +1701,14 @@ public final class StrategyRunner {
             // to record.
             return .cancelled
         } catch {
-            if let rejection = (error as? TradeError)?.exchangeRejection {
+            if let reason = (error as? TradeError)?.undelivered {
+                // Nothing happened, so this bar's decision still stands: it
+                // is decided again on the next tick rather than a bar later.
+                lastActedBar[strategy.id] = nil
+                Log.warn("runner: \(strategy.id) \(order.instId) 下单没有送达：\(reason)")
+                return .notDelivered(reason)
+            }
+            if let rejection = (error as? TradeError)?.refusal {
                 return .rejected(rejection)
             }
             let clOrdId = order.clOrdId ?? ""
@@ -1913,6 +1938,9 @@ public final class StrategyRunner {
                 $0.message = "交易所拒绝期权下单：\(rejection)"
             }
             return
+        case .notDelivered(let why):
+            update(strategy.id) { $0.message = "期权下单没有送达（\(why)），下轮重试" }
+            return
         case .cancelled:
             return
         case .accepted, .unconfirmed:
@@ -2015,6 +2043,9 @@ public final class StrategyRunner {
                 $0.status = .failed
                 $0.message = "交易所拒绝期权平仓：\(rejection)"
             }
+        case .notDelivered(let why):
+            update(strategy.id) { $0.message = "期权平仓没有送达（\(why)），下轮重试" }
+            return
         case .cancelled:
             return
         case .accepted, .unconfirmed:

@@ -223,6 +223,10 @@ char *ms_settlement_currency(const char *venue,
                              const char *inst_id,
                              char **error_out);
 
+/* OKX account documents (CLI JSON or socket pushes), parsed once for the
+ * whole app. kind: "positions" | "equity" | "balances". Caller frees. */
+char *ms_okx_account_document(const char *kind, const char *json, char **error_out);
+
 /* The live data layer: every real-time market and account connection the
  * checkup screen reads, held in the kernel. Read-only — nothing it sends can
  * place, amend or cancel an order.
@@ -232,10 +236,6 @@ char *ms_settlement_currency(const char *venue,
  * the snapshot every frame. ms_live_snapshot returns NULL when nothing has
  * changed since `since_seq`, otherwise the snapshot JSON (caller frees) and
  * its sequence number in `seq_out`. */
-/* OKX account documents (CLI JSON or socket pushes), parsed once for the
- * whole app. kind: "positions" | "equity" | "balances". Caller frees. */
-char *ms_okx_account_document(const char *kind, const char *json, char **error_out);
-
 typedef struct MSLive MSLive;
 MSLive *ms_live_start(const char *config_json, char **error_out);
 int32_t ms_live_configure(MSLive *handle, const char *config_json, char **error_out);
@@ -244,6 +244,51 @@ int32_t ms_live_configure(MSLive *handle, const char *config_json, char **error_
 int32_t ms_live_ingest(MSLive *handle, const char *topic, const char *payload, char **error_out);
 char *ms_live_snapshot(const MSLive *handle, uint64_t since_seq, uint64_t *seq_out);
 void ms_live_stop(MSLive *handle);
+
+/* Trading: the one place an account is acted on. The kernel signs and sends
+ * OKX REST requests itself, with the key from the okx CLI's config.toml, and
+ * can send nothing but the closed set of actions in trade::wire::Action
+ * (place, place an algo order, cancel, cancel an algo order, move a stop,
+ * precheck). A live action with the lock closed is refused before a key is
+ * read.
+ *
+ * Every request waits for room under OKX's published limit for its route
+ * (trade::route), and one the exchange certainly did not act on — no
+ * connection, or turned away at the rate limit — is sent again.
+ *
+ * ms_trade_send blocks until OKX answers or the request times out, and always
+ * returns a reply (caller frees): {"outcome":"accepted","id",...},
+ * "rejected" (the exchange refused — final), "notDelivered" (the exchange
+ * certainly did not act on it — safe to send again), "unconfirmed" (it left
+ * and no verdict came back — it may have been acted on) or "refused"
+ * (stopped here); each with "retries", "retryReason", "pacedRequests",
+ * "pacedMs" and, when any of them is not nothing, "note" saying what it
+ * took in words. ms_trade_read does the
+ * trading path's signed reads (trade::reads::Read): working orders, one
+ * order's status, protective orders, fee rates, positions, balances, the
+ * account snapshot and configuration, fills, funding. ms_trade_describe gives
+ * the exact request an action becomes. */
+char *ms_trade_send(const char *request_json);
+char *ms_trade_read(const char *request_json);
+char *ms_trade_describe(const char *action_json, char **error_out);
+int64_t ms_trade_warm(char **error_out);
+
+/* Closing a holding by hand. Capabilities are declared per venue and family
+ * ("okx"|"schwab", "SWAP"|"SPOT"|"OPTION"|"STOCK"). ms_close_plan turns a
+ * ticket into the one action that does it, planned against the book the
+ * ticket shows, with the confirmation's words; null and error_out when it
+ * cannot be done. */
+char *ms_close_capabilities(const char *venue, const char *family, char **error_out);
+char *ms_close_plan(const char *input_json, const char *book_json, char **error_out);
+
+/* One instrument's live order book (OKX books + bbo-tbt + tickers, merged by
+ * sequence number). Config {"instId","instType","mode","network"}. The
+ * snapshot is the document ms_close_plan reads; NULL when unchanged. */
+typedef struct MSBook MSBook;
+MSBook *ms_book_start(const char *config_json, char **error_out);
+char *ms_book_snapshot(const MSBook *handle, uint64_t since_seq, uint64_t *seq_out);
+int32_t ms_book_ingest(MSBook *handle, const char *frame, char **error_out);
+void ms_book_stop(MSBook *handle);
 
 #ifdef __cplusplus
 }

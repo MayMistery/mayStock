@@ -22,6 +22,8 @@ use super::rest::{self, HistoryKind, Leg, MacroQuote, OptionVenue, RestUpdate};
 use super::schwab::{self, SchwabSource};
 use super::{Effect, Feed, FeedState, LiveConfig, Update};
 use crate::gravity::{self, StrikeInterest};
+use crate::trade::reads::{self, Book, WorkingOrder};
+use crate::trade::Delivery;
 use crate::implied::{self, Smile, SmilePoint};
 
 const HOUR_MS: i64 = 3_600_000;
@@ -151,7 +153,7 @@ pub struct State {
     equity: Option<(f64, LocalMs)>,
     risk_source: RiskSource,
     private_down_since: Option<i64>,
-    stops: Option<(Vec<okx::AlgoOrder>, LocalMs)>,
+    stops: Option<(Vec<WorkingOrder>, LocalMs)>,
     stops_error: Option<String>,
     // Deribit
     surface: HashMap<String, SurfaceQuote>,
@@ -549,13 +551,18 @@ impl State {
                     });
                 }
             }
-            RestUpdate::Stops(result, read_at) => match result {
-                Ok(orders) => {
-                    self.stops = Some((orders, LocalMs(read_at)));
-                    self.stops_error = None;
+            RestUpdate::Stops(result, read_at, delivery) => {
+                if let Some(note) = delivery.note {
+                    self.event(now, format!("OKX 条件单：{note}"));
                 }
-                Err(why) => self.stops_error = Some(why),
-            },
+                match result {
+                    Ok(orders) => {
+                        self.stops = Some((orders, LocalMs(read_at)));
+                        self.stops_error = None;
+                    }
+                    Err(why) => self.stops_error = Some(why),
+                }
+            }
             RestUpdate::Yahoo(result) => match result {
                 Ok(quotes) => self.yahoo = quotes,
                 Err(why) => self.event(now, format!("Yahoo：{why}")),
@@ -605,7 +612,8 @@ impl State {
                 Vec::new()
             }
             "rest.okx.stops" => {
-                self.apply_rest(RestUpdate::Stops(okx::algo_orders(payload), now), now);
+                let orders = reads::parse_page(payload, Book::Algo).map(|(orders, _, _)| orders);
+                self.apply_rest(RestUpdate::Stops(orders, now, Delivery::default()), now);
                 Vec::new()
             }
             "cli.positions" => {
@@ -1021,9 +1029,9 @@ impl State {
                     kind: "仓位止盈止损",
                 })
                 .chain(self.stops.iter().flat_map(|(orders, _)| orders.iter()).filter(|o| o.inst_id == row.inst_id).map(|o| ProtectiveView {
-                    algo_id: o.algo_id.clone(),
-                    stop_price: o.stop_price,
-                    take_profit_price: o.take_profit_price,
+                    algo_id: o.id.clone(),
+                    stop_price: o.stop_trigger_price,
+                    take_profit_price: o.take_profit_trigger_price,
                     size: o.size,
                     fraction: None,
                     kind: if o.ord_type == "oco" { "OCO 条件单" } else { "条件单" },

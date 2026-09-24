@@ -147,6 +147,9 @@ final class AppState {
     /// Set by a deep link, read once by the checkup page. See
     /// `AppState.requestedCheckupInstId`.
     @ObservationIgnored var pendingCheckupInstId: String?
+    /// The holding the close ticket is open on, presented as a sheet on the
+    /// terminal window. See `openCloseTicket`.
+    var closeTicketRequest: CloseTicketRequest?
 
     init(options: LaunchOptions = LaunchOptions()) {
         self.options = options
@@ -567,7 +570,8 @@ final class AppState {
     func tradingBlocker(for venue: Venue) -> String? {
         switch venue {
         case .okx:
-            if cliInfo == nil { return "未检测到 okx CLI" }
+            // The kernel signs with the key in the CLI's config file; the CLI
+            // binary is needed only for the ledger, not to trade.
             if !profileCatalog.fileExists { return "okx CLI 尚未配置 API Key（运行 okx config）" }
             if !credentialsConfigured(for: tradingMode) {
                 return "\(tradingMode.displayName)没有可用的 profile（账户与连接页配置）"
@@ -630,16 +634,10 @@ final class AppState {
         let mode = tradingMode
         do {
             books.accountSnapshot = try await exchange.accountSnapshot(mode: mode)
-            // Every position the venue holds, whatever family: the unfiltered
-            // derivative listing, plus each family that is held as a
-            // position rather than as a balance but is not a contract — a
-            // share count. A failed listing is an error on screen, not an
-            // empty list that reads as "nothing held".
-            var positions = try await exchange.allPositions(mode: mode)
-            for instType in venue.instrumentTypes where !instType.isDerivative && instType != .spot {
-                positions += try await exchange.positions(mode: mode, instType: instType)
-            }
-            books.exchangePositions = positions
+            // Every position the venue holds, contracts and shares alike. A
+            // failed listing is an error on screen, not an empty list that
+            // reads as "nothing held".
+            books.exchangePositions = try await exchange.heldPositions(mode: mode)
             books.accountError = nil
             books.accountRefreshedAt = Date()
         } catch {
@@ -652,7 +650,7 @@ final class AppState {
         do {
             switch venue {
             case .okx:
-                let listing = try await tradeBridge.openOrders(mode: mode)
+                let listing = try await KernelTradeClient(bridge: tradeBridge).workingOrders(mode: mode)
                 books.openOrders = listing.orders
                 books.openOrdersNote = listing.unavailable.isEmpty
                     ? nil : "未能读取：" + listing.unavailable.joined(separator: "、") + "。这些簿上若有挂单，这里不会显示。"
@@ -674,7 +672,7 @@ final class AppState {
         do {
             switch venue {
             case .okx:
-                let listing = try await tradeBridge.fillListing(mode: mode)
+                let listing = try await KernelTradeClient(bridge: tradeBridge).fillListing(mode: mode)
                 books.exchangeFills = listing.fills
                 books.exchangeFillsNote = listing.unavailable.isEmpty
                     ? nil : "未能读取：" + listing.unavailable.joined(separator: "、") + "的成交。这些簿上的成交，这里不会显示。"
@@ -711,18 +709,19 @@ final class AppState {
     }
 
     /// Pull the OKX account's real fee rates into the schedule the backtester
-    /// uses. Returns the failure, if any, in words. Only OKX has a CLI to
-    /// ask; every other venue's schedule is a published table.
+    /// uses. Returns the failure, if any, in words. Only OKX publishes an
+    /// account's own rates; every other venue's schedule is a published table.
     func syncFeeRates() async -> String? {
         guard tradingReady(for: .okx) else { return tradingBlocker(for: .okx) }
-        let bridge = tradeBridge
+        let trade = KernelTradeClient(bridge: tradeBridge)
         let mode = tradingMode
         var schedule = store.config.strategy.feeSchedules.okx
         var failures: [String] = []
         let families = Venue.okx.instrumentTypes
         for instType in families {
             do {
-                schedule.apply(try await bridge.feeRates(instType: instType, mode: mode))
+                let rates = try await trade.feeRates(family: instType, instId: nil, groupId: nil, mode: mode)
+                schedule.apply(AccountFeeRates(instType: instType, rates: rates))
             } catch {
                 failures.append("\(instType.displayName)：\(error)")
             }

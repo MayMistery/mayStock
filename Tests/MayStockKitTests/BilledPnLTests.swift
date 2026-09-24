@@ -127,7 +127,7 @@ struct AllPositionsTests {
          {"instId":"BTC-USD-260917-80000-C","instType":"OPTION","pos":"-2","posSide":"net","avgPx":"0.02",
           "markPx":"0.021","upl":"-1"}]
         """
-        let positions = TradeBridge.parsePositions(json: json)
+        let positions = KernelAccount.positions(json)
         let future = try #require(positions.first { $0.instId == "BTC-USDT-250926" })
         #expect(future.instType == "FUTURES" && future.familyLabel == "交割" && !future.isOption)
         #expect(future.notionalUsd == 2403)

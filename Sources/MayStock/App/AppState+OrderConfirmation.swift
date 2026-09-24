@@ -317,17 +317,18 @@ extension AppState {
                 Log.warn("order-intent: 第 1 步成交 nonce=\(intent.nonce) ordId=\(result.ordId)")
             } catch {
                 // The option leg is not attempted: it would be refused for the
-                // very shortfall this step existed to close.
-                let reason = (error as? TradeError)?.description ?? String(describing: error)
+                // very shortfall this step existed to close — and if the buy's
+                // outcome is unknown, placing the next leg on a guess is worse.
+                let outcome = Self.failure(error)
                 store.resolve(intent.nonce)
-                Log.warn("order-intent: 第 1 步失败 nonce=\(intent.nonce)，不再下期权单：\(reason)")
-                notifications.post(title: "换币失败，未下期权单", body: reason, sound: true)
+                Log.warn("order-intent: 第 1 步\(outcome.title) nonce=\(intent.nonce)，不再下期权单：\(outcome.detail)")
+                notifications.post(title: "换币\(outcome.title)，未下期权单", body: outcome.detail, sound: true)
                 _ = await presentAlert(
-                    title: "第 1 步失败，已停止",
+                    title: "第 1 步\(outcome.title)，已停止",
                     message: """
-                        买入 \(step.coin) 失败，因此没有提交期权单。
+                        买入 \(step.coin)\(outcome.title)，因此没有提交期权单。\(outcome.advice.map { "\n\n\($0)" } ?? "")
 
-                        \(reason)
+                        \(outcome.detail)
                         """,
                     style: .critical, buttons: ["好"])
                 return
@@ -395,23 +396,38 @@ extension AppState {
                 style: .informational, buttons: ["好"])
         } catch {
             // The exchange's own words. Not softened, not retried: a rejection
-            // here is information, and a second attempt is the user's call.
+            // here is information, and a second attempt is the user's call —
+            // all the more when the outcome is unknown.
             //
             // Any coin bought in step 1 stays bought. Selling it back is
             // another market order and another spread; that is a decision for
             // the person, not a cleanup this code performs silently.
-            let reason = (error as? TradeError)?.description ?? String(describing: error)
-            let hint = (error as? TradeError)?.hint
+            let outcome = Self.failure(error)
             store.resolve(intent.nonce)
-            Log.warn("order-intent: 下单失败 nonce=\(intent.nonce)：\(reason)")
-            notifications.post(title: "订单被拒绝", body: reason, sound: true)
-            var text = hint.map { "\(reason)\n\n\($0)" } ?? reason
+            Log.warn("order-intent: 下单\(outcome.title) nonce=\(intent.nonce)：\(outcome.detail)")
+            notifications.post(title: "订单\(outcome.title)", body: outcome.detail, sound: true)
+            var text = [outcome.advice, outcome.detail, outcome.hint].compactMap { $0 }.joined(separator: "\n\n")
             if case .needed(let step) = funding {
                 text += "\n\n已买入的 \(PriceFormatter.plain(step.buyAmount)) \(step.coin) 留在账户里，未自动卖回。"
             }
             _ = await presentAlert(
-                title: "下单失败", message: text, style: .critical, buttons: ["好"])
+                title: "订单\(outcome.title)", message: text, style: .critical, buttons: ["好"])
         }
+    }
+
+    /// A failed order in words that say what is now true, the same words
+    /// every screen uses. An unknown outcome is not a failure to be retried
+    /// but an order to be checked for on the exchange.
+    static func failure(_ error: Error) -> (title: String, detail: String, advice: String?, hint: String?) {
+        let trade = error as? TradeError
+        let detail = trade?.description ?? String(describing: error)
+        let standing = TradeError.standing(of: error)
+        let advice: String? = switch standing {
+        case .unknown: "订单可能已经成交，也可能没有。先到交易所核对挂单和成交，不要直接重下。"
+        case .undelivered: TradeError.undeliveredAdvice
+        case .refused: nil
+        }
+        return (standing.title, detail, advice, trade?.hint)
     }
 
     // MARK: - Reading the world

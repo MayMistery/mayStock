@@ -102,13 +102,20 @@ public protocol ExchangeVenue: Sendable {
 
     func positions(mode: TradingMode, instType: InstrumentType) async throws -> [ExchangePosition]
 
-    /// Every position the exchange holds on the account, whatever family,
-    /// each carrying the family the venue files it under. What the account's
-    /// risk is measured from: a family this app does not trade is still a
-    /// family the account can be long in.
+    /// Every contract position the exchange holds on the account, whatever
+    /// family — perpetuals, options, delivery futures, margin — each carrying
+    /// the family the venue files it under. What the account's contract risk
+    /// is measured from: a family this app does not trade is still a family
+    /// the account can be long in. Shares are not here: a share count is
+    /// valued through the balances, and `heldPositions` adds it for screens
+    /// that list holdings.
     func allPositions(mode: TradingMode) async throws -> [ExchangePosition]
 
     func accountSnapshot(mode: TradingMode) async throws -> AccountSnapshot
+
+    /// How much of a coin an order can sell right now: the trading account's
+    /// available balance, not the account's total holding of it.
+    func sellableBalance(ccy: String, mode: TradingMode) async throws -> Double
 
     /// The venue's own positions and balance documents, unparsed.
     ///
@@ -153,6 +160,38 @@ public protocol ExchangeVenue: Sendable {
     func placeProtectiveOrder(
         instId: String, instType: InstrumentType, posSide: PositionSide?,
         size: Double, stopPrice: Double, mode: TradingMode, liveUnlocked: Bool
+    ) async throws
+
+    // MARK: Closing by hand
+
+    /// A live book of one instrument for the close ticket: the venue's own
+    /// depth where it publishes one, its quote where that is all there is.
+    /// What the ticket draws is what the kernel plans from.
+    func closeBook(instId: String, instType: InstrumentType, mode: TradingMode) async throws -> any CloseBookFeed
+
+    /// Send an action a close plan produced. Returns the venue's id for the
+    /// order, empty when the venue gives none.
+    func execute(_ action: TradeAction, mode: TradingMode, liveUnlocked: Bool) async throws -> String
+
+    /// The account's fee rates on one instrument; nil where the venue does
+    /// not publish them.
+    func feeRates(instId: String, instType: InstrumentType, groupId: String?, mode: TradingMode) async throws -> FeeRates?
+
+    /// Open the trading connection ahead of the first order, when the venue
+    /// keeps one. The default does nothing.
+    func warmTrading() async
+
+    /// Every order the venue holds open on one instrument, resting and armed
+    /// alike — what a close has to be weighed against, since a resting close
+    /// and a new one together close more than is held.
+    func workingOrders(
+        instId: String, instType: InstrumentType, mode: TradingMode
+    ) async throws -> OpenOrderListing
+
+    /// Cancel one of those orders.
+    func cancelWorkingOrder(
+        _ order: ExchangeOpenOrder, instType: InstrumentType,
+        mode: TradingMode, liveUnlocked: Bool
     ) async throws
 }
 
@@ -199,6 +238,24 @@ extension ExchangeVenue {
         throw ExchangeVenueError.unsupported(venue.displayName, "账户文档")
     }
 
+    /// A venue with one account: what it reports available.
+    public func sellableBalance(ccy: String, mode: TradingMode) async throws -> Double {
+        try await accountSnapshot(mode: mode).balance(of: ccy)?.available ?? 0
+    }
+
+    /// Every position the account holds, contracts and shares alike: the
+    /// contract listing plus each family held as a position without being a
+    /// contract. What a screen lists as holdings, and what the close ticket
+    /// finds a holding in. The runner asks `allPositions` alone, because it
+    /// values shares through the balances and would count them twice.
+    public func heldPositions(mode: TradingMode) async throws -> [ExchangePosition] {
+        var positions = try await allPositions(mode: mode)
+        for instType in venue.instrumentTypes where !instType.isDerivative && instType != .spot {
+            positions += try await self.positions(mode: mode, instType: instType)
+        }
+        return positions
+    }
+
     /// A venue with no single listing answers with the union of the families
     /// it has, one position per id however many listings named it.
     public func allPositions(mode: TradingMode) async throws -> [ExchangePosition] {
@@ -229,6 +286,33 @@ extension ExchangeVenue {
 
     public func accountTradingConfig(mode: TradingMode) async throws -> AccountTradingConfig {
         throw ExchangeVenueError.unsupported(venueName, "账户配置")
+    }
+
+    public func closeBook(instId: String, instType: InstrumentType, mode: TradingMode) async throws -> any CloseBookFeed {
+        throw ExchangeVenueError.unsupported(venueName, "盘口")
+    }
+
+    public func execute(_ action: TradeAction, mode: TradingMode, liveUnlocked: Bool) async throws -> String {
+        throw ExchangeVenueError.unsupported(venueName, "手动平仓")
+    }
+
+    public func feeRates(instId: String, instType: InstrumentType, groupId: String?, mode: TradingMode) async throws -> FeeRates? {
+        nil
+    }
+
+    public func warmTrading() async {}
+
+    public func workingOrders(
+        instId: String, instType: InstrumentType, mode: TradingMode
+    ) async throws -> OpenOrderListing {
+        throw ExchangeVenueError.unsupported(venueName, "按标的读取挂单")
+    }
+
+    public func cancelWorkingOrder(
+        _ order: ExchangeOpenOrder, instType: InstrumentType,
+        mode: TradingMode, liveUnlocked: Bool
+    ) async throws {
+        throw ExchangeVenueError.unsupported(venueName, "撤单")
     }
 }
 

@@ -1,13 +1,12 @@
 import SwiftUI
 import MayStockKit
 
-/// Account equity, trailing returns, and this instrument's strategy positions —
-/// all read-only.
+/// Account equity, trailing returns, and this instrument's strategy positions.
 ///
-/// The panel deliberately has no order entry and no account switch. Trading
-/// happens through strategies in the terminal, where a position is always
-/// attached to a rule and a budget; a hover panel is the wrong place to put
-/// money at risk on impulse.
+/// The panel deliberately has no order entry and no account switch: a hover
+/// panel is the wrong place to put money at risk on impulse. Its 平仓 buttons
+/// only open the close ticket on the terminal window, where the order is
+/// reviewed before it is sent.
 struct PanelAccountStrip: View {
     let appState: AppState
     let instId: String
@@ -393,6 +392,7 @@ struct PanelAccountStrip: View {
                     .font(Theme.Text.captionMedium).numeric()
                     .foregroundStyle(Theme.signed(position.unrealisedPnL))
                     .frame(width: 50, alignment: .trailing)
+                CloseHoldingButton(appState: appState, request: appState.closeTicket(for: position, on: venue))
             }
             .help("非 MayStock 策略开的仓（手动、其它程序，或本机安装前就有）· 名义 "
                   + (position.notionalUsd.map { PriceFormatter.money($0, decimals: 0) } ?? "—")
@@ -436,24 +436,27 @@ struct PanelAccountStrip: View {
         // market it is actually on — spot, perpetual or an option contract.
         let family = state.venue.instrumentType(of: state.instId).displayName
         let name = appState.strategy(id: state.strategyId)?.name ?? state.strategyId
-        return Button {
-            appState.openTerminal(.strategies, strategyId: state.strategyId)
-        } label: {
-            HStack(spacing: 6) {
-                StatusDot(color: Theme.trend(state.quantity > 0), size: 5)
-                Text(name).font(Theme.Text.caption).foregroundStyle(.secondary).lineLimit(1)
-                Badge(text: family, tint: .secondary, size: .small)
-                Spacer(minLength: 2)
-                Text(PriceFormatter.plain(abs(state.baseQuantity))).font(Theme.Text.caption).numeric().foregroundStyle(.tertiary)
-                Text("@ \(PriceFormatter.auto(state.averagePrice))").font(Theme.Text.caption).numeric().foregroundStyle(.tertiary)
-                Text(pct.map(PriceFormatter.signedPercent) ?? "—")
-                    .font(Theme.Text.captionMedium).numeric()
-                    .foregroundStyle(Theme.signed(pct ?? 0))
-                    .frame(width: 50, alignment: .trailing)
+        return HStack(spacing: 6) {
+            Button {
+                appState.openTerminal(.strategies, strategyId: state.strategyId)
+            } label: {
+                HStack(spacing: 6) {
+                    StatusDot(color: Theme.trend(state.quantity > 0), size: 5)
+                    Text(name).font(Theme.Text.caption).foregroundStyle(.secondary).lineLimit(1)
+                    Badge(text: family, tint: .secondary, size: .small)
+                    Spacer(minLength: 2)
+                    Text(PriceFormatter.plain(abs(state.baseQuantity))).font(Theme.Text.caption).numeric().foregroundStyle(.tertiary)
+                    Text("@ \(PriceFormatter.auto(state.averagePrice))").font(Theme.Text.caption).numeric().foregroundStyle(.tertiary)
+                    Text(pct.map(PriceFormatter.signedPercent) ?? "—")
+                        .font(Theme.Text.captionMedium).numeric()
+                        .foregroundStyle(Theme.signed(pct ?? 0))
+                        .frame(width: 50, alignment: .trailing)
+                }
+                .contentShape(Rectangle())
             }
-            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+            .help("在终端里打开「\(name)」")
+            CloseHoldingButton(appState: appState, request: appState.closeTicket(for: state))
         }
-        .buttonStyle(.plain)
-        .help("在终端里打开「\(name)」")
     }
 }

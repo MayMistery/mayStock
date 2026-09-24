@@ -25,6 +25,7 @@ enum KernelAccount {
         let marginRatio: Double?
         let settlementCurrency: String?
         let usdRate: Double?
+        let marginMode: String?
     }
 
     private struct Equity: Decodable {
@@ -56,7 +57,8 @@ enum KernelAccount {
                 maintenanceMargin: row.maintenanceMargin,
                 marginRatio: row.marginRatio,
                 settlementCurrency: row.settlementCurrency,
-                usdRate: row.usdRate)
+                usdRate: row.usdRate,
+                marginMode: row.marginMode.flatMap(MarginMode.init(rawValue:)))
         } ?? []
     }
 

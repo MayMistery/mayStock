@@ -1,16 +1,20 @@
 //! MayStock's trading kernel.
 //!
-//! Everything here except [`live`] is pure computation over arrays:
-//! indicators, the sandboxed strategy DSL, the backtest engine, sizing, the
-//! live signal decision, and the option-book arithmetic (`implied`,
-//! `gravity`). Those modules have no I/O, no clock, and no network.
+//! Everything here except [`live`] and [`trade`] is pure computation over
+//! arrays: indicators, the sandboxed strategy DSL, the backtest engine,
+//! sizing, the live signal decision, and the option-book arithmetic
+//! (`implied`, `gravity`). Those modules have no I/O, no clock, and no
+//! network.
 //!
-//! [`live`] is the one exception, and deliberately so: it holds the real-time
-//! market and account connections (read-only — orders still go through the
-//! CLI from Swift) and feeds them into the same pure functions, so there is one
-//! implementation of every number whether it is backtested, tested from a
-//! recorded frame, or shown live. Swift owns the UI and persistence, and asks
-//! this layer for a snapshot every frame.
+//! [`live`] and [`trade`] are the two exceptions, and deliberately so.
+//! [`live`] holds the real-time market and account connections — read-only —
+//! and feeds them into the same pure functions, so there is one implementation
+//! of every number whether it is backtested, tested from a recorded frame, or
+//! shown live. [`trade`] is the only code that acts on an account: it signs
+//! and sends orders over REST, and can send nothing but the closed set of
+//! actions in [`trade::wire::Action`]. Swift owns the UI and persistence, asks
+//! this layer for a snapshot every frame, and hands it orders a person has
+//! confirmed.
 //!
 //! The point of the split is that **backtest and live trading run the same
 //! compiled function**. [`decide::desired_direction`] is called by the
@@ -39,6 +43,7 @@ pub mod resample;
 pub mod series;
 pub mod sizing;
 pub mod strategy;
+pub mod trade;
 
 pub use calendar::MarketCalendar;
 pub use candle::Candle;

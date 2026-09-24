@@ -113,7 +113,8 @@ struct LiveKernelGoldenTests {
         ]))
         try model.ingest(topic: "okx.private", payload: json(["arg": ["channel": "account"], "data": [["totalEq": "6773.9", "uTime": "\(now - 100)"]]]))
         try model.ingest(topic: "rest.okx.stops", payload: json(["code": "0", "data": [
-            ["algoId": "s1", "instId": "ETH-USDT-SWAP", "ordType": "conditional", "sz": "187.75", "slTriggerPx": "2580", "tpTriggerPx": "", "reduceOnly": "true"],
+            ["algoId": "s1", "instId": "ETH-USDT-SWAP", "instType": "SWAP", "ordType": "conditional", "side": "sell", "posSide": "net",
+             "sz": "187.75", "slTriggerPx": "2580", "slOrdPx": "-1", "tpTriggerPx": "", "reduceOnly": "true", "state": "live"],
         ]]))
         // Schwab: two instruments and the six FX pairs the dollar index is built from.
         var content: [[String: Any]] = [["key": "TLT", "delayed": false, "1": 80.72, "2": 80.74, "3": 80.73, "12": 81.75, "34": now - 900, "35": now - 1_200]]
@@ -159,6 +160,8 @@ struct LiveKernelGoldenTests {
         #expect(risk.source == "okx.private" && risk.wasRead)
         #expect(position.markSource == "okx.mark-price" && position.markPrice == 2721.3)
         #expect(Set(position.protective.map(\.kind)) == ["仓位止盈止损", "条件单"])
+        let standalone = try #require(position.protective.first { $0.algoId == "s1" })
+        #expect(standalone.stopPrice == 2580 && standalone.takeProfitPrice == nil && standalone.size == 187.75)
         #expect(risk.liquidationOdds.count == 3)
         #expect(risk.liquidationOdds.allSatisfy { $0.touching >= $0.atHorizon })
         #expect(abs((risk.exposure?.effectiveLeverage ?? 0) - 51_090 / 6773.9) < 1e-9)

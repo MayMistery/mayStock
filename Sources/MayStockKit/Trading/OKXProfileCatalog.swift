@@ -3,15 +3,18 @@ import Foundation
 /// One named credential set in the official CLI's `~/.okx/config.toml`.
 ///
 /// Only the *shape* of the profile is read here — its name and whether the CLI
-/// has it marked as a demo-environment key. The credential model: the CLI owns
-/// the secrets for everything that **acts** (orders, amendments, cancels), and
-/// this app only ever asks the CLI to act. The one other reader is the
-/// kernel's live layer (`kernel/src/live/okx.rs`), which reads the selected
-/// profile's key to sign **read-only** requests — the private socket's login
-/// for the `positions` / `account` channels and GETs of pending stop orders —
-/// holds it in memory only, never logs or writes it, and cannot build an
-/// order frame. Chosen on 2026-09-23 because the CLI path read positions every
-/// 20–40 s with frequent 15 s timeouts, and the page needs them as they change.
+/// has it marked as a demo-environment key. The credential model: the secrets
+/// stay in the CLI's config file, and the kernel reads the selected profile's
+/// key only to sign a request, holds it in memory for that request, never logs
+/// or writes it. Two readers, each with a closed list of what it may send:
+/// the live layer (`kernel/src/live/okx.rs`) signs **read-only** requests —
+/// the private socket's login and GETs of pending stops — and cannot build an
+/// order frame; the trading path (`kernel/src/trade`) signs the actions in
+/// `trade::wire::Action` and the reads in `trade::reads::Read`, and refuses a
+/// live action unless live trading is unlocked. The live layer's reads were
+/// moved off the CLI on 2026-09-23 (positions every 20–40 s with frequent 15 s
+/// timeouts); orders followed on 2026-09-25, so an order pays one round trip
+/// on a warm connection rather than a process launch.
 public struct OKXProfile: Sendable, Equatable, Identifiable, Hashable {
     public let name: String
     /// `demo = true` in the profile. Nil when the profile does not say.

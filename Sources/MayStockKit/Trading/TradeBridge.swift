@@ -25,6 +25,25 @@ public enum PositionSide: String, Sendable, Equatable, Codable {
     case long, short, net
 }
 
+/// How a derivative position is margined — OKX's `mgnMode`, and the `tdMode`
+/// any order acting on that position has to repeat. A default of `cross` on
+/// an isolated position is an order for a different position entirely, so
+/// the close ticket states the position's own mode, always.
+public enum MarginMode: String, Sendable, Equatable, Codable {
+    case cross, isolated
+    /// Not margined: paid for in full. How a simple account (acctLv 1) holds
+    /// an option it bought.
+    case cash
+
+    public var displayName: String {
+        switch self {
+        case .cross: return "全仓"
+        case .isolated: return "逐仓"
+        case .cash: return "现金"
+        }
+    }
+}
+
 /// How `size` is denominated. Quote sizing is only meaningful for spot market
 /// orders (`tgtCcy=quote_ccy`); everything else is in base units / contracts.
 public enum OrderSizeUnit: String, Sendable, Equatable, Codable {
@@ -187,11 +206,6 @@ public enum VenueConnectionStatus: Sendable, Equatable {
     /// The exchange, the CLI or the network said no; `hint` is what to do
     /// about it when the cause is one this app recognises.
     case failed(message: String, hint: String?, at: Date)
-
-    public var isConnected: Bool {
-        if case .connected = self { return true }
-        return false
-    }
 
     public var report: VenueConnectionReport? {
         if case .connected(let report) = self { return report }
@@ -371,6 +385,9 @@ public struct ExchangePosition: Sendable, Equatable, Identifiable {
     /// The exchange's own health ratio for the position (`mgnRatio`). Higher is
     /// safer; it is the number the exchange itself would liquidate on.
     public let marginRatio: Double?
+    /// How the exchange margins it; nil when the venue does not say (Schwab)
+    /// or said nothing recognisable.
+    public let marginMode: MarginMode?
 
     public var id: String { instId + posSide.rawValue }
 
@@ -379,8 +396,9 @@ public struct ExchangePosition: Sendable, Equatable, Identifiable {
         markPrice: Double?, unrealisedPnL: Double, leverage: Double?, liquidationPrice: Double?,
         notionalUsd: Double? = nil, instType: String = "",
         margin: Double? = nil, maintenanceMargin: Double? = nil, marginRatio: Double? = nil,
-        settlementCurrency: String? = nil, usdRate: Double? = nil
+        settlementCurrency: String? = nil, usdRate: Double? = nil, marginMode: MarginMode? = nil
     ) {
+        self.marginMode = marginMode
         self.margin = margin
         self.maintenanceMargin = maintenanceMargin
         self.marginRatio = marginRatio
@@ -445,36 +463,6 @@ public struct ExchangeOpenOrder: Sendable, Equatable, Identifiable {
         case order, algo
 
         public var displayName: String { self == .order ? "普通委托" : "策略委托" }
-    }
-
-    /// The kinds of algo order OKX keeps, each in its own list.
-    ///
-    /// This is an enum and not a `String` default because the listing
-    /// endpoint takes exactly one kind per call and has no "all": asking
-    /// without one is refused (`51000 Parameter ordType error`), and asking
-    /// with the CLI's default returns `conditional` alone. So the only way to
-    /// see the whole algo book is to ask for every case here — which is what
-    /// makes the set a *declaration*: add a kind the exchange grows and the
-    /// listing covers it the same day, with no call site to update.
-    ///
-    /// Measured against CLI 1.4.1 on 2026-09-20: every case below is accepted
-    /// by `spot`, `swap` and `futures`; an unknown word is rejected outright,
-    /// which is how this list was checked rather than assumed.
-    public enum AlgoKind: String, Sendable, CaseIterable {
-        case conditional, oco, trigger, moveOrderStop = "move_order_stop"
-        case chase, iceberg, twap
-
-        public var displayName: String {
-            switch self {
-            case .conditional: return "止盈止损"
-            case .oco: return "OCO"
-            case .trigger: return "计划委托"
-            case .moveOrderStop: return "移动止损"
-            case .chase: return "追单"
-            case .iceberg: return "冰山"
-            case .twap: return "TWAP"
-            }
-        }
     }
 
     /// `ordId`, or `algoId` for the algo book.
@@ -670,19 +658,38 @@ public enum TradeError: Error, CustomStringConvertible, Sendable {
     case badOutput(String)
     case liveTradingLocked
     case notConfigured
-    /// An order reached the OKX bridge for a family OKX does not list — a
-    /// routing bug rather than a market condition. Named here so it reads as
-    /// one, instead of as an opaque CLI usage error.
+    /// An order reached a venue for a family it does not list — a routing
+    /// bug rather than a market condition, named so it reads as one.
     case unsupportedInstrument(InstrumentType)
     /// A venue saw the order and refused it — the definite verdict every
     /// adapter reports the same way, so the runner needs one rule to read
     /// "nothing is in flight" off a failure.
     case rejected(venue: String, reason: String)
+    /// The exchange certainly did not act on it, and nothing is in flight:
+    /// the connection never opened, or OKX kept turning it away at its rate
+    /// limit, which it does before reading the request. Safe to send again.
+    case notDelivered(String)
+    /// The order left and no verdict came back. It may have been acted on,
+    /// and has to be resolved by asking the exchange — never retried blind.
+    case unconfirmed(String)
+    /// Stopped before the network: a key for the wrong environment, an order
+    /// the exchange could not accept as written.
+    case refused(String)
+    /// A read on the trading path failed; nothing was changed.
+    case readFailed(String)
 
     public var description: String {
         switch self {
         case .rejected(let venue, let reason):
             return "\(venue)拒绝了订单：\(reason)"
+        case .notDelivered(let reason):
+            return "订单没有送达交易所：\(reason)"
+        case .unconfirmed(let reason):
+            return "订单结果未确认，可能已经成交：\(reason)"
+        case .refused(let reason):
+            return "订单未发出：\(reason)"
+        case .readFailed(let reason):
+            return "读取失败：\(reason)"
         case .cliNotFound:
             return "未找到官方 okx CLI。安装：npm install -g @okx_ai/okx-trade-cli"
         case .cliFailed(let code, let stderr):
@@ -694,51 +701,70 @@ public enum TradeError: Error, CustomStringConvertible, Sendable {
         case .notConfigured:
             return "okx CLI 尚未配置 API Key。运行 `okx config` 添加模拟盘密钥后重试。"
         case .unsupportedInstrument(let instType):
-            return "OKX 不交易\(instType.displayName)，这笔请求不该走到 okx CLI"
+            return "\(instType.displayName)不在这个交易所能交易的品种里，这笔请求不该发到这里"
         }
     }
 
-    /// The exchange's own verdict, when the failure carries one.
-    ///
-    /// A CLI that could not start, timed out, or died on a socket error says
-    /// nothing about whether the order reached OKX — that outcome is *unknown*
-    /// and has to be resolved by asking. A response carrying a non-zero OKX
-    /// code says something definite: the exchange saw the order and refused it.
-    /// Only the second kind may be treated as "this did not happen".
-    public var exchangeRejection: String? {
-        if case .rejected(let venue, let reason) = self { return "\(venue)：\(reason)" }
-        guard case .cliFailed(let exitCode, let stderr) = self, exitCode > 0,
-              let code = Self.okxCode(in: stderr) else { return nil }
-        let words = Self.okxMessage(in: stderr)
-            ?? stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-        return "OKX \(code)：\(words.prefix(180))"
+    /// Why the order certainly did not reach the book, when that is certain:
+    /// the exchange refused it, or it was stopped here before it was sent.
+    /// Nil for every failure whose outcome is unknown — those are resolved by
+    /// asking, never read as "this did not happen".
+    public var refusal: String? {
+        switch self {
+        case .rejected(let venue, let reason): return "\(venue)：\(reason)"
+        case .refused(let reason): return reason
+        case .liveTradingLocked, .unsupportedInstrument: return description
+        default: return nil
+        }
     }
 
-    /// The exchange's own words for a refusal, when the payload carries them.
-    ///
-    /// Three places they can be, matching the three shapes `okxCode` reads:
-    /// `sMsg` on a per-order result, `msg` on the envelope, and the `Error:`
-    /// line of a failure the CLI formatted itself. Without any of them the
-    /// raw payload is all there is, and the caller shows that instead — a
-    /// message that starts with a JSON bracket is worse than one that says
-    /// "insufficient BTC margin", but better than one that says nothing.
-    static func okxMessage(in text: String) -> String? {
-        let patterns = [
-            #"\"sMsg\"\s*:\s*\"([^\"]+)\""#,
-            #"\"msg\"\s*:\s*\"([^\"]+)\""#,
-            #"(?m)^\s*Error:\s*(.+?)\s*$"#,
-        ]
-        let range = NSRange(text.startIndex..<text.endIndex, in: text)
-        for pattern in patterns {
-            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
-            for match in regex.matches(in: text, range: range) {
-                guard let found = Range(match.range(at: 1), in: text) else { continue }
-                let words = text[found].trimmingCharacters(in: .whitespacesAndNewlines)
-                if !words.isEmpty { return words }
-            }
-        }
+    /// Why the exchange certainly did not act on the order, when that is so.
+    /// Nothing is in flight and nothing was refused: the same order can
+    /// simply be tried again.
+    public var undelivered: String? {
+        if case .notDelivered(let reason) = self { return reason }
         return nil
     }
+
+    /// True when the order may have been acted on although no answer said
+    /// so. Every screen that reports a failed order says this differently
+    /// from a refusal: "check the exchange before trying again".
+    public var outcomeUnknown: Bool {
+        if case .unconfirmed = self { return true }
+        return false
+    }
+
+    /// Where a failed order stands — the one classification every screen
+    /// that reports a failed order reads, so no two can disagree.
+    public enum Standing: Sendable, Equatable {
+        /// It may have been acted on: find out before sending it again.
+        case unknown
+        /// The exchange certainly did not act on it: safe to send again.
+        case undelivered
+        /// Refused — by the exchange, or here before it was sent.
+        case refused
+
+        public var title: String {
+            switch self {
+            case .unknown: "结果未确认"
+            case .undelivered: "没有送达"
+            case .refused: "被拒绝"
+            }
+        }
+    }
+
+    /// Any error a send can throw. Only what says so is refused or
+    /// undelivered; everything else — whatever it is — may have been acted
+    /// on, the same rule the runner reads a failed placement by.
+    public static func standing(of error: Error) -> Standing {
+        guard let trade = error as? TradeError else { return .unknown }
+        if trade.undelivered != nil { return .undelivered }
+        if trade.refusal != nil { return .refused }
+        return .unknown
+    }
+
+    /// What to do about an undelivered order, true of both ways it happens.
+    public static let undeliveredAdvice = "这笔单没有进入交易所的订单系统，没有东西在途，可以放心重试。"
 
     /// What to do about it, for the failures whose cause is known.
     ///
@@ -746,13 +772,18 @@ public enum TradeError: Error, CustomStringConvertible, Sendable {
     /// current environment" does not say that demo and live keys are issued
     /// separately, which is the thing the reader has to know to fix it.
     public var hint: String? {
-        guard case .cliFailed(_, let stderr) = self else { return nil }
-        return Self.hint(forCLIOutput: stderr)
+        switch self {
+        case .cliFailed(_, let text), .rejected(_, let text), .notDelivered(let text),
+             .unconfirmed(let text), .refused(let text), .readFailed(let text):
+            return Self.hint(for: text)
+        default:
+            return nil
+        }
     }
 
-    /// Advice keyed on the exchange's own code or message, whichever the CLI
-    /// passed through.
-    public static func hint(forCLIOutput text: String) -> String? {
+    /// Advice keyed on the exchange's own code or message, wherever it came
+    /// through: the CLI's output, or the kernel's reply.
+    public static func hint(for text: String) -> String? {
         let lower = text.lowercased()
         let code = okxCode(in: text)
         if code == "50101" || lower.contains("does not match current environment") {
@@ -774,9 +805,18 @@ public enum TradeError: Error, CustomStringConvertible, Sendable {
         if lower.contains("profile") && lower.contains("not found") {
             return "CLI 里没有这个 profile，检查 ~/.okx/config.toml。"
         }
+        if code == "51169" || lower.contains("don't have any positions in this direction") {
+            return "交易所上这个方向已经没有仓位了：可能已被别的单平掉。刷新持仓后再看。"
+        }
+        if code == "51205" {
+            return "交易所不接受这张单的「只减仓」：这个持仓模式下平仓单不带它。"
+        }
+        if lower.contains("profile") && lower.contains("不能用于") {
+            return "模拟盘和实盘的 API Key 不能互用：在设置里为这个环境选对应的 profile。"
+        }
         if lower.contains("未返回") || lower.contains("timed out") || lower.contains("timeout")
-            || lower.contains("enotfound") || lower.contains("econnrefused") {
-            return "网络或代理问题：CLI 没能连上 OKX。"
+            || lower.contains("enotfound") || lower.contains("econnrefused") || lower.contains("连不上") {
+            return "网络或代理问题：没能连上 OKX。"
         }
         return nil
     }
@@ -792,6 +832,8 @@ public enum TradeError: Error, CustomStringConvertible, Sendable {
         let patterns = [
             #"\"(?:sCode|code)\"\s*:\s*\"?(\d+)\"?"#,
             #"(?m)^\s*Code:\s*(\d{5})\s*$"#,
+            // The kernel's rejection: the exchange's code, then its words.
+            #"^\s*(\d{5})\b"#,
         ]
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
         for pattern in patterns {
@@ -808,13 +850,15 @@ public enum TradeError: Error, CustomStringConvertible, Sendable {
 
 // MARK: - Bridge
 
-/// Wraps OKX's official CLI (Agent Trade Kit, `okx`) so MayStock never touches
-/// API keys — credentials live in the CLI's own `~/.okx/config.toml`.
+/// Wraps OKX's official CLI (Agent Trade Kit, `okx`) for the one reading
+/// with no kernel path — the ledger (bills, and its archive) behind the
+/// equity page — and holds the parsers of OKX's account documents, which the
+/// kernel's reads hand back whole. Credentials live in the CLI's own
+/// `~/.okx/config.toml`, and every call carries an explicit `TradingMode`.
 ///
-/// Safety model: every call carries an explicit `TradingMode`. Live orders are
-/// refused at this layer unless the caller passes `liveUnlocked: true`, which
-/// the app only does after the user flips the global setting *and* arms the
-/// individual strategy.
+/// Nothing here acts on the account. Orders and every reading the trading
+/// loop depends on go through the kernel (`KernelTradeClient`), which signs
+/// them itself with the same config file's key.
 public struct TradeBridge: Sendable {
     public var explicitCLIPath: String?
     /// CLI profile for each environment. Nil means the CLI's default profile.
@@ -916,83 +960,12 @@ public struct TradeBridge: Sendable {
         return FileManager.default.fileExists(atPath: config.path)
     }
 
-    // MARK: Trading
+    // MARK: Account documents
+    //
+    // OKX's own documents, read by the kernel (`KernelTradeClient`) and
+    // parsed here — one reader of each document's fields.
 
-    /// The `okx` CLI module that trades this family, or a refusal naming the
-    /// family OKX does not list. Every command below starts with one, so a
-    /// stock that somehow reached this bridge is turned back here rather than
-    /// sent to a subcommand that does not exist.
-    private static func module(for instType: InstrumentType) throws -> String {
-        guard let module = instType.cliModule else {
-            throw TradeError.unsupportedInstrument(instType)
-        }
-        return module
-    }
-
-    public func place(
-        _ order: OrderRequest, mode: TradingMode, liveUnlocked: Bool = false
-    ) async throws -> OrderResult {
-        if mode == .live && !liveUnlocked { throw TradeError.liveTradingLocked }
-
-        var args = [try Self.module(for: order.instType), "place",
-                    "--instId", order.instId,
-                    "--side", order.side.rawValue,
-                    "--ordType", order.kind.rawValue,
-                    "--sz", PriceFormatter.wire(order.size)]
-        if order.kind.isPriced, let price = order.limitPrice {
-            args += ["--px", PriceFormatter.wire(price)]
-        }
-        if let tradeMode = order.tradeMode {
-            args += ["--tdMode", tradeMode]
-        }
-        if order.instType == .spot, order.kind == .market {
-            // Market orders: spend quote ccy when buying by quote size.
-            args += ["--tgtCcy", order.sizeUnit == .quote ? "quote_ccy" : "base_ccy"]
-        }
-        if let posSide = order.posSide, order.instType.usesPositionSide {
-            args += ["--posSide", posSide.rawValue]
-        }
-        if order.reduceOnly, order.instType.isDerivative {
-            // A bare flag, as the CLI documents it for every module.
-            args += ["--reduceOnly"]
-        }
-        // `-1` is OKX's "fill at market once triggered". A limit exit could sit
-        // unfilled through the move it was meant to escape.
-        if let stop = order.stopTriggerPrice, stop > 0 {
-            args += ["--slTriggerPx", PriceFormatter.wire(stop), "--slOrdPx", "-1"]
-        }
-        if let target = order.takeProfitTriggerPrice, target > 0 {
-            args += ["--tpTriggerPx", PriceFormatter.wire(target), "--tpOrdPx", "-1"]
-        }
-        if let clOrdId = order.clOrdId {
-            args += ["--clOrdId", clOrdId]
-        }
-
-        let output = try await runCLI(args, mode: mode)
-        guard let ordId = Self.findString(key: "ordId", in: output), !ordId.isEmpty else {
-            throw TradeError.badOutput(output)
-        }
-        return OrderResult(ordId: ordId, clOrdId: order.clOrdId, raw: output)
-    }
-
-    public func cancel(
-        instId: String, instType: InstrumentType, ordId: String,
-        mode: TradingMode, liveUnlocked: Bool = false
-    ) async throws {
-        if mode == .live && !liveUnlocked { throw TradeError.liveTradingLocked }
-        _ = try await runCLI(
-            [try Self.module(for: instType), "cancel", instId, "--ordId", ordId], mode: mode)
-    }
-
-    /// How the account is configured for derivatives.
-    public func accountTradingConfig(mode: TradingMode) async throws -> AccountTradingConfig {
-        let output = try await runCLI(["account", "config"], mode: mode)
-        guard let config = Self.parseAccountTradingConfig(json: output) else {
-            throw TradeError.badOutput(output)
-        }
-        return config
-    }
-
+    /// The account's derivatives setup, from `account/config`.
     static func parseAccountTradingConfig(json: String) -> AccountTradingConfig? {
         var result: AccountTradingConfig?
         walkObjects(in: json) { dict in
@@ -1007,190 +980,10 @@ public struct TradeBridge: Sendable {
         return result
     }
 
-    // MARK: Account
-
-    /// `okx account balance-all` — trading + funding balances with valuation.
-    /// Falls back to `account balance` on CLI versions without the aggregate.
-    ///
-    /// `--no-aggregate` is not a preference: the server-side aggregate trims
-    /// each currency down to `{availEq, ccy, currencyId, eq, frozenBal, upl}`,
-    /// dropping the `eqUsd` that every USD figure on the account is built
-    /// from — measured against CLI 1.4.1, where the aggregate's details carry
-    /// 6 keys and the fallback's carry 49. Paying ~500ms instead of ~90ms
-    /// buys per-currency USD valuation; the account is read every 300s.
-    public func accountSnapshot(mode: TradingMode) async throws -> AccountSnapshot {
-        let output: String
-        if let perCurrency = try? await runCLI(
-            ["account", "balance-all", "--no-aggregate", "--valuationCcy", "USD"], mode: mode) {
-            output = perCurrency
-        } else {
-            output = try await runCLI(["account", "balance"], mode: mode)
-        }
-        return AccountSnapshot(
-            balances: Self.parseBalances(json: output),
-            totalEquity: Self.parseTotalEquity(json: output),
-            // Both figures the parse can return are dollars: `totalEq` is
-            // OKX's own USD equity, and `totalBal` is the valuation block,
-            // which is why `--valuationCcy USD` is passed above rather than
-            // left to default to the account's USDT.
-            equityCurrency: "USD")
-    }
-
-    public func balances(mode: TradingMode) async throws -> [AccountBalance] {
-        try await accountSnapshot(mode: mode).balances
-    }
-
-    /// Open derivative positions. Spot has no position concept — its exposure
-    /// is simply the base-currency balance.
-    public func positions(mode: TradingMode, instType: InstrumentType = .swap) async throws -> [ExchangePosition] {
-        let output = try await runCLI(
-            ["account", "positions", "--instType", instType.rawValue], mode: mode)
-        return Self.parsePositions(json: output)
-    }
-
-    /// Every position the exchange holds, whatever family — perpetuals,
-    /// delivery futures, options, margin — in one unfiltered listing. The
-    /// per-family call above only knows the families this app trades; an
-    /// account can hold more than that, and all of it is price risk.
-    public func allPositions(mode: TradingMode) async throws -> [ExchangePosition] {
-        Self.parsePositions(json: try await runCLI(["account", "positions"], mode: mode))
-    }
-
-    /// Resolve an order by its client id.
-    ///
-    /// A timeout is not a rejection: the request may have reached the exchange
-    /// and filled. Absent from the listing is the *only* answer that makes a
-    /// retry safe, so that is the only case reported as `.unknown`.
-    ///
-    /// Two listings, because the CLI keeps them apart: `orders` is the working
-    /// book and `orders --history` the last week of finished ones. An order
-    /// that filled is in the second and not the first, so asking only the
-    /// first — which is what this used to do, with a `--state all` flag the
-    /// CLI silently ignored — answered "never seen" for every filled order.
-    public func orderStatus(
-        instId: String, instType: InstrumentType, clOrdId: String, mode: TradingMode
-    ) async throws -> VenueOrderStatus {
-        let module = try Self.module(for: instType)
-        let working = try await runCLI([module, "orders", "--instId", instId], mode: mode)
-        let status = Self.parseOrderStatus(json: working, clOrdId: clOrdId)
-        if status != .unknown { return status }
-        let finished = try await runCLI(
-            [module, "orders", "--instId", instId, "--history"], mode: mode)
-        return Self.parseOrderStatus(json: finished, clOrdId: clOrdId)
-    }
-
-    static func parseOrderStatus(json: String, clOrdId: String) -> VenueOrderStatus {
-        var result: VenueOrderStatus = .unknown
-        walkObjects(in: json) { dict in
-            guard (dict["clOrdId"] as? String) == clOrdId else { return }
-            let filled = number(dict, "accFillSz") ?? number(dict, "fillSz") ?? 0
-            let average = number(dict, "avgPx") ?? number(dict, "fillPx") ?? 0
-            switch (dict["state"] as? String) ?? "" {
-            case "filled", "partially_filled":
-                result = .filled(filledSize: filled, averagePrice: average)
-            case "canceled", "mmp_canceled":
-                // A cancel after a partial fill still left us holding something.
-                result = filled > 0
-                    ? .filled(filledSize: filled, averagePrice: average) : .canceled
-            case "live", "pending":
-                result = .live
-            default:
-                result = filled > 0
-                    ? .filled(filledSize: filled, averagePrice: average) : .live
-            }
-        }
-        return result
-    }
-
-    /// Recent fills. This is what makes per-strategy attribution auditable:
-    /// each row carries the `clOrdId` we tagged the order with.
-    public func fills(
-        instId: String? = nil, instType: InstrumentType = .spot, mode: TradingMode
-    ) async throws -> [ExchangeFill] {
-        var args = [try Self.module(for: instType), "fills"]
-        if let instId { args += ["--instId", instId] }
-        let output = try await runCLI(args, mode: mode)
-        return Self.parseFills(json: output)
-    }
-
-    /// Everything the account has filled lately, whichever family and whoever
-    /// placed it, newest first.
-    ///
-    /// One call per family, because the listing endpoint takes one `instType`
-    /// and has no "all" — the same reason `openOrders` fans out. The
-    /// difference is what the caller learns: an order book that could not be
-    /// read hides what is armed, while a fill book that could not be read
-    /// hides what *happened*, which is how 「最近成交」 came to read "nothing
-    /// traded" on an account that traded all week. So an unreadable family is
-    /// named in `unavailable` rather than quietly contributing nothing.
-    ///
-    /// Named `fillListing` rather than a second `fills` because the per-family
-    /// reader above already defaults both of its first arguments, and two
-    /// overloads that both answer to `fills(mode:)` would be a coin toss.
-    public func fillListing(mode: TradingMode, perFamily limit: Int = 100) async throws -> ExchangeFillListing {
-        var requests: [(label: String, arguments: [String])] = []
-        for instType in InstrumentType.allCases {
-            guard let module = instType.cliModule else { continue }
-            requests.append((
-                label: instType.displayName,
-                arguments: [module, "fills", "--limit", String(limit)]))
-        }
-
-        let results = await withTaskGroup(
-            of: (label: String, fills: [ExchangeFill]?, error: Error?).self
-        ) { group in
-            for request in requests {
-                group.addTask {
-                    do {
-                        let output = try await runCLI(request.arguments, mode: mode)
-                        return (request.label, Self.parseFills(json: output), nil)
-                    } catch {
-                        return (request.label, nil, error)
-                    }
-                }
-            }
-            var out: [(label: String, fills: [ExchangeFill]?, error: Error?)] = []
-            for await result in group { out.append(result) }
-            return out
-        }
-
-        var listing = ExchangeFillListing()
-        var firstError: Error?
-        for result in results {
-            if let fills = result.fills {
-                listing.fills += fills
-            } else {
-                firstError = firstError ?? result.error
-                listing.unavailable.append(result.label)
-                Log.warn("bridge: 读取\(result.label)成交失败：\(result.error.map(String.init(describing:)) ?? "未知")")
-            }
-        }
-        if listing.unavailable.count == requests.count, let firstError { throw firstError }
-        // One execution is one row whatever family it is filed under; the
-        // kernel's identity rule is what decides that, and it is asked
-        // elsewhere rather than re-derived here. Newest-first is the listing
-        // type's own invariant.
-        listing.unavailable.sort()
-        return listing
-    }
-
-    /// Funding settlements charged on perpetual positions.
-    ///
-    /// The backtester models funding from real rate history; live ignored it
-    /// entirely, which for a short held across several days is not a rounding
-    /// error — it is the position's whole edge, paid out eight-hourly.
-    ///
-    /// OKX files these under bill type 8; `balChg` carries the signed amount,
-    /// negative when we paid.
-    public func fundingPayments(
-        instId: String?, mode: TradingMode, limit: Int = 100
-    ) async throws -> [FundingPayment] {
-        var args = ["account", "bills", "--instType", "SWAP", "--limit", String(limit)]
-        if let instId { args += ["--instId", instId] }
-        let output = try await runCLI(args, mode: mode)
-        return Self.parseFundingPayments(json: output, instId: instId)
-    }
-
+    /// Funding settled on perpetual positions: OKX files it under bill type
+    /// 8. The backtester models funding from real rate history, and live has
+    /// to book it too — for a short held across several days it is not a
+    /// rounding error but the position's whole edge, paid out eight-hourly.
     static func parseFundingPayments(json: String, instId: String?) -> [FundingPayment] {
         var found: [FundingPayment] = []
         walkObjects(in: json) { dict in
@@ -1224,6 +1017,8 @@ public struct TradeBridge: Sendable {
         if let balanceChange, balanceChange != 0 { return balanceChange }
         return pnl ?? balanceChange
     }
+
+    // MARK: Ledger (through the CLI)
 
     /// The exchange's own ledger of this account, newest first.
     ///
@@ -1353,36 +1148,6 @@ public struct TradeBridge: Sendable {
 
     // MARK: Connection
 
-    /// Prove that a mode's credentials reach *its* environment.
-    ///
-    /// One authenticated read — the balance — is the whole test: it fails on
-    /// a missing profile, a key from the other environment, a wrong secret or
-    /// passphrase, and a frozen key, each with the exchange's own words. The
-    /// account configuration is read afterwards on a best-effort basis, because
-    /// the position mode decides whether perpetual orders are accepted at all
-    /// and that is worth showing next to the green tick.
-    public func verifyConnection(mode: TradingMode) async throws -> VenueConnectionReport {
-        let snapshot = try await accountSnapshot(mode: mode)
-        let config = try? await accountConfig(mode: mode)
-        return VenueConnectionReport(
-            mode: mode,
-            profile: profile(for: mode),
-            checkedAt: Date(),
-            totalEquity: snapshot.totalEquity,
-            balanceCount: snapshot.balances.count,
-            account: config)
-    }
-
-    /// `okx account config` — the account's level, position mode and the key's
-    /// permissions. Read-only.
-    public func accountConfig(mode: TradingMode) async throws -> AccountConfigInfo {
-        let output = try await runCLI(["account", "config"], mode: mode)
-        guard let info = Self.parseAccountConfig(json: output) else {
-            throw TradeError.badOutput(output)
-        }
-        return info
-    }
-
     static func parseAccountConfig(json: String) -> AccountConfigInfo? {
         var result: AccountConfigInfo?
         walkObjects(in: json) { dict in
@@ -1397,209 +1162,6 @@ public struct TradeBridge: Sendable {
                 uid: dict["uid"] as? String)
         }
         return result
-    }
-
-    // MARK: Open orders
-
-    /// Every order the exchange is holding open on this account: the normal
-    /// book, plus every kind of algo order, for each family the CLI has a
-    /// module for.
-    ///
-    /// Why one call per algo kind rather than one per family: the listing
-    /// endpoint takes exactly one `ordType` and has no "all". Asking without
-    /// one is refused, and the CLI's own default is `conditional` — so the
-    /// version of this that asked once per family was not reading the algo
-    /// book, it was reading one seventh of it, and a trailing stop or a
-    /// planned order sat on the exchange invisible to every screen here.
-    /// `AlgoKind.allCases` is the fix and the guard: a kind added there is
-    /// listed from that moment, with nothing to remember to update.
-    ///
-    /// Books are asked for concurrently. Serially this is 22 invocations at
-    /// roughly 0.6s apiece, which would put the account refresh past the
-    /// runner's tick; the exchange's own rate limit, not this loop, is what
-    /// should bound it.
-    ///
-    /// A book that *could not be read* is named in `unavailable`, because an
-    /// empty list in its place would read as "nothing armed". A book that
-    /// *does not exist* — see `InstrumentType.hasAlgoBook` — is not asked for
-    /// and not reported: there is nothing there to miss. Only when every book
-    /// that was asked for failed is the whole listing an error.
-    public func openOrders(mode: TradingMode) async throws -> OpenOrderListing {
-        struct Request: Sendable {
-            let label: String
-            let book: ExchangeOpenOrder.Book
-            let arguments: [String]
-        }
-        var requests: [Request] = []
-        for instType in InstrumentType.allCases {
-            guard let module = instType.cliModule else { continue }
-            requests.append(Request(
-                label: "\(instType.displayName)\(ExchangeOpenOrder.Book.order.displayName)",
-                book: .order, arguments: [module, "orders"]))
-            guard instType.hasAlgoBook else { continue }
-            for kind in ExchangeOpenOrder.AlgoKind.allCases {
-                requests.append(Request(
-                    label: "\(instType.displayName)\(kind.displayName)",
-                    book: .algo, arguments: [module, "algo", "orders", "--ordType", kind.rawValue]))
-            }
-        }
-
-        let results = await withTaskGroup(
-            of: (label: String, orders: [ExchangeOpenOrder]?, error: Error?).self
-        ) { group in
-            for request in requests {
-                group.addTask {
-                    do {
-                        let output = try await runCLI(request.arguments, mode: mode)
-                        return (request.label, Self.parseOpenOrders(json: output, book: request.book), nil)
-                    } catch {
-                        return (request.label, nil, error)
-                    }
-                }
-            }
-            var out: [(label: String, orders: [ExchangeOpenOrder]?, error: Error?)] = []
-            for await result in group { out.append(result) }
-            return out
-        }
-
-        var listing = OpenOrderListing()
-        var firstError: Error?
-        for result in results {
-            if let orders = result.orders {
-                listing.orders += orders
-            } else {
-                firstError = firstError ?? result.error
-                listing.unavailable.append(result.label)
-                Log.warn("bridge: 读取\(result.label)失败：\(result.error.map(String.init(describing:)) ?? "未知")")
-            }
-        }
-        if listing.unavailable.count == requests.count, let firstError { throw firstError }
-        // The same order can only come back once — one kind per call, and the
-        // normal and algo books are disjoint — but ids are what the UI keys
-        // rows by, so a duplicate would corrupt the list rather than lengthen
-        // it. Cheap insurance against a CLI that someday widens a filter.
-        var seen = Set<String>()
-        listing.orders = listing.orders.filter { seen.insert($0.id).inserted }
-        listing.unavailable.sort()
-        listing.orders.sort { ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast) }
-        return listing
-    }
-
-    /// States in which an order is still on the book. The listing endpoints
-    /// only return open orders, but their history variants share the shape,
-    /// and a finished order must never be shown as armed.
-    static let openOrderStates: Set<String> = [
-        "live", "partially_filled", "effective", "partially_effective", "pause",
-    ]
-
-    static func parseOpenOrders(json: String, book: ExchangeOpenOrder.Book) -> [ExchangeOpenOrder] {
-        var out: [ExchangeOpenOrder] = []
-        walkObjects(in: json) { dict in
-            guard let id = dict[book == .algo ? "algoId" : "ordId"] as? String, !id.isEmpty,
-                  let instId = dict["instId"] as? String, !instId.isEmpty,
-                  let sideRaw = dict["side"] as? String, let side = OrderSide(rawValue: sideRaw)
-            else { return }
-            let state = (dict["state"] as? String) ?? ""
-            guard state.isEmpty || openOrderStates.contains(state) else { return }
-
-            let stop = number(dict, "slTriggerPx")
-            let target = number(dict, "tpTriggerPx")
-            // A leg priced at -1 fills at market; only a real level is a price.
-            let legPrice = [number(dict, "tpOrdPx"), number(dict, "slOrdPx")].compactMap { $0 }.first { $0 > 0 }
-            let price = number(dict, "px") ?? number(dict, "orderPx") ?? legPrice
-            let trigger = number(dict, "triggerPx") ?? number(dict, "moveTriggerPx")
-                ?? (stop != nil && target != nil ? nil : (stop ?? target))
-            let createdAt = number(dict, "cTime").map { Date(timeIntervalSince1970: $0 / 1_000) }
-            out.append(ExchangeOpenOrder(
-                id: id, book: book, instId: instId,
-                ordType: (dict["ordType"] as? String) ?? "",
-                side: side,
-                posSide: (dict["posSide"] as? String).flatMap(PositionSide.init(rawValue:)),
-                price: price, triggerPrice: trigger,
-                stopTriggerPrice: stop, takeProfitTriggerPrice: target,
-                size: number(dict, "sz"),
-                closeFraction: number(dict, "closeFraction"),
-                filledSize: number(dict, "fillSz") ?? number(dict, "actualSz") ?? 0,
-                state: state,
-                reduceOnly: flag(dict, "reduceOnly") ?? false,
-                clOrdId: (dict["clOrdId"] as? String).flatMap { $0.isEmpty ? nil : $0 },
-                createdAt: createdAt))
-        }
-        return out
-    }
-
-    // MARK: Protective orders
-
-    /// Stops and take-profits the exchange is currently holding.
-    ///
-    /// `--ordType conditional,oco` covers both the single stop attached to an
-    /// entry and the paired stop/target; anything else in the algo book (grid
-    /// bots, TWAP) is somebody else's and is not reported here.
-    public func protectiveOrders(
-        instId: String, instType: InstrumentType, mode: TradingMode
-    ) async throws -> [VenueProtectiveOrder] {
-        let output = try await runCLI(
-            [try Self.module(for: instType), "algo", "orders", "--instId", instId], mode: mode)
-        return Self.parseProtectiveOrders(json: output, instId: instId)
-    }
-
-    static func parseProtectiveOrders(json: String, instId: String) -> [VenueProtectiveOrder] {
-        var found: [VenueProtectiveOrder] = []
-        walkObjects(in: json) { dict in
-            guard let algoId = dict["algoId"] as? String, !algoId.isEmpty,
-                  (dict["instId"] as? String) == instId else { return }
-            let stop = number(dict, "slTriggerPx")
-            let target = number(dict, "tpTriggerPx")
-            // An algo order with neither leg is not protecting anything.
-            guard stop != nil || target != nil else { return }
-            found.append(VenueProtectiveOrder(
-                algoId: algoId, instId: instId,
-                stopTriggerPrice: stop, takeProfitTriggerPrice: target,
-                size: number(dict, "sz") ?? 0,
-                posSide: (dict["posSide"] as? String).flatMap(PositionSide.init(rawValue:))))
-        }
-        return found
-    }
-
-    /// Move an existing stop's trigger price, leaving everything else alone.
-    public func amendProtectiveOrder(
-        instId: String, instType: InstrumentType, algoId: String,
-        stopPrice: Double, mode: TradingMode, liveUnlocked: Bool = false
-    ) async throws {
-        if mode == .live && !liveUnlocked { throw TradeError.liveTradingLocked }
-        _ = try await runCLI(
-            [try Self.module(for: instType), "algo", "amend", "--instId", instId, "--algoId", algoId,
-             "--newSlTriggerPx", PriceFormatter.wire(stopPrice), "--newSlOrdPx", "-1"],
-            mode: mode)
-    }
-
-    /// Attach a standalone reduce-only stop to a position that has none.
-    public func placeProtectiveOrder(
-        instId: String, instType: InstrumentType, posSide: PositionSide?,
-        size: Double, stopPrice: Double, mode: TradingMode, liveUnlocked: Bool = false
-    ) async throws {
-        if mode == .live && !liveUnlocked { throw TradeError.liveTradingLocked }
-        // The order that closes a long is a sell, and vice versa.
-        let side: OrderSide = posSide == .short ? .buy : .sell
-        var args = [try Self.module(for: instType), "algo", "place", "--instId", instId,
-                    "--side", side.rawValue, "--sz", PriceFormatter.wire(size),
-                    "--ordType", "conditional",
-                    "--slTriggerPx", PriceFormatter.wire(stopPrice),
-                    "--slOrdPx", "-1", "--reduceOnly"]
-        if let posSide, instType.usesPositionSide { args += ["--posSide", posSide.rawValue] }
-        _ = try await runCLI(args, mode: mode)
-    }
-
-    /// This account's actual fee rates. The published tier table is a good
-    /// default, but promotions, OKB discounts and sub-account terms all move
-    /// the real number — so when credentials exist, ask.
-    public func feeRates(instType: InstrumentType, mode: TradingMode) async throws -> AccountFeeRates {
-        let output = try await runCLI(
-            ["account", "fees", "--instType", instType.rawValue], mode: mode)
-        guard let rates = Self.parseFeeRates(json: output, instType: instType) else {
-            throw TradeError.badOutput(output)
-        }
-        return rates
     }
 
     /// Public market ping through the CLI (no keys needed) — used by e2e.
@@ -1708,10 +1270,6 @@ public struct TradeBridge: Sendable {
         KernelAccount.totalEquity(json)
     }
 
-    static func parsePositions(json: String) -> [ExchangePosition] {
-        KernelAccount.positions(json)
-    }
-
     static func parseFills(json: String) -> [ExchangeFill] {
         var out: [ExchangeFill] = []
         walkObjects(in: json) { dict in
@@ -1750,24 +1308,6 @@ public struct TradeBridge: Sendable {
         return out.sorted { $0.ts < $1.ts }
     }
 
-    /// OKX reports fees as signed fractions where **negative means a charge**
-    /// (`"taker": "-0.001"` is 10 bps out of your pocket). We store costs as
-    /// positive basis points, so the sign flips; a genuine maker rebate stays
-    /// negative after the flip, which is exactly right.
-    static func parseFeeRates(json: String, instType: InstrumentType) -> AccountFeeRates? {
-        var result: AccountFeeRates?
-        walkObjects(in: json) { dict in
-            guard result == nil,
-                  let taker = number(dict, "taker") ?? number(dict, "takerU"),
-                  let maker = number(dict, "maker") ?? number(dict, "makerU") else { return }
-            result = AccountFeeRates(
-                instType: instType,
-                makerBps: -maker * 10_000,
-                takerBps: -taker * 10_000)
-        }
-        return result
-    }
-
     /// OKX sends every number as a string; some CLI paths pass through doubles.
     static func number(_ dict: [String: Any], _ key: String) -> Double? {
         if let text = dict[key] as? String { return text.isEmpty ? nil : Double(text) }
@@ -1785,14 +1325,6 @@ public struct TradeBridge: Sendable {
         case "false": return false
         default: return nil
         }
-    }
-
-    static func findString(key: String, in json: String) -> String? {
-        var result: String?
-        walkObjects(in: json) { dict in
-            if result == nil, let value = dict[key] as? String, !value.isEmpty { result = value }
-        }
-        return result
     }
 
     static func walkObjects(in json: String, visit: ([String: Any]) -> Void) {

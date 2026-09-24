@@ -1,16 +1,17 @@
 # 交易内核（Rust）
 
-> 量化策略实际运行的内核是 Rust，体检页的实时数据层也在 Rust。Swift 保留 UI、下单与持久化。
+> 量化策略实际运行的内核是 Rust，体检页的实时数据层、OKX 下单与平仓规划也在 Rust。Swift 保留 UI 与持久化。
 
 ## 1. 边界怎么划的
 
 | 归属 | 内容 | 为什么 |
 |---|---|---|
 | **Rust 纯计算**（`kernel/src/` 除 `live/`） | 指标库、表达式 DSL、回测引擎、绩效指标、仓位计算、**实盘信号决策**、期权簿算术（`implied` 隐含分布、`gravity` max pain）、OKX 账户文档解析 | 确定性计算。正确性与可复现性是第一位的，且这里是「回测与实盘必须一致」的地方 |
-| **Rust 实时层**（`kernel/src/live/`） | 体检页读的全部实时连接：OKX 公有行情与只读私有账户推送、Deribit 波动率曲面、Binance 标记价、嘉信报价推送，以及没有推送的 REST 读数（四家期权持仓量、5 分钟持仓结构、条件单、时钟） | 同一个数只有一份实现：线上帧、录制帧、回测都走同一批纯函数 |
-| **Swift**（`Sources/`） | SwiftUI 界面、菜单栏、交易行情 WebSocket、okx CLI 桥（**下单只走这里**）、配置与台账持久化、异步编排 | 平台 I/O 与界面 |
+| **Rust 实时层**（`kernel/src/live/`） | 体检页读的全部实时连接：OKX 公有行情与只读私有账户推送、Deribit 波动率曲面、Binance 标记价、嘉信报价推送，以及没有推送的 REST 读数（四家期权持仓量、5 分钟持仓结构、条件单、时钟）；平仓面板的单标的盘口（`live/book.rs`） | 同一个数只有一份实现：线上帧、录制帧、回测都走同一批纯函数 |
+| **Rust 交易通道**（`kernel/src/trade/`） | OKX 下单、策略委托、撤单、改止损、预检（内核自己签名 REST）；交易路径的签名读取（挂单、按 clOrdId 查单、费率、持仓、余额与估值、账户配置、成交、资金费）；平仓规划（价格来源、逐档预估、复核文字） | 发出去的请求体、复核给人看的请求体、测试钉住的请求体是同一个函数的输出 |
+| **Swift**（`Sources/`） | SwiftUI 界面、菜单栏、交易行情 WebSocket、okx CLI 桥（只剩账单流水）、嘉信 `schwabctl` 桥、配置与台账持久化、异步编排 | 平台 I/O 与界面 |
 
-**下单没有搬进 Rust**：实时层只读，它能构造的帧里没有任何下单、改单、撤单操作。私有频道只订阅 `positions` / `account`，签名请求只放行 `GET /api/v5/trade/orders-algo-pending`，两份白名单各写一处（`live/okx.rs`），测试钉住。
+**签名 REST 只有一个出口，清单封闭**：所有签名 REST 请求——App 的下单与读取、实时层的条件单轮询——都经由进程唯一的 `trade::shared()` 客户端；能发的只有 `trade::wire::Action` 列出的六种动作，能读的只有 `trade::reads::Read` 列出的几种读取，每条路由都在 `trade::route::Route` 里，没有一个参数能指定任意路径。实时层自己只签 WebSocket 登录，私有频道只订阅 `positions` / `account`。密钥只在签名时从 okx CLI 的 `config.toml` 读，不另存、不写日志，`Debug` 打印不出任何一段。
 
 ### 1.0 实时层的形状（2026-09-24）
 
@@ -21,13 +22,31 @@
 - **离线模式**：`ms_live_ingest` 把录制的帧送进与线上完全相同的解析路径，整条管线可测（`LiveKernelGoldenTests`）。
 - **网络底线是实测出来的**，不是代码能改的：这台机器所有交易所流量走公司 VPN，单向 150–400 ms；高频流（Binance 期货 `bookTicker` 每秒约 65 帧）单独跑也迟到 1.6 s，并拖累同机其它流。所以只订阅小频道（Deribit 用整曲面一帧/秒的 `markprice.options`，而不是 26 个逐合约 ticker），并对每个连接只并发抢连 IPv4（IPv6 在这台机器上是黑洞，系统先试它会白等约 10 s）。
 
+### 1.0.1 交易通道与盘口（2026-09-25）
+
+May 的决定：「交易相关都走内核」「内核直接签名下单」，平仓面板要有最优价格和同向 / 对手第 N 档。实现与实测：
+
+- **结果只有五种，且互斥**（`trade::Reply`）：`accepted`（交易所给了 ordId/algoId）、`rejected`（交易所自己的拒绝，带 sCode）、`notDelivered`（交易所确定没有处理：连接都没建立、一个字节没发出，或者被 OKX 限频挡回——限频在网关读请求之前就拦下，官方 CLI 也按「退避后重试」处理 50011/50061）、`unconfirmed`（发出去了但没有裁决——可能已成交，只能按 clOrdId 去查）、`refused`（在本机就拦下：实盘未解锁、密钥环境不对、订单写法交易所读不了）。超时、5xx、回复读一半断了、回复成功但没有 id，以及 OKX 自己的服务端错误码 `50001`/`50004`/`50013`/`50026`（OKX 对 50004 的说明是「不代表请求成功或失败」；`close-doctor` 实测在模拟盘查单时遇到过 50004），全部是 `unconfirmed`，绝不当成拒绝，也绝不重发。runner 对三种失败各有去向：拒绝→策略停下；没送达→清掉「本根 K 线已处理」标记，下一次轮询重下；未确认→记为在途，按 clOrdId 查到结果为止，不重发。
+- **实盘锁在内核里**：实盘动作在读密钥之前就被拒；demo key 发实盘、实盘 key 发 demo 也在网络之前拒（本地模拟服务器测试钉住：被拒时服务器一个请求都没收到）。
+- **连接常热**：交易客户端是进程级单例，IPv4、keep-alive；平仓面板一打开就预热，一笔单只付一次往返（实测模拟盘撤单 250–470 ms，含 VPN）。
+- **建连这一步也按「抢最快」来**：OKX 的域名解析出多个 IPv4 边缘节点，连接器默认按解析顺序逐个尝试，排在最前的节点慢或挂了，一批并发连接就一起超时（实测：`close-doctor` 首批 15 个并发连接全部 `client error (Connect): operation timed out`，约 1/12 次）。所以 REST 客户端（交易与轮询共用 `net::FastestFirst`）解析时并发抢连所有 IPv4，把先答的放第一个，记住这个顺序 60 秒，同一时刻只跑一次抢连。即便如此，建连阶段（请求一个字节都还没发出）的失败仍会重签名重试，最多 3 次。发出之后的失败一律不重试，归 `unconfirmed`。
+- **不超 OKX 的限频**（`trade::route`）：客户端访问的每条 OKX 路由都声明在 `Route` 里，附官方限额（按 ccxt 的 OKX 定义核对，cost 1 = 每 2 秒 20 次；官方 CLI 自己的节流放得更宽，algo 列表给了每秒 20 次）；请求只能经由 `Target` 发出，而 `Target` 只能由 `Route` 构造，`Route::limit` 是没有默认分支的穷举 match——新加一条路由，不写限额就编译不过。进程内按「账户 × 路由」配速：每个请求从放行起占一个名额，直到回复到达、再过一个窗口才让出。OKX 按到达计数，而到达一定不晚于回复，所以这样排出的请求在 OKX 那边任意一个窗口里都不超限，与网络和冷连接握手多慢无关——本进程自己永远不会超限。按「放行时刻 + 300 ms 抖动」计数是不够的：冷启动时估值读取（每秒 1 次）第一个请求在冷连接上飞了约 0.8 s，第二个走热连接追上，三次启动三次 `50011`；改成按回复计数后三次启动零次（2026-09-25 实测）。跨进程仍可能撞上（实测：App 轮询挂单的同时 `close-doctor` 读同一实盘账户，12 个 algo 列表里有 4 个被回 `50011 Too Many Requests`，而 OKX 对 `orders-algo-pending` 的限额是每账户每 2 秒 20 次），所以 HTTP 429 或 50011/50061 会等满一个窗口后重签重发，与建连失败共用 3 次的额度，仍被限频就归 `notDelivered`——不是拒单，runner 不会因此停掉策略。读取不改变任何东西，所以服务端出错（5xx 与上面四个码）时也等一两秒再问，同样计入 3 次。哪条路由会改变账户只由 `Route::acts` 声明一处。每个回复都带 `retries`、第一次重发的原因 `retryReason`，以及排过队的请求数 `pacedRequests` 和其中最长的等待 `pacedMs`（一次调用的请求是并排等的，所以取最长而不是加总）；这些用文字写成 `note` 只由内核写一次，App 原样写进 engine-log（`trade: … 重发 N 次（首次原因：…）` / `N 个请求为不超 OKX 限频排队，最长等了 N ms`），实时层写进自己的事件。实时层的条件单轮询也走同一个 `trade::shared()` 客户端（`Read::Protection` 不带品种即整个账户，一个 `conditional,oco` 请求），所以全进程的签名请求共用一个配速器；它在交易客户端自己的 runtime 上执行，连接不会挂在实时层的 runtime 上、随实时层停止而断在下一笔订单底下。
+- **签名 POST 已端到端验证**：`close-doctor` 在模拟盘撤一笔不存在的订单，OKX 答 `51400`（订单不存在）——请求被认证、被读懂；每种价格来源 × 有效方式的平仓单都过了模拟盘的 `order-precheck`。预检只收合约：现货一律答 `3 Operation not supported`（实测）。
+- **盘口**：订阅 `books`（400 档，100 ms 增量）+ `bbo-tbt`（10 ms）+ `tickers`。两者共用同一个 seqId 序列（实测：快照与其后第一条 bbo-tbt 的 seqId 相同），所以严格按序合并：增量的 `prevSeqId` 必须接上本地序号（心跳 seq==prev、维护重置 seq<prev 也都是「接上」），接不上即丢帧，断开重订阅从新快照重建，并计入 `resyncs` 由 App 记日志；比盘口新的 bbo 覆盖第一档并删掉盘口里所有比它更优的档（那些已被吃掉或撤掉）；合并后买一 ≥ 卖一视为丢帧。价格按十进制文本解析成整数（10⁻¹⁸），不用浮点做键。随机模型对拍：200 轮 × 300 帧，合并结果与真实盘口逐档一致。OKX 的 checksum 在这个频道恒为 0，不能用。l2-tbt 需要 VIP4，账户是 VIP1。
+- **价格来源照 Binance 的 `priceMatch`**：对手价第 N 档（卖出=买 N，立即吃掉 1…N 档）、同向价第 N 档（卖出=卖 N，排队）、中间价（向对自己有利的一侧取整）、最新成交价、自定义（同样向有利侧取整）。OKX 没有服务端 BBO，所以在内核里按「面板上画的那份盘口」解析，复核冻结这份价格并写明它来自哪个 seq；复核后盘口再动，界面实时显示漂移，确认发送的仍是复核时的价格，复核超过 60 秒必须重新复核。
+- **预估逐档走盘口**：立即成交量、均价、吃几档、最差价、相对中间价的滑点、挂单余量、IOC 撤销量、FOK 不足整单撤销、超出可见档位的市价量；手续费按合约自己的费率组（现货各组 taker 从 0.08% 到 0.32% 不等，实测，所以不按品种族一刀切），期权按「名义 × 费率」与「权利金 12.5%」取小；盈亏按合约条款（线性、反向、期权权利金、股票），现货余额没有成本价就不估。金额文本由内核写一次（`money_text`），界面只显示。
+- **能做什么由内核声明一次**（`trade::close::capabilities`，按交易所 × 品种族），界面只提供声明里有的，规划器拒绝其余并给出声明里的原因；Swift 测试遍历每个交易所 × 品种 × 方式 × 价格来源 × 有效方式，断言每张复核里的请求体与 `send` 实际会签名的请求体逐字节一致。
+- **嘉信**：只有一档报价、没有挂单量（`sizesKnown: false`），预估按「报价全部成交」算并在复核里写明这是假设；只提供 GTC 限价、市价和止损，其余在边界上按名字拒绝。
+
 ### 1.1 交易所是注入进来的，不是写死的
 
 Swift 那一侧还有一条边界：`ExchangeVenue`。它是交易 infra 的**端口**，
 `StrategyRunner` 只认这个协议，全文没有出现过 OKX。
 
 ```
-StrategyRunner ──▶ ExchangeVenue（协议）──▶ OKXVenue ──▶ OKXRESTClient + TradeBridge
+StrategyRunner ──▶ ExchangeVenue（协议）──▶ OKXVenue ──▶ OKXRESTClient（行情）
+                                        │                 + KernelTradeClient（下单与交易读取，内核签名）
+                                        │                 + TradeBridge（CLI：账单流水；OKX 文档解析器）
                                         └▶ 换任何交易所：新增一个同级 conformance
 ```
 
@@ -78,8 +97,24 @@ int32_t     ms_live_ingest   (MSLive *, const char *topic, const char *payload, 
 char       *ms_live_snapshot (const MSLive *, uint64_t since_seq, uint64_t *seq_out);
 void        ms_live_stop     (MSLive *);
 
-/* OKX 账户文档（CLI JSON 或推送）的唯一解析：positions / equity / balances */
+/* OKX 账户文档（REST、CLI JSON 或推送）的唯一解析：positions / equity / balances */
 char       *ms_okx_account_document(const char *kind, const char *json, char **err);
+
+/* 交易通道：动作与读取都是 JSON，回复永远是一份结果，从不是 NULL */
+char       *ms_trade_send    (const char *request_json);   /* accepted|rejected|notDelivered|unconfirmed|refused */
+char       *ms_trade_read    (const char *request_json);   /* ok|failed|refused */
+char       *ms_trade_describe(const char *action_json, char **err);  /* 一个动作会变成的确切请求 */
+int64_t     ms_trade_warm    (char **err);
+
+/* 平仓：能力声明与规划（按面板上那份盘口） */
+char       *ms_close_capabilities(const char *venue, const char *family, char **err);
+char       *ms_close_plan        (const char *input_json, const char *book_json, char **err);
+
+/* 单标的盘口：books + bbo-tbt + tickers，按 seqId 合并 */
+MSBook     *ms_book_start   (const char *config_json, char **err);
+char       *ms_book_snapshot(const MSBook *, uint64_t since_seq, uint64_t *seq_out);
+int32_t     ms_book_ingest  (MSBook *, const char *frame, char **err);
+void        ms_book_stop    (MSBook *);
 
 /* 市场日历与品种政策：Swift 侧所有「bar ↔ 时间」换算都问这里，不自己算 */
 double      ms_calendar_bars_per_year(const char *market_json, char **err);
@@ -98,7 +133,9 @@ char       *ms_instrument_policy     (const char *inst_type, char **err);
   只会变成永久的布局 bug 来源。
 - **编译后的策略是不透明句柄**：解析清单不免费，而实盘运行器每 20 秒就要用一次。
 - **每个入口都包了 `catch_unwind`**：panic 跨 FFI 边界是未定义行为，
-  而这个库被加载进持有交易所会话的进程里 —— 必须以错误字符串失败，不能以崩溃失败。
+  而这个库被加载进持有交易所会话、并且会发单的进程里 —— 必须以错误字符串失败，不能以崩溃失败。
+  这要求 release 用 `panic = "unwind"`：2026-09-25 之前是 `"abort"`，这道护栏编译出来什么都不做，
+  任何 panic 都会直接带走整个 App。现在静态库里链接的是 `panic_unwind`（`ar t` 可查）。
 
 ## 4. 编译时就拒绝，而不是第一根 K 线上才炸
 

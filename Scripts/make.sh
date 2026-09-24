@@ -102,6 +102,7 @@ cmd_e2e() {
   "$BUILD_DIR/maystock-e2e" trade-doctor
   "$BUILD_DIR/maystock-e2e" strategy-doctor
   "$BUILD_DIR/maystock-e2e" live 30
+  "$BUILD_DIR/maystock-e2e" close-doctor
 }
 
 cmd_verify() {

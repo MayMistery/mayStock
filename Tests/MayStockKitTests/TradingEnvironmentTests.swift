@@ -36,7 +36,7 @@ struct TradingEnvironmentTests {
             explicitCLIPath: cli.path, demoProfile: bridge.demoProfile, liveProfile: bridge.liveProfile)
 
         for mode in TradingMode.allCases {
-            _ = try await underTest.balances(mode: mode)
+            _ = try await underTest.runCLI(["account", "bills"], mode: mode)
             let args = (try String(contentsOf: argsFile, encoding: .utf8))
                 .split(separator: "\n").map(String.init)
             let flag = mode == .demo ? "--demo" : "--live"
@@ -65,7 +65,7 @@ struct TradingEnvironmentTests {
         """.write(to: cli, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cli.path)
 
-        _ = try await TradeBridge(explicitCLIPath: cli.path).balances(mode: .demo)
+        _ = try await TradeBridge(explicitCLIPath: cli.path).runCLI(["account", "bills"], mode: .demo)
         let args = (try String(contentsOf: argsFile, encoding: .utf8))
             .split(separator: "\n").map(String.init)
         #expect(!args.contains("--profile"))
@@ -200,17 +200,17 @@ struct TradingEnvironmentTests {
         let error = TradeError.cliFailed(
             exitCode: 1, stderr: "Error: HTTP 401 from OKX: APIKey does not match current environment.")
         #expect(error.hint?.contains("另一个环境") == true)
-        #expect(error.exchangeRejection == nil, "an auth failure is not an order rejection")
+        #expect(error.refusal == nil, "an auth failure is not an order rejection")
     }
 
     @Test func codedFailuresGetHints() {
-        #expect(TradeError.hint(forCLIOutput: #"{"code":"50111","msg":"Invalid OK-ACCESS-KEY"}"#)?
+        #expect(TradeError.hint(for: #"{"code":"50111","msg":"Invalid OK-ACCESS-KEY"}"#)?
             .contains("API Key 无效") == true)
-        #expect(TradeError.hint(forCLIOutput: #"{"code":"50113","msg":"Invalid Sign"}"#)?
+        #expect(TradeError.hint(for: #"{"code":"50113","msg":"Invalid Sign"}"#)?
             .contains("签名") == true)
-        #expect(TradeError.hint(forCLIOutput: "okx CLI 超过 15 秒未返回，已终止")?
+        #expect(TradeError.hint(for: "okx CLI 超过 15 秒未返回，已终止")?
             .contains("网络") == true)
-        #expect(TradeError.hint(forCLIOutput: "something else entirely") == nil)
+        #expect(TradeError.hint(for: "something else entirely") == nil)
     }
 
     @Test func parsesAccountConfig() {

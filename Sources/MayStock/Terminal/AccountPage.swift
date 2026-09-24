@@ -28,7 +28,7 @@ struct AccountPage: View {
         PageScroll {
             VStack(alignment: .leading, spacing: Theme.sectionSpacing) {
                 PageHeader(title: "账户与连接",
-                           subtitle: "OKX 的 API Key 由官方 okx CLI 管理（okx config），嘉信的 App Key/Secret 与 token 由 schwabctl 管理；MayStock 不接触、不存储任何密钥。回测只用公开行情，无需凭证。") {
+                           subtitle: "OKX 的 API Key 存在官方 okx CLI 的配置文件里（okx config），MayStock 内核只在签名请求时读取，不另存、不写日志；嘉信的 App Key/Secret 与 token 由 schwabctl 管理。回测只用公开行情，无需凭证。") {
                     Button {
                         appState.reloadProfiles()
                         Task {
@@ -66,7 +66,7 @@ struct AccountPage: View {
     // MARK: CLI
 
     private var cliCard: some View {
-        Card(title: "okx CLI", subtitle: "OKX 官方 Agent Trade Kit，所有账户读写都经它执行") {
+        Card(title: "okx CLI", subtitle: "OKX 官方 Agent Trade Kit：只剩账单流水经它读取；下单、撤单、挂单、持仓、余额、成交与资金费都由内核直接签名请求") {
             if appState.isDetectingCLI {
                 ProgressView().controlSize(.small)
             } else {

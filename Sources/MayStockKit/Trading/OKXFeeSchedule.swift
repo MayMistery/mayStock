@@ -241,7 +241,7 @@ public struct OKXFeeSchedule: FeeSchedule {
             + " · 滑点 \(PriceFormatter.plain(slippageBps)) bps"
     }
 
-    /// Apply rates returned by `okx account fees`. Rates for an instrument
+    /// Apply the account's own rates. Rates for an instrument
     /// OKX does not trade cannot come back from it, and are ignored.
     public mutating func apply(_ rates: AccountFeeRates) {
         switch rates.instType {
@@ -284,5 +284,11 @@ public struct AccountFeeRates: Sendable, Equatable {
         self.instType = instType
         self.makerBps = makerBps
         self.takerBps = takerBps
+    }
+
+    /// The family's standard rates as the kernel reads them (fractions,
+    /// positive when charged).
+    public init(instType: InstrumentType, rates: FeeRates) {
+        self.init(instType: instType, makerBps: rates.maker * 10_000, takerBps: rates.taker * 10_000)
     }
 }

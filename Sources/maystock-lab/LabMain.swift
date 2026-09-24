@@ -435,17 +435,19 @@ struct LabMain {
 
         if arguments.has("sync") {
             let bridge = TradeBridge()
-            guard bridge.resolveCLIPath() != nil else { throw TradeError.cliNotFound }
             guard bridge.hasCredentials() else { throw TradeError.notConfigured }
             let mode: TradingMode = arguments.has("live") ? .live : .demo
+            let trade = KernelTradeClient(bridge: bridge)
             for instType in Venue.okx.instrumentTypes {
-                if let rates = try? await bridge.feeRates(instType: instType, mode: mode) {
+                do {
+                    let read = try await trade.feeRates(family: instType, instId: nil, groupId: nil, mode: mode)
+                    let rates = AccountFeeRates(instType: instType, rates: read)
                     schedule.apply(rates)
                     Out.good("同步 \(instType.displayName)：maker "
                              + "\(PriceFormatter.decimals(rates.makerBps, 3)) bps · taker "
                              + "\(PriceFormatter.decimals(rates.takerBps, 3)) bps")
-                } else {
-                    Out.warn("\(instType.displayName) 费率同步失败")
+                } catch {
+                    Out.warn("\(instType.displayName) 费率同步失败：\(error)")
                 }
             }
         }

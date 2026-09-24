@@ -2,127 +2,10 @@ import Foundation
 import Testing
 @testable import MayStockKit
 
-/// TradeBridge tests run against a *fake* `okx` executable written to a temp
-/// dir — verifying argument construction, JSON parsing and the live-trading
-/// safety interlock without ever touching the network or a real account.
+/// The CLI's account documents, parsed without a CLI or a network. Orders no
+/// longer go through the CLI; the kernel's own tests pin those.
 @Suite("Trade bridge")
 struct TradeBridgeTests {
-    /// Writes a stub `okx` script that echoes its args and emits canned JSON.
-    private func makeStubCLI(stdout: String, exitCode: Int = 0) throws -> (bridge: TradeBridge, argsFile: URL, dir: URL) {
-        let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("maystock-stub-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let cli = dir.appendingPathComponent("okx")
-        let argsFile = dir.appendingPathComponent("args.txt")
-        let script = """
-        #!/bin/sh
-        printf '%s\\n' "$@" > "\(argsFile.path)"
-        cat <<'JSON'
-        \(stdout)
-        JSON
-        exit \(exitCode)
-        """
-        try script.write(to: cli, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cli.path)
-        return (TradeBridge(explicitCLIPath: cli.path), argsFile, dir)
-    }
-
-    private func recordedArgs(_ url: URL) -> [String] {
-        (try? String(contentsOf: url, encoding: .utf8))?
-            .split(separator: "\n").map(String.init) ?? []
-    }
-
-    @Test func demoMarketBuyBuildsCorrectCommand() async throws {
-        let stub = try makeStubCLI(stdout: #"{"code":"0","data":[{"ordId":"123456","sCode":"0"}]}"#)
-        defer { try? FileManager.default.removeItem(at: stub.dir) }
-
-        let order = OrderRequest(instId: "BTC-USDT", side: .buy, kind: .market,
-                                 size: 100, sizeUnit: .quote, clOrdId: "ms0123abcd0000000001")
-        let result = try await stub.bridge.place(order, mode: .demo)
-
-        #expect(result.ordId == "123456")
-        let args = recordedArgs(stub.argsFile)
-        #expect(args.contains("spot") && args.contains("place"))
-        #expect(args.contains("--instId") && args.contains("BTC-USDT"))
-        #expect(args.contains("--side") && args.contains("buy"))
-        #expect(args.contains("--ordType") && args.contains("market"))
-        #expect(args.contains("--sz") && args.contains("100"))
-        #expect(args.contains("--tgtCcy") && args.contains("quote_ccy"))
-        #expect(args.contains("--clOrdId") && args.contains("ms0123abcd0000000001"),
-                "every order must carry its strategy tag")
-        #expect(args.contains("--demo"), "demo orders must carry --demo")
-        #expect(args.contains("--json"))
-    }
-
-    @Test func swapOrderUsesSwapModule() async throws {
-        let stub = try makeStubCLI(stdout: #"{"code":"0","data":[{"ordId":"55","sCode":"0"}]}"#)
-        defer { try? FileManager.default.removeItem(at: stub.dir) }
-
-        let order = OrderRequest(instId: "BTC-USDT-SWAP", instType: .swap, side: .sell,
-                                 kind: .market, size: 3, sizeUnit: .base)
-        _ = try await stub.bridge.place(order, mode: .demo)
-
-        let args = recordedArgs(stub.argsFile)
-        #expect(args.contains("swap") && args.contains("place"))
-        #expect(!args.contains("--tgtCcy"), "tgtCcy is spot-only")
-    }
-
-    @Test func limitSellIncludesPrice() async throws {
-        let stub = try makeStubCLI(stdout: #"{"code":"0","data":[{"ordId":"789","sCode":"0"}]}"#)
-        defer { try? FileManager.default.removeItem(at: stub.dir) }
-
-        let order = OrderRequest(instId: "ETH-USDT", side: .sell, kind: .limit,
-                                 size: 0.5, sizeUnit: .base, limitPrice: 4000)
-        _ = try await stub.bridge.place(order, mode: .demo)
-
-        let args = recordedArgs(stub.argsFile)
-        #expect(args.contains("--px") && args.contains("4000"))
-        #expect(!args.contains("--tgtCcy"), "limit orders must not send tgtCcy")
-    }
-
-    @Test func liveOrderRefusedWhenLocked() async throws {
-        let stub = try makeStubCLI(stdout: "{}")
-        defer { try? FileManager.default.removeItem(at: stub.dir) }
-
-        let order = OrderRequest(instId: "BTC-USDT", side: .buy, kind: .market, size: 10)
-        await #expect(throws: TradeError.self) {
-            _ = try await stub.bridge.place(order, mode: .live, liveUnlocked: false)
-        }
-        // The stub must never have been invoked.
-        #expect(!FileManager.default.fileExists(atPath: stub.argsFile.path))
-    }
-
-    @Test func liveOrderSendsLiveFlagWhenUnlocked() async throws {
-        let stub = try makeStubCLI(stdout: #"{"code":"0","data":[{"ordId":"1","sCode":"0"}]}"#)
-        defer { try? FileManager.default.removeItem(at: stub.dir) }
-
-        let order = OrderRequest(instId: "BTC-USDT", side: .buy, kind: .market, size: 10)
-        _ = try await stub.bridge.place(order, mode: .live, liveUnlocked: true)
-        let args = recordedArgs(stub.argsFile)
-        #expect(!args.contains("--demo"))
-        #expect(args.contains("--live"))
-    }
-
-    @Test func cliFailureSurfacesStderr() async throws {
-        let stub = try makeStubCLI(stdout: #"{"code":"51000","msg":"Parameter sz error"}"#, exitCode: 2)
-        defer { try? FileManager.default.removeItem(at: stub.dir) }
-
-        let order = OrderRequest(instId: "BTC-USDT", side: .buy, kind: .market, size: 0)
-        await #expect(throws: TradeError.self) {
-            _ = try await stub.bridge.place(order, mode: .demo)
-        }
-    }
-
-    @Test func missingOrdIdIsNotSilentlyAccepted() async throws {
-        let stub = try makeStubCLI(stdout: #"{"code":"0","data":[{"sCode":"51008","sMsg":"insufficient"}]}"#)
-        defer { try? FileManager.default.removeItem(at: stub.dir) }
-
-        let order = OrderRequest(instId: "BTC-USDT", side: .buy, kind: .market, size: 10)
-        await #expect(throws: TradeError.self) {
-            _ = try await stub.bridge.place(order, mode: .demo)
-        }
-    }
-
     @Test func parsesBalances() {
         let json = """
         {"code":"0","data":[{"details":[
@@ -143,7 +26,7 @@ struct TradeBridgeTests {
            "markPx":"59000","upl":"30","lever":"2","liqPx":"88000"},
           {"instId":"ETH-USDT-SWAP","posSide":"net","pos":"-2","avgPx":"3000","upl":"-5"}]}
         """
-        let positions = TradeBridge.parsePositions(json: json)
+        let positions = KernelAccount.positions(json)
         #expect(positions.count == 2)
         #expect(positions.first?.quantity == -3, "a short leg is negative exposure")
         #expect(positions.first?.leverage == 2)
@@ -165,17 +48,6 @@ struct TradeBridgeTests {
         #expect(fills.first!.ts < fills.last!.ts, "fills are returned oldest first")
     }
 
-    @Test func missingCLIThrowsCliNotFound() async {
-        let bridge = TradeBridge(explicitCLIPath: "/nonexistent/okx-\(UUID().uuidString)")
-        // explicit path invalid + nothing in search paths ⇒ depends on machine;
-        // so only assert when truly absent:
-        if bridge.resolveCLIPath() == nil {
-            let order = OrderRequest(instId: "BTC-USDT", side: .buy, kind: .market, size: 1)
-            await #expect(throws: TradeError.self) {
-                _ = try await bridge.place(order, mode: .demo)
-            }
-        }
-    }
 }
 
 @Suite("Config persistence & migration")
@@ -281,11 +153,9 @@ struct TradeBridgeRobustnessTests {
 
         let started = Date()
         await #expect(throws: TradeError.self) {
-            _ = try await bridge.balances(mode: .demo)
+            _ = try await bridge.runCLI(["account", "bills"], mode: .demo)
         }
-        // `balances` falls back to a second command when the first fails, so
-        // the worst case is two timeouts — still far short of the child's 120s.
-        #expect(Date().timeIntervalSince(started) < bridge.commandTimeout * 2 + 10,
+        #expect(Date().timeIntervalSince(started) < bridge.commandTimeout + 10,
                 "the watchdog must fire well before the child would finish")
     }
 
@@ -307,7 +177,7 @@ struct TradeBridgeRobustnessTests {
 
         let started = Date()
         await #expect(throws: TradeError.self) {
-            _ = try await bridge.positions(mode: .demo)
+            _ = try await bridge.runCLI(["account", "bills"], mode: .demo)
         }
         #expect(Date().timeIntervalSince(started) < 20,
                 "the deadline must fire even though the child has already exited")
@@ -328,7 +198,8 @@ struct TradeBridgeRobustnessTests {
         defer { try? FileManager.default.removeItem(at: stub.deletingLastPathComponent()) }
         let bridge = TradeBridge(explicitCLIPath: stub.path)
 
-        let balances = try await bridge.balances(mode: .demo)
+        let output = try await bridge.runCLI(["account", "bills"], mode: .demo)
+        let balances = TradeBridge.parseBalances(json: output)
         #expect(balances.first?.ccy == "USDT")
         #expect(balances.first?.available == 5)
     }
@@ -345,147 +216,15 @@ struct TradeBridgeRobustnessTests {
         """)
         defer { try? FileManager.default.removeItem(at: stub.deletingLastPathComponent()) }
         let bridge = TradeBridge(explicitCLIPath: stub.path)
-        let balances = try await bridge.balances(mode: .demo)
+        let balances = TradeBridge.parseBalances(json: try await bridge.runCLI(["account", "bills"], mode: .demo))
         #expect(balances.count > 100)
         #expect(balances.first { $0.ccy == "USDT" }?.available == 9)
     }
 }
 
-@Suite("Order status resolution")
-struct OrderStatusTests {
-    /// A request that timed out may well have reached the exchange and filled.
-    /// Absent from the listing is the only answer that makes a retry safe —
-    /// everything else means the exchange acted and the ledger must catch up.
-    @Test func anAbsentOrderIsTheOnlySafeRetry() {
-        let json = #"{"data":[{"clOrdId":"msother","state":"filled","accFillSz":"1"}]}"#
-        #expect(TradeBridge.parseOrderStatus(json: json, clOrdId: "msmine") == .unknown)
-        #expect(TradeBridge.parseOrderStatus(json: "[]", clOrdId: "msmine") == .unknown)
-    }
 
-    @Test func aFilledOrderReportsItsSizeAndPrice() {
-        let json = #"""
-        {"data":[{"clOrdId":"msmine","state":"filled","accFillSz":"11.65","avgPx":"64769.39"}]}
-        """#
-        guard case .filled(let size, let price) =
-            TradeBridge.parseOrderStatus(json: json, clOrdId: "msmine") else {
-            Issue.record("expected a fill"); return
-        }
-        #expect(abs(size - 11.65) < 1e-9)
-        #expect(abs(price - 64_769.39) < 1e-6)
-    }
-
-    /// A cancel that followed a partial fill still left a position behind.
-    /// Reporting it as merely "canceled" would lose those coins.
-    @Test func aPartiallyFilledCancelIsStillAFill() {
-        let json = #"""
-        {"data":[{"clOrdId":"msmine","state":"canceled","accFillSz":"3","avgPx":"100"}]}
-        """#
-        #expect(TradeBridge.parseOrderStatus(json: json, clOrdId: "msmine").didExecute)
-    }
-
-    @Test func aCleanCancelIsTerminalAndDidNotExecute() {
-        let json = #"{"data":[{"clOrdId":"msmine","state":"canceled","accFillSz":"0"}]}"#
-        let status = TradeBridge.parseOrderStatus(json: json, clOrdId: "msmine")
-        #expect(status == .canceled)
-        #expect(status.isTerminal)
-        #expect(!status.didExecute)
-    }
-
-    @Test func aWorkingOrderIsNotTerminal() {
-        let json = #"{"data":[{"clOrdId":"msmine","state":"live","accFillSz":"0"}]}"#
-        let status = TradeBridge.parseOrderStatus(json: json, clOrdId: "msmine")
-        #expect(status == .live)
-        #expect(!status.isTerminal)
-    }
-
-    @Test func garbageIsUnknownRatherThanACrash() {
-        #expect(TradeBridge.parseOrderStatus(json: "not json", clOrdId: "x") == .unknown)
-        #expect(TradeBridge.parseOrderStatus(json: "", clOrdId: "x") == .unknown)
-    }
-}
-
-@Suite("Option orders through the bridge")
+@Suite("OKX account readings and fees")
 struct TradeBridgeOptionTests {
-    private func makeStubCLI(stdout: String) throws -> (bridge: TradeBridge, argsFile: URL, dir: URL) {
-        let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("maystock-option-stub-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let cli = dir.appendingPathComponent("okx")
-        let argsFile = dir.appendingPathComponent("args.txt")
-        let script = """
-        #!/bin/sh
-        printf '%s\\n' "$@" > "\(argsFile.path)"
-        cat <<'JSON'
-        \(stdout)
-        JSON
-        """
-        try script.write(to: cli, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cli.path)
-        return (TradeBridge(explicitCLIPath: cli.path), argsFile, dir)
-    }
-
-    private func recordedArgs(_ url: URL) -> [String] {
-        (try? String(contentsOf: url, encoding: .utf8))?
-            .split(separator: "\n").map(String.init) ?? []
-    }
-
-    @Test("期权单走 option 模块，带 tdMode、IOC 限价、reduceOnly 裸标志，不带 posSide/tgtCcy")
-    func anOptionOrderIsShapedForItsModule() async throws {
-        let stub = try makeStubCLI(stdout: #"{"code":"0","data":[{"ordId":"9","sCode":"0"}]}"#)
-        defer { try? FileManager.default.removeItem(at: stub.dir) }
-
-        let order = OrderRequest(
-            instId: "BTC-USD-260926-80000-C", instType: .option, side: .sell, kind: .ioc,
-            size: 3, sizeUnit: .base, limitPrice: 0.0214, reduceOnly: true,
-            clOrdId: "ms0123abcd0000000001", tradeMode: "cross")
-        _ = try await stub.bridge.place(order, mode: .demo)
-
-        let args = recordedArgs(stub.argsFile)
-        #expect(args.prefix(2) == ["option", "place"])
-        #expect(args.contains("--tdMode") && args.contains("cross"))
-        #expect(args.contains("--ordType") && args.contains("ioc"))
-        #expect(args.contains("--px") && args.contains("0.0214"))
-        #expect(args.contains("--sz") && args.contains("3"))
-        let reduce = try #require(args.firstIndex(of: "--reduceOnly"))
-        #expect(args.indices.contains(reduce + 1) ? args[reduce + 1] != "true" : true,
-                "the CLI documents a bare flag")
-        #expect(!args.contains("--posSide"), "options have no legs")
-        #expect(!args.contains("--tgtCcy"), "tgtCcy is spot-only")
-        #expect(args.contains("--demo"))
-    }
-
-    @Test("永续 reduceOnly 也是裸标志")
-    func aSwapReduceOnlyIsABareFlag() async throws {
-        let stub = try makeStubCLI(stdout: #"{"code":"0","data":[{"ordId":"9","sCode":"0"}]}"#)
-        defer { try? FileManager.default.removeItem(at: stub.dir) }
-        let order = OrderRequest(
-            instId: "BTC-USDT-SWAP", instType: .swap, side: .sell, kind: .market,
-            size: 2, sizeUnit: .base, posSide: .long, reduceOnly: true)
-        _ = try await stub.bridge.place(order, mode: .demo)
-        let args = recordedArgs(stub.argsFile)
-        #expect(args.contains("--reduceOnly"))
-        #expect(!args.contains("true"))
-        #expect(args.contains("--posSide") && args.contains("long"))
-    }
-
-    @Test("下单数量按原样上线，不被显示用的格式化器涨上去")
-    func orderSizeReachesTheWireExactly() async throws {
-        let stub = try makeStubCLI(stdout: #"{"code":"0","data":[{"ordId":"9","sCode":"0"}]}"#)
-        defer { try? FileManager.default.removeItem(at: stub.dir) }
-        // A spot lot is 1e-8 on BTC, so eight decimals are a legal size. The
-        // display formatter stops at six and rounds half-up getting there,
-        // which turns this into "0.012346" — larger than the balance it was
-        // checked against, and no longer a whole lot.
-        let order = OrderRequest(
-            instId: "BTC-USDT", instType: .spot, side: .sell, kind: .limit,
-            size: 0.01234567, sizeUnit: .base, limitPrice: 64_769.12345678)
-        _ = try await stub.bridge.place(order, mode: .demo)
-        let args = recordedArgs(stub.argsFile)
-        #expect(args.contains("0.01234567"), "the size the caller computed, unrounded")
-        #expect(!args.contains("0.012346"), "never rounded up at the wire")
-        #expect(args.contains("64769.12345678"))
-    }
-
     @Test("期权成交带上美元价和指数价")
     func optionFillStampsAreRead() {
         let json = """
@@ -538,35 +277,6 @@ struct TradeBridgeOptionTests {
         }
     }
 
-    @Test("拒单文案用交易所的话，不用原始 JSON")
-    func aRejectionSpeaksTheExchangesWords() {
-        let perOrder = TradeError.cliFailed(exitCode: 1, stderr: """
-            [
-              {
-                "clOrdId": "ms3c9ace0fmtrcq2h4e4",
-                "ordId": "",
-                "sCode": "51008",
-                "sMsg": "Order failed. Insufficient BTC margin in account ",
-                "tag": ""
-              }
-            ]
-            """)
-        #expect(perOrder.exchangeRejection == "OKX 51008：Order failed. Insufficient BTC margin in account")
-
-        let envelope = TradeError.cliFailed(
-            exitCode: 1, stderr: #"{"code":"51000","msg":"Parameter slTriggerPx error","data":[]}"#)
-        #expect(envelope.exchangeRejection == "OKX 51000：Parameter slTriggerPx error")
-
-        let formatted = TradeError.cliFailed(
-            exitCode: 1, stderr: "Error: Parameter ordType error\nCode: 51000\nVersion: 1.4.1")
-        #expect(formatted.exchangeRejection == "OKX 51000：Parameter ordType error")
-
-        // An envelope whose `msg` is empty falls through to the raw payload
-        // rather than to an empty verdict.
-        let wordless = TradeError.cliFailed(exitCode: 1, stderr: #"{"code":"51119","msg":""}"#)
-        #expect(wordless.exchangeRejection == #"OKX 51119：{"code":"51119","msg":""}"#)
-    }
-
     @Test("合约面值是 ctVal × ctMult，期权的 0.01 在 ctMult 里")
     func contractValueMultipliesBothFields() {
         #expect(InstrumentMeta.contractValue(ctVal: 1, ctMult: 0.01) == 0.01)
@@ -601,80 +311,9 @@ struct TradeBridgeOptionTests {
     }
 }
 
-@Suite("Order status asks both listings")
-struct OrderStatusListingTests {
-    /// A stub whose answer depends on whether `--history` was asked for: the
-    /// working book is empty, the finished book holds the order.
-    private func makeStub() throws -> (bridge: TradeBridge, dir: URL) {
-        let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("maystock-status-stub-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let cli = dir.appendingPathComponent("okx")
-        let script = """
-        #!/bin/sh
-        case "$*" in
-          *--history*) echo '{"data":[{"clOrdId":"msmine","state":"filled","accFillSz":"2","avgPx":"100"}]}' ;;
-          *) echo '[]' ;;
-        esac
-        """
-        try script.write(to: cli, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cli.path)
-        return (TradeBridge(explicitCLIPath: cli.path), dir)
-    }
 
-    @Test("成交了的订单在历史单里，不在挂单里；只问挂单会把它当成从未送达")
-    func aFilledOrderIsFoundInTheHistoryListing() async throws {
-        let stub = try makeStub()
-        defer { try? FileManager.default.removeItem(at: stub.dir) }
-        let status = try await stub.bridge.orderStatus(
-            instId: "BTC-USDT", instType: .spot, clOrdId: "msmine", mode: .demo)
-        #expect(status.didExecute)
-        guard case .filled(let size, _) = status else { Issue.record("expected a fill"); return }
-        #expect(size == 2)
-        // An order in neither listing is the one case that is safe to retry.
-        let absent = try await stub.bridge.orderStatus(
-            instId: "BTC-USDT", instType: .spot, clOrdId: "msother", mode: .demo)
-        #expect(absent == .unknown)
-    }
-}
-
-@Suite("A refusal on stdout is still a refusal")
+@Suite("The exchange's verdict in CLI output")
 struct FailureTextTests {
-    @Test("非零退出时 stdout 里的 sCode 不能被 stderr 的更新横幅盖掉")
-    func theVerdictOnStdoutSurvivesTheNagOnStderr() async throws {
-        // Exactly what the demo account returned for an option order before
-        // options trading was activated: the verdict as JSON on stdout, the
-        // update nag on stderr, exit code 1.
-        let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("maystock-refusal-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let cli = dir.appendingPathComponent("okx")
-        try """
-        #!/bin/sh
-        echo 'Update available for @okx_ai/okx-trade-cli: 1.4.1 -> 1.4.5' >&2
-        echo 'Run: npm install -g @okx_ai/okx-trade-cli' >&2
-        echo '[{"clOrdId":"x","ordId":"","sCode":"51198","sMsg":"activate options trading first"}]'
-        exit 1
-        """.write(to: cli, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cli.path)
-        defer { try? FileManager.default.removeItem(at: dir) }
-
-        let bridge = TradeBridge(explicitCLIPath: cli.path)
-        let order = OrderRequest(
-            instId: "BTC-USD-261225-100000-C", instType: .option, side: .buy, kind: .ioc,
-            size: 3, sizeUnit: .base, limitPrice: 0.021, tradeMode: "cross")
-        do {
-            _ = try await bridge.place(order, mode: .demo)
-            Issue.record("a non-zero exit must throw")
-        } catch let error as TradeError {
-            let rejection = try #require(error.exchangeRejection,
-                                         "the exchange's own verdict is final, not an unconfirmed order")
-            #expect(rejection.contains("51198"))
-            #expect(rejection.contains("activate"))
-            #expect(!error.description.contains("Update available"), "the nag is noise, not the reason")
-        }
-    }
-
     @Test("CLI 自己格式化的 Code: 行也算裁决，HTTP 状态码不算")
     func plainTextCodesCountAndHttpStatusesDoNot() {
         #expect(TradeError.okxCode(in: "Error: Parameter ordType error\nCode: 51000\nVersion: 1.4.1") == "51000")
@@ -691,125 +330,5 @@ struct FailureTextTests {
         #expect(text.contains("socket hang up"))
         #expect(!text.contains("Update available"))
         #expect(TradeBridge.failureText(stdout: "", stderr: "  \n") == "")
-    }
-}
-
-// MARK: - Open orders
-
-/// The exchange's open-order books, read as they come off the CLI: the algo
-/// fixture is the shape OKX actually returns for a close-all take-profit.
-@Suite("Open orders")
-struct OpenOrderParsingTests {
-    static let algoBook = """
-    [{"algoId":"3902370090634240000","instId":"SOL-USDT-SWAP","instType":"SWAP","ordType":"conditional",
-      "side":"sell","posSide":"long","sz":"","closeFraction":"1","tpTriggerPx":"107.2","tpOrdPx":"-1",
-      "slTriggerPx":"","slOrdPx":"","triggerPx":"","state":"live","reduceOnly":"true","cTime":"1788802091517",
-      "clOrdId":"","tag":"","tdMode":"isolated","linkedOrd":{"ordId":""},"attachAlgoOrds":[]},
-     {"algoId":"777","instId":"BTC-USDT-SWAP","ordType":"conditional","side":"sell","posSide":"long",
-      "sz":"10","slTriggerPx":"58000","slOrdPx":"57900","state":"canceled","cTime":"1788800000000"}]
-    """
-
-    static let orderBook = """
-    {"data":[{"ordId":"1001","instId":"ETH-USDT","ordType":"limit","side":"buy","px":"2400","sz":"0.5",
-              "fillSz":"0.1","state":"partially_filled","reduceOnly":"false","cTime":"1788801000000",
-              "clOrdId":"MSemaTrend1a2b3c"},
-             {"ordId":"1002","instId":"ETH-USDT","ordType":"limit","side":"sell","px":"2600","sz":"0.5",
-              "fillSz":"0.5","state":"filled","cTime":"1788800500000"}]}
-    """
-
-    @Test("全平止盈条件单：读出触发价、方向、全平，且 -1 不当成价格")
-    func aCloseAllTakeProfitIsRead() throws {
-        let orders = TradeBridge.parseOpenOrders(json: Self.algoBook, book: .algo)
-        #expect(orders.count == 1, "the cancelled one is history, not an open order")
-        let order = try #require(orders.first)
-        #expect(order.id == "3902370090634240000")
-        #expect(order.book == .algo)
-        #expect(order.kindLabel == "止盈")
-        #expect(order.side == .sell)
-        #expect(order.posSide == .long)
-        #expect(order.reduceOnly)
-        #expect(order.triggerPrice == 107.2)
-        #expect(order.takeProfitTriggerPrice == 107.2)
-        #expect(order.stopTriggerPrice == nil)
-        #expect(order.price == nil, "tpOrdPx -1 means market")
-        #expect(order.size == nil)
-        #expect(order.closeFraction == 1)
-        #expect(order.clOrdId == nil)
-        #expect(order.createdAt == Date(timeIntervalSince1970: 1_788_802_091.517))
-    }
-
-    @Test("普通挂单：只保留还在簿上的，部分成交计入已成交")
-    func onlyOpenOrdersAreKept() throws {
-        let orders = TradeBridge.parseOpenOrders(json: Self.orderBook, book: .order)
-        #expect(orders.map(\.id) == ["1001"])
-        let order = try #require(orders.first)
-        #expect(order.kindLabel == "限价")
-        #expect(order.price == 2_400)
-        #expect(order.size == 0.5)
-        #expect(order.filledSize == 0.1)
-        #expect(order.triggerPrice == nil)
-        #expect(order.clOrdId == "MSemaTrend1a2b3c")
-    }
-
-    @Test("每个声明存在的簿都会被问到，不存在的簿不问，读不到的簿按名字报出来而不是当成空")
-    func everyDeclaredBookIsAskedAndFailuresAreNamed() async throws {
-        // A stub that answers every listing with the same open algo order —
-        // enough to prove each book is asked, and that the listing is one list.
-        // 期权策略委托在交易所根本不存在：实测 `okx option algo orders
-        // --ordType <k>` 对全部 7 种 kind 都回 HTTP 400 Parameter instType
-        // error，而 `okx swap algo orders` 7 种全都能答。这里让桩照样回 400，
-        // 用来证明我们**压根没问**，而不是问了之后把错误咽下去。
-        let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("maystock-stub-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let cli = dir.appendingPathComponent("okx")
-        let log = dir.appendingPathComponent("calls.txt")
-        let script = """
-        #!/bin/sh
-        printf '%s ' "$@" >> "\(log.path)"; printf '\\n' >> "\(log.path)"
-        case "$*" in
-          *"option algo orders"*) echo 'Error: HTTP 400 from OKX: Parameter instType error' >&2; exit 1 ;;
-        esac
-        cat <<'JSON'
-        \(Self.algoBook.replacingOccurrences(of: "\n", with: " "))
-        JSON
-        """
-        try script.write(to: cli, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cli.path)
-        let bridge = TradeBridge(explicitCLIPath: cli.path)
-
-        let listing = try await bridge.openOrders(mode: .demo)
-
-        let calls = try String(contentsOf: log, encoding: .utf8).split(separator: "\n").map(String.init)
-        // 遍历声明而不是点名今天这几个模块：将来新增一种 instrument type，
-        // 它的簿当天就被这条断言覆盖。
-        var algoBooks = 0
-        for instType in InstrumentType.allCases {
-            guard let module = instType.cliModule else {
-                #expect(!calls.contains { $0.contains("\(instType.rawValue.lowercased()) orders") },
-                        "\(instType) 没有 CLI 模块，不该被问")
-                continue
-            }
-            #expect(calls.contains { $0.contains("\(module) orders") },
-                    "\(module) orders was never asked")
-            let askedAlgo = calls.contains { $0.contains("\(module) algo orders") }
-            if instType.hasAlgoBook {
-                #expect(askedAlgo, "\(module) algo orders was never asked")
-                algoBooks += 1
-            } else {
-                #expect(!askedAlgo, "\(module) 没有策略委托簿，问了就会拿到 400")
-            }
-        }
-
-        // 没有任何簿读失败：不存在的簿不问，就没有东西可失败。这正是修复
-        // 「挂单不完整」的判据——以前这里会稳定多出一条「期权策略委托」。
-        #expect(listing.unavailable.isEmpty)
-        #expect(algoBooks > 1, "桩要能同时喂给多本策略委托簿，去重才有东西可去")
-        // 每本答话的策略委托簿都回同一条 fixture，而同一个 algoId 只能在列表里
-        // 出现一次——去重按 id，不按「问了几次」。普通委托簿一条都不贡献：
-        // fixture 只有 algoId 没有 ordId。
-        #expect(listing.orders.count == 1)
-        #expect(listing.orders.allSatisfy { $0.book == .algo && $0.id == "3902370090634240000" })
     }
 }

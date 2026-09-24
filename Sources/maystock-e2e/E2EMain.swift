@@ -9,6 +9,9 @@ import MayStockKit
 ///   maystock-e2e trade-doctor          okx CLI detection + public call
 ///   maystock-e2e strategy-doctor       compile presets + real multi-window backtest
 ///   maystock-e2e live [sec]            the kernel's live layer against the real venues
+///   maystock-e2e close-doctor          the close ticket on every real holding: the kernel's
+///                                      live book, every method planned and reviewed, the demo
+///                                      account's exchange precheck; places nothing
 ///   maystock-e2e option-demo           buy and sell one option on the DEMO account,
 ///                                      through the runner's own order path
 ///
@@ -16,6 +19,11 @@ import MayStockKit
 @main
 struct E2EMain {
     static func main() async {
+        // One line at a time, even into a file: the kernel's and the app's
+        // log lines go to stderr unbuffered, and a block-buffered stdout
+        // sharing a file with them was cut mid-character (measured: a split
+        // UTF-8 sequence at every 8 KB boundary of `close-doctor > f 2>&1`).
+        setvbuf(stdout, nil, _IOLBF, 0)
         let args = Array(CommandLine.arguments.dropFirst())
         let command = args.first ?? "doctor"
         let ok: Bool
@@ -35,6 +43,8 @@ struct E2EMain {
             ok = await strategyDoctor(instId: args.count > 1 ? args[1] : nil)
         case "live":
             ok = await liveDoctor(seconds: args.count > 1 ? Int(args[1]) ?? 30 : 30)
+        case "close-doctor":
+            ok = await closeDoctor()
         default:
             print("unknown command: \(command)")
             ok = false

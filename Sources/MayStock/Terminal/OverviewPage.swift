@@ -228,7 +228,7 @@ struct OverviewPage: View {
             DataGrid(columns: [
                 GridColumn(title: "标的"), GridColumn(title: "方向"),
                 GridColumn(title: "数量", alignment: .trailing),
-                GridColumn(title: "盈亏", alignment: .trailing),
+                GridColumn(title: "盈亏", alignment: .trailing), GridColumn(title: ""),
             ], rows: positions, emptyText: books.accountError ?? "空仓") { position in
                 let mark = appState.mark(for: position.instId)
                 let pnl = position.netPnL(mark: mark)
@@ -237,6 +237,7 @@ struct OverviewPage: View {
                          tint: Theme.trend(position.quantity > 0), weight: .semibold, fit: true)
                 GridText(PriceFormatter.plain(abs(position.baseQuantity)), mono: true, alignment: .trailing)
                 GridText(PriceFormatter.signedMoney(pnl), tint: Theme.signed(pnl), mono: true, alignment: .trailing)
+                CloseHoldingButton(appState: appState, request: appState.closeTicket(for: position))
             }
             if !external.isEmpty {
                 Text("交易所持仓 · 非 MayStock 策略开仓")
@@ -244,7 +245,7 @@ struct OverviewPage: View {
                 DataGrid(columns: [
                     GridColumn(title: "标的"), GridColumn(title: "方向"),
                     GridColumn(title: "名义额", alignment: .trailing),
-                    GridColumn(title: "未实现", alignment: .trailing),
+                    GridColumn(title: "未实现", alignment: .trailing), GridColumn(title: ""),
                 ], rows: external) { position in
                     GridText(position.instId, mono: true, weight: .medium, fit: true)
                     GridText(position.quantity > 0 ? "多" : "空",
@@ -253,6 +254,7 @@ struct OverviewPage: View {
                              mono: true, alignment: .trailing)
                     GridText(PriceFormatter.signedMoney(position.unrealisedPnL),
                              tint: Theme.signed(position.unrealisedPnL), mono: true, alignment: .trailing)
+                    CloseHoldingButton(appState: appState, request: appState.closeTicket(for: position, on: venue))
                 }
             }
             if let note = books.openOrdersNote ?? books.openOrdersError {
@@ -453,7 +455,7 @@ struct OverviewPage: View {
                 GridColumn(title: "策略"), GridColumn(title: "标的"), GridColumn(title: "方向"),
                 GridColumn(title: "数量", alignment: .trailing), GridColumn(title: "均价", alignment: .trailing),
                 GridColumn(title: "现价", alignment: .trailing), GridColumn(title: "盈亏", alignment: .trailing),
-                GridColumn(title: "收益率", alignment: .trailing),
+                GridColumn(title: "收益率", alignment: .trailing), GridColumn(title: ""),
             ], rows: positions, emptyText: venueStrategies.isEmpty ? "还没有\(venue.displayName)策略" : "空仓") { position in
                 let mark = appState.mark(for: position.instId)
                 let pnl = position.netPnL(mark: mark)
@@ -467,6 +469,7 @@ struct OverviewPage: View {
                 GridText(mark.map(PriceFormatter.auto) ?? "—", mono: true, alignment: .trailing)
                 GridText(PriceFormatter.signedMoney(pnl), tint: Theme.signed(pnl), mono: true, alignment: .trailing)
                 GridText(pct.map(PriceFormatter.signedPercent) ?? "—", tint: Theme.signed(pct ?? 0), mono: true, alignment: .trailing)
+                CloseHoldingButton(appState: appState, request: appState.closeTicket(for: position))
             }
             externalPositionsGrid
         }
@@ -486,6 +489,7 @@ struct OverviewPage: View {
                 GridColumn(title: "张数", alignment: .trailing), GridColumn(title: "均价", alignment: .trailing),
                 GridColumn(title: "标记价", alignment: .trailing), GridColumn(title: "名义额", alignment: .trailing),
                 GridColumn(title: "未实现", alignment: .trailing), GridColumn(title: "杠杆", alignment: .trailing),
+                GridColumn(title: ""),
             ], rows: external) { position in
                 GridText(position.instId, mono: true, weight: .medium, fit: true)
                 GridText(position.familyLabel, tint: .secondary, fit: true)
@@ -496,6 +500,7 @@ struct OverviewPage: View {
                 GridText(position.notionalUsd.map { PriceFormatter.money($0, decimals: 0) } ?? "—", mono: true, alignment: .trailing)
                 GridText(PriceFormatter.signedMoney(position.unrealisedPnL), tint: Theme.signed(position.unrealisedPnL), mono: true, alignment: .trailing)
                 GridText(position.leverage.map { "\(PriceFormatter.decimals($0, 0))×" } ?? "—", mono: true, alignment: .trailing)
+                CloseHoldingButton(appState: appState, request: appState.closeTicket(for: position, on: venue))
             }
         }
     }
@@ -524,31 +529,14 @@ struct OverviewPage: View {
                 GridText(order.createdAt.map(Format.stamp) ?? "—", tint: .secondary, mono: true, fit: true)
                 GridText(order.instId, mono: true, fit: true)
                 GridText(order.kindLabel, weight: .medium, fit: true)
-                GridText(Self.directionLabel(order), tint: Theme.trend(order.side == .buy), weight: .semibold, fit: true)
+                GridText(OrderLabels.direction(order), tint: Theme.trend(order.side == .buy), weight: .semibold, fit: true)
                 GridText(order.price.map(PriceFormatter.auto) ?? "市价", mono: true, alignment: .trailing)
                 GridText(order.triggerPrice.map(PriceFormatter.auto) ?? "—", mono: true, alignment: .trailing)
-                GridText(Self.sizeLabel(order), mono: true, alignment: .trailing)
+                GridText(OrderLabels.size(order), mono: true, alignment: .trailing)
                 GridText(order.filledSize > 0 ? PriceFormatter.plain(order.filledSize) : "—", mono: true, alignment: .trailing)
                 GridText(appState.orderSource(order), tint: .secondary, fit: true)
             }
         }
-    }
-
-    /// "卖出平多", "买入开空", or plain "买入" on a market without legs.
-    static func directionLabel(_ order: ExchangeOpenOrder) -> String {
-        let action = order.side == .buy ? "买入" : "卖出"
-        guard let posSide = order.posSide, posSide != .net else {
-            return order.reduceOnly ? action + "·只减仓" : action
-        }
-        return action + (order.reduceOnly ? "平" : "开") + (posSide == .long ? "多" : "空")
-    }
-
-    static func sizeLabel(_ order: ExchangeOpenOrder) -> String {
-        if let size = order.size { return PriceFormatter.plain(size) }
-        if let fraction = order.closeFraction {
-            return fraction >= 1 ? "全平" : "平 \(PriceFormatter.decimals(fraction * 100, 0))%"
-        }
-        return "—"
     }
 
     // MARK: Strategies
@@ -637,6 +625,7 @@ struct OverviewPage: View {
             DataGrid(columns: [
                 GridColumn(title: "币种"), GridColumn(title: "总额", alignment: .trailing),
                 GridColumn(title: "可用", alignment: .trailing), GridColumn(title: "估值 USD", alignment: .trailing),
+                GridColumn(title: ""),
             ], rows: books.accountBalances.sorted { ($0.valuationUsd ?? 0) > ($1.valuationUsd ?? 0) },
                emptyText: books.accountError ?? "读取账户后显示") { balance in
                 GridText(balance.ccy, weight: .medium, fit: true)
@@ -644,6 +633,14 @@ struct OverviewPage: View {
                 GridText(PriceFormatter.plain(balance.available), mono: true, alignment: .trailing)
                 GridText(balance.valuationUsd.map { PriceFormatter.money($0, decimals: 0) } ?? "—",
                          mono: true, alignment: .trailing)
+                // Not on a balance this row shows as worth $0: dust below any
+                // exchange minimum, which the ticket could only refuse.
+                if balance.available > 0, (balance.valuationUsd ?? 1) >= 0.5,
+                   let request = appState.closeTicket(forCoin: balance.ccy, on: venue) {
+                    CloseHoldingButton(appState: appState, request: request, title: "卖出")
+                } else {
+                    Color.clear.frame(width: 1, height: 1)
+                }
             }
         }
     }

@@ -144,6 +144,9 @@ struct TerminalView: View {
         }
         .navigationSplitViewStyle(.balanced)
         .frame(minWidth: 980, minHeight: 620)
+        .sheet(item: Bindable(appState).closeTicketRequest) { request in
+            CloseTicketSheet(appState: appState, request: request)
+        }
     }
 }
 

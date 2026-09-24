@@ -462,11 +462,17 @@ public struct InstrumentMeta: Sendable, Equatable {
     /// position. Across multipliers 0.001 … 100 and the first 2,000 contract
     /// counts, 238 counts floor a lot short without the nudge and none with it.
     public func exchangeSize(forBaseQuantity quantity: Double) -> Double {
-        let raw = quantity / (contractValue ?? 1)
-        let step = lotSize > 0 ? lotSize : 0
-        let rounded = step > 0 ? ((raw / step) + 1e-9).rounded(.down) * step : raw
+        let rounded = flooredToLot(quantity / (contractValue ?? 1))
         guard rounded >= minSize, rounded > 0 else { return 0 }
-        // Trim binary noise so "0.30000000000000004" never reaches the CLI.
+        return rounded
+    }
+
+    /// An order size already in exchange units, floored to a whole lot with
+    /// the nudge described on `exchangeSize`, binary noise trimmed so
+    /// "0.30000000000000004" never reaches the CLI. No minimum applied.
+    public func flooredToLot(_ size: Double) -> Double {
+        let step = lotSize > 0 ? lotSize : 0
+        let rounded = step > 0 ? ((size / step) + 1e-9).rounded(.down) * step : size
         return (rounded * 1e10).rounded() / 1e10
     }
 

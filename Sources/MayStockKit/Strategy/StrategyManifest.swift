@@ -35,17 +35,6 @@ public enum InstrumentType: String, Codable, Sendable, CaseIterable {
     /// balance — which is what makes it reconcilable per instrument, and what
     /// lets the exchange close it out from under us.
     public var isDerivative: Bool { self == .swap || self == .option }
-    /// The `okx` CLI module that trades this family. Nil for a family OKX
-    /// does not list, so an order that reaches the OKX bridge on the wrong
-    /// venue is refused by name rather than sent to a module that is not there.
-    public var cliModule: String? {
-        switch self {
-        case .spot: return "spot"
-        case .swap: return "swap"
-        case .option: return "option"
-        case .stock: return nil
-        }
-    }
     /// A perpetual in long/short mode must name the leg every order acts on;
     /// options, spot and stocks have no legs.
     public var usesPositionSide: Bool { self == .swap }

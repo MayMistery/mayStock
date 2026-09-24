@@ -347,7 +347,7 @@ struct SchwabWireTests {
         #expect(failure(#"{"error":{"code":"not_logged_in","message":"expired"}}"#) as? SchwabAPIError == .loggedOut("expired"))
         #expect(failure(#"{"error":{"code":"refused","message":"no --live"}}"#) as? TradeError != nil)
         let rejected = failure(#"{"error":{"code":"rejected","message":"insufficient buying power"}}"#) as? TradeError
-        #expect(rejected?.exchangeRejection?.contains("insufficient buying power") == true)
+        #expect(rejected?.refusal?.contains("insufficient buying power") == true)
         #expect(failure(#"{"error":{"code":"rate_limited","message":"429"}}"#) as? SchwabAPIError == .rateLimited)
         let http = failure(#"{"error":{"code":"http","status":503,"message":"down"}}"#) as? SchwabAPIError
         #expect(http == .http(status: 503, body: "down"))
@@ -451,7 +451,7 @@ struct ShadowBookTests {
             try await book.place(order(.sell, 200, tag: "ms-too-much"), quote: quote, economics: economics, now: open)
             Issue.record("Reg T should have refused")
         } catch let error as TradeError {
-            #expect(error.exchangeRejection?.contains("Reg T") == true)
+            #expect(error.refusal?.contains("Reg T") == true)
         }
         #expect(await book.status(clOrdId: "ms-too-much").isTerminal)
         // Reducing is always allowed, even when exposure is at the cap.
@@ -672,5 +672,77 @@ struct HubSourceNameTests {
         }
         #expect(hub.sourceName(for: .schwab) == "测试源")
         #expect(hub.sourceName(for: .okx) == Venue.okx.marketDataSourceName)
+    }
+}
+
+/// A failed Schwab order call says what Schwab did — the terms every screen
+/// and the runner read — and never less than what happened.
+@Suite("Schwab order failures")
+struct SchwabOrderFailureTests {
+
+    @Test("没启动、限频是没送达；未登录、4xx 是拒绝；超时、5xx 和其余一律未确认")
+    func eachFailureSaysWhatSchwabDid() throws {
+        let standing = { (error: Error) in TradeError.standing(of: SchwabBridge.orderFailure(error)) }
+        #expect(standing(SchwabBridgeError.cliNotFound) == .undelivered)
+        #expect(standing(SchwabBridgeError.notLaunched("permission denied")) == .undelivered)
+        #expect(standing(SchwabAPIError.rateLimited) == .undelivered)
+        #expect(standing(SchwabAPIError.loggedOut("expired")) == .refused)
+        #expect(standing(SchwabAPIError.unauthorised) == .refused)
+        #expect(standing(SchwabAPIError.http(status: 400, body: "bad symbol")) == .refused)
+        #expect(standing(TradeError.liveTradingLocked) == .refused)
+        #expect(standing(TradeError.rejected(venue: "嘉信", reason: "insufficient buying power")) == .refused)
+        #expect(standing(SchwabAPIError.http(status: 408, body: "timeout")) == .unknown)
+        #expect(standing(SchwabAPIError.http(status: 503, body: "down")) == .unknown)
+        #expect(standing(SchwabAPIError.transport("connection reset")) == .unknown)
+        #expect(standing(SchwabBridgeError.cliFailed(exitCode: -1, detail: "schwabctl 超过 30 秒未返回，已终止")) == .unknown)
+        #expect(standing(CancellationError()) == .unknown, "an error nobody classified may have been acted on")
+        #expect(throws: TradeError.self) { try SchwabBridge.orderId(in: Data("{}".utf8)) }
+        do {
+            _ = try SchwabBridge.orderId(in: Data("{}".utf8))
+        } catch {
+            #expect(TradeError.standing(of: error) == .unknown, "taken, but under an id nobody has")
+        }
+    }
+
+    @Test("反手的第二腿失败时第一腿已在簿上：整笔是未确认，不是拒绝")
+    func aFailedSecondLegLeavesTheFirstOnTheBook() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("maystock-schwab-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let placed = dir.appendingPathComponent("placed")
+        let cli = dir.appendingPathComponent("schwabctl")
+        // Long 10; the first placement is taken, the second refused outright.
+        try """
+        #!/bin/sh
+        case "$1" in
+          account)
+            echo '{"securitiesAccount":{"accountNumber":"1","type":"MARGIN","currentBalances":{"cashBalance":0},"positions":[{"instrument":{"symbol":"TSLA","assetType":"EQUITY"},"longQuantity":10,"shortQuantity":0,"averagePrice":100,"marketValue":1000}]}}' ;;
+          place)
+            cat > /dev/null
+            if [ -f "\(placed.path)" ]; then
+              echo '{"error":{"code":"rejected","message":"short sale not allowed"}}'; exit 2
+            fi
+            touch "\(placed.path)"; echo '{"orderId":"111"}' ;;
+        esac
+        """.write(to: cli, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cli.path)
+        let venue = SchwabVenue(
+            data: SchwabMarketDataSource(schwab: SchwabRESTClient(tokens: SchwabStaticToken("x"))),
+            bridge: SchwabBridge(explicitCLIPath: cli.path, commandTimeout: 5),
+            shadow: ShadowBook(venue: .schwab, fileURL: nil, startingCash: 0),
+            tags: SchwabOrderTags(fileURL: nil),
+            economics: ShadowBook.Economics(schedule: SchwabFeeSchedule()))
+        // Sell 25 while long 10: SELL the 10, then SELL_SHORT 15.
+        let order = OrderRequest(instId: "TSLA", instType: .stock, side: .sell, kind: .market, size: 25, sizeUnit: .base,
+                                 limitPrice: nil, reduceOnly: false, stopTriggerPrice: nil, takeProfitTriggerPrice: nil,
+                                 clOrdId: "ms-flip")
+        do {
+            _ = try await venue.place(order, mode: .live, liveUnlocked: true)
+            Issue.record("the second leg failed; the order must not read as placed")
+        } catch {
+            #expect(TradeError.standing(of: error) == .unknown, "\(error)")
+            #expect((error as? TradeError)?.refusal == nil, "a refusal would say nothing is on the book")
+            #expect(String(describing: error).contains("111"), "the leg that went through is named")
+        }
     }
 }

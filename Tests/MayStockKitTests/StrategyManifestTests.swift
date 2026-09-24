@@ -538,8 +538,11 @@ struct OptionManifestTests {
     func everyFamilyDeclaresItself() {
         for family in InstrumentType.allCases {
             #expect(!family.displayName.isEmpty)
-            // OKX has a CLI module for exactly the families it lists.
-            #expect((family.cliModule != nil) == Venue.okx.trades(family), "\(family)")
+            // The kernel declares closes for exactly the families a venue lists.
+            let closes = CloseMethod.allCases.contains {
+                KernelClose.capabilities(venue: .okx, family: family).availability(of: $0).available
+            }
+            #expect(closes == Venue.okx.trades(family), "\(family)")
             #expect(family.tradesInContracts == (family.impliedContractSize == nil),
                     "\(family): a contract multiplier is known without asking only in base units")
             #expect(!family.usesPositionSide || family.isDerivative)

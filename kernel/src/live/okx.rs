@@ -161,9 +161,9 @@ pub fn decode_public(frame: &str) -> Vec<PublicEvent> {
 pub struct Credentials {
     pub profile: String,
     pub demo: bool,
-    api_key: String,
-    secret: String,
-    passphrase: String,
+    pub(crate) api_key: String,
+    pub(crate) secret: String,
+    pub(crate) passphrase: String,
 }
 
 impl std::fmt::Debug for Credentials {
@@ -231,12 +231,10 @@ impl PrivateDialect {
     }
 }
 
-/// The login signature: Base64(HMAC-SHA256(secret, ts + "GET" + "/users/self/verify")),
-/// with the timestamp in whole seconds.
+/// The login signature: the REST signature of `GET /users/self/verify`, with
+/// the timestamp in whole seconds.
 pub(crate) fn login_signature(secret: &str, timestamp: &str) -> Result<String, String> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|_| "密钥长度不合法".to_string())?;
-    mac.update(format!("{timestamp}GET/users/self/verify").as_bytes());
-    Ok(base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
+    sign(secret, timestamp, "GET", "/users/self/verify", "")
 }
 
 impl super::socket::Dialect for PrivateDialect {
@@ -319,6 +317,10 @@ pub struct PositionRow {
     /// that into dollars (`usdPx`).
     pub settlement_currency: Option<String>,
     pub usd_rate: Option<f64>,
+    /// `cross` or `isolated` (`mgnMode`). An order that closes or protects
+    /// the position has to name the same mode: the CLI fills in `cross` when
+    /// none is given, which is a different position from an isolated one.
+    pub margin_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -371,6 +373,7 @@ fn position_row(row: &Value) -> Option<PositionRow> {
         updated_ms: millis(row, "uTime").or_else(|| millis(row, "pTime")),
         settlement_currency: text(row, "ccy").map(str::to_string),
         usd_rate: num(row, "usdPx"),
+        margin_mode: text(row, "mgnMode").filter(|m| !m.is_empty()).map(str::to_string),
     })
 }
 
@@ -499,75 +502,20 @@ pub fn decode_private(frame: &str, received_ms: i64) -> Vec<PrivateEvent> {
     }
 }
 
-// MARK: - Signed reads
+// MARK: - Signing
 
-/// The only account paths a signed request may touch. All are GETs of state
-/// the account already shows; there is no signed POST anywhere in the kernel,
-/// and this list is the single place that would have to change for one.
-const SIGNED_READS: [&str; 1] = ["/api/v5/trade/orders-algo-pending"];
-
-/// REST signature: Base64(HMAC-SHA256(secret, ts + "GET" + path?query)),
-/// with the timestamp in ISO 8601 milliseconds.
-pub(crate) fn rest_signature(secret: &str, timestamp: &str, path_and_query: &str) -> Result<String, String> {
+/// OKX's REST signature: Base64(HMAC-SHA256(secret, ts + METHOD +
+/// path?query + body)), with the timestamp in ISO 8601 milliseconds and the
+/// body exactly as sent (empty for a GET).
+pub(crate) fn sign(secret: &str, timestamp: &str, method: &str, path_and_query: &str, body: &str) -> Result<String, String> {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|_| "密钥长度不合法".to_string())?;
-    mac.update(format!("{timestamp}GET{path_and_query}").as_bytes());
+    mac.update(format!("{timestamp}{method}{path_and_query}{body}").as_bytes());
     Ok(base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
 }
 
-pub(crate) async fn signed_get(http: &reqwest::Client, credentials: &Credentials, path_and_query: &str) -> Result<String, String> {
-    let path = path_and_query.split('?').next().unwrap_or("");
-    if !SIGNED_READS.contains(&path) {
-        return Err(format!("{path} 不在只读白名单里"));
-    }
-    let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-    let sign = rest_signature(&credentials.secret, &timestamp, path_and_query)?;
-    let mut request = http
-        .get(format!("{REST}{path_and_query}"))
-        .header("OK-ACCESS-KEY", &credentials.api_key)
-        .header("OK-ACCESS-SIGN", sign)
-        .header("OK-ACCESS-TIMESTAMP", timestamp)
-        .header("OK-ACCESS-PASSPHRASE", &credentials.passphrase);
-    if credentials.demo {
-        request = request.header("x-simulated-trading", "1");
-    }
-    let response = request.send().await.map_err(|e| format!("{path}：{e}"))?;
-    let status = response.status();
-    let body = response.text().await.map_err(|e| format!("{path}：{e}"))?;
-    if !status.is_success() {
-        return Err(format!("HTTP {} {path}：{}", status.as_u16(), body.chars().take(160).collect::<String>()));
-    }
-    Ok(body)
-}
-
-/// A pending stop or take-profit the exchange holds for an instrument —
-/// standalone conditional and OCO orders, which a position's own
-/// `closeOrderAlgo` does not list.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AlgoOrder {
-    pub algo_id: String,
-    pub inst_id: String,
-    pub ord_type: String,
-    pub size: Option<f64>,
-    pub stop_price: Option<f64>,
-    pub take_profit_price: Option<f64>,
-    pub reduce_only: bool,
-}
-
-pub(crate) fn algo_orders(body: &str) -> Result<Vec<AlgoOrder>, String> {
-    Ok(rows(body)?
-        .iter()
-        .filter_map(|row| {
-            Some(AlgoOrder {
-                algo_id: text(row, "algoId")?.to_string(),
-                inst_id: text(row, "instId")?.to_string(),
-                ord_type: text(row, "ordType").unwrap_or("").to_string(),
-                size: num(row, "sz"),
-                stop_price: num(row, "slTriggerPx"),
-                take_profit_price: num(row, "tpTriggerPx"),
-                reduce_only: text(row, "reduceOnly") == Some("true"),
-            })
-        })
-        .collect())
+/// The timestamp every signed request carries.
+pub(crate) fn rest_timestamp() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
 // MARK: - REST parsers
@@ -690,6 +638,20 @@ mod tests {
     }
 
     #[test]
+    fn a_position_says_which_margin_mode_holds_it() {
+        // Shape of the live account's isolated long, 2026-09-24.
+        let cli = r#"{"data":[
+            {"instId":"ETH-USDT-SWAP","pos":"122.04","posSide":"long","mgnMode":"isolated"},
+            {"instId":"BTC-USDT-SWAP","pos":"-2","posSide":"net","mgnMode":"cross"},
+            {"instId":"SOL-USDT-SWAP","pos":"5","posSide":"net","mgnMode":""}]}"#;
+        let rows = positions_in(&serde_json::from_str(cli).unwrap());
+        let modes: Vec<_> = rows.iter().map(|r| r.margin_mode.as_deref()).collect();
+        // Empty is unknown, never a mode: a close sent with a guessed mode is
+        // aimed at a position that does not exist.
+        assert_eq!(modes, [Some("isolated"), Some("cross"), None]);
+    }
+
+    #[test]
     fn a_refused_login_says_why() {
         let dialect = PrivateDialect::new(parse_credentials("[profiles.a]\napi_key=\"k\"\nsecret_key=\"s\"\npassphrase=\"p\"\n", Some("a")).unwrap(), false);
         use super::super::socket::Dialect;
@@ -704,28 +666,11 @@ mod tests {
     }
 
     #[test]
-    fn signed_requests_are_reads_of_whitelisted_paths_only() {
-        assert_eq!(SIGNED_READS, ["/api/v5/trade/orders-algo-pending"]);
-        let credentials = parse_credentials("[profiles.a]\napi_key=\"k\"\nsecret_key=\"s\"\npassphrase=\"p\"\n", Some("a")).unwrap();
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let refused = runtime.block_on(signed_get(&reqwest::Client::new(), &credentials, "/api/v5/trade/order"));
-        assert!(matches!(refused, Err(m) if m.contains("白名单")));
-    }
-
-    #[test]
     fn signs_rest_reads_the_way_okx_documents() {
         // Cross-checked with Node: crypto.createHmac("sha256", "secret")
         //   .update("2020-12-08T09:08:57.715ZGET/api/v5/trade/orders-algo-pending?ordType=conditional").digest("base64")
-        let sign = rest_signature("secret", "2020-12-08T09:08:57.715Z", "/api/v5/trade/orders-algo-pending?ordType=conditional").unwrap();
-        assert_eq!(sign, "mPX3LoZ/GEHVDZ5YoUFyA/xqHCpn6C7/iFE6qkj6hcQ=");
+        let signature = sign("secret", "2020-12-08T09:08:57.715Z", "GET", "/api/v5/trade/orders-algo-pending?ordType=conditional", "").unwrap();
+        assert_eq!(signature, "mPX3LoZ/GEHVDZ5YoUFyA/xqHCpn6C7/iFE6qkj6hcQ=");
     }
 
-    #[test]
-    fn reads_pending_stops() {
-        let body = r#"{"code":"0","data":[{"algoId":"9","instId":"ETH-USDT-SWAP","ordType":"conditional","sz":"187.75","slTriggerPx":"2560","tpTriggerPx":"","reduceOnly":"true"}]}"#;
-        let orders = algo_orders(body).unwrap();
-        assert_eq!(orders[0].stop_price, Some(2560.0));
-        assert_eq!(orders[0].take_profit_price, None);
-        assert!(orders[0].reduce_only);
-    }
 }

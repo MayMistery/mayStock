@@ -407,30 +407,27 @@ struct StrategyRunnerReconcileTests {
 // MARK: - Rejection classification
 
 struct ExchangeRejectionTests {
-    @Test("带非零 OKX 错误码的失败是确定性拒绝")
-    func aCodedFailureIsDefinite() {
-        let error = TradeError.cliFailed(
-            exitCode: 1, stderr: #"{"code":"51000","msg":"Parameter slTriggerPx error"}"#)
-        #expect(error.exchangeRejection?.contains("51000") == true)
+    @Test("只有交易所的拒单或本地拦下才是确定未下单")
+    func onlyARefusalIsDefinite() {
+        #expect(TradeError.rejected(venue: "OKX", reason: "51000 Parameter slTriggerPx error").refusal?.contains("51000") == true)
+        #expect(TradeError.refused("profile 是模拟盘的 key").refusal != nil)
     }
 
-    @Test("超时不是拒绝")
+    @Test("超时不是拒绝，是未知")
     func aTimeoutIsNotARejection() {
-        // The watchdog reports exit code −1: the CLI never came back, so the
-        // order's fate is unknown and must not be treated as refused.
-        let error = TradeError.cliFailed(
-            exitCode: -1, stderr: "okx CLI 超过 15 秒未返回，已终止：okx swap place")
-        #expect(error.exchangeRejection == nil)
+        let error = TradeError.unconfirmed("发出后没有回音：operation timed out")
+        #expect(error.refusal == nil)
+        #expect(error.outcomeUnknown)
     }
 
-    @Test("没有交易所裁决的失败也不算拒绝")
-    func aVerdictlessFailureIsNotARejection() {
-        #expect(TradeError.cliFailed(exitCode: 1, stderr: "socket hang up")
-            .exchangeRejection == nil)
-        #expect(TradeError.cliNotFound.exchangeRejection == nil)
-        // code 0 is OKX saying "fine", which cannot be a rejection.
-        #expect(TradeError.cliFailed(exitCode: 1, stderr: #"{"code":"0"}"#)
-            .exchangeRejection == nil)
+    @Test("没连上、被限频都不是拒绝，是没有送达")
+    func anUndeliveredOrderIsNotARejection() {
+        for error in [TradeError.notDelivered("试了 3 次都没送达 OKX：没连上"),
+                      TradeError.notDelivered("试了 3 次都没送达 OKX：OKX 限频（50011 Too Many Requests）")] {
+            #expect(error.refusal == nil)
+            #expect(error.undelivered != nil)
+            #expect(!error.outcomeUnknown)
+        }
     }
 
     @Test("从嵌套响应里挑出第一个非零码")
@@ -547,44 +544,41 @@ struct PositionOpenedAtTests {
 // MARK: - Protective order parsing
 
 struct ProtectiveOrderParsingTests {
-    @Test("从 algo orders 输出里读出止损单")
+    /// An algo order as the kernel's listing reads one (`trade::reads`).
+    private func algo(
+        _ id: String, instId: String = "BTC-USDT-SWAP", ordType: String = "conditional",
+        stop: Double? = nil, target: Double? = nil, posSide: PositionSide? = nil
+    ) -> ExchangeOpenOrder {
+        ExchangeOpenOrder(
+            id: id, book: .algo, instId: instId, ordType: ordType, side: .sell, posSide: posSide,
+            price: nil, triggerPrice: stop ?? target, stopTriggerPrice: stop, takeProfitTriggerPrice: target,
+            size: 10, closeFraction: nil, filledSize: 0, state: "live", reduceOnly: true, clOrdId: nil, createdAt: nil)
+    }
+
+    @Test("从策略委托里读出止损单")
     func aStopIsFound() {
-        let json = """
-        {"data":[{"algoId":"9001","instId":"BTC-USDT-SWAP","slTriggerPx":"58000",
-                  "slOrdPx":"-1","sz":"10","posSide":"long","state":"live"}]}
-        """
-        let orders = TradeBridge.parseProtectiveOrders(json: json, instId: "BTC-USDT-SWAP")
+        let orders = KernelTradeClient.protective([algo("9001", stop: 58_000, posSide: .long)], instId: "BTC-USDT-SWAP")
         #expect(orders.count == 1)
         #expect(orders.first?.algoId == "9001")
         #expect(orders.first?.stopTriggerPrice == 58_000)
         #expect(orders.first?.posSide == .long)
+        #expect(orders.first?.size == 10)
     }
 
     @Test("别的合约的算法单不算数")
     func anotherInstrumentIsIgnored() {
-        let json = """
-        {"data":[{"algoId":"9002","instId":"ETH-USDT-SWAP","slTriggerPx":"3000","sz":"1"}]}
-        """
-        #expect(TradeBridge.parseProtectiveOrders(
-            json: json, instId: "BTC-USDT-SWAP").isEmpty)
+        #expect(KernelTradeClient.protective([algo("9002", instId: "ETH-USDT-SWAP", stop: 3_000)], instId: "BTC-USDT-SWAP").isEmpty)
     }
 
     @Test("两条腿都没有的算法单不保护任何东西")
     func anOrderWithNeitherLegIsNotProtective() {
         // Grid bots and TWAP legs live in the same algo book; they are not stops.
-        let json = """
-        {"data":[{"algoId":"9003","instId":"BTC-USDT-SWAP","sz":"10","ordType":"twap"}]}
-        """
-        #expect(TradeBridge.parseProtectiveOrders(
-            json: json, instId: "BTC-USDT-SWAP").isEmpty)
+        #expect(KernelTradeClient.protective([algo("9003", ordType: "twap")], instId: "BTC-USDT-SWAP").isEmpty)
     }
 
     @Test("止盈腿也读得出来")
     func aTakeProfitLegIsRead() {
-        let json = """
-        {"data":[{"algoId":"9004","instId":"BTC-USDT-SWAP","tpTriggerPx":"72000","sz":"10"}]}
-        """
-        let orders = TradeBridge.parseProtectiveOrders(json: json, instId: "BTC-USDT-SWAP")
+        let orders = KernelTradeClient.protective([algo("9004", target: 72_000)], instId: "BTC-USDT-SWAP")
         #expect(orders.first?.takeProfitTriggerPrice == 72_000)
         #expect(orders.first?.stopTriggerPrice == nil)
     }
@@ -1665,6 +1659,45 @@ struct OptionRunnerTests {
         #expect((position.averagePrice * 1e6).rounded() / 1e6 == 1_720, "0.0215 BTC/unit × 80,000")
         #expect(position.signalDirection == .long)
         #expect(host.runner_stateMessage(runner, "opt")?.contains("拒绝") != true)
+    }
+
+    @Test("交易所拒单是终局：策略停下，账本不动")
+    func aRejectionStopsTheStrategy() async throws {
+        let host = try armedHost()
+        host.fake.placeOutcomes = [TradeError.rejected(venue: "OKX", reason: "51008 Order failed. Insufficient BTC margin")]
+        let runner = runner(for: host)
+        await runner.tick()
+        #expect(runner.state(for: "opt").status == .failed)
+        #expect(runner.state(for: "opt").message?.contains("51008") == true)
+        #expect(host.ledger.position(for: "opt")?.isFlat ?? true)
+    }
+
+    @Test("没有送达的单不算失败：下一次轮询就按同一根 K 线重下")
+    func anUndeliveredOrderIsTriedAgainNextTick() async throws {
+        let host = try armedHost()
+        host.fake.placeOutcomes = [TradeError.notDelivered("试了 3 次都没送达 OKX：OKX 限频（50011 Too Many Requests）")]
+        let runner = runner(for: host)
+        await runner.tick()
+        #expect(runner.state(for: "opt").status != .failed)
+        #expect(runner.state(for: "opt").message?.contains("没有送达") == true)
+        #expect(host.ledger.position(for: "opt")?.isFlat ?? true)
+        // Same bar, next tick: decided again and sent.
+        await runner.tick()
+        #expect(host.fake.placed.count == 2)
+        #expect(host.ledger.position(for: "opt")?.quantity == 59)
+    }
+
+    @Test("结果未确认的单被跟踪，不当成拒绝、也不盲目重发")
+    func anUnconfirmedOrderIsTrackedNotRetried() async throws {
+        let host = try armedHost()
+        host.fake.placeOutcomes = [TradeError.unconfirmed("发出后没有回音：timeout")]
+        host.fake.orderStatusResult = .live
+        let runner = runner(for: host)
+        await runner.tick()
+        #expect(runner.state(for: "opt").status != .failed)
+        #expect(runner.state(for: "opt").message?.contains("未确认") == true)
+        await runner.tick()
+        #expect(host.fake.placed.count == 1, "an order that may be working is never sent twice")
     }
 
     @Test("信号消失时以 reduceOnly 的 IOC 卖单平掉整个合约")

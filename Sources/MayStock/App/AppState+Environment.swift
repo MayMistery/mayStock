@@ -92,13 +92,9 @@ extension AppState {
         let books = books(for: venue)
         switch venue {
         case .okx:
-            if cliInfo == nil { await detectTradeCLI() }
-            guard cliInfo != nil else {
-                let status = VenueConnectionStatus.failed(
-                    message: TradeError.cliNotFound.description, hint: nil, at: Date())
-                books.connections[mode] = status
-                return status
-            }
+            // The kernel signs with the key in the CLI's config file; the CLI
+            // binary itself is only needed for the ledger, and its absence is
+            // the CLI card's to report, not a reason the account cannot trade.
             guard credentialsConfigured(for: mode) else {
                 let status = VenueConnectionStatus.failed(
                     message: profileCatalog.fileExists
@@ -109,10 +105,10 @@ extension AppState {
                 return status
             }
             books.connections[mode] = .checking
-            let bridge = tradeBridge
+            let trade = KernelTradeClient(bridge: tradeBridge)
             let status: VenueConnectionStatus
             do {
-                let report = try await bridge.verifyConnection(mode: mode)
+                let report = try await trade.verifyConnection(mode: mode)
                 status = .connected(report)
                 Log.warn("connection: okx \(mode.rawValue) verified via profile \(report.profile ?? "<default>")")
             } catch {

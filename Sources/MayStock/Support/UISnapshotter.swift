@@ -113,6 +113,76 @@ final class UISnapshotter {
         }
         selection.overviewScope = .combined
         terminalWindow.orderOut(nil)
+
+        try await renderCloseTickets()
+    }
+
+    /// The close ticket on whatever each account holds — a position, or the
+    /// largest coin balance when the account holds none — against the live
+    /// book: the form as it opens, a review of a limit at the third
+    /// counterparty level, and on a perpetual a review of a stop and target.
+    /// Read-only against the exchange: `confirm` is never called here, so
+    /// nothing is sent.
+    private func renderCloseTickets() async throws {
+        let venue = appState.exchangeVenue(for: .okx)
+        for mode in TradingMode.allCases {
+            guard let request = await closeTicketSample(venue: venue, mode: mode) else {
+                Log.warn("snapshot: \(mode.rawValue) 账户没有可平的持仓或余额，跳过平仓面板")
+                continue
+            }
+            let model = CloseTicketModel(request: request, venue: venue)
+            await model.open()
+            defer { model.close() }
+            // The book arrives over a socket; the ticket is drawn once it has.
+            for _ in 0..<100 where !(model.book?.isLive == true && model.book?.spec != nil && model.holding != nil) {
+                try await Task.sleep(nanoseconds: 100_000_000)
+            }
+            try await renderTicket(model, name: "close-ticket-\(mode.rawValue)-form")
+
+            model.priceSource = .counterparty
+            model.level = 3
+            model.useFraction(0.5)
+            await model.review()
+            try await renderTicket(model, name: "close-ticket-\(mode.rawValue)-review")
+            model.backToEditing()
+
+            guard model.holding?.family == .swap, let last = model.book?.lastPrice, let holding = model.holding else { continue }
+            model.method = .protect
+            model.useFraction(1)
+            let levels = CloseTicketModel.illustrativeProtection(reference: last, holding: holding)
+            model.takeProfitText = PriceFormatter.wire(levels.takeProfit.rounded())
+            model.stopLossText = PriceFormatter.wire(levels.stopLoss.rounded())
+            await model.review()
+            try await renderTicket(model, name: "close-ticket-\(mode.rawValue)-protect")
+        }
+    }
+
+    /// A holding to draw the ticket on: the account's first position, else
+    /// its largest coin balance that has a USDT market.
+    private func closeTicketSample(venue: any ExchangeVenue, mode: TradingMode) async -> CloseTicketRequest? {
+        if let position = try? await venue.heldPositions(mode: mode).first {
+            return .position(position, venue: .okx, mode: mode)
+        }
+        let balances = (try? await venue.accountSnapshot(mode: mode).balances) ?? []
+        return balances
+            .sorted { ($0.valuationUsd ?? 0) > ($1.valuationUsd ?? 0) }
+            .lazy.compactMap { CloseTicketRequest.coin($0.ccy, venue: .okx, mode: mode) }
+            .first
+    }
+
+    private func renderTicket(_ model: CloseTicketModel, name: String) async throws {
+        let sheet = NSHostingView(
+            rootView: CloseTicketSheet(appState: appState, model: model)
+                .environment(\.snapshotMode, true))
+        let window = OffscreenWindow(size: sheet.fittingSize, chrome: false)
+        window.contentView = sheet
+        window.orderFrontRegardless()
+        try await pause()
+        try await pause()
+        window.setContentSize(sheet.fittingSize)
+        try await pause()
+        try capture(sheet, name: name)
+        window.orderOut(nil)
     }
 
     /// A run-loop breath for SwiftUI to lay out and draw a state change.

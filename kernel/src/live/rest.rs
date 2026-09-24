@@ -14,6 +14,8 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use super::socket::health;
+use crate::trade::reads::{Read, WorkingOrder, WorkingOrders};
+use crate::trade::{Access, Answered, Delivery, ReadReply, ReadRequest};
 use super::{binance, deribit, net, now_ms, okx, Feed, FeedState, Update};
 
 // MARK: - Option book
@@ -117,8 +119,9 @@ pub enum RestUpdate {
     BinanceOpenInterest(Result<(f64, i64), String>),
     /// Server time and the local instants the request left and returned.
     Clock(Result<(i64, i64, i64), String>),
-    /// Pending stops and take-profits, and when they were read (local).
-    Stops(Result<Vec<okx::AlgoOrder>, String>, i64),
+    /// Pending stops and take-profits, when they were read (local), and
+    /// what the read took beyond one request.
+    Stops(Result<Vec<WorkingOrder>, String>, i64, Delivery),
     Yahoo(Result<Vec<MacroQuote>, String>),
 }
 
@@ -144,7 +147,7 @@ impl RestUpdate {
             RestUpdate::OkxHistory { result, .. } | RestUpdate::BinanceHistory { result, .. } => result.is_ok(),
             RestUpdate::BinanceOpenInterest(result) => result.is_ok(),
             RestUpdate::Clock(result) => result.is_ok(),
-            RestUpdate::Stops(result, _) => result.is_ok(),
+            RestUpdate::Stops(result, ..) => result.is_ok(),
             RestUpdate::Yahoo(result) => result.is_ok(),
         }
     }
@@ -361,25 +364,29 @@ pub async fn binance_open_interest(http: reqwest::Client, updates: mpsc::Sender<
 
 /// The standalone stops the app places are conditional algo orders, which a
 /// position's `closeOrderAlgo` does not list, so they are read on their own,
-/// at `Feed::OkxStops`'s cadence.
-pub async fn okx_stops(http: reqwest::Client, updates: mpsc::Sender<Update>, credentials: okx::Credentials) {
+/// at `Feed::OkxStops`'s cadence — the account's whole protection listing,
+/// through the trading client, whose pacer every signed request of the
+/// process shares.
+pub async fn okx_stops(updates: mpsc::Sender<Update>, access: Access) {
     health(&updates, Feed::OkxStops, FeedState::Connecting).await;
-    let paths = ["/api/v5/trade/orders-algo-pending?ordType=conditional", "/api/v5/trade/orders-algo-pending?ordType=oco"];
+    let request = ReadRequest { access, read: Read::Protection { family: None, inst_id: None } };
     loop {
-        let mut orders = Vec::new();
-        let mut failure = None;
-        for path in paths {
-            match okx::signed_get(&http, &credentials, path).await.and_then(|body| okx::algo_orders(&body)) {
-                Ok(found) => orders.extend(found),
-                Err(e) => failure = Some(e),
-            }
-        }
-        let read_at = now_ms();
-        let (result, state) = match failure {
-            None => (Ok(orders), FeedState::Live),
-            Some(e) => (Err(e.clone()), FeedState::Degraded(e)),
+        let answered = match crate::trade::shared() {
+            Ok(client) => client.read_async(request.clone()).await,
+            Err(reason) => Answered::local(ReadReply::Failed { reason }),
         };
-        send(&updates, RestUpdate::Stops(result, read_at)).await;
+        let read_at = now_ms();
+        let result = match answered.reply {
+            ReadReply::Ok { data } => {
+                serde_json::from_value::<WorkingOrders>(data).map(|listing| listing.orders).map_err(|e| format!("条件单回复无法读取：{e}"))
+            }
+            ReadReply::Failed { reason } | ReadReply::Refused { reason, .. } => Err(reason),
+        };
+        let state = match &result {
+            Ok(_) => FeedState::Live,
+            Err(e) => FeedState::Degraded(e.clone()),
+        };
+        send(&updates, RestUpdate::Stops(result, read_at, answered.delivery)).await;
         health(&updates, Feed::OkxStops, state).await;
         tokio::time::sleep(Feed::OkxStops.cadence()).await;
     }
@@ -438,7 +445,6 @@ async fn sample_clock(http: &reqwest::Client, url: &str) -> Result<(i64, i64, i6
 // MARK: - Yahoo fallback
 
 /// Used only when Schwab's stream is not live, at `Feed::Yahoo`'s cadence.
-
 pub async fn yahoo(http: reqwest::Client, updates: mpsc::Sender<Update>, why: &'static str) {
     loop {
         poll_yahoo(&http, &updates, why).await;
