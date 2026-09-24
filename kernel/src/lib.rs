@@ -1,9 +1,16 @@
-//! MayStock's deterministic trading kernel.
+//! MayStock's trading kernel.
 //!
-//! Everything here is pure computation over arrays: indicators, the sandboxed
-//! strategy DSL, the backtest engine, sizing, and the live signal decision.
-//! There is no I/O, no clock, and no network — those stay in Swift, which owns
-//! the exchange connection, the UI, and persistence.
+//! Everything here except [`live`] is pure computation over arrays:
+//! indicators, the sandboxed strategy DSL, the backtest engine, sizing, the
+//! live signal decision, and the option-book arithmetic (`implied`,
+//! `gravity`). Those modules have no I/O, no clock, and no network.
+//!
+//! [`live`] is the one exception, and deliberately so: it holds the real-time
+//! market and account connections (read-only — orders still go through the
+//! CLI from Swift) and feeds them into the same pure functions, so there is one
+//! implementation of every number whether it is backtested, tested from a
+//! recorded frame, or shown live. Swift owns the UI and persistence, and asks
+//! this layer for a snapshot every frame.
 //!
 //! The point of the split is that **backtest and live trading run the same
 //! compiled function**. [`decide::desired_direction`] is called by the
@@ -19,7 +26,10 @@ pub mod expr;
 pub mod fees;
 pub mod ffi;
 pub mod fills;
+pub mod gravity;
 pub mod guard;
+pub mod implied;
+pub mod live;
 pub mod optimize;
 pub mod options;
 pub mod overfit;

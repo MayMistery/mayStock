@@ -1171,3 +1171,123 @@ mod market_ffi_tests {
         unsafe { ms_string_free(error) };
     }
 }
+
+// MARK: - Live data layer
+
+/// Opaque handle to a running live layer.
+pub struct MSLive {
+    engine: Option<crate::live::Engine>,
+}
+
+fn live_config(pointer: *const c_char) -> Result<crate::live::LiveConfig, String> {
+    let json = unsafe { borrow_str(pointer) }.ok_or("实时层配置不是 UTF-8")?;
+    serde_json::from_str(json).map_err(|e| format!("实时层配置解析失败：{e}"))
+}
+
+/// Start the live layer. Returns null and sets `error_out` on failure; the
+/// handle must be released with `ms_live_stop`.
+#[no_mangle]
+pub unsafe extern "C" fn ms_live_start(config_json: *const c_char, error_out: *mut *mut c_char) -> *mut MSLive {
+    guarded(error_out, ptr::null_mut(), || {
+        let engine = crate::live::Engine::start(live_config(config_json)?)?;
+        Ok(Box::into_raw(Box::new(MSLive { engine: Some(engine) })))
+    })
+}
+
+/// Point a running live layer at another instrument, mode or profile.
+/// Returns 1 on success, 0 with `error_out` set on failure.
+#[no_mangle]
+pub unsafe extern "C" fn ms_live_configure(handle: *mut MSLive, config_json: *const c_char, error_out: *mut *mut c_char) -> i32 {
+    guarded(error_out, 0, || {
+        let live = handle.as_ref().and_then(|h| h.engine.as_ref()).ok_or("实时层句柄无效")?;
+        live.configure(live_config(config_json)?)?;
+        Ok(1)
+    })
+}
+
+/// Feed a recorded frame or REST body down the live path (tests; and the
+/// CLI fallback for positions). Returns 1 on success, 0 on failure.
+#[no_mangle]
+pub unsafe extern "C" fn ms_live_ingest(handle: *mut MSLive, topic: *const c_char, payload: *const c_char, error_out: *mut *mut c_char) -> i32 {
+    guarded(error_out, 0, || {
+        let live = handle.as_ref().and_then(|h| h.engine.as_ref()).ok_or("实时层句柄无效")?;
+        let topic = borrow_str(topic).ok_or("topic 不是 UTF-8")?;
+        let payload = borrow_str(payload).ok_or("payload 不是 UTF-8")?;
+        live.ingest(topic, payload)?;
+        Ok(1)
+    })
+}
+
+/// The latest snapshot (JSON) if it is newer than `since_seq`, else null.
+/// `seq_out` receives the snapshot's sequence number. Cheap enough to call
+/// every frame: an unchanged snapshot costs one lock and no copy.
+#[no_mangle]
+pub unsafe extern "C" fn ms_live_snapshot(handle: *const MSLive, since_seq: u64, seq_out: *mut u64) -> *mut c_char {
+    guarded(ptr::null_mut(), ptr::null_mut(), || {
+        let live = handle.as_ref().and_then(|h| h.engine.as_ref()).ok_or("实时层句柄无效")?;
+        match live.snapshot(since_seq) {
+            Some((seq, json)) => {
+                if !seq_out.is_null() {
+                    *seq_out = seq;
+                }
+                Ok(to_c_string(json.as_ref().clone()))
+            }
+            None => Ok(ptr::null_mut()),
+        }
+    })
+}
+
+/// Stop the live layer and release the handle. Null is a no-op.
+#[no_mangle]
+pub unsafe extern "C" fn ms_live_stop(handle: *mut MSLive) {
+    if handle.is_null() {
+        return;
+    }
+    let mut boxed = Box::from_raw(handle);
+    if let Some(engine) = boxed.engine.take() {
+        engine.stop();
+    }
+}
+
+// MARK: - OKX account documents
+
+/// Parse an OKX account document — the CLI's JSON or a socket push — into
+/// the app's normalised shape. The one reader of these fields: the trading
+/// path and the live layer both come here, so a position cannot mean one
+/// thing to the runner and another to the checkup.
+///
+/// `kind` is `positions` (non-zero positions, short legs negative),
+/// `equity` (`{"totalEquity": number|null}`) or `balances`. A document that is
+/// not JSON reads as empty, never as an error: an unreadable listing is
+/// "nothing read", which the callers already report as such.
+#[no_mangle]
+pub unsafe extern "C" fn ms_okx_account_document(kind: *const c_char, json: *const c_char, error_out: *mut *mut c_char) -> *mut c_char {
+    guarded(error_out, ptr::null_mut(), || {
+        let kind = borrow_str(kind).ok_or("kind 不是 UTF-8")?;
+        let value: serde_json::Value = borrow_str(json).and_then(|text| serde_json::from_str(text).ok()).unwrap_or(serde_json::Value::Null);
+        let out = match kind {
+            "positions" => serde_json::Value::Array(
+                crate::live::okx_positions_in(&value)
+                    .into_iter()
+                    .filter(|r| r.contracts != 0.0)
+                    .map(|r| serde_json::json!({
+                        "instId": r.inst_id, "instType": r.inst_type, "posSide": r.pos_side,
+                        "contracts": r.contracts, "averagePrice": r.average_price, "markPrice": r.mark_price,
+                        "unrealisedPnl": r.unrealised_pnl, "leverage": r.leverage, "liquidationPrice": r.liquidation_price,
+                        "notionalUsd": r.notional_usd, "margin": r.margin, "maintenanceMargin": r.maintenance_margin,
+                        "marginRatio": r.margin_ratio, "settlementCurrency": r.settlement_currency, "usdRate": r.usd_rate,
+                    }))
+                    .collect(),
+            ),
+            "equity" => serde_json::json!({"totalEquity": crate::live::okx_total_equity_in(&value)}),
+            "balances" => serde_json::Value::Array(
+                crate::live::okx_balances_in(&value)
+                    .into_iter()
+                    .map(|b| serde_json::json!({"ccy": b.ccy, "available": b.available, "total": b.total, "valuationUsd": b.valuation_usd}))
+                    .collect(),
+            ),
+            other => return Err(format!("未知的账户文档类型：{other}")),
+        };
+        Ok(to_c_string(out.to_string()))
+    })
+}

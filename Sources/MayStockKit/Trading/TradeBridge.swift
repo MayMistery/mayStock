@@ -1695,71 +1695,21 @@ public struct TradeBridge: Sendable {
     // (`--env` adds another layer). Rather than chase envelope shapes, we walk
     // the JSON tree and pick up any object carrying the fields we need.
 
+    // Positions, equity and balances are read by the kernel — the one reader
+    // of these fields, shared with the live layer's socket pushes.
+
     static func parseBalances(json: String) -> [AccountBalance] {
-        var best: [String: AccountBalance] = [:]
-        walkObjects(in: json) { dict in
-            guard let ccy = dict["ccy"] as? String, !ccy.isEmpty else { return }
-            let available = number(dict, "availBal") ?? number(dict, "availEq") ?? 0
-            let total = number(dict, "cashBal") ?? number(dict, "bal") ?? number(dict, "eq") ?? available
-            guard available > 0 || total > 0 else { return }
-            let candidate = AccountBalance(
-                ccy: ccy, available: available, total: total,
-                valuationUsd: number(dict, "eqUsd") ?? number(dict, "valuationUsd"))
-            // The same currency appears in trading and funding sections; keep
-            // the larger holding rather than whichever the walker hit last.
-            if let existing = best[ccy], existing.total >= total { return }
-            best[ccy] = candidate
-        }
-        return best.values.sorted { $0.ccy < $1.ccy }
+        KernelAccount.balances(json)
     }
 
-    /// Total account equity, wherever the CLI happened to put it.
-    ///
-    /// `balance-all` reports `trading.totalEq` alongside a separate
-    /// `valuation.totalBal`; the plain `balance` command reports only the
-    /// former. Prefer unified-account equity and fall back to the valuation
-    /// block, because the two disagree slightly and picking whichever the tree
-    /// walk hit last would make the number flicker.
+    /// Total account equity: the unified account's `totalEq`, else the
+    /// valuation block's `totalBal` (see `KernelAccount`).
     static func parseTotalEquity(json: String) -> Double? {
-        var accountEquity: Double?
-        var valuation: Double?
-        walkObjects(in: json) { dict in
-            if let value = number(dict, "totalEq"), value > 0 {
-                accountEquity = Swift.max(accountEquity ?? 0, value)
-            }
-            if let value = number(dict, "totalBal"), value > 0 {
-                valuation = Swift.max(valuation ?? 0, value)
-            }
-        }
-        return accountEquity ?? valuation
+        KernelAccount.totalEquity(json)
     }
 
     static func parsePositions(json: String) -> [ExchangePosition] {
-        var out: [ExchangePosition] = []
-        walkObjects(in: json) { dict in
-            guard let instId = dict["instId"] as? String, !instId.isEmpty,
-                  let raw = number(dict, "pos"), raw != 0 else { return }
-            let side = PositionSide(rawValue: (dict["posSide"] as? String) ?? "net") ?? .net
-            // In long/short mode OKX reports a positive size on the short leg.
-            let signed = side == .short ? -abs(raw) : raw
-            out.append(ExchangePosition(
-                instId: instId,
-                posSide: side,
-                quantity: signed,
-                averagePrice: number(dict, "avgPx") ?? 0,
-                markPrice: number(dict, "markPx"),
-                unrealisedPnL: number(dict, "upl") ?? 0,
-                leverage: number(dict, "lever"),
-                liquidationPrice: number(dict, "liqPx"),
-                notionalUsd: number(dict, "notionalUsd"),
-                instType: (dict["instType"] as? String) ?? "",
-                margin: number(dict, "margin"),
-                maintenanceMargin: number(dict, "mmr"),
-                marginRatio: number(dict, "mgnRatio"),
-                settlementCurrency: (dict["ccy"] as? String).flatMap { $0.isEmpty ? nil : $0 },
-                usdRate: number(dict, "usdPx")))
-        }
-        return out
+        KernelAccount.positions(json)
     }
 
     static func parseFills(json: String) -> [ExchangeFill] {

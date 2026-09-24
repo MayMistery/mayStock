@@ -133,6 +133,12 @@ public struct OKXVenue: ExchangeVenue {
         try await bridge.accountSnapshot(mode: mode)
     }
 
+    public func accountDocuments(mode: TradingMode) async throws -> (positions: String, balance: String) {
+        async let positions = bridge.runCLI(["account", "positions"], mode: mode)
+        async let balance = bridge.runCLI(["account", "balance"], mode: mode)
+        return try await (positions, balance)
+    }
+
     public func fundingPayments(
         instId: String?, mode: TradingMode
     ) async throws -> [FundingPayment] {

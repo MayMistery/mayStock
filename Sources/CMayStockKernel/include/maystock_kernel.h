@@ -223,6 +223,28 @@ char *ms_settlement_currency(const char *venue,
                              const char *inst_id,
                              char **error_out);
 
+/* The live data layer: every real-time market and account connection the
+ * checkup screen reads, held in the kernel. Read-only — nothing it sends can
+ * place, amend or cancel an order.
+ *
+ * Start it with a JSON config ({"instId","mode","okxProfile","okxConfigPath",
+ * "schwabctlPath","followsHeldPosition","network","nowOverrideMs"}); ask for
+ * the snapshot every frame. ms_live_snapshot returns NULL when nothing has
+ * changed since `since_seq`, otherwise the snapshot JSON (caller frees) and
+ * its sequence number in `seq_out`. */
+/* OKX account documents (CLI JSON or socket pushes), parsed once for the
+ * whole app. kind: "positions" | "equity" | "balances". Caller frees. */
+char *ms_okx_account_document(const char *kind, const char *json, char **error_out);
+
+typedef struct MSLive MSLive;
+MSLive *ms_live_start(const char *config_json, char **error_out);
+int32_t ms_live_configure(MSLive *handle, const char *config_json, char **error_out);
+/* Feed a recorded frame or REST body down the live path: tests use it, and
+ * so does the CLI fallback for positions ("cli.positions", "cli.account"). */
+int32_t ms_live_ingest(MSLive *handle, const char *topic, const char *payload, char **error_out);
+char *ms_live_snapshot(const MSLive *handle, uint64_t since_seq, uint64_t *seq_out);
+void ms_live_stop(MSLive *handle);
+
 #ifdef __cplusplus
 }
 #endif

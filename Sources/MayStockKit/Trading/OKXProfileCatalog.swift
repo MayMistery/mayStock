@@ -2,10 +2,16 @@ import Foundation
 
 /// One named credential set in the official CLI's `~/.okx/config.toml`.
 ///
-/// Only the *shape* of the profile is read — its name and whether the CLI has
-/// it marked as a demo-environment key. The key material itself is never
-/// parsed, held or shown: MayStock's whole credential model is that the CLI
-/// owns the secrets and this app only ever asks the CLI to act.
+/// Only the *shape* of the profile is read here — its name and whether the CLI
+/// has it marked as a demo-environment key. The credential model: the CLI owns
+/// the secrets for everything that **acts** (orders, amendments, cancels), and
+/// this app only ever asks the CLI to act. The one other reader is the
+/// kernel's live layer (`kernel/src/live/okx.rs`), which reads the selected
+/// profile's key to sign **read-only** requests — the private socket's login
+/// for the `positions` / `account` channels and GETs of pending stop orders —
+/// holds it in memory only, never logs or writes it, and cannot build an
+/// order frame. Chosen on 2026-09-23 because the CLI path read positions every
+/// 20–40 s with frequent 15 s timeouts, and the page needs them as they change.
 public struct OKXProfile: Sendable, Equatable, Identifiable, Hashable {
     public let name: String
     /// `demo = true` in the profile. Nil when the profile does not say.

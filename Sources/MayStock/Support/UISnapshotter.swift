@@ -70,7 +70,11 @@ final class UISnapshotter {
         let terminal = NSHostingView(
             rootView: TerminalView(appState: appState, selection: selection)
                 .environment(\.snapshotMode, true))
-        let terminalWindow = OffscreenWindow(size: CGSize(width: 1_180, height: 2_400), chrome: true)
+        // Tall enough for the longest page: a page laid out unscrolled that
+        // overflows the window pushes the whole split view out of it and
+        // squeezes wrapped text to one truncated line (the checkup, at about
+        // 4,000 pt, captured with its header and toolbar missing).
+        let terminalWindow = OffscreenWindow(size: CGSize(width: 1_180, height: 4_800), chrome: true)
         terminalWindow.contentView = terminal
         terminalWindow.orderFrontRegardless()
         // The first draw of a freshly ordered window lags a beat behind its
@@ -80,6 +84,12 @@ final class UISnapshotter {
         for page in TerminalPage.allCases {
             selection.page = page
             try await pause()
+            if page == .checkup {
+                // The checkup starts its own live layer when it appears; its
+                // sockets and REST reads take several seconds to fill, and a
+                // capture before then shows only "connecting".
+                try await Task.sleep(nanoseconds: 14_000_000_000)
+            }
             Log.warn("snapshot: \(page.rawValue) fitting \(terminal.fittingSize) bounds \(terminal.bounds.size)")
             try capture(terminal, name: "terminal-\(page.rawValue)")
         }

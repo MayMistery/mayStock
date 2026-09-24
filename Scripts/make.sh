@@ -4,7 +4,7 @@
 #
 #   ./Scripts/make.sh build      release build (app + kit + e2e driver)
 #   ./Scripts/make.sh test       unit tests (swift-testing)
-#   ./Scripts/make.sh e2e        live end-to-end against OKX
+#   ./Scripts/make.sh e2e        live end-to-end against OKX and the live layer's venues
 #   ./Scripts/make.sh verify     build + test + e2e
 #   ./Scripts/make.sh install    assemble /Applications/MayStock.app
 #   ./Scripts/make.sh run        install + launch
@@ -101,6 +101,7 @@ cmd_e2e() {
   "$BUILD_DIR/maystock-e2e" alert-sim
   "$BUILD_DIR/maystock-e2e" trade-doctor
   "$BUILD_DIR/maystock-e2e" strategy-doctor
+  "$BUILD_DIR/maystock-e2e" live 30
 }
 
 cmd_verify() {

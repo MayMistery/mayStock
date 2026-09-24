@@ -110,6 +110,15 @@ public protocol ExchangeVenue: Sendable {
 
     func accountSnapshot(mode: TradingMode) async throws -> AccountSnapshot
 
+    /// The venue's own positions and balance documents, unparsed.
+    ///
+    /// For the live layer's fallback: when the read-only account socket is
+    /// down, the checkup reads these and hands them to the kernel, which
+    /// parses them with the same rules it applies to the socket's pushes —
+    /// so a position looks the same whichever way it arrived. Optional: a
+    /// venue without such documents inherits a default that says so.
+    func accountDocuments(mode: TradingMode) async throws -> (positions: String, balance: String)
+
     /// Funding settled on perpetual positions.
     ///
     /// Optional: a venue with no perpetuals, or no way to report the charge,
@@ -185,6 +194,10 @@ extension ExchangeVenue {
     public func fundingPayments(
         instId: String?, mode: TradingMode
     ) async throws -> [FundingPayment] { [] }
+
+    public func accountDocuments(mode: TradingMode) async throws -> (positions: String, balance: String) {
+        throw ExchangeVenueError.unsupported(venue.displayName, "账户文档")
+    }
 
     /// A venue with no single listing answers with the union of the families
     /// it has, one position per id however many listings named it.

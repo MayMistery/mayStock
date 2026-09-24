@@ -221,24 +221,8 @@ fn argmax(values: &[f64]) -> Option<usize> {
 
 // MARK: - Normal distribution
 
-/// Φ(x), via the error function.
-pub fn normal_cdf(x: f64) -> f64 {
-    0.5 * (1.0 + erf(x / std::f64::consts::SQRT_2))
-}
-
-/// Abramowitz & Stegun 7.1.26 — max error 1.5e-7, far below anything that
-/// changes a decision here.
-fn erf(x: f64) -> f64 {
-    let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let x = x.abs();
-    let t = 1.0 / (1.0 + 0.327_591_1 * x);
-    let y = 1.0
-        - (((((1.061_405_429 * t - 1.453_152_027) * t) + 1.421_413_741) * t - 0.284_496_736) * t
-            + 0.254_829_592)
-            * t
-            * (-x * x).exp();
-    sign * y
-}
+/// Φ(x) — the kernel's one normal distribution, in `options`.
+pub use crate::options::normal_cdf;
 
 /// Φ⁻¹(p) — Acklam's rational approximation, accurate to ~1e-9.
 pub fn inverse_normal_cdf(p: f64) -> f64 {

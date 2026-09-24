@@ -8,6 +8,7 @@ import MayStockKit
 ///   maystock-e2e alert-sim             alert engine simulation (offline)
 ///   maystock-e2e trade-doctor          okx CLI detection + public call
 ///   maystock-e2e strategy-doctor       compile presets + real multi-window backtest
+///   maystock-e2e live [sec]            the kernel's live layer against the real venues
 ///   maystock-e2e option-demo           buy and sell one option on the DEMO account,
 ///                                      through the runner's own order path
 ///
@@ -32,6 +33,8 @@ struct E2EMain {
             ok = await tradeDoctor()
         case "strategy-doctor":
             ok = await strategyDoctor(instId: args.count > 1 ? args[1] : nil)
+        case "live":
+            ok = await liveDoctor(seconds: args.count > 1 ? Int(args[1]) ?? 30 : 30)
         default:
             print("unknown command: \(command)")
             ok = false

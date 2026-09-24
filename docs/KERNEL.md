@@ -1,15 +1,25 @@
 # 交易内核（Rust）
 
-> 量化策略实际运行的内核是 Rust。Swift 保留 UI、交易所连接与持久化。
+> 量化策略实际运行的内核是 Rust，体检页的实时数据层也在 Rust。Swift 保留 UI、下单与持久化。
 
 ## 1. 边界怎么划的
 
 | 归属 | 内容 | 为什么 |
 |---|---|---|
-| **Rust**（`kernel/`） | 指标库、表达式 DSL（词法/语法/求值）、回测引擎（二值 + 连续敞口）、绩效指标、仓位计算、**实盘信号决策** | 确定性计算。正确性与可复现性是第一位的，且这里是「回测与实盘必须一致」的地方 |
-| **Swift**（`Sources/`） | SwiftUI 界面、菜单栏、OKX REST/WebSocket、okx CLI 桥、配置与台账持久化、异步编排 | 平台 I/O。URLSession、async/await 和 AppKit 在这里是正确的工具，搬进 Rust 只会重复造轮子 |
+| **Rust 纯计算**（`kernel/src/` 除 `live/`） | 指标库、表达式 DSL、回测引擎、绩效指标、仓位计算、**实盘信号决策**、期权簿算术（`implied` 隐含分布、`gravity` max pain）、OKX 账户文档解析 | 确定性计算。正确性与可复现性是第一位的，且这里是「回测与实盘必须一致」的地方 |
+| **Rust 实时层**（`kernel/src/live/`） | 体检页读的全部实时连接：OKX 公有行情与只读私有账户推送、Deribit 波动率曲面、Binance 标记价、嘉信报价推送，以及没有推送的 REST 读数（四家期权持仓量、5 分钟持仓结构、条件单、时钟） | 同一个数只有一份实现：线上帧、录制帧、回测都走同一批纯函数 |
+| **Swift**（`Sources/`） | SwiftUI 界面、菜单栏、交易行情 WebSocket、okx CLI 桥（**下单只走这里**）、配置与台账持久化、异步编排 | 平台 I/O 与界面 |
 
-**没有把网络和下单搬进 Rust**，因为那部分的难点是并发与平台集成，不是计算，Swift 做得更好。
+**下单没有搬进 Rust**：实时层只读，它能构造的帧里没有任何下单、改单、撤单操作。私有频道只订阅 `positions` / `account`，签名请求只放行 `GET /api/v5/trade/orders-algo-pending`，两份白名单各写一处（`live/okx.rs`），测试钉住。
+
+### 1.0 实时层的形状（2026-09-24）
+
+- **一个任务独占全部状态**。连接只转发收到的帧；解码、合并、所有派生数都在这个任务里按到达顺序算，没有锁，没有竞争。
+- **每次更新重新发布一份带序号的快照（JSON）**。页面可见时 Swift 每帧（16 ms）调 `ms_live_snapshot(since)`，没变化时拿到 NULL，只花一次锁；窗口被遮挡、最小化或切到别的 Space 超过半秒，降到每秒一次，照常记事件日志、跟随 CLI 兜底，但不重绘，重新可见时立刻发布最新一份。
+- **每个数带交易所自己的时间戳**，界面按本机与交易所的时钟偏差（连测 6 次取往返最短）校正后显示毫秒级年龄。本机测得的时间（帧到达、轮询返回）在状态里是 `LocalMs` 类型，进快照只能经 `to_server` 换到交易所时钟——漏换是编译错误，不是随本机时钟漂移而错的年龄。
+- **每个源在 `Feed::cadence` 声明自己的节奏**：轮询器按它睡眠，年龄超过 3 个节奏变黄（`Feed::stale_after_ms`，随快照发给界面）。socket 帧和成功返回的轮询走同一个 `note_frame` 记新鲜度，所以「多久前」对每个源是同一个意思。
+- **离线模式**：`ms_live_ingest` 把录制的帧送进与线上完全相同的解析路径，整条管线可测（`LiveKernelGoldenTests`）。
+- **网络底线是实测出来的**，不是代码能改的：这台机器所有交易所流量走公司 VPN，单向 150–400 ms；高频流（Binance 期货 `bookTicker` 每秒约 65 帧）单独跑也迟到 1.6 s，并拖累同机其它流。所以只订阅小频道（Deribit 用整曲面一帧/秒的 `markprice.options`，而不是 26 个逐合约 ticker），并对每个连接只并发抢连 IPv4（IPv6 在这台机器上是黑洞，系统先试它会白等约 10 s）。
 
 ### 1.1 交易所是注入进来的，不是写死的
 
@@ -60,6 +70,16 @@ char       *ms_strategy_decide (const MSStrategy *, const MSCandle *, size_t, in
 char       *ms_backtest_run    (const MSStrategy *, const MSCandle *, size_t, const char *config_json, char **err);
 void        ms_strategy_free(MSStrategy *);
 void        ms_string_free(char *);
+
+/* 实时层：start 一次，每帧取快照（没变化返回 NULL），录制帧走 ingest */
+MSLive     *ms_live_start    (const char *config_json, char **err);
+int32_t     ms_live_configure(MSLive *, const char *config_json, char **err);
+int32_t     ms_live_ingest   (MSLive *, const char *topic, const char *payload, char **err);
+char       *ms_live_snapshot (const MSLive *, uint64_t since_seq, uint64_t *seq_out);
+void        ms_live_stop     (MSLive *);
+
+/* OKX 账户文档（CLI JSON 或推送）的唯一解析：positions / equity / balances */
+char       *ms_okx_account_document(const char *kind, const char *json, char **err);
 
 /* 市场日历与品种政策：Swift 侧所有「bar ↔ 时间」换算都问这里，不自己算 */
 double      ms_calendar_bars_per_year(const char *market_json, char **err);

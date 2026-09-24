@@ -180,22 +180,15 @@ impl OptionsSpec {
 
 // MARK: - Pricing
 
-/// Standard normal cumulative distribution.
+/// Standard normal cumulative distribution, to full double precision in the
+/// tails (via `erfc`), where the option-book probabilities live.
 pub fn normal_cdf(x: f64) -> f64 {
-    0.5 * (1.0 + erf(x / std::f64::consts::SQRT_2))
+    0.5 * libm::erfc(-x / std::f64::consts::SQRT_2)
 }
 
-/// Abramowitz & Stegun 7.1.26: absolute error below 1.5e-7, which is far
-/// inside the precision any premium here is quoted to.
-fn erf(x: f64) -> f64 {
-    let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let x = x.abs();
-    let t = 1.0 / (1.0 + 0.327_591_1 * x);
-    let poly = ((((1.061_405_429 * t - 1.453_152_027) * t) + 1.421_413_741) * t
-        - 0.284_496_736)
-        * t
-        + 0.254_829_592;
-    sign * (1.0 - poly * t * (-x * x).exp())
+/// Standard normal density.
+pub fn normal_pdf(x: f64) -> f64 {
+    (-x * x / 2.0).exp() / (2.0 * std::f64::consts::PI).sqrt()
 }
 
 /// What the contract pays if it expired right now.

@@ -181,7 +181,7 @@ public final class KernelStrategy: @unchecked Sendable {
         }
     }
 
-    fileprivate static func take(_ error: inout UnsafeMutablePointer<CChar>?) -> String? {
+    static func take(_ error: inout UnsafeMutablePointer<CChar>?) -> String? {
         guard let pointer = error else { return nil }
         defer {
             ms_string_free(pointer)

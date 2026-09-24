@@ -21,9 +21,11 @@ enum Theme {
         static let secondary = Font.system(size: 11)
         static let secondaryMedium = Font.system(size: 11, weight: .medium)
         /// Labels above numbers, footnotes. The smallest size used anywhere.
-        static let caption = Font.system(size: 10)
-        static let captionMedium = Font.system(size: 10, weight: .medium)
-        static let captionBold = Font.system(size: 10, weight: .bold)
+        static let caption = Font.system(size: captionSize)
+        static let captionMedium = Font.system(size: captionSize, weight: .medium)
+        static let captionBold = Font.system(size: captionSize, weight: .bold)
+        /// The caption size itself, for text AppKit draws (`AgeView`).
+        static let captionSize: CGFloat = 10
         /// Big figures: account equity, the instrument price.
         static let hero = Font.system(size: 28, weight: .medium, design: .rounded)
         static let heroSmall = Font.system(size: 20, weight: .medium, design: .rounded)
