@@ -163,6 +163,52 @@ enum CheckupText {
         }
     }
 
+    /// A leg's heading: side, size, and whether its liquidation is its own.
+    static func legTitle(_ position: LiveSnapshot.Position) -> String {
+        let side = position.isShort ? "空头腿" : "多头腿"
+        let mode = position.marginMode == "isolated" ? "逐仓" : (position.marginMode == "cross" ? "全仓" : nil)
+        return ([side, "\(PriceFormatter.plain(abs(position.contracts))) 张", mode].compactMap { $0 }).joined(separator: " · ")
+    }
+
+    /// Net notional with its direction, e.g. `净空 $3,955`.
+    static func netNotional(_ exposure: LiveSnapshot.Exposure, hedged: Bool) -> String {
+        let amount = PriceFormatter.money(abs(exposure.netNotional))
+        guard hedged else { return amount }
+        if exposure.netNotional == 0 { return "完全对冲 $0" }
+        return (exposure.netNotional > 0 ? "净多 " : "净空 ") + amount
+    }
+
+    /// What a liquidation on one isolated leg leaves behind: the other leg,
+    /// unhedged. Nil unless at least one leg is isolated with a known price.
+    static func nakedLegs(_ positions: [LiveSnapshot.Position]) -> String? {
+        let lines = positions.compactMap { leg -> String? in
+            guard leg.isIsolated, let liquidation = leg.liquidationPrice else { return nil }
+            let others = positions.filter { $0.isShort != leg.isShort }
+            guard !others.isEmpty else { return nil }
+            let left = others.map { "\($0.isShort ? "空" : "多") \(PriceFormatter.plain(abs($0.contracts))) 张" }.joined(separator: "、")
+            return "\(leg.isShort ? "空头腿" : "多头腿")在 \(price(liquidation)) 被强平后，剩下的\(left)就没有对冲了"
+        }
+        guard !lines.isEmpty else { return nil }
+        return lines.joined(separator: "；") + "。上面的净敞口只在两条腿都还在时成立。"
+    }
+
+    /// `买入平空`, `卖出开空` …: what a standalone order does when it fires.
+    static func orderDirection(side: String?, posSide: String?) -> String {
+        let verb = side == "buy" ? "买入" : (side == "sell" ? "卖出" : "—")
+        switch (side, posSide) {
+        case ("buy", "long"): return "买入开多"
+        case ("sell", "long"): return "卖出平多"
+        case ("sell", "short"): return "卖出开空"
+        case ("buy", "short"): return "买入平空"
+        default: return verb
+        }
+    }
+
+    static func orderSize(_ order: LiveSnapshot.Protective) -> String {
+        order.size.map { PriceFormatter.plain($0) }
+            ?? order.fraction.map { String(format: "全仓 × %.0f%%", $0 * 100) } ?? "—"
+    }
+
     static func bufferTint(_ buffer: Double?) -> Color {
         guard let buffer else { return .primary }
         if buffer < 5 { return Theme.down }
@@ -234,16 +280,21 @@ private struct RiskCard: View {
             let offset = model.clock?.offsetMs ?? 0
             Card(
                 title: "持仓风险",
-                subtitle: risk.position?.instId ?? (risk.wasRead ? "无持仓" : nil)
+                subtitle: risk.positions.isEmpty
+                    ? (risk.wasRead ? "无持仓" : nil)
+                    : risk.instId + (risk.isHedged ? " · 多空双向" : "")
             ) {
                 HStack(spacing: 6) {
                     Text(CheckupText.source(risk.source)).font(Theme.Text.caption).foregroundStyle(.secondary)
                     if let ms = risk.positionsMs { AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: 10_000) }
-                    if let position = risk.position {
+                    // One ticket per leg: closing a long/short account's short
+                    // must not open on its long.
+                    ForEach(risk.positions) { position in
                         CloseHoldingButton(
                             appState: appState,
                             request: appState.closeTicket(instId: position.instId, isLong: !position.isShort, on: .okx),
-                            title: "平仓 / 止盈止损")
+                            title: risk.positions.count > 1
+                                ? "\(position.isShort ? "平空" : "平多") / 止盈止损" : "平仓 / 止盈止损")
                     }
                 }
             } content: {
@@ -251,8 +302,15 @@ private struct RiskCard: View {
                     if let fallbackError = model.fallbackError {
                         InlineNotice(kind: .warning, message: "账户推送不可用，CLI 读取也失败了：\(fallbackError)")
                     }
-                    if let position = risk.position {
-                        tiles(position, risk: risk, offset: offset)
+                    if !risk.positions.isEmpty {
+                        instrumentTiles(risk, offset: offset)
+                        if risk.isHedged, let notice = CheckupText.nakedLegs(risk.positions) {
+                            InlineNotice(kind: .warning, title: "两条腿各自逐仓", message: notice)
+                        }
+                        ForEach(risk.positions) { position in
+                            leg(position, risk: risk, offset: offset)
+                        }
+                        unattached(risk, offset: offset)
                     } else if risk.wasRead {
                         EmptyState(icon: "checkmark.shield", title: "当前没有持仓",
                                    message: "开仓后这里显示强平距离、敞口与强平概率。")
@@ -267,8 +325,54 @@ private struct RiskCard: View {
         }
     }
 
+    /// What the instrument as a whole risks: every leg netted for price,
+    /// summed for margin.
     @ViewBuilder
-    private func tiles(_ position: LiveSnapshot.Position, risk: LiveSnapshot.Risk, offset: Double) -> some View {
+    private func instrumentTiles(_ risk: LiveSnapshot.Risk, offset: Double) -> some View {
+        let single = risk.positions.count == 1 ? risk.positions.first : nil
+        HStack(spacing: 8) {
+            StatTile(
+                label: "实际杠杆",
+                value: risk.exposure.map { String(format: "%.1fx", $0.effectiveLeverage) } ?? "—",
+                caption: risk.isHedged
+                    ? risk.exposure.map { String(format: "按净额；总名义 %.1fx", $0.grossLeverage) }
+                    : single?.leverageSetting.map { "合约设置 \(PriceFormatter.plain($0))x" },
+                help: "名义 ÷ 权益。决定生死的是这个，不是合约上的倍数。多空同时持有时，价格风险看净额，保证金和一条腿被强平后的裸仓看总额")
+            if let exposure = risk.exposure {
+                StatTile(
+                    label: risk.isHedged ? "净敞口（名义）" : "敞口（名义）",
+                    value: CheckupText.netNotional(exposure, hedged: risk.isHedged),
+                    caption: risk.isHedged
+                        ? "多 \(PriceFormatter.money(exposure.longNotional)) · 空 \(PriceFormatter.money(exposure.shortNotional))"
+                        : "权益 \(PriceFormatter.money(exposure.equity))")
+                StatTile(
+                    label: "标的每涨 1%", value: PriceFormatter.money(exposure.pnlPerOnePercentRise),
+                    tint: CheckupText.pnlTint(exposure.pnlPerOnePercentRise),
+                    caption: String(format: "权益的 %.1f%%", exposure.onePercentAsEquityPct))
+            }
+            StatTile(
+                label: "标记价", value: risk.mark.map { CheckupText.price($0.price) } ?? "—",
+                caption: risk.mark?.source == "okx.mark-price" ? "实时标记价推送" : "来自最近一次持仓推送")
+        }
+        if let ms = risk.mark?.ms {
+            HStack(spacing: 6) {
+                Text("标记价").font(Theme.Text.caption).foregroundStyle(.secondary)
+                AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: 8_000)
+                Text("· OKX 标记价的时间戳本身约晚 4 秒（2026-09-23 实测），不是本机延迟")
+                    .font(Theme.Text.caption).foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    /// One leg: its own liquidation, odds and protection.
+    @ViewBuilder
+    private func leg(_ position: LiveSnapshot.Position, risk: LiveSnapshot.Risk, offset: Double) -> some View {
+        if risk.positions.count > 1 {
+            Divider()
+            Text(CheckupText.legTitle(position))
+                .font(Theme.Text.captionMedium)
+                .foregroundStyle(position.isShort ? Theme.down : Theme.up)
+        }
         HStack(spacing: 8) {
             StatTile(
                 label: "方向 / 张数",
@@ -285,49 +389,23 @@ private struct RiskCard: View {
                 caption: position.liquidationPrice.map { "强平 \(CheckupText.price($0))" },
                 help: "标记价要走多远才触发强平，按实时标记价算")
             StatTile(
-                label: "实际杠杆",
-                value: risk.exposure.map { String(format: "%.1fx", $0.effectiveLeverage) } ?? "—",
-                caption: position.leverageSetting.map { "合约设置 \(PriceFormatter.plain($0))x" },
-                help: "名义 ÷ 权益。决定生死的是这个，不是合约上的倍数")
-        }
-        HStack(spacing: 8) {
-            if let exposure = risk.exposure {
-                StatTile(
-                    label: "敞口（名义）", value: PriceFormatter.money(exposure.notional),
-                    caption: "权益 \(PriceFormatter.money(exposure.equity))")
-                StatTile(
-                    label: "标的每动 1%", value: PriceFormatter.money(exposure.lossPerOnePercent),
-                    caption: String(format: "权益的 %.1f%%", exposure.onePercentAsEquityPct))
-            }
-            StatTile(
                 label: "资金费累计", value: position.fundingFee.map { PriceFormatter.money($0) } ?? "—",
                 tint: CheckupText.pnlTint(position.fundingFee ?? 0), caption: "这个仓位至今")
-            StatTile(
-                label: "标记价", value: position.markPrice.map { CheckupText.price($0) } ?? "—",
-                caption: position.markSource == "okx.mark-price" ? "实时标记价推送" : "来自最近一次持仓推送",
-                help: position.maintenanceMargin.map { "维持保证金 \(PriceFormatter.money($0))" })
-        }
-        if let markMs = position.markMs {
-            HStack(spacing: 6) {
-                Text("标记价").font(Theme.Text.caption).foregroundStyle(.secondary)
-                AgeLabel(ms: markMs, offsetMs: offset, staleAfterMs: 8_000)
-                Text("· OKX 标记价的时间戳本身约晚 4 秒（2026-09-23 实测），不是本机延迟")
-                    .font(Theme.Text.caption).foregroundStyle(.tertiary)
-            }
         }
         if let ratio = position.marginRatio {
             // The exchange's own health figure — the one it would act on.
             StatTile(
                 label: "交易所保证金率", value: String(format: "%.2f", ratio),
                 tint: ratio < 15 ? Theme.warning : .primary,
-                caption: "交易所自己的口径，越低越接近强平",
+                caption: "交易所自己的口径，越低越接近强平"
+                    + (position.maintenanceMargin.map { " · 维持保证金 \(PriceFormatter.money($0))" } ?? ""),
                 help: "与「强平缓冲」不同：缓冲是价格距离，这是保证金健康度")
         }
-        if !risk.liquidationOdds.isEmpty {
-            Text("强平概率（在强平价处读期权曲线；触及按 put–call 对称静态复制）")
+        if !position.liquidationOdds.isEmpty {
+            Text("强平概率（在这条腿的强平价处读期权曲线；触及按 put–call 对称静态复制）")
                 .font(Theme.Text.captionMedium).foregroundStyle(.secondary)
             HStack(spacing: 8) {
-                ForEach(risk.liquidationOdds) { odds in
+                ForEach(position.liquidationOdds) { odds in
                     StatTile(
                         label: "\(Int(odds.hours / 24)) 天内触及",
                         value: String(format: "%.1f%%", odds.touching * 100),
@@ -350,7 +428,7 @@ private struct RiskCard: View {
             // Not read yet (or never readable) is not "none".
             InlineNotice(kind: .info, message: risk.stopsError.map { "条件单读取失败：\($0)" } ?? "正在读取条件单…")
         } else if position.protective.isEmpty {
-            InlineNotice(kind: .warning, message: "没有止盈止损单——仓位在交易所侧没有自动保护。")
+            InlineNotice(kind: .warning, message: "\(risk.positions.count > 1 ? (position.isShort ? "空头腿" : "多头腿") : "仓位")没有止盈止损单——在交易所侧没有自动保护。")
         } else {
             HStack(spacing: 6) {
                 Text("止盈止损").font(Theme.Text.captionMedium).foregroundStyle(.secondary)
@@ -364,13 +442,38 @@ private struct RiskCard: View {
                 GridText(order.kind)
                 GridText(order.stopPrice.map { CheckupText.price($0) } ?? "—", alignment: .trailing)
                 GridText(order.takeProfitPrice.map { CheckupText.price($0) } ?? "—", alignment: .trailing)
-                GridText(order.size.map { PriceFormatter.plain($0) }
-                         ?? order.fraction.map { String(format: "全仓 × %.0f%%", $0 * 100) } ?? "—",
-                         alignment: .trailing)
+                GridText(CheckupText.orderSize(order), alignment: .trailing)
             }
             if let error = risk.stopsError {
                 InlineNotice(kind: .warning, message: "最近一次条件单读取失败，下面是上一次成功读到的：\(error)")
             }
+        }
+    }
+
+    /// Orders on this instrument that close no leg. Shown apart, so a
+    /// trigger that would open or add is never read as protection.
+    @ViewBuilder
+    private func unattached(_ risk: LiveSnapshot.Risk, offset: Double) -> some View {
+        if !risk.unattachedOrders.isEmpty {
+            Divider()
+            HStack(spacing: 6) {
+                Text("不平任何持仓的条件单（\(risk.unattachedOrders.count) 张）")
+                    .font(Theme.Text.captionMedium).foregroundStyle(.secondary)
+                if let ms = risk.stopsMs { AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: risk.stopsStaleAfterMs) }
+            }
+            DataGrid(
+                columns: [.init(title: "类型"), .init(title: "方向"), .init(title: "止损触发", alignment: .trailing),
+                          .init(title: "止盈触发", alignment: .trailing), .init(title: "数量", alignment: .trailing)],
+                rows: risk.unattachedOrders
+            ) { order in
+                GridText(order.kind)
+                GridText(CheckupText.orderDirection(side: order.side, posSide: order.posSide))
+                GridText(order.stopPrice.map { CheckupText.price($0) } ?? "—", alignment: .trailing)
+                GridText(order.takeProfitPrice.map { CheckupText.price($0) } ?? "—", alignment: .trailing)
+                GridText(CheckupText.orderSize(order), alignment: .trailing)
+            }
+            Text("这些单子触发后是开仓或加仓，不会减少上面任何一条腿——它们不算保护。")
+                .font(Theme.Text.caption).foregroundStyle(.tertiary)
         }
     }
 }

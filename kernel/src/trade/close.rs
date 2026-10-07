@@ -223,7 +223,7 @@ pub struct Holding {
 impl Holding {
     /// The side that closes this: a long is sold, a short bought back.
     pub fn closing_side(&self) -> Side {
-        if self.is_long { Side::Sell } else { Side::Buy }
+        Side::closing(self.is_long)
     }
 
     pub fn action_label(&self) -> &'static str {

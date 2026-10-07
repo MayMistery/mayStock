@@ -156,15 +156,18 @@ struct LiveKernelGoldenTests {
         #expect(row.maxPain != nil && row.pBeyondMaxPain != nil)
 
         let risk = snapshot.risk
-        let position = try #require(risk.position)
+        #expect(risk.positions.count == 1)
+        let position = try #require(risk.positions.first)
         #expect(risk.source == "okx.private" && risk.wasRead)
-        #expect(position.markSource == "okx.mark-price" && position.markPrice == 2721.3)
+        #expect(risk.mark?.source == "okx.mark-price" && risk.mark?.price == 2721.3)
         #expect(Set(position.protective.map(\.kind)) == ["仓位止盈止损", "条件单"])
         let standalone = try #require(position.protective.first { $0.algoId == "s1" })
         #expect(standalone.stopPrice == 2580 && standalone.takeProfitPrice == nil && standalone.size == 187.75)
-        #expect(risk.liquidationOdds.count == 3)
-        #expect(risk.liquidationOdds.allSatisfy { $0.touching >= $0.atHorizon })
+        #expect(risk.unattachedOrders.isEmpty)
+        #expect(position.liquidationOdds.count == 3)
+        #expect(position.liquidationOdds.allSatisfy { $0.touching >= $0.atHorizon })
         #expect(abs((risk.exposure?.effectiveLeverage ?? 0) - 51_090 / 6773.9) < 1e-9)
+        #expect(risk.exposure?.netNotional == 51_090 && risk.exposure?.grossNotional == 51_090)
 
         let okxVenue = try #require(snapshot.structure.first { $0.venue == "OKX" })
         #expect(okxVenue.fundingRate?.value == 0.0001)

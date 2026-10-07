@@ -24,6 +24,7 @@ use super::schwab::{self, SchwabSource};
 use super::{Effect, Feed, FeedState, LiveConfig, Update};
 use crate::gravity::{self, StrikeInterest};
 use crate::trade::reads::{self, Book, WorkingOrder};
+use crate::trade::wire::PosSide;
 use crate::trade::Delivery;
 use crate::implied::{self, Smile, SmilePoint};
 
@@ -1028,47 +1029,110 @@ impl State {
             Some(FeedState::Refused(_)) | Some(FeedState::Off(_)) | None => true,
             _ => self.private_down_since.is_some_and(|since| now - since > PRIVATE_GRACE_MS),
         };
+        let mut held: Vec<String> = Vec::new();
+        for row in self.positions.values() {
+            if !held.contains(&row.inst_id) {
+                held.push(row.inst_id.clone());
+            }
+        }
         let mut view = RiskView {
             source,
             note,
             fallback_needed,
             inst_id: self.inst_id.clone(),
             positions_ms: self.positions_local_ms.map(|ms| self.to_server(ms)),
-            held: self.positions.values().map(|r| r.inst_id.clone()).collect(),
-            position: None,
+            held,
+            positions: Vec::new(),
+            mark: None,
             equity: self.equity.map(|(value, ms)| StampView { value, ms: self.to_server(ms) }),
             exposure: None,
-            liquidation_odds: Vec::new(),
+            unattached_orders: Vec::new(),
             stops_ms: self.stops.as_ref().map(|(_, ms)| self.to_server(*ms)),
             stops_stale_after_ms: Feed::OkxStops.stale_after_ms(),
             stops_error: self.stops_error.clone(),
         };
-        let Some(row) = self.positions.values().find(|r| r.inst_id == self.inst_id) else { return view };
-        let is_short = row.pos_side == "short" || row.contracts < 0.0;
-        let (mark, mark_ms, mark_source) = match (self.okx_mark, row.mark_price) {
-            (Some(live), _) => (Some(live.value), Some(live.ms), "okx.mark-price"),
-            (None, Some(m)) => (Some(m), self.positions_local_ms.map(|ms| self.to_server(ms)), "position"),
-            _ => (None, None, "none"),
+        // One instrument can hold more than one leg — a long/short account
+        // holds both sides of it at once — and every leg is shown: a page
+        // that picked one would hide the other leg's liquidation price.
+        let mut legs: Vec<&PositionRow> = self.positions.values().filter(|r| r.inst_id == self.inst_id).collect();
+        if legs.is_empty() {
+            return view;
+        }
+        legs.sort_by_key(|r| (r.contracts < 0.0, r.key.clone()));
+        // One instrument, one mark: the live stream, else the last push.
+        view.mark = match self.okx_mark {
+            Some(live) => Some(MarkView { price: live.value, ms: Some(live.ms), source: "okx.mark-price" }),
+            None => legs.iter().find_map(|r| r.mark_price).map(|price| MarkView {
+                price,
+                ms: self.positions_local_ms.map(|ms| self.to_server(ms)),
+                source: "position",
+            }),
         };
-        let notional = row.notional_usd.unwrap_or(0.0);
-        let base_quantity = match (row.mark_price, mark) {
-            (Some(m), _) | (None, Some(m)) if m > 0.0 => notional / m,
+        let mark = view.mark.as_ref().map(|m| m.price);
+        // Each horizon reads total variance blended between the expiries
+        // either side of it — see `implied::term_smile`.
+        let mut by_maturity: Vec<(i64, &Smile)> = smiles.iter().map(|(expiry, live)| (*expiry, &live.smile)).collect();
+        by_maturity.sort_by(|a, b| a.1.years().total_cmp(&b.1.years()));
+        let orders: Vec<&WorkingOrder> =
+            self.stops.iter().flat_map(|(orders, _)| orders.iter()).filter(|o| o.inst_id == self.inst_id).collect();
+        let (mut long_notional, mut short_notional, mut margin) = (0.0, 0.0, 0.0);
+        for row in &legs {
+            let is_long = row.contracts > 0.0;
+            let notional = row.notional_usd.unwrap_or(0.0).abs();
+            if is_long { long_notional += notional } else { short_notional += notional }
+            margin += row.margin.unwrap_or(0.0);
+            let leg = PosSide::from_venue(Some(&row.pos_side));
+            let closing: Vec<&WorkingOrder> =
+                orders.iter().copied().filter(|o| leg.is_some_and(|leg| o.closes(&row.inst_id, leg, is_long))).collect();
+            view.positions.push(self.leg_view(row, mark, &by_maturity, &closing));
+        }
+        // Orders on this instrument that close no held leg: an entry trigger,
+        // or protection left behind by a leg since closed. Listed, so a stop
+        // that protects nothing is never mistaken for one that does.
+        view.unattached_orders = orders
+            .iter()
+            .filter(|o| {
+                !legs.iter().any(|r| {
+                    PosSide::from_venue(Some(&r.pos_side)).is_some_and(|leg| o.closes(&r.inst_id, leg, r.contracts > 0.0))
+                })
+            })
+            .map(|o| order_view(o))
+            .collect();
+        if let Some((equity, _)) = self.equity {
+            let exposure = gravity::Exposure { long_notional, short_notional, equity, margin };
+            view.exposure = Some(ExposureView {
+                long_notional,
+                short_notional,
+                net_notional: exposure.net_notional(),
+                gross_notional: exposure.gross_notional(),
+                equity,
+                margin,
+                effective_leverage: exposure.effective_leverage(),
+                gross_leverage: exposure.gross_leverage(),
+                pnl_per_one_percent_rise: exposure.pnl_per_one_percent_rise(),
+                one_percent_as_equity_pct: exposure.one_percent_as_equity_pct(),
+                margin_as_equity_pct: exposure.margin_as_equity_pct(),
+            });
+        }
+        view
+    }
+
+    /// One leg as the page shows it: its own liquidation price, buffer and
+    /// odds, and the orders that close it.
+    fn leg_view(&self, row: &PositionRow, mark: Option<f64>, by_maturity: &[(i64, &Smile)], closing: &[&WorkingOrder]) -> PositionView {
+        let is_short = row.contracts < 0.0;
+        let notional = row.notional_usd.unwrap_or(0.0).abs();
+        let base_quantity = match row.mark_price.or(mark) {
+            Some(m) if m > 0.0 => notional / m,
             _ => 0.0,
         };
-        let buffer = match (mark, row.liquidation_price) {
-            (Some(m), Some(liq)) => gravity::liquidation_buffer(m, liq, is_short),
-            _ => None,
-        };
+        let mut liquidation_odds = Vec::new();
         if let (Some(m), Some(liq)) = (mark, row.liquidation_price) {
-            // Each horizon reads total variance blended between the expiries
-            // either side of it — see `implied::term_smile`.
-            let mut by_maturity: Vec<(i64, &Smile)> = smiles.iter().map(|(expiry, live)| (*expiry, &live.smile)).collect();
-            by_maturity.sort_by(|a, b| a.1.years().total_cmp(&b.1.years()));
             for hours in implied::LIQUIDATION_HORIZONS {
                 let years = hours / (365.0 * 24.0);
-                let Some((curve, near, far)) = implied::term_smile(&by_maturity, years) else { continue };
+                let Some((curve, near, far)) = implied::term_smile(by_maturity, years) else { continue };
                 if let Some(odds) = implied::liquidation_odds(liq, &curve, m, years, is_short) {
-                    view.liquidation_odds.push(OddsView {
+                    liquidation_odds.push(OddsView {
                         hours,
                         at_horizon: odds.at_horizon,
                         touching: odds.touching,
@@ -1084,31 +1148,22 @@ impl State {
                 }
             }
         }
-        if let Some((equity, _)) = self.equity {
-            let exposure = gravity::Exposure { notional, equity, margin: row.margin.unwrap_or(0.0) };
-            view.exposure = Some(ExposureView {
-                notional,
-                equity,
-                margin: exposure.margin,
-                effective_leverage: exposure.effective_leverage(),
-                loss_per_one_percent: exposure.loss_per_one_percent(),
-                one_percent_as_equity_pct: exposure.one_percent_as_equity_pct(),
-                margin_as_equity_pct: exposure.margin_as_equity_pct(),
-            });
-        }
-        view.position = Some(PositionView {
+        PositionView {
+            key: row.key.clone(),
             inst_id: row.inst_id.clone(),
             pos_side: row.pos_side.clone(),
+            margin_mode: row.margin_mode.clone(),
             contracts: row.contracts,
             base_quantity,
             is_short,
             average_price: row.average_price,
-            mark_price: mark,
-            mark_ms,
-            mark_source,
             unrealised_pnl: row.unrealised_pnl,
             liquidation_price: row.liquidation_price,
-            liquidation_buffer_pct: buffer,
+            liquidation_buffer_pct: match (mark, row.liquidation_price) {
+                (Some(m), Some(liq)) => gravity::liquidation_buffer(m, liq, is_short),
+                _ => None,
+            },
+            liquidation_odds,
             margin: row.margin,
             maintenance_margin: row.maintenance_margin,
             margin_ratio: row.margin_ratio,
@@ -1125,19 +1180,13 @@ impl State {
                     size: None,
                     fraction: p.fraction,
                     kind: "仓位止盈止损",
+                    side: None,
+                    pos_side: None,
                 })
-                .chain(self.stops.iter().flat_map(|(orders, _)| orders.iter()).filter(|o| o.inst_id == row.inst_id).map(|o| ProtectiveView {
-                    algo_id: o.id.clone(),
-                    stop_price: o.stop_trigger_price,
-                    take_profit_price: o.take_profit_trigger_price,
-                    size: o.size,
-                    fraction: None,
-                    kind: if o.ord_type == "oco" { "OCO 条件单" } else { "条件单" },
-                }))
+                .chain(closing.iter().map(|o| order_view(o)))
                 .collect(),
             updated_ms: row.updated_ms,
-        });
-        view
+        }
     }
 
     fn okx_structure(&self, now: i64) -> VenueStructure {
@@ -1491,11 +1540,17 @@ struct RiskView {
     fallback_needed: bool,
     inst_id: String,
     positions_ms: Option<i64>,
+    /// Every instrument the account holds, each once.
     held: Vec<String>,
-    position: Option<PositionView>,
+    /// Every leg held on `inst_id`, longs first: one on a one-way account,
+    /// two when a long/short account holds both sides.
+    positions: Vec<PositionView>,
+    /// The instrument's mark, which every leg's buffer and odds are read at.
+    mark: Option<MarkView>,
     equity: Option<StampView>,
     exposure: Option<ExposureView>,
-    liquidation_odds: Vec<OddsView>,
+    /// Conditional orders on `inst_id` that close none of its legs.
+    unattached_orders: Vec<ProtectiveView>,
     /// When pending stops were last read, and why the last read failed.
     stops_ms: Option<i64>,
     /// The stops feed's stale age, for `stops_ms`.
@@ -1505,19 +1560,30 @@ struct RiskView {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct MarkView {
+    price: f64,
+    ms: Option<i64>,
+    /// `okx.mark-price` (the live stream) or `position` (the last push).
+    source: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PositionView {
+    /// The venue's id for this leg.
+    key: String,
     inst_id: String,
     pos_side: String,
+    /// `cross` or `isolated`: whether this leg's liquidation price is its own.
+    margin_mode: Option<String>,
     contracts: f64,
     base_quantity: f64,
     is_short: bool,
     average_price: Option<f64>,
-    mark_price: Option<f64>,
-    mark_ms: Option<i64>,
-    mark_source: &'static str,
     unrealised_pnl: Option<f64>,
     liquidation_price: Option<f64>,
     liquidation_buffer_pct: Option<f64>,
+    liquidation_odds: Vec<OddsView>,
     margin: Option<f64>,
     maintenance_margin: Option<f64>,
     margin_ratio: Option<f64>,
@@ -1538,16 +1604,41 @@ struct ProtectiveView {
     size: Option<f64>,
     fraction: Option<f64>,
     kind: &'static str,
+    /// A standalone order's side and leg, as the venue reports them.
+    side: Option<String>,
+    pos_side: Option<String>,
+}
+
+/// A standalone conditional order as the risk card lists it.
+fn order_view(order: &WorkingOrder) -> ProtectiveView {
+    ProtectiveView {
+        algo_id: order.id.clone(),
+        stop_price: order.stop_trigger_price,
+        take_profit_price: order.take_profit_trigger_price,
+        size: order.size,
+        fraction: order.close_fraction,
+        kind: if order.ord_type == "oco" { "OCO 条件单" } else { "条件单" },
+        side: Some(order.side.clone()),
+        pos_side: order.pos_side.clone(),
+    }
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ExposureView {
-    notional: f64,
+    long_notional: f64,
+    short_notional: f64,
+    /// Long minus short: positive when net long.
+    net_notional: f64,
+    gross_notional: f64,
     equity: f64,
     margin: f64,
+    /// Net notional over equity.
     effective_leverage: f64,
-    loss_per_one_percent: f64,
+    /// Gross notional over equity.
+    gross_leverage: f64,
+    /// P&L from a 1% rise; negative when net short.
+    pnl_per_one_percent_rise: f64,
     one_percent_as_equity_pct: f64,
     margin_as_equity_pct: f64,
 }
@@ -2068,5 +2159,92 @@ mod tests {
         let recovered = snapshot(&state, NOW + 3_000);
         assert!(recovered["predictions"]["topics"][0]["error"].is_null());
         assert_eq!(lines(&recovered), 2, "and one for the recovery");
+    }
+
+    /// The live account on 2026-10-07: one perpetual, both legs, each
+    /// isolated with its own liquidation price.
+    const HEDGED: &str = r#"{"data":[
+        {"posId":"P-SHORT","instId":"ETH-USDT-SWAP","instType":"SWAP","posSide":"short","pos":"83.32","avgPx":"2593.37","markPx":"2562.78","upl":"254.88","lever":"10","liqPx":"2840.06","notionalUsd":"21344.11","mgnMode":"isolated","margin":"2160.80","mgnRatio":"25.42"},
+        {"posId":"P-LONG","instId":"ETH-USDT-SWAP","instType":"SWAP","posSide":"long","pos":"67.88","avgPx":"2617.5","markPx":"2562.78","upl":"-371.44","lever":"10","liqPx":"2366.31","notionalUsd":"17388.84","mgnMode":"isolated","margin":"1776.59","mgnRatio":"18.15"}
+    ]}"#;
+
+    fn hedged() -> State {
+        let mut state = state();
+        okx_index(&mut state, 2562.78, NOW - 800);
+        surface(&mut state);
+        state.ingest("cli.positions", HEDGED, NOW).unwrap();
+        state.ingest("cli.account", r#"{"data":[{"totalEq":"7000"}]}"#, NOW).unwrap();
+        state
+    }
+
+    #[test]
+    fn every_leg_held_on_the_instrument_is_shown_with_its_own_liquidation() {
+        let snapshot = snapshot(&hedged(), NOW);
+        let risk = &snapshot["risk"];
+        let held: Vec<Value> = serde_json::from_str::<Value>(HEDGED).unwrap()["data"].as_array().unwrap().clone();
+        let legs = risk["positions"].as_array().unwrap();
+        assert_eq!(legs.len(), held.len(), "every leg the account holds, not the first one found");
+        assert_eq!(risk["held"], serde_json::json!(["ETH-USDT-SWAP"]), "an instrument held on two legs is still one instrument");
+        assert_eq!(legs[0]["posSide"], "long", "longs first");
+        for row in &held {
+            let leg = legs.iter().find(|l| l["key"] == row["posId"]).unwrap();
+            let liq: f64 = row["liqPx"].as_str().unwrap().parse().unwrap();
+            assert_eq!(leg["liquidationPrice"].as_f64(), Some(liq));
+            assert_eq!(leg["isShort"], row["posSide"] == "short");
+            assert_eq!(leg["marginMode"], "isolated");
+            assert!(leg["liquidationBufferPct"].as_f64().unwrap() > 0.0, "{}: the buffer points away from the mark", row["posSide"]);
+            assert_eq!(leg["liquidationOdds"].as_array().unwrap().len(), implied::LIQUIDATION_HORIZONS.len(), "{}: each leg has its own odds", row["posSide"]);
+        }
+        let (long, short) = (&legs[0]["liquidationOdds"][0], &legs[1]["liquidationOdds"][0]);
+        assert!(long["touching"] != short["touching"], "read at each leg's own liquidation price");
+        assert_eq!(risk["mark"]["price"].as_f64(), Some(2562.78));
+
+        let exposure = &risk["exposure"];
+        assert!((exposure["netNotional"].as_f64().unwrap() + 3_955.27).abs() < 0.01, "net short");
+        assert!((exposure["grossNotional"].as_f64().unwrap() - 38_732.95).abs() < 0.01);
+        assert!((exposure["margin"].as_f64().unwrap() - 3_937.39).abs() < 0.01, "both legs' margin");
+        assert!(exposure["pnlPerOnePercentRise"].as_f64().unwrap() < 0.0);
+    }
+
+    #[test]
+    fn an_order_protects_the_leg_it_closes_and_no_other() {
+        let mut state = hedged();
+        // Two that close a leg, and two on the same instrument that close
+        // neither: a trigger to open more long, and one adding to the short.
+        let stops = r#"{"code":"0","data":[
+            {"algoId":"CLOSE-LONG","instId":"ETH-USDT-SWAP","ordType":"conditional","side":"sell","posSide":"long","sz":"67.88","slTriggerPx":"2450","slOrdPx":"-1","state":"live"},
+            {"algoId":"CLOSE-SHORT","instId":"ETH-USDT-SWAP","ordType":"oco","side":"buy","posSide":"short","sz":"83.32","slTriggerPx":"2700","slOrdPx":"-1","tpTriggerPx":"2450","tpOrdPx":"-1","state":"live"},
+            {"algoId":"OPEN-LONG","instId":"ETH-USDT-SWAP","ordType":"conditional","side":"buy","posSide":"long","sz":"10","slTriggerPx":"2700","slOrdPx":"-1","state":"live"},
+            {"algoId":"ADD-SHORT","instId":"ETH-USDT-SWAP","ordType":"conditional","side":"sell","posSide":"short","sz":"10","slTriggerPx":"2500","slOrdPx":"-1","state":"live"},
+            {"algoId":"OTHER","instId":"BTC-USDT-SWAP","ordType":"conditional","side":"sell","posSide":"long","sz":"1","slTriggerPx":"80000","slOrdPx":"-1","state":"live"}
+        ]}"#;
+        state.ingest("rest.okx.stops", stops, NOW).unwrap();
+        let snapshot = snapshot(&state, NOW);
+        let ids = |orders: &Value| -> Vec<String> { orders.as_array().unwrap().iter().map(|o| o["algoId"].as_str().unwrap().to_string()).collect() };
+        let legs = snapshot["risk"]["positions"].as_array().unwrap();
+        assert_eq!(ids(&legs[0]["protective"]), ["CLOSE-LONG"]);
+        assert_eq!(ids(&legs[1]["protective"]), ["CLOSE-SHORT"]);
+        let mut unattached = ids(&snapshot["risk"]["unattachedOrders"]);
+        unattached.sort();
+        assert_eq!(unattached, ["ADD-SHORT", "OPEN-LONG"], "listed apart, never shown as protection; other instruments are not this card's");
+        assert_eq!(snapshot["risk"]["unattachedOrders"][0]["side"].as_str().is_some(), true);
+    }
+
+    #[test]
+    fn a_one_way_account_attributes_by_side_alone() {
+        let mut state = state();
+        state
+            .ingest("cli.positions", r#"{"data":[{"instId":"ETH-USDT-SWAP","instType":"SWAP","posSide":"net","pos":"-12","markPx":"2562.78","liqPx":"2900","notionalUsd":"3075.34","mgnMode":"cross"}]}"#, NOW)
+            .unwrap();
+        let stops = r#"{"code":"0","data":[
+            {"algoId":"STOP","instId":"ETH-USDT-SWAP","ordType":"conditional","side":"buy","posSide":"net","sz":"12","slTriggerPx":"2700","slOrdPx":"-1","state":"live"},
+            {"algoId":"ADD","instId":"ETH-USDT-SWAP","ordType":"conditional","side":"sell","sz":"5","slTriggerPx":"2500","slOrdPx":"-1","state":"live"}
+        ]}"#;
+        state.ingest("rest.okx.stops", stops, NOW).unwrap();
+        let snapshot = snapshot(&state, NOW);
+        let legs = snapshot["risk"]["positions"].as_array().unwrap();
+        assert_eq!(legs.len(), 1);
+        assert_eq!(legs[0]["protective"][0]["algoId"], "STOP", "a buy closes a net short");
+        assert_eq!(snapshot["risk"]["unattachedOrders"][0]["algoId"], "ADD", "a sell adds to it, with or without a posSide");
     }
 }

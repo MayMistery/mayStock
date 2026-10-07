@@ -151,26 +151,44 @@ pub fn liquidation_buffer(mark: f64, liquidation: f64, is_short: bool) -> Option
     Some(if is_short { (liquidation / mark - 1.0) * 100.0 } else { (1.0 - liquidation / mark) * 100.0 })
 }
 
-/// What a position actually risks, as opposed to what its leverage setting
-/// says: notional against equity decides survival, and the contract's own
-/// setting routinely misstates it.
+/// What an instrument's positions actually risk, as opposed to what their
+/// leverage setting says: notional against equity decides survival, and the
+/// contract's own setting routinely misstates it.
+///
+/// Notional is kept per side because one instrument can hold both: a hedged
+/// account's price risk is the difference, while the margin, the fees and
+/// what is left naked when one leg is liquidated all follow the sum.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Exposure {
-    pub notional: f64,
+    pub long_notional: f64,
+    pub short_notional: f64,
     pub equity: f64,
     pub margin: f64,
 }
 
 impl Exposure {
-    pub fn effective_leverage(&self) -> f64 {
-        if self.equity > 0.0 { self.notional / self.equity } else { 0.0 }
+    /// Long minus short: positive when net long.
+    pub fn net_notional(&self) -> f64 {
+        self.long_notional - self.short_notional
     }
-    /// Quote-currency P&L from a 1% move in the underlying.
-    pub fn loss_per_one_percent(&self) -> f64 {
-        self.notional * 0.01
+    pub fn gross_notional(&self) -> f64 {
+        self.long_notional + self.short_notional
+    }
+    /// Net notional over equity: what a move in the price does to the account.
+    pub fn effective_leverage(&self) -> f64 {
+        if self.equity > 0.0 { self.net_notional().abs() / self.equity } else { 0.0 }
+    }
+    /// Gross notional over equity: what margin and a lost leg answer to.
+    pub fn gross_leverage(&self) -> f64 {
+        if self.equity > 0.0 { self.gross_notional() / self.equity } else { 0.0 }
+    }
+    /// Quote-currency P&L from a 1% rise in the underlying: negative when
+    /// net short.
+    pub fn pnl_per_one_percent_rise(&self) -> f64 {
+        self.net_notional() * 0.01
     }
     pub fn one_percent_as_equity_pct(&self) -> f64 {
-        if self.equity > 0.0 { self.loss_per_one_percent() / self.equity * 100.0 } else { 0.0 }
+        if self.equity > 0.0 { self.pnl_per_one_percent_rise().abs() / self.equity * 100.0 } else { 0.0 }
     }
     pub fn margin_as_equity_pct(&self) -> f64 {
         if self.equity > 0.0 { self.margin / self.equity * 100.0 } else { 0.0 }
@@ -277,10 +295,22 @@ mod tests {
 
     #[test]
     fn effective_leverage_is_notional_over_equity() {
-        let exposure = Exposure { notional: 14_586.0, equity: 7_045.0, margin: 1_553.0 };
+        let exposure = Exposure { long_notional: 0.0, short_notional: 14_586.0, equity: 7_045.0, margin: 1_553.0 };
         assert!((exposure.effective_leverage() - 2.07).abs() < 0.01);
-        assert!((exposure.loss_per_one_percent() - 145.86).abs() < 0.01);
-        let broke = Exposure { notional: 1000.0, equity: 0.0, margin: 100.0 };
+        assert!((exposure.pnl_per_one_percent_rise() + 145.86).abs() < 0.01, "a short loses on a rise");
+        let broke = Exposure { long_notional: 1000.0, short_notional: 0.0, equity: 0.0, margin: 100.0 };
         assert_eq!(broke.effective_leverage(), 0.0);
+    }
+
+    #[test]
+    fn a_hedged_instrument_risks_the_difference_and_carries_the_sum() {
+        // The live account on 2026-10-07: ETH-USDT-SWAP long 67.88 and short
+        // 83.32 contracts, each isolated.
+        let exposure = Exposure { long_notional: 17_388.84, short_notional: 21_344.11, equity: 7_000.0, margin: 3_937.39 };
+        assert!((exposure.net_notional() + 3_955.27).abs() < 0.01, "net short");
+        assert!((exposure.gross_notional() - 38_732.95).abs() < 0.01);
+        assert!((exposure.effective_leverage() - 0.565).abs() < 0.001, "price risk is the difference");
+        assert!((exposure.gross_leverage() - 5.533).abs() < 0.001, "margin answers to the sum");
+        assert!((exposure.pnl_per_one_percent_rise() + 39.55).abs() < 0.01);
     }
 }

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::route::{Route, Target};
-use super::wire::Family;
+use super::wire::{Family, PosSide, Side};
 
 /// Everything the kernel reads for the trading path. Closed, like `Action`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -244,6 +244,18 @@ pub struct WorkingOrder {
     pub client_id: Option<String>,
     #[serde(default)]
     pub created_ms: Option<i64>,
+}
+
+impl WorkingOrder {
+    /// Whether this order closes the holding on `inst_id`'s `leg`: the same
+    /// instrument, the same leg, and the side that closes it. An order on the
+    /// other leg, or one that would open or add (a buy on a long), protects
+    /// nothing, however near its trigger sits.
+    pub fn closes(&self, inst_id: &str, leg: PosSide, is_long: bool) -> bool {
+        self.inst_id == inst_id
+            && PosSide::from_venue(self.pos_side.as_deref()) == Some(leg)
+            && self.side == Side::closing(is_long).as_str()
+    }
 }
 
 /// States in which an order is still working. The pending listings return

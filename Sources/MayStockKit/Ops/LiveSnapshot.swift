@@ -88,11 +88,18 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
         public let fallbackNeeded: Bool
         public let instId: String
         public let positionsMs: Int64?
+        /// Every instrument the account holds, each once.
         public let held: [String]
-        public let position: Position?
+        /// Every leg held on `instId`, longs first: one on a one-way account,
+        /// two when a long/short account holds both sides.
+        public let positions: [Position]
+        /// The instrument's mark, which every leg's buffer and odds are read at.
+        public let mark: Mark?
         public let equity: Stamped?
         public let exposure: Exposure?
-        public let liquidationOdds: [Odds]
+        /// Conditional orders on `instId` that close none of its legs: entry
+        /// triggers, or protection left by a leg since closed.
+        public let unattachedOrders: [Protective]
         /// When pending stops were last read; nil until they have been, which
         /// is not the same as "there are none".
         public let stopsMs: Int64?
@@ -103,22 +110,32 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
         /// Positions were actually read — the only state in which "flat" is a
         /// claim this screen may make.
         public var wasRead: Bool { source != "none" && positionsMs != nil }
+        /// Both sides of one instrument at once.
+        public var isHedged: Bool { positions.contains { $0.isShort } && positions.contains { !$0.isShort } }
     }
 
-    public struct Position: Decodable, Sendable, Equatable {
+    public struct Mark: Decodable, Sendable, Equatable {
+        public let price: Double
+        public let ms: Int64?
+        /// `okx.mark-price` (the live stream) or `position` (the last push).
+        public let source: String
+    }
+
+    public struct Position: Decodable, Sendable, Equatable, Identifiable {
+        /// The venue's id for this leg.
+        public let key: String
         public let instId: String
         public let posSide: String
+        /// `cross` or `isolated`: whether this leg's liquidation price is its own.
+        public let marginMode: String?
         public let contracts: Double
         public let baseQuantity: Double
         public let isShort: Bool
         public let averagePrice: Double?
-        public let markPrice: Double?
-        public let markMs: Int64?
-        /// `okx.mark-price` (the live stream) or `position` (the last push).
-        public let markSource: String
         public let unrealisedPnl: Double?
         public let liquidationPrice: Double?
         public let liquidationBufferPct: Double?
+        public let liquidationOdds: [Odds]
         public let margin: Double?
         public let maintenanceMargin: Double?
         public let marginRatio: Double?
@@ -127,6 +144,8 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
         public let fundingFee: Double?
         public let protective: [Protective]
         public let updatedMs: Int64?
+        public var id: String { key }
+        public var isIsolated: Bool { marginMode == "isolated" }
     }
 
     public struct Protective: Decodable, Sendable, Equatable, Identifiable {
@@ -139,15 +158,26 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
         public let fraction: Double?
         /// `仓位止盈止损`, `条件单` or `OCO 条件单`.
         public let kind: String
+        /// A standalone order's side and leg, as the venue reports them.
+        public let side: String?
+        public let posSide: String?
         public var id: String { algoId }
     }
 
     public struct Exposure: Decodable, Sendable, Equatable {
-        public let notional: Double
+        public let longNotional: Double
+        public let shortNotional: Double
+        /// Long minus short: positive when net long.
+        public let netNotional: Double
+        public let grossNotional: Double
         public let equity: Double
         public let margin: Double
+        /// Net notional over equity.
         public let effectiveLeverage: Double
-        public let lossPerOnePercent: Double
+        /// Gross notional over equity.
+        public let grossLeverage: Double
+        /// P&L from a 1% rise; negative when net short.
+        public let pnlPerOnePercentRise: Double
         public let onePercentAsEquityPct: Double
         public let marginAsEquityPct: Double
     }

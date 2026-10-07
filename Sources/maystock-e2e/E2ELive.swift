@@ -108,18 +108,31 @@ extension E2EMain {
         }
         let risk = s.risk
         print("  risk: source \(risk.source) read \(risk.wasRead) held \(risk.held) stops \(age(s, risk.stopsMs))")
-        if let position = risk.position {
-            print(String(format: "    %@ %.2f liq %@ buffer %@ mark %@ (%@)", position.instId, position.contracts,
-                         position.liquidationPrice.map { String($0) } ?? "—",
-                         position.liquidationBufferPct.map { String(format: "%.2f%%", $0) } ?? "—",
-                         position.markPrice.map { String($0) } ?? "—", age(s, position.markMs)))
-            print("    protective \(position.protective.count)" + position.protective.map { order in
+        if let mark = risk.mark {
+            print("    mark \(mark.price) (\(mark.source), \(age(s, mark.ms)))")
+        }
+        if let exposure = risk.exposure {
+            print(String(format: "    exposure net %.2f gross %.2f (long %.2f short %.2f) leverage %.2fx net / %.2fx gross",
+                         exposure.netNotional, exposure.grossNotional, exposure.longNotional, exposure.shortNotional,
+                         exposure.effectiveLeverage, exposure.grossLeverage))
+        }
+        for position in risk.positions {
+            print(String(format: "    %@ %@ %@ %.2f liq %@ buffer %@", position.instId, position.posSide, position.marginMode ?? "—",
+                         position.contracts, position.liquidationPrice.map { String($0) } ?? "—",
+                         position.liquidationBufferPct.map { String(format: "%.2f%%", $0) } ?? "—"))
+            print("      protective \(position.protective.count)" + position.protective.map { order in
                 " · \(order.kind) sl \(order.stopPrice.map { String($0) } ?? "—") tp \(order.takeProfitPrice.map { String($0) } ?? "—")"
-            }.joined() + (risk.stopsError.map { " · stops error: \($0)" } ?? ""))
-            for odds in risk.liquidationOdds {
-                print(String(format: "    %3.0fh touch %.2f%% at %.2f%% iv %.0f%% (%@)", odds.hours, odds.touching * 100, odds.atHorizon * 100, odds.iv, odds.placement))
+            }.joined())
+            for odds in position.liquidationOdds {
+                print(String(format: "      %3.0fh touch %.2f%% at %.2f%% iv %.0f%% (%@)", odds.hours, odds.touching * 100, odds.atHorizon * 100, odds.iv, odds.placement))
             }
         }
+        if !risk.unattachedOrders.isEmpty {
+            print("    unattached \(risk.unattachedOrders.count)" + risk.unattachedOrders.map { order in
+                " · \(order.side ?? "—")/\(order.posSide ?? "—") sl \(order.stopPrice.map { String($0) } ?? "—") tp \(order.takeProfitPrice.map { String($0) } ?? "—")"
+            }.joined())
+        }
+        if let error = risk.stopsError { print("    stops error: \(error)") }
         for venue in s.structure {
             print("  \(venue.venue): price \(venue.price.map { String($0.value) } ?? "—") (\(age(s, venue.price?.ms))) funding \(venue.fundingRate.map { String($0.value) } ?? "—") OI 1h \(venue.oiChange1h.map { String(format: "%+.2f%%", $0.pct) } ?? "—")")
         }

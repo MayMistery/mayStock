@@ -62,6 +62,11 @@ impl Side {
             Side::Sell => "sell",
         }
     }
+
+    /// The side that closes a holding: a long is sold, a short bought back.
+    pub fn closing(is_long: bool) -> Side {
+        if is_long { Side::Sell } else { Side::Buy }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +83,17 @@ impl PosSide {
             PosSide::Long => "long",
             PosSide::Short => "short",
             PosSide::Net => "net",
+        }
+    }
+
+    /// The leg a venue's `posSide` names. Absent or empty is a one-way
+    /// account's single leg, `net`; anything else is not a leg.
+    pub fn from_venue(text: Option<&str>) -> Option<PosSide> {
+        match text.unwrap_or("") {
+            "long" => Some(PosSide::Long),
+            "short" => Some(PosSide::Short),
+            "net" | "" => Some(PosSide::Net),
+            _ => None,
         }
     }
 }
