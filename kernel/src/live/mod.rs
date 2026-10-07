@@ -231,7 +231,7 @@ impl Feed {
             // Yahoo's chart API rate-limits hard and the block sticks for a
             // day, so this is a slow, sequential poll.
             Feed::Yahoo => Duration::from_secs(120),
-            // A handful of light requests per round; the prices are context
+            // One request per topic, all at once; the prices are context
             // for the page, not a timing signal, so a minute is plenty.
             Feed::Polymarket => Duration::from_secs(60),
         }

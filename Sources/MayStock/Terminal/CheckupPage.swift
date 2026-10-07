@@ -867,15 +867,25 @@ private struct PredictionCard: View {
     var body: some View {
         if let predictions = model.predictions {
             let offset = model.clock?.offsetMs ?? 0
-            Card(title: "预测市场", subtitle: "Polymarket 对议息与美伊局势的定价——交代背景，不做择时") {
+            Card(title: "预测市场", subtitle: "Polymarket：未来 \(predictions.upcomingDays) 天要结算的大事件，和议息、霍尔木兹这些更长的主线——交代背景，不做择时") {
                 EmptyView()
             } content: {
                 VStack(alignment: .leading, spacing: 14) {
                     InlineNotice(
                         kind: .info,
                         message: "价格即概率（66.5¢ = 66.5%）；涨跌按价格点数计（+3.0 = 概率升 3 个百分点）。2026-09 实测：这些概率的小时变化与 ETH 不相关（ρ≈0），它们说明市场押的方向，不提示进出场时机。")
-                    ForEach(predictions.topics) { topic in
-                        section(topic, offset: offset, staleAfterMs: predictions.staleAfterMs)
+                    if !predictions.upcoming.isEmpty {
+                        Text("未来 \(predictions.upcomingDays) 天（按纽约日期，结算早的在前）").font(Theme.Text.captionMedium).foregroundStyle(.secondary)
+                        ForEach(predictions.upcoming) { topic in
+                            section(topic, offset: offset, staleAfterMs: predictions.staleAfterMs)
+                        }
+                    }
+                    if !predictions.later.isEmpty {
+                        Divider()
+                        Text("更远的主线").font(Theme.Text.captionMedium).foregroundStyle(.secondary)
+                        ForEach(predictions.later) { topic in
+                            section(topic, offset: offset, staleAfterMs: predictions.staleAfterMs)
+                        }
                     }
                 }
             }
@@ -894,12 +904,16 @@ private struct PredictionCard: View {
                 InlineNotice(kind: .warning, message: "最近一次读取失败，下面是上一次读数：\(error)")
             }
             if topic.lines.isEmpty {
-                Text(topic.fetchedMs == nil ? "正在读取…" : "没有未结束的事件")
+                Text(topic.fetchedMs == nil ? "正在读取…" : "没有还没到截止的盘")
                     .font(Theme.Text.secondary).foregroundStyle(.secondary)
             }
             ForEach(Array(topic.lines.enumerated()), id: \.offset) { _, line in
                 Text(summary(line, of: topic)).font(Theme.Text.caption).foregroundStyle(.secondary)
-                grid(line)
+                grid(line, layout: topic.layout)
+            }
+            if topic.settling > 0 {
+                Text("另有 \(topic.settling) 个盘已过截止、等待结算，不显示")
+                    .font(Theme.Text.caption).foregroundStyle(.tertiary)
             }
         }
     }
@@ -912,14 +926,13 @@ private struct PredictionCard: View {
         return "\(title)\(when)24h 成交 $\(PriceFormatter.compact(line.volume24h)) · 挂单深度 $\(PriceFormatter.compact(line.liquidity))"
     }
 
-    private func grid(_ line: LiveSnapshot.PredictionLine) -> some View {
-        let byDeadline = line.cells.contains { $0.deadline != nil }
+    private func grid(_ line: LiveSnapshot.PredictionLine, layout: String) -> some View {
         let rows = line.cells.enumerated().map { index, cell in
-            Row(id: index, cell: cell, label: cell.deadline.map { "\(Self.day($0)) 前" } ?? (cell.label.isEmpty ? line.title : cell.label))
+            Row(id: index, cell: cell, label: Self.rowLabel(cell, layout: layout, title: line.title))
         }
         return DataGrid(
             columns: [
-                .init(title: byDeadline ? "截止" : "结果"),
+                .init(title: layout == "daily" ? "日期" : (layout == "deadlines" ? "截止" : "结果")),
                 .init(title: "概率", alignment: .trailing),
                 .init(title: "买一", alignment: .trailing), .init(title: "卖一", alignment: .trailing),
                 .init(title: "最新成交", alignment: .trailing),
@@ -930,7 +943,7 @@ private struct PredictionCard: View {
             rows: rows
         ) { row in
             let cell = row.cell
-            GridText(row.label)
+            GridText(row.label, weight: cell.upcoming && layout != "outcomes" ? .semibold : .regular)
             if let probability = cell.probability {
                 GridText(CheckupText.percent(probability) + (cell.fromLastTrade ? " · 成交价" : ""),
                          tint: cell.fromLastTrade ? Theme.warning : .primary, alignment: .trailing,
@@ -952,6 +965,25 @@ private struct PredictionCard: View {
         guard let value else { return GridText("—", tint: .secondary, alignment: .trailing) }
         return GridText(String(format: "%+.1f", value * 100),
                         tint: value > 0 ? Theme.up : (value < 0 ? Theme.down : .secondary), alignment: .trailing)
+    }
+
+    /// `10/9 前` for a deadline, `10/8 当天` for a day's question, the
+    /// outcome's own name otherwise; a deadline inside the coming week says so.
+    private static func rowLabel(_ cell: LiveSnapshot.PredictionCell, layout: String, title: String) -> String {
+        guard let deadline = cell.deadline else { return cell.label.isEmpty ? title : cell.label }
+        let label = "\(day(deadline)) \(layout == "daily" ? "当天" : "前")"
+        return cell.upcoming && layout == "deadlines" ? label + " · \(weekday(deadline))" : label
+    }
+
+    /// `2026-10-09` → `周五`: the coming week is read by weekday.
+    private static func weekday(_ iso: String) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.timeZone = TimeZone(identifier: "America/New_York")
+        formatter.dateFormat = "yyyy-MM-dd"
+        guard let date = formatter.date(from: iso) else { return "" }
+        formatter.dateFormat = "EEE"
+        return formatter.string(from: date)
     }
 
     /// A price in cents, the way Polymarket quotes it.

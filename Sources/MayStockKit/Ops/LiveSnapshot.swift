@@ -387,13 +387,26 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
     /// per entry the kernel declares — read or not.
     public struct Predictions: Decodable, Sendable, Equatable {
         public let staleAfterMs: Double
+        /// How many New York days count as the coming week.
+        public let upcomingDays: Int
+        /// The coming week's topics first (soonest first), then the rest in
+        /// declaration order.
         public let topics: [PredictionTopic]
+        public var upcoming: [PredictionTopic] { topics.filter { $0.upcomingMs != nil } }
+        public var later: [PredictionTopic] { topics.filter { $0.upcomingMs == nil } }
     }
 
     public struct PredictionTopic: Decodable, Sendable, Equatable, Identifiable {
         public let id: String
         public let label: String
         public let meaning: String
+        /// `outcomes`, `deadlines` or `daily`.
+        public let layout: String
+        /// When its first shown market inside the coming week settles; nil
+        /// when none does.
+        public let upcomingMs: Int64?
+        /// Markets past their deadline, awaiting resolution: not shown.
+        public let settling: Int
         /// The last good reading, on the venues' clock; nil until one.
         public let fetchedMs: Int64?
         /// The latest poll's error, while the last good reading stays.
@@ -416,6 +429,8 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
         public let label: String
         /// `YYYY-MM-DD`, a New York day, for a deadline cell.
         public let deadline: String?
+        /// Settles within the coming week.
+        public let upcoming: Bool
         /// The price, which is the probability; nil where the book makes none.
         public let probability: Double?
         /// The price is the last trade: the book is too wide for a midpoint.

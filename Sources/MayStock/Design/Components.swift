@@ -512,7 +512,11 @@ extension EnvironmentValues {
 }
 
 /// The page-level scroll container. A plain stack while a snapshot is being
-/// drawn; see `snapshotMode`.
+/// drawn; see `snapshotMode`. The content takes its ideal height there, as
+/// a scroll view would give it: a plain stack shares the window's height
+/// out among its cards, and a long card handed less than it needs squeezes
+/// its wrapped notices to one truncated line (2026-10-07, the checkup's
+/// prediction card) while its rigid tables run on past the share.
 struct PageScroll<Content: View>: View {
     @Environment(\.snapshotMode) private var snapshotMode
     @ViewBuilder var content: () -> Content
@@ -520,7 +524,7 @@ struct PageScroll<Content: View>: View {
     var body: some View {
         if snapshotMode {
             VStack(spacing: 0) {
-                content()
+                content().fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 0)
             }
         } else {

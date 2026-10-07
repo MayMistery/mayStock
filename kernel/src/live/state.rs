@@ -847,7 +847,7 @@ impl State {
             gravity: self.gravity_view(now, &smiles),
             probability: self.probability_view(now, &smiles),
             macro_tape: self.macro_view(),
-            predictions: self.prediction_view(),
+            predictions: self.prediction_view(now),
         };
         serde_json::to_string(&snapshot).unwrap_or_else(|e| format!("{{\"seq\":{seq},\"error\":\"{e}\"}}"))
     }
@@ -1347,15 +1347,21 @@ impl State {
 
     /// Every declared topic, read or not: one never read says so rather than
     /// vanishing from the card.
-    fn prediction_view(&self) -> PredictionView {
-        let topics = polymarket::TOPICS
+    /// Every declared topic, the coming week's first — soonest to settle
+    /// leading — then the rest in declaration order. A market past its
+    /// deadline is decided and waiting on the oracle: it is counted, not
+    /// shown as a forecast.
+    fn prediction_view(&self, now: i64) -> PredictionView {
+        let mut topics: Vec<PredictionTopicView> = polymarket::TOPICS
             .iter()
             .map(|topic| {
                 let reading = self.predictions.get(topic.id);
                 let events = reading.map(|r| r.events.as_slice()).unwrap_or(&[]);
+                let ahead = |m: &&polymarket::Market| m.end_ms > now;
                 let cell = |m: &polymarket::Market, deadline: bool| PredictionCellView {
                     label: m.label.clone(),
                     deadline: if deadline { polymarket::deadline_day(m.end_ms) } else { None },
+                    upcoming: polymarket::is_upcoming(m.end_ms, now),
                     probability: m.probability,
                     from_last_trade: m.from_last_trade,
                     bid: m.bid,
@@ -1366,41 +1372,51 @@ impl State {
                     change_1w: m.change_1w,
                     volume_24h: m.volume_24h,
                 };
+                let mut ahead_markets: Vec<&polymarket::Market> = events.iter().flat_map(|e| &e.markets).filter(ahead).collect();
+                ahead_markets.sort_by_key(|m| m.end_ms);
+                let one_line = |cells: Vec<PredictionCellView>| PredictionLineView {
+                    title: topic.label.to_string(),
+                    deadline: None,
+                    volume_24h: events.iter().map(|e| e.volume_24h).sum(),
+                    liquidity: events.iter().map(|e| e.liquidity).sum(),
+                    cells,
+                };
                 let lines = match topic.layout {
                     polymarket::Layout::Outcomes => events
                         .iter()
+                        .filter(|e| e.markets.iter().any(|m| ahead(&m)))
                         .map(|e| PredictionLineView {
                             title: e.title.clone(),
                             deadline: polymarket::deadline_day(e.end_ms),
                             volume_24h: e.volume_24h,
                             liquidity: e.liquidity,
-                            cells: e.markets.iter().map(|m| cell(m, false)).collect(),
+                            cells: e.markets.iter().filter(ahead).map(|m| cell(m, false)).collect(),
                         })
                         .collect(),
-                    polymarket::Layout::Deadlines if events.is_empty() => Vec::new(),
-                    polymarket::Layout::Deadlines => {
-                        let mut markets: Vec<&polymarket::Market> = events.iter().flat_map(|e| &e.markets).collect();
-                        markets.sort_by_key(|m| m.end_ms);
-                        vec![PredictionLineView {
-                            title: topic.label.to_string(),
-                            deadline: None,
-                            volume_24h: events.iter().map(|e| e.volume_24h).sum(),
-                            liquidity: events.iter().map(|e| e.liquidity).sum(),
-                            cells: markets.into_iter().map(|m| cell(m, true)).collect(),
-                        }]
-                    }
+                    _ if ahead_markets.is_empty() => Vec::new(),
+                    polymarket::Layout::Deadlines => vec![one_line(ahead_markets.iter().map(|m| cell(m, true)).collect())],
+                    polymarket::Layout::Daily => vec![one_line(vec![cell(ahead_markets[0], true)])],
+                };
+                let shown: Vec<i64> = match topic.layout {
+                    polymarket::Layout::Daily => ahead_markets.first().map(|m| m.end_ms).into_iter().collect(),
+                    _ => ahead_markets.iter().map(|m| m.end_ms).collect(),
                 };
                 PredictionTopicView {
                     id: topic.id,
                     label: topic.label,
                     meaning: topic.meaning,
+                    layout: topic.layout.id(),
+                    upcoming_ms: shown.into_iter().filter(|ms| polymarket::is_upcoming(*ms, now)).min(),
+                    settling: events.iter().flat_map(|e| &e.markets).filter(|m| m.end_ms <= now).count(),
                     fetched_ms: reading.and_then(|r| r.fetched_ms).map(|ms| self.to_server(ms)),
                     error: reading.and_then(|r| r.error.clone()),
                     lines,
                 }
             })
             .collect();
-        PredictionView { stale_after_ms: Feed::Polymarket.stale_after_ms(), topics }
+        // Stable: equal keys keep the declared order.
+        topics.sort_by_key(|t| (t.upcoming_ms.is_none(), t.upcoming_ms.unwrap_or(0)));
+        PredictionView { stale_after_ms: Feed::Polymarket.stale_after_ms(), upcoming_days: polymarket::UPCOMING_DAYS, topics }
     }
 
     fn schwab_reading(&self, service: &str, key: &str) -> (Option<f64>, Option<f64>, Option<i64>, bool) {
@@ -1916,6 +1932,11 @@ struct MacroView {
 #[serde(rename_all = "camelCase")]
 struct PredictionView {
     stale_after_ms: i64,
+    /// The coming week's length (`polymarket::UPCOMING_DAYS`), for the page
+    /// to name it.
+    upcoming_days: u64,
+    /// The coming week's topics first (those with `upcoming_ms`), soonest
+    /// first; then the rest, in declaration order.
     topics: Vec<PredictionTopicView>,
 }
 
@@ -1925,6 +1946,14 @@ struct PredictionTopicView {
     id: &'static str,
     label: &'static str,
     meaning: &'static str,
+    /// `outcomes`, `deadlines` or `daily` (`polymarket::Layout`).
+    layout: &'static str,
+    /// When the first shown market inside the coming week settles; none
+    /// when nothing shown settles that soon.
+    upcoming_ms: Option<i64>,
+    /// Markets past their deadline and not yet resolved: decided, so not
+    /// shown as forecasts.
+    settling: usize,
     /// When the last good reading was taken, on the venues' clock.
     fetched_ms: Option<i64>,
     /// The latest poll's error, while the last good reading is kept.
@@ -1949,6 +1978,8 @@ struct PredictionCellView {
     label: String,
     /// The New York day of a deadline cell.
     deadline: Option<String>,
+    /// Settles within the coming week.
+    upcoming: bool,
     /// None where the book makes no price (see `polymarket`).
     probability: Option<f64>,
     from_last_trade: bool,
@@ -2217,9 +2248,63 @@ mod tests {
                     assert_eq!(days, ["10-28", "10-31", "12-31"], "{}: every open deadline, earliest first, settled ones gone", topic.id);
                     assert_eq!(lines[0]["volume24h"], 1300.0);
                 }
+                polymarket::Layout::Daily => {
+                    assert_eq!(lines.len(), 1, "{}: one line for the topic", topic.id);
+                    let days: Vec<String> = cells(&lines[0]).iter().map(|c| c["deadline"].as_str().unwrap().to_string()).collect();
+                    assert_eq!(days, ["2026-10-28"], "{}: only the nearest day ahead", topic.id);
+                }
             }
+            assert_eq!(view["layout"], topic.layout.id());
         }
         assert!(state.ingest("rest.polymarket.nope", GAMMA_BODY, NOW).is_err(), "an undeclared topic is refused, not dropped");
+    }
+
+    /// A month of daily questions on 2026-09-23 (New York morning): one day
+    /// already past and waiting on the oracle, today's, and tomorrow's.
+    const DAILY_BODY: &str = r#"[{"title":"Houthi military action against Saudi Arabia on...?","endDate":"2026-10-01T03:59:00Z","volume24hr":50,"liquidity":900,"markets":[
+        {"groupItemTitle":"September 22","bestBid":0.4,"bestAsk":0.6,"endDate":"2026-09-23T03:59:00Z"},
+        {"groupItemTitle":"September 23","bestBid":0.3,"bestAsk":0.35,"endDate":"2026-09-24T03:59:00Z"},
+        {"groupItemTitle":"September 24","bestBid":0.2,"bestAsk":0.25,"endDate":"2026-09-25T03:59:00Z"}]}]"#;
+
+    /// Deadlines either side of the week's edge: the 30th is today plus
+    /// seven, October 1 plus eight.
+    const EDGE_BODY: &str = r#"[{"title":"Israel x Iran ceasefire continues through...?","endDate":"2026-12-31T20:29:00Z","volume24hr":900,"liquidity":4000,"markets":[
+        {"groupItemTitle":"September 22","bestBid":0.98,"bestAsk":0.99,"endDate":"2026-09-23T03:59:00Z"},
+        {"groupItemTitle":"October 31","bestBid":0.84,"bestAsk":0.85,"endDate":"2026-10-31T20:29:00Z"},
+        {"groupItemTitle":"September 30","bestBid":0.95,"bestAsk":0.96,"endDate":"2026-10-01T03:59:00Z"},
+        {"groupItemTitle":"October 1","bestBid":0.94,"bestAsk":0.95,"endDate":"2026-10-02T03:59:00Z"}]}]"#;
+
+    #[test]
+    fn the_coming_week_leads_and_a_passed_deadline_is_not_a_forecast() {
+        assert_eq!(polymarket::UPCOMING_DAYS, 7, "the fixtures straddle a seven-day edge");
+        let mut state = state();
+        state.ingest("rest.polymarket.israel-iran", EDGE_BODY, NOW).unwrap();
+        state.ingest("rest.polymarket.houthi-saudi", DAILY_BODY, NOW).unwrap();
+        state.ingest("rest.polymarket.fomc", GAMMA_BODY, NOW).unwrap();
+        let snapshot = snapshot(&state, NOW);
+        let predictions = &snapshot["predictions"];
+        assert_eq!(predictions["upcomingDays"], polymarket::UPCOMING_DAYS);
+        let topics = predictions["topics"].as_array().unwrap();
+        let ids: Vec<&str> = topics.iter().map(|t| t["id"].as_str().unwrap()).collect();
+        let rest: Vec<&str> = polymarket::TOPICS.iter().map(|t| t.id).filter(|id| !["houthi-saudi", "israel-iran"].contains(id)).collect();
+        assert_eq!(ids[..2], ["houthi-saudi", "israel-iran"], "the week's topics lead, soonest first");
+        assert_eq!(ids[2..], rest[..], "the rest keep their declared order");
+
+        let daily = &topics[0];
+        assert_eq!(daily["settling"], 1, "yesterday's question is decided, counted, not shown");
+        let cells = daily["lines"][0]["cells"].as_array().unwrap();
+        assert_eq!(cells.len(), 1);
+        assert_eq!((cells[0]["deadline"].as_str(), cells[0]["upcoming"].as_bool()), (Some("2026-09-23"), Some(true)), "today's, not tomorrow's");
+        assert_eq!(daily["upcomingMs"], 1_790_222_340_000i64, "settles 23:59 ET tonight");
+
+        let edge = &topics[1];
+        assert_eq!(edge["settling"], 1);
+        let cells = edge["lines"][0]["cells"].as_array().unwrap();
+        let days: Vec<(&str, bool)> = cells.iter().map(|c| (&c["deadline"].as_str().unwrap()[5..], c["upcoming"].as_bool().unwrap())).collect();
+        assert_eq!(days, [("09-30", true), ("10-01", false), ("10-31", false)], "the seventh day is in, the eighth out");
+
+        let fomc = topics.iter().find(|t| t["id"] == "fomc").unwrap();
+        assert!(fomc["upcomingMs"].is_null() && fomc["settling"] == 0);
     }
 
     #[test]
@@ -2230,7 +2315,8 @@ mod tests {
             state.apply(Update::Rest(RestUpdate::Prediction { topic: "fomc", result: Err("超时".into()), ms: NOW + later }), NOW + later);
         }
         let failed = snapshot(&state, NOW + 2_000);
-        let fomc = &failed["predictions"]["topics"][0];
+        let topic = |s: &Value| s["predictions"]["topics"].as_array().unwrap().iter().find(|t| t["id"] == "fomc").unwrap().clone();
+        let fomc = topic(&failed);
         assert_eq!(fomc["error"], "超时");
         assert_eq!(fomc["fetchedMs"], NOW, "the age is the last good reading's");
         assert_eq!(fomc["lines"].as_array().unwrap().len(), 2, "the last reading stays");
@@ -2238,7 +2324,7 @@ mod tests {
         assert_eq!(lines(&failed), 1, "one line for the failure, not one per poll");
         state.ingest("rest.polymarket.fomc", GAMMA_BODY, NOW + 3_000).unwrap();
         let recovered = snapshot(&state, NOW + 3_000);
-        assert!(recovered["predictions"]["topics"][0]["error"].is_null());
+        assert!(topic(&recovered)["error"].is_null());
         assert_eq!(lines(&recovered), 2, "and one for the recovery");
     }
 

@@ -1,10 +1,11 @@
 //! Polymarket's prices for the events behind this market's macro inputs: the
-//! next rate decisions, and the war that sets the oil price.
+//! week's scheduled data and the war that sets the oil price first, then the
+//! longer threads (the next rate decisions, Hormuz, the ceasefire).
 //!
 //! What is watched is declared once, in `TOPICS`, by series or event — never
-//! by market id. A series rolls forward on its own (the next FOMC meeting,
-//! the next Hormuz deadline), so the card does not go stale when one market
-//! settles.
+//! by market id. A series rolls forward on its own (the next CPI print, the
+//! next week's Hormuz count, the next month's daily questions), so the card
+//! does not go stale when one market settles.
 //!
 //! A price is only shown where the book makes one: Polymarket's own rule is
 //! the midpoint while the spread is at most `MAX_SPREAD`, else the last trade.
@@ -12,12 +13,20 @@
 //! 0.45 midpoint as its price; that is not a probability, and it is shown as
 //! having none.
 
+use chrono::NaiveDate;
 use serde_json::Value;
 
 pub const GAMMA: &str = "https://gamma-api.polymarket.com";
 
 /// Widest spread whose midpoint Polymarket itself displays as the price.
 pub const MAX_SPREAD: f64 = 0.10;
+
+/// How far ahead counts as "the coming week": a market settling on a New
+/// York day up to this many days after today's. Polymarket names its
+/// deadlines by New York day, so the window is counted the same way — a
+/// CPI print on the 14th settles at 23:59 ET that day, inside a window that
+/// opened on the 7th.
+pub const UPCOMING_DAYS: u64 = 7;
 
 pub struct Topic {
     pub id: &'static str,
@@ -36,15 +45,96 @@ pub enum Source {
 }
 
 pub enum Layout {
-    /// Mutually exclusive outcomes of each event (a rate decision): one line
-    /// per event, a cell per outcome.
+    /// Mutually exclusive outcomes of each event (a rate decision, a CPI
+    /// print): one line per event, a cell per outcome.
     Outcomes,
     /// The same question at successive deadlines ("by October 31?"): one
     /// line for the topic, a cell per deadline, earliest first.
     Deadlines,
+    /// The same question asked of each day ("on October 8?"): one line, one
+    /// cell — the nearest day still ahead. The rest of the month says
+    /// nothing the next day will not.
+    Daily,
 }
 
-pub const TOPICS: [Topic; 4] = [
+impl Layout {
+    pub fn id(&self) -> &'static str {
+        match self {
+            Layout::Outcomes => "outcomes",
+            Layout::Deadlines => "deadlines",
+            Layout::Daily => "daily",
+        }
+    }
+}
+
+/// Chosen by May on 2026-10-07 from the events settling that week: the CPI
+/// print, the oil route, and the fighting around it; then the four threads
+/// the card started with. Daily questions come as one event per month, so
+/// their series are read two deep to cross a month's end.
+pub const TOPICS: [Topic; 13] = [
+    Topic {
+        id: "core-cpi",
+        label: "美国核心 CPI 环比",
+        meaning: "通胀超预期 → 加息预期 → 美债收益率 → 币价（2026-09 小时相关：10 年美债期货 +0.23）",
+        source: Source::Series("core-cpi-mom", 1),
+        layout: Layout::Outcomes,
+    },
+    Topic {
+        id: "israel-iran",
+        label: "以伊停火延续到",
+        meaning: "停火破裂是油价跳涨的直接来源",
+        source: Source::Event("israel-x-iran-ceasefire-continues-throughptptpt-20260716224448963"),
+        layout: Layout::Deadlines,
+    },
+    Topic {
+        id: "hormuz-deal",
+        label: "美伊达成霍尔木兹协议",
+        meaning: "协议意味着通航恢复、油价回落",
+        source: Source::Event("us-iran-hormuz-agreement-byptptpt-20260803235957575"),
+        layout: Layout::Deadlines,
+    },
+    Topic {
+        id: "hormuz-ships",
+        label: "霍尔木兹本周通航船数",
+        meaning: "直接量油路：船越少，油价越高；油价涨 1%，ETH 平均跌约 0.2%（2026-09 小时回归）",
+        source: Source::Series("ships-transit-the-strait-of-hormuz", 1),
+        layout: Layout::Outcomes,
+    },
+    Topic {
+        id: "hormuz-attacks",
+        label: "霍尔木兹航运遇袭",
+        meaning: "油轮遇袭当天油价跳涨",
+        source: Source::Series("hormuz-shipping-targeted", 2),
+        layout: Layout::Daily,
+    },
+    Topic {
+        id: "houthi-saudi",
+        label: "胡塞对沙特动武",
+        meaning: "2026-10-07 胡塞打沙特吉赞的炼油设施，布伦特回到 102",
+        source: Source::Series("houthi-military-action-against-saudi-arabia-on", 2),
+        layout: Layout::Daily,
+    },
+    Topic {
+        id: "saudi-yemen",
+        label: "沙特对也门动武",
+        meaning: "也门战事升级牵动红海航运与沙特产能",
+        source: Source::Series("saudi-arabia-military-action-against-yemen-on", 2),
+        layout: Layout::Daily,
+    },
+    Topic {
+        id: "israel-lebanon",
+        label: "以色列对黎巴嫩动武",
+        meaning: "中东战线是否扩大",
+        source: Source::Series("israel-military-action-against-lebanon", 2),
+        layout: Layout::Daily,
+    },
+    Topic {
+        id: "russia-kyiv",
+        label: "俄罗斯打基辅",
+        meaning: "俄乌战事烈度；与油价、币价的关系弱",
+        source: Source::Series("russia-target-kyiv-on", 2),
+        layout: Layout::Daily,
+    },
     Topic {
         id: "fomc",
         label: "美联储议息",
@@ -206,11 +296,24 @@ fn time(value: &Value, key: &str) -> Option<i64> {
 /// `…-09-30T23:59:00Z` or as `…-10-01T03:59:00Z`. Both are September 30 in
 /// New York; read in UTC the second one would be a day late.
 pub fn deadline_day(end_ms: i64) -> Option<String> {
+    new_york_day(end_ms).map(|day| day.format("%Y-%m-%d").to_string())
+}
+
+fn new_york_day(ms: i64) -> Option<NaiveDate> {
     use chrono::TimeZone;
-    let utc = chrono::DateTime::from_timestamp_millis(end_ms)?;
+    let utc = chrono::DateTime::from_timestamp_millis(ms)?;
     // A deadline written as 23:59 UTC is 19:59 ET the same day; as 03:59 or
     // 04:59 UTC the next day, 23:59 ET — both land on the intended day.
-    Some(chrono_tz::America::New_York.from_utc_datetime(&utc.naive_utc()).format("%Y-%m-%d").to_string())
+    Some(chrono_tz::America::New_York.from_utc_datetime(&utc.naive_utc()).date_naive())
+}
+
+/// Whether a market settling at `end_ms` is still ahead and settles within
+/// the coming week (`UPCOMING_DAYS`), both counted in New York days.
+pub fn is_upcoming(end_ms: i64, now: i64) -> bool {
+    match (new_york_day(end_ms), new_york_day(now)) {
+        (Some(end), Some(today)) => end_ms > now && end <= today + chrono::Days::new(UPCOMING_DAYS),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -263,6 +366,18 @@ mod tests {
         assert_eq!(day("2026-10-01T03:59:00Z"), "2026-09-30", "EDT");
         assert_eq!(day("2026-12-01T04:59:00Z"), "2026-11-30", "EST");
         assert_eq!(day("2026-10-29T03:59:00Z"), "2026-10-28", "the October FOMC decides on the 28th");
+    }
+
+    #[test]
+    fn the_coming_week_is_counted_in_new_york_days() {
+        let at = |text: &str| chrono::DateTime::parse_from_rfc3339(text).unwrap().timestamp_millis();
+        // 23:30 CST on 2026-10-07 is 11:30 ET the same day.
+        let now = at("2026-10-07T15:30:00Z");
+        assert_eq!(UPCOMING_DAYS, 7, "the dates below are written for a seven-day window");
+        assert!(is_upcoming(at("2026-10-15T03:59:00Z"), now), "a CPI print settling 23:59 ET on the 14th is inside");
+        assert!(!is_upcoming(at("2026-10-16T03:59:00Z"), now), "the 15th is a day past the window");
+        assert!(!is_upcoming(at("2026-10-07T15:00:00Z"), now), "a deadline already past is not ahead");
+        assert!(is_upcoming(at("2026-10-08T03:59:00Z"), now), "tonight 23:59 ET is");
     }
 
     #[test]

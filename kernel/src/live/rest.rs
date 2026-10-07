@@ -448,22 +448,27 @@ async fn sample_clock(http: &reqwest::Client, url: &str) -> Result<(i64, i64, i6
 
 // MARK: - Polymarket
 
-/// Every topic in `polymarket::TOPICS`, one after another, at
-/// `Feed::Polymarket`'s cadence. A topic that fails keeps its last reading
-/// (labelled with its age and the error); the others carry on.
+/// Every topic in `polymarket::TOPICS` at once, every `Feed::Polymarket`
+/// interval. Gamma answers this machine in anything from one second to a
+/// timeout, so each topic is published the moment its own answer lands
+/// rather than after the slowest; a round of thirteen in sequence would
+/// take minutes. A topic that fails keeps its last reading (labelled with
+/// its age and the error); the others carry on.
 pub async fn polymarket(http: reqwest::Client, updates: mpsc::Sender<Update>) {
     loop {
-        let mut failures = Vec::new();
-        for topic in polymarket::TOPICS.iter() {
-            let result = match net::get_text(&http, &polymarket::url(&topic.source), None).await {
-                Ok(body) => polymarket::events(&body),
-                Err(e) => Err(e),
-            };
-            if let Err(e) = &result {
-                failures.push(format!("{}：{e}", topic.label));
+        let reads = polymarket::TOPICS.iter().map(|topic| {
+            let (http, updates) = (&http, &updates);
+            async move {
+                let result = match net::get_text(http, &polymarket::url(&topic.source), None).await {
+                    Ok(body) => polymarket::events(&body),
+                    Err(e) => Err(e),
+                };
+                let failure = result.as_ref().err().map(|e| format!("{}：{e}", topic.label));
+                send(updates, RestUpdate::Prediction { topic: topic.id, result, ms: now_ms() }).await;
+                failure
             }
-            send(&updates, RestUpdate::Prediction { topic: topic.id, result, ms: now_ms() }).await;
-        }
+        });
+        let failures: Vec<String> = futures_util::future::join_all(reads).await.into_iter().flatten().collect();
         let state = if failures.is_empty() { FeedState::Live } else { FeedState::Degraded(failures.join("；")) };
         health(&updates, Feed::Polymarket, state).await;
         tokio::time::sleep(Feed::Polymarket.cadence()).await;

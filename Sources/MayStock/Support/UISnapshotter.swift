@@ -74,8 +74,10 @@ final class UISnapshotter {
         // overflows the window pushes the whole split view out of it and
         // squeezes wrapped text to one truncated line (the checkup, at about
         // 4,000 pt, captured with its header and toolbar missing; again at
-        // 4,800 pt once it gained the prediction-market card).
-        let terminalWindow = OffscreenWindow(size: CGSize(width: 1_180, height: 6_400), chrome: true)
+        // 4,800 pt once it gained the prediction-market card, and at 6,400 pt
+        // once that card listed the coming week's events and the risk card
+        // a section per leg).
+        let terminalWindow = OffscreenWindow(size: CGSize(width: 1_180, height: 9_600), chrome: true)
         terminalWindow.contentView = terminal
         terminalWindow.orderFrontRegardless()
         // The first draw of a freshly ordered window lags a beat behind its

@@ -107,7 +107,9 @@ extension E2EMain {
             let cells = topic.lines.flatMap(\.cells).map { cell in
                 "\(cell.deadline ?? cell.label) \(cell.probability.map { String(format: "%.1f%%", $0 * 100) } ?? "无报价")"
             }
-            print("  polymarket \(topic.label) (\(age(s, topic.fetchedMs)))\(topic.error.map { " error: \($0)" } ?? ""): " + cells.joined(separator: " · "))
+            let week = topic.upcomingMs == nil ? "" : "[\(s.predictions.upcomingDays)d] "
+            let settling = topic.settling > 0 ? " (+\(topic.settling) settling)" : ""
+            print("  polymarket \(week)\(topic.label) (\(age(s, topic.fetchedMs)))\(topic.error.map { " error: \($0)" } ?? ""): " + cells.joined(separator: " · ") + settling)
         }
         let risk = s.risk
         print("  risk: source \(risk.source) read \(risk.wasRead) held \(risk.held) stops \(age(s, risk.stopsMs))")
