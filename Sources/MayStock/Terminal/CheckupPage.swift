@@ -20,13 +20,16 @@ import MayStockKit
 struct CheckupPage: View {
     let appState: AppState
     @State private var model: CheckupModel?
+    /// How finely the probability table is cut, kept across launches. Only
+    /// ever set from the widths the kernel offers.
+    @AppStorage("checkup.gridDivisor") private var gridDivisor = 1
 
     var body: some View {
         PageScroll {
             VStack(alignment: .leading, spacing: Theme.sectionSpacing) {
                 PageHeader(
                     title: "体检",
-                    subtitle: "持仓风险、价格区间概率、期权引力、永续结构、宏观——实时推送，只读，不下单"
+                    subtitle: "持仓风险、价格区间概率、期权引力、永续结构、宏观、预测市场——实时推送，只读，不下单"
                 ) {
                     ModeBadge(mode: appState.tradingMode)
                 }
@@ -48,7 +51,8 @@ struct CheckupPage: View {
                     followsHeldPosition: requested == nil,
                     okxProfile: { bridge.profile(for: $0) },
                     okxConfigPath: OKXProfileCatalog.defaultFileURL().path,
-                    schwabctlPath: appState.schwabBridge.resolveCLIPath())
+                    schwabctlPath: appState.schwabBridge.resolveCLIPath(),
+                    gridDivisor: gridDivisor)
                 appState.pendingCheckupInstId = nil
                 model = created
                 created.start()
@@ -57,6 +61,9 @@ struct CheckupPage: View {
         .onDisappear { model?.stop() }
         .onChange(of: appState.tradingMode) { _, mode in
             model?.mode = mode
+        }
+        .onChange(of: gridDivisor) { _, divisor in
+            model?.gridDivisor = divisor
         }
     }
 
@@ -80,10 +87,11 @@ struct CheckupPage: View {
                 // tick in one redraws that card and nothing else.
                 FeedsCard(model: model)
                 RiskCard(model: model, appState: appState)
-                ProbabilityCard(model: model)
+                ProbabilityCard(model: model, gridDivisor: $gridDivisor)
                 GravityCard(model: model)
                 StructureCard(model: model)
                 MacroCard(model: model)
+                PredictionCard(model: model)
             } else {
                 Card { EmptyState(icon: "antenna.radiowaves.left.and.right", title: "正在连接", message: "打开行情、账户与期权推送…") }
             }
@@ -371,6 +379,7 @@ private struct RiskCard: View {
 
 private struct ProbabilityCard: View {
     let model: CheckupModel
+    @Binding var gridDivisor: Int
 
     /// One row of the table: a price range.
     private struct RangeRow: Identifiable {
@@ -394,6 +403,7 @@ private struct ProbabilityCard: View {
                 }
             } content: {
                 VStack(alignment: .leading, spacing: 10) {
+                    if !probability.gridChoices.isEmpty { widthPicker(probability) }
                     if probability.columns.isEmpty {
                         Text(model.feeds.first { $0.id == "deribit" }?.isLive == true ? "等待期权曲面与指数…" : "Deribit 曲面推送不在线，算不出概率")
                             .font(Theme.Text.secondary).foregroundStyle(.secondary)
@@ -402,6 +412,19 @@ private struct ProbabilityCard: View {
                     }
                 }
             }
+        }
+    }
+
+    /// The widths the kernel offers. The selection shown is the one the
+    /// kernel applied, so a stored width it no longer offers reads as what
+    /// is actually on screen.
+    private func widthPicker(_ probability: LiveSnapshot.Probability) -> some View {
+        HStack(spacing: 8) {
+            Text("每档宽度").font(Theme.Text.caption).foregroundStyle(.secondary)
+            Picker("", selection: Binding(get: { probability.gridDivisor }, set: { gridDivisor = $0 })) {
+                ForEach(probability.gridChoices) { Text(PriceFormatter.plain($0.step)).tag($0.divisor) }
+            }
+            .pickerStyle(.segmented).labelsHidden().controlSize(.small).fixedSize()
         }
     }
 
@@ -696,5 +719,123 @@ private struct MacroCard: View {
                 }
             }
         }
+    }
+}
+
+// MARK: - Predictions
+
+/// Polymarket's prices for the rate decisions and the war behind the macro
+/// tape. The price is the probability; every row shows the book it came
+/// from, so a thin market reads as thin.
+private struct PredictionCard: View {
+    let model: CheckupModel
+
+    private struct Row: Identifiable {
+        let id: Int
+        let cell: LiveSnapshot.PredictionCell
+        let label: String
+    }
+
+    var body: some View {
+        if let predictions = model.predictions {
+            let offset = model.clock?.offsetMs ?? 0
+            Card(title: "预测市场", subtitle: "Polymarket 对议息与美伊局势的定价——交代背景，不做择时") {
+                EmptyView()
+            } content: {
+                VStack(alignment: .leading, spacing: 14) {
+                    InlineNotice(
+                        kind: .info,
+                        message: "价格即概率（66.5¢ = 66.5%）；涨跌按价格点数计（+3.0 = 概率升 3 个百分点）。2026-09 实测：这些概率的小时变化与 ETH 不相关（ρ≈0），它们说明市场押的方向，不提示进出场时机。")
+                    ForEach(predictions.topics) { topic in
+                        section(topic, offset: offset, staleAfterMs: predictions.staleAfterMs)
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func section(_ topic: LiveSnapshot.PredictionTopic, offset: Double, staleAfterMs: Double) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text(topic.label).font(Theme.Text.bodyMedium)
+                if let ms = topic.fetchedMs { AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: staleAfterMs) }
+                Text(topic.meaning).font(Theme.Text.caption).foregroundStyle(.secondary)
+            }
+            if let error = topic.error {
+                InlineNotice(kind: .warning, message: "最近一次读取失败，下面是上一次读数：\(error)")
+            }
+            if topic.lines.isEmpty {
+                Text(topic.fetchedMs == nil ? "正在读取…" : "没有未结束的事件")
+                    .font(Theme.Text.secondary).foregroundStyle(.secondary)
+            }
+            ForEach(Array(topic.lines.enumerated()), id: \.offset) { _, line in
+                Text(summary(line, of: topic)).font(Theme.Text.caption).foregroundStyle(.secondary)
+                grid(line)
+            }
+        }
+    }
+
+    /// The line's event and its money. A line that spans a topic's
+    /// deadlines is titled with the topic itself, already in the header.
+    private func summary(_ line: LiveSnapshot.PredictionLine, of topic: LiveSnapshot.PredictionTopic) -> String {
+        let title = line.title == topic.label ? "" : "\(line.title)  "
+        let when = line.deadline.map { "\(Self.day($0)) 结算 · " } ?? ""
+        return "\(title)\(when)24h 成交 $\(PriceFormatter.compact(line.volume24h)) · 挂单深度 $\(PriceFormatter.compact(line.liquidity))"
+    }
+
+    private func grid(_ line: LiveSnapshot.PredictionLine) -> some View {
+        let byDeadline = line.cells.contains { $0.deadline != nil }
+        let rows = line.cells.enumerated().map { index, cell in
+            Row(id: index, cell: cell, label: cell.deadline.map { "\(Self.day($0)) 前" } ?? (cell.label.isEmpty ? line.title : cell.label))
+        }
+        return DataGrid(
+            columns: [
+                .init(title: byDeadline ? "截止" : "结果"),
+                .init(title: "概率", alignment: .trailing),
+                .init(title: "买一", alignment: .trailing), .init(title: "卖一", alignment: .trailing),
+                .init(title: "最新成交", alignment: .trailing),
+                .init(title: "1 小时", alignment: .trailing), .init(title: "24 小时", alignment: .trailing),
+                .init(title: "1 周", alignment: .trailing),
+                .init(title: "24h 成交", alignment: .trailing),
+            ],
+            rows: rows
+        ) { row in
+            let cell = row.cell
+            GridText(row.label)
+            if let probability = cell.probability {
+                GridText(CheckupText.percent(probability) + (cell.fromLastTrade ? " · 成交价" : ""),
+                         tint: cell.fromLastTrade ? Theme.warning : .primary, alignment: .trailing,
+                         weight: probability >= 0.2 ? .semibold : .regular)
+            } else {
+                GridText("无有效报价", tint: .secondary, alignment: .trailing)
+            }
+            GridText(Self.cents(cell.bid), tint: .secondary, alignment: .trailing)
+            GridText(Self.cents(cell.ask), tint: .secondary, alignment: .trailing)
+            GridText(Self.cents(cell.lastTrade), tint: .secondary, alignment: .trailing)
+            change(cell.change1h)
+            change(cell.change1d)
+            change(cell.change1w)
+            GridText("$" + PriceFormatter.compact(cell.volume24h), tint: .secondary, alignment: .trailing)
+        }
+    }
+
+    private func change(_ value: Double?) -> some View {
+        guard let value else { return GridText("—", tint: .secondary, alignment: .trailing) }
+        return GridText(String(format: "%+.1f", value * 100),
+                        tint: value > 0 ? Theme.up : (value < 0 ? Theme.down : .secondary), alignment: .trailing)
+    }
+
+    /// A price in cents, the way Polymarket quotes it.
+    private static func cents(_ price: Double?) -> String {
+        guard let price else { return "—" }
+        return PriceFormatter.plain((price * 1000).rounded() / 10) + "¢"
+    }
+
+    /// `2026-10-31` → `10/31`.
+    private static func day(_ iso: String) -> String {
+        let parts = iso.split(separator: "-")
+        guard parts.count == 3, let month = Int(parts[1]), let day = Int(parts[2]) else { return iso }
+        return "\(month)/\(day)"
     }
 }

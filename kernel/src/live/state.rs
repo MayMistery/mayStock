@@ -18,6 +18,7 @@ use serde_json::Value;
 use super::binance::{self, MarkUpdate};
 use super::deribit::{self, SurfaceQuote};
 use super::okx::{self, PositionRow, PrivateEvent, PublicEvent};
+use super::polymarket;
 use super::rest::{self, HistoryKind, Leg, MacroQuote, OptionVenue, RestUpdate};
 use super::schwab::{self, SchwabSource};
 use super::{Effect, Feed, FeedState, LiveConfig, Update};
@@ -38,6 +39,16 @@ const MAX_COLUMNS: usize = 5;
 const MAX_GRAVITY_ROWS: usize = 8;
 /// Strikes shown in the nearest expiry's detail.
 const NEAR_STRIKES: usize = 12;
+/// The price-range table's automatic step, as a share of spot: about one
+/// day's move for a major coin (100 for ETH near 2,700).
+const GRID_FRACTION: f64 = 0.035;
+/// Whole steps the table lays below the range spot sits in, and above it.
+const GRID_BELOW: i32 = 4;
+const GRID_ABOVE: i32 = 5;
+/// The ways the table may cut the automatic step finer, coarsest first —
+/// 100, 50, 20 and 10 for ETH near 2,700. `LiveConfig::grid_divisor` picks
+/// one; the page offers exactly these, read back from the snapshot.
+pub(crate) const GRID_DIVISORS: [u32; 4] = [1, 2, 5, 10];
 /// The private socket counts as down after this long out of service, and the
 /// app is asked to fall back to reading positions through the CLI.
 const PRIVATE_GRACE_MS: i64 = 20_000;
@@ -174,8 +185,27 @@ pub struct State {
     schwab_quotes: HashMap<(String, String), schwab::Quote>,
     yahoo: Vec<MacroQuote>,
     schwab_live: Arc<AtomicBool>,
+    // Polymarket, by `polymarket::TOPICS` id.
+    predictions: BTreeMap<&'static str, PredictionReading>,
     // Derived memory: the price grid keeps its anchor while spot hovers.
-    grid_anchor: Option<f64>,
+    grid: Option<GridAnchor>,
+}
+
+/// One topic's last good reading, when it was taken (local), and the error
+/// of the latest poll if it failed — the reading stays, labelled.
+#[derive(Default)]
+struct PredictionReading {
+    events: Vec<polymarket::Event>,
+    fetched_ms: Option<LocalMs>,
+    error: Option<String>,
+}
+
+/// Where the price grid was last laid, and on which step: an anchor laid on
+/// one step is not a multiple of another, so it is only reused on its own.
+#[derive(Debug, Clone, Copy)]
+struct GridAnchor {
+    step: f64,
+    anchor: f64,
 }
 
 fn base_of(inst_id: &str) -> String {
@@ -219,9 +249,11 @@ impl State {
             schwab_quotes: HashMap::new(),
             yahoo: Vec::new(),
             schwab_live: Arc::new(AtomicBool::new(false)),
-            grid_anchor: None,
+            predictions: BTreeMap::new(),
+            grid: None,
         };
         state.event(now, format!("实时层启动：{}（{}）", state.inst_id, state.config.mode));
+        state.note_grid_divisor(now);
         state
     }
 
@@ -352,7 +384,10 @@ impl State {
                         self.surface.retain(|_, q| q.expiry_ms > now);
                         self.refit(now);
                     }
-                    Some(deribit::Event::Index { price, ms }) => self.deribit_index = Some(Stamp { value: price, ms }),
+                    Some(deribit::Event::Index { price, ms }) => {
+                        self.deribit_index = Some(Stamp { value: price, ms });
+                        self.update_grid();
+                    }
                     None => {}
                 }
                 Vec::new()
@@ -389,7 +424,7 @@ impl State {
                 while self.index_trail.front().is_some_and(|s| s.ms < ms - INDEX_TRAIL_MS) {
                     self.index_trail.pop_front();
                 }
-                self.update_grid_anchor(price);
+                self.update_grid();
             }
             PublicEvent::Mark { inst_id, price, ms } if inst_id == self.inst_id => self.okx_mark = Some(Stamp { value: price, ms }),
             PublicEvent::Last { inst_id, price, ms } if inst_id == self.inst_id => self.okx_last = Some(Stamp { value: price, ms }),
@@ -411,11 +446,42 @@ impl State {
         }
     }
 
-    fn update_grid_anchor(&mut self, spot: f64) {
-        if let Some(step) = implied::nice_step(spot, 0.035) {
-            if let Some((anchor, _)) = implied::price_edges(spot, step, self.grid_anchor, 4, 5) {
-                self.grid_anchor = Some(anchor);
-            }
+    /// The divisor in force: the configured one when it is on offer, else
+    /// the automatic step (and `note_grid_divisor` has said why).
+    fn grid_divisor(&self) -> u32 {
+        if GRID_DIVISORS.contains(&self.config.grid_divisor) { self.config.grid_divisor } else { 1 }
+    }
+
+    fn note_grid_divisor(&mut self, now: i64) {
+        if !GRID_DIVISORS.contains(&self.config.grid_divisor) {
+            self.event(now, format!(
+                "价格区间档宽细分 {} 不在可选的 {:?} 里，按自动档宽显示",
+                self.config.grid_divisor, GRID_DIVISORS));
+        }
+    }
+
+    /// Every step the price-range table offers at `spot`, coarsest first: the
+    /// automatic round step cut by each of `GRID_DIVISORS`.
+    fn grid_choices(spot: f64) -> Vec<GridChoiceView> {
+        let Some(automatic) = implied::nice_step(spot, GRID_FRACTION) else { return Vec::new() };
+        GRID_DIVISORS.iter().map(|&divisor| GridChoiceView { divisor, step: automatic / f64::from(divisor) }).collect()
+    }
+
+    /// The table's step and edges at `spot`. The remembered anchor is kept
+    /// only when it was laid on this same step.
+    fn grid_edges(&self, spot: f64) -> Option<(f64, f64, Vec<f64>)> {
+        let divisor = self.grid_divisor();
+        let step = Self::grid_choices(spot).into_iter().find(|c| c.divisor == divisor)?.step;
+        let previous = self.grid.filter(|g| (g.step - step).abs() <= step * 1e-9).map(|g| g.anchor);
+        let (anchor, edges) = implied::price_edges(spot, step, previous, GRID_BELOW, GRID_ABOVE)?;
+        Some((step, anchor, edges))
+    }
+
+    /// Re-lay the grid on the spot the table reads, whichever index that is.
+    fn update_grid(&mut self) {
+        let Some((spot, _, _)) = self.spot() else { return };
+        if let Some((step, anchor, _)) = self.grid_edges(spot) {
+            self.grid = Some(GridAnchor { step, anchor });
         }
     }
 
@@ -481,7 +547,7 @@ impl State {
             self.fits.clear();
             self.deribit_index = None;
             self.book.clear();
-            self.grid_anchor = None;
+            self.grid = None;
             vec![Effect::BaseChanged]
         } else {
             vec![Effect::InstrumentChanged]
@@ -490,8 +556,12 @@ impl State {
 
     pub(crate) fn reconfigure(&mut self, config: LiveConfig, now: i64) -> Vec<Effect> {
         let mode_changed = config.mode != self.config.mode;
+        let divisor_changed = config.grid_divisor != self.config.grid_divisor;
         let requested = config.inst_id.clone();
         self.config = config;
+        if divisor_changed {
+            self.note_grid_divisor(now);
+        }
         if mode_changed {
             // Positions and equity belong to an account; the other account's
             // must not survive a switch.
@@ -567,6 +637,25 @@ impl State {
                 Ok(quotes) => self.yahoo = quotes,
                 Err(why) => self.event(now, format!("Yahoo：{why}")),
             },
+            RestUpdate::Prediction { topic, result, ms } => {
+                let label = polymarket::topic(topic).map(|t| t.label).unwrap_or(topic);
+                let reading = self.predictions.entry(topic).or_default();
+                let line = match result {
+                    Ok(events) => {
+                        reading.events = events;
+                        reading.fetched_ms = Some(LocalMs(ms));
+                        reading.error.take().map(|_| format!("Polymarket「{label}」恢复读取"))
+                    }
+                    Err(why) => {
+                        let first = reading.error.is_none();
+                        reading.error = Some(why.clone());
+                        first.then(|| format!("Polymarket「{label}」读取失败，保留上一次读数：{why}"))
+                    }
+                };
+                if let Some(line) = line {
+                    self.event(now, line);
+                }
+            }
         }
     }
 
@@ -609,6 +698,12 @@ impl State {
                 let sent = value.get("sentMs").and_then(Value::as_i64).ok_or("缺少 sentMs")?;
                 let received = value.get("receivedMs").and_then(Value::as_i64).ok_or("缺少 receivedMs")?;
                 self.apply_rest(RestUpdate::Clock(Ok((server, sent, received))), now);
+                Vec::new()
+            }
+            other if other.starts_with("rest.polymarket.") => {
+                let id = &other["rest.polymarket.".len()..];
+                let topic = polymarket::topic(id).ok_or_else(|| format!("未知的 Polymarket 主题：{id}"))?;
+                self.apply_rest(RestUpdate::Prediction { topic: topic.id, result: polymarket::events(payload), ms: now }, now);
                 Vec::new()
             }
             "rest.okx.stops" => {
@@ -686,6 +781,7 @@ impl State {
             gravity: self.gravity_view(now, &smiles),
             probability: self.probability_view(now, &smiles),
             macro_tape: self.macro_view(),
+            predictions: self.prediction_view(),
         };
         serde_json::to_string(&snapshot).unwrap_or_else(|e| format!("{{\"seq\":{seq},\"error\":\"{e}\"}}"))
     }
@@ -780,16 +876,18 @@ impl State {
             surface_ms: self.surface.values().map(|q| q.ms).max(),
             index_ms: self.index.map(|s| s.ms),
             spot: spot.map(|s| s.0),
+            grid_divisor: self.grid_divisor(),
+            grid_step: None,
+            grid_choices: Vec::new(),
             edges: Vec::new(),
             spot_bucket: None,
             forward_anchor: None,
             columns: Vec::new(),
         };
-        let (Some((spot_value, _, _)), Some(anchor)) = (spot, self.grid_anchor.or_else(|| spot.map(|s| s.0))) else {
-            return view;
-        };
-        let Some(step) = implied::nice_step(spot_value, 0.035) else { return view };
-        let Some((_, edges)) = implied::price_edges(spot_value, step, Some(anchor), 4, 5) else { return view };
+        let Some((spot_value, _, _)) = spot else { return view };
+        view.grid_choices = Self::grid_choices(spot_value);
+        let Some((step, _, edges)) = self.grid_edges(spot_value) else { return view };
+        view.grid_step = Some(step);
         view.spot_bucket = Some(edges.iter().filter(|e| **e <= spot_value).count());
 
         // Columns: the expiries that hold the market's money, in time order;
@@ -1133,6 +1231,64 @@ impl State {
         MacroView { source: "none", note: Some("宏观数据源都还没有数据".into()), rows: schwab_rows }
     }
 
+    /// Every declared topic, read or not: one never read says so rather than
+    /// vanishing from the card.
+    fn prediction_view(&self) -> PredictionView {
+        let topics = polymarket::TOPICS
+            .iter()
+            .map(|topic| {
+                let reading = self.predictions.get(topic.id);
+                let events = reading.map(|r| r.events.as_slice()).unwrap_or(&[]);
+                let cell = |m: &polymarket::Market, deadline: bool| PredictionCellView {
+                    label: m.label.clone(),
+                    deadline: if deadline { polymarket::deadline_day(m.end_ms) } else { None },
+                    probability: m.probability,
+                    from_last_trade: m.from_last_trade,
+                    bid: m.bid,
+                    ask: m.ask,
+                    last_trade: m.last_trade,
+                    change_1h: m.change_1h,
+                    change_1d: m.change_1d,
+                    change_1w: m.change_1w,
+                    volume_24h: m.volume_24h,
+                };
+                let lines = match topic.layout {
+                    polymarket::Layout::Outcomes => events
+                        .iter()
+                        .map(|e| PredictionLineView {
+                            title: e.title.clone(),
+                            deadline: polymarket::deadline_day(e.end_ms),
+                            volume_24h: e.volume_24h,
+                            liquidity: e.liquidity,
+                            cells: e.markets.iter().map(|m| cell(m, false)).collect(),
+                        })
+                        .collect(),
+                    polymarket::Layout::Deadlines if events.is_empty() => Vec::new(),
+                    polymarket::Layout::Deadlines => {
+                        let mut markets: Vec<&polymarket::Market> = events.iter().flat_map(|e| &e.markets).collect();
+                        markets.sort_by_key(|m| m.end_ms);
+                        vec![PredictionLineView {
+                            title: topic.label.to_string(),
+                            deadline: None,
+                            volume_24h: events.iter().map(|e| e.volume_24h).sum(),
+                            liquidity: events.iter().map(|e| e.liquidity).sum(),
+                            cells: markets.into_iter().map(|m| cell(m, true)).collect(),
+                        }]
+                    }
+                };
+                PredictionTopicView {
+                    id: topic.id,
+                    label: topic.label,
+                    meaning: topic.meaning,
+                    fetched_ms: reading.and_then(|r| r.fetched_ms).map(|ms| self.to_server(ms)),
+                    error: reading.and_then(|r| r.error.clone()),
+                    lines,
+                }
+            })
+            .collect();
+        PredictionView { stale_after_ms: Feed::Polymarket.stale_after_ms(), topics }
+    }
+
     fn schwab_reading(&self, service: &str, key: &str) -> (Option<f64>, Option<f64>, Option<i64>, bool) {
         let (Some(quote), Some(fields)) = (self.schwab_quotes.get(&(service.to_string(), key.to_string())), schwab::fields(service)) else {
             return (None, None, None, false);
@@ -1271,6 +1427,7 @@ struct Snapshot {
     probability: ProbabilityView,
     #[serde(rename = "macro")]
     macro_tape: MacroView,
+    predictions: PredictionView,
 }
 
 #[derive(Serialize)]
@@ -1536,10 +1693,24 @@ struct ProbabilityView {
     surface_ms: Option<i64>,
     index_ms: Option<i64>,
     spot: Option<f64>,
+    /// The divisor in force — the configured one, or 1 when that one is not
+    /// on offer.
+    grid_divisor: u32,
+    /// The width of each range between the edges.
+    grid_step: Option<f64>,
+    /// What the page may offer instead, one per `GRID_DIVISORS`.
+    grid_choices: Vec<GridChoiceView>,
     edges: Vec<f64>,
     spot_bucket: Option<usize>,
     forward_anchor: Option<&'static str>,
     columns: Vec<ColumnView>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GridChoiceView {
+    divisor: u32,
+    step: f64,
 }
 
 #[derive(Serialize)]
@@ -1567,6 +1738,56 @@ struct MacroView {
     source: &'static str,
     note: Option<String>,
     rows: Vec<MacroRowView>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PredictionView {
+    stale_after_ms: i64,
+    topics: Vec<PredictionTopicView>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PredictionTopicView {
+    id: &'static str,
+    label: &'static str,
+    meaning: &'static str,
+    /// When the last good reading was taken, on the venues' clock.
+    fetched_ms: Option<i64>,
+    /// The latest poll's error, while the last good reading is kept.
+    error: Option<String>,
+    lines: Vec<PredictionLineView>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PredictionLineView {
+    title: String,
+    /// The New York day an event of mutually exclusive outcomes resolves.
+    deadline: Option<String>,
+    volume_24h: f64,
+    liquidity: f64,
+    cells: Vec<PredictionCellView>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PredictionCellView {
+    label: String,
+    /// The New York day of a deadline cell.
+    deadline: Option<String>,
+    /// None where the book makes no price (see `polymarket`).
+    probability: Option<f64>,
+    from_last_trade: bool,
+    bid: Option<f64>,
+    ask: Option<f64>,
+    last_trade: Option<f64>,
+    /// In price units; none where Polymarket omits them.
+    change_1h: Option<f64>,
+    change_1d: Option<f64>,
+    change_1w: Option<f64>,
+    volume_24h: f64,
 }
 
 #[derive(Serialize)]
@@ -1661,5 +1882,191 @@ mod tests {
         assert_eq!(feed(&snapshot, "options.book")["lastFrameMs"], NOW + 6_000 - 1_500);
         assert_eq!(snapshot["gravity"]["bookMs"], NOW + 6_000 - 1_500);
         assert_eq!(snapshot["clock"]["measuredMs"], NOW + 100 - 1_500);
+    }
+
+    /// 25SEP26 08:00 UTC, 44 hours after `NOW`.
+    const EXPIRY_25SEP: i64 = 1_790_323_200_000;
+    const FORWARD: f64 = 2720.0;
+
+    fn config(divisor: u32) -> LiveConfig {
+        serde_json::from_str(&format!(r#"{{"instId":"ETH-USDT-SWAP","network":false,"gridDivisor":{divisor}}}"#)).unwrap()
+    }
+
+    fn okx_index(state: &mut State, price: f64, ms: i64) {
+        let text = format!(r#"{{"arg":{{"channel":"index-tickers","instId":"ETH-USD"}},"data":[{{"instId":"ETH-USD","idxPx":"{price}","ts":"{ms}"}}]}}"#);
+        state.apply(Update::Frame { feed: Feed::OkxPublic, text, received_ms: ms }, ms);
+    }
+
+    fn deribit_index(state: &mut State, price: f64, ms: i64) {
+        let text = format!(r#"{{"jsonrpc":"2.0","method":"subscription","params":{{"channel":"deribit_price_index.eth_usd","data":{{"timestamp":{ms},"price":{price},"index_name":"eth_usd"}}}}}}"#);
+        state.apply(Update::Frame { feed: Feed::Deribit, text, received_ms: ms }, ms);
+    }
+
+    /// Deribit's 25SEP26 surface, priced off a put-skewed smile so parity
+    /// recovers `FORWARD`.
+    fn surface(state: &mut State) {
+        use crate::options::{black_scholes, OptionKind};
+        let years = (EXPIRY_25SEP - NOW) as f64 / YEAR_MS;
+        let mut rows = Vec::new();
+        for strike in (2300..=3200).step_by(50).map(f64::from) {
+            let k = (strike / FORWARD).ln();
+            let iv = 0.47 - 0.8 * k + 3.0 * k * k;
+            for (kind, letter) in [(OptionKind::Call, "C"), (OptionKind::Put, "P")] {
+                let mark = black_scholes(kind, FORWARD, strike, years, iv) / FORWARD;
+                rows.push(format!(r#"{{"timestamp":{},"iv":{iv},"instrument_name":"ETH-25SEP26-{strike}-{letter}","mark_price":{mark}}}"#, NOW - 500));
+            }
+        }
+        let text = format!(r#"{{"jsonrpc":"2.0","method":"subscription","params":{{"channel":"markprice.options.eth_usd","data":[{}]}}}}"#, rows.join(","));
+        state.apply(Update::Frame { feed: Feed::Deribit, text, received_ms: NOW }, NOW);
+    }
+
+    fn numbers(value: &Value) -> Vec<f64> {
+        value.as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect()
+    }
+
+    /// What every grid must be, whatever step it was cut to: edges one step
+    /// apart on multiples of the step, spot inside its marked range, and each
+    /// column a whole distribution over the ranges.
+    fn assert_grid(probability: &Value, spot: f64, step: f64) {
+        let edges = numbers(&probability["edges"]);
+        assert_eq!(edges.len() as i32, GRID_BELOW + GRID_ABOVE + 1);
+        for pair in edges.windows(2) {
+            assert!((pair[1] - pair[0] - step).abs() < 1e-9, "edges {edges:?} are not {step} apart");
+        }
+        for edge in &edges {
+            assert!(((edge / step).round() * step - edge).abs() < 1e-6, "edge {edge} is off the {step} grid: {edges:?}");
+        }
+        let bucket = probability["spotBucket"].as_u64().unwrap() as usize;
+        assert!(bucket > 0 && bucket < edges.len(), "spot {spot} left the table: {edges:?}");
+        assert!(edges[bucket - 1] <= spot && spot < edges[bucket], "spot {spot} is not in range {bucket} of {edges:?}");
+        let columns = probability["columns"].as_array().unwrap();
+        assert!(!columns.is_empty());
+        for column in columns {
+            let p = numbers(&column["probabilities"]);
+            assert_eq!(p.len(), edges.len() + 1);
+            assert!((p.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn every_offered_step_lays_a_grid_on_its_own_multiples() {
+        let spot = 2663.4;
+        let automatic = implied::nice_step(spot, GRID_FRACTION).unwrap();
+        let mut state = State::new(config(1), NOW);
+        okx_index(&mut state, spot, NOW - 800);
+        surface(&mut state);
+        // Coarse to fine and back: each switch must drop an anchor laid on the
+        // previous step (2650 on 50 is not a multiple of 20).
+        let order: Vec<u32> = GRID_DIVISORS.iter().chain(GRID_DIVISORS.iter().rev()).copied().collect();
+        for (tick, divisor) in order.into_iter().enumerate() {
+            state.reconfigure(config(divisor), NOW);
+            let step = automatic / f64::from(divisor);
+            for moment in ["on the switch", "on the next index tick"] {
+                let snapshot = snapshot(&state, NOW);
+                let probability = &snapshot["probability"];
+                assert_eq!(probability["gridDivisor"], divisor, "{moment}");
+                assert_eq!(probability["gridStep"].as_f64(), Some(step), "{moment}");
+                let offered: Vec<(u64, f64)> = probability["gridChoices"].as_array().unwrap().iter()
+                    .map(|c| (c["divisor"].as_u64().unwrap(), c["step"].as_f64().unwrap())).collect();
+                assert_eq!(offered, GRID_DIVISORS.iter().map(|d| (u64::from(*d), automatic / f64::from(*d))).collect::<Vec<_>>());
+                assert_grid(probability, spot, step);
+                okx_index(&mut state, spot, NOW - 700 + tick as i64);
+            }
+        }
+    }
+
+    #[test]
+    fn a_divisor_that_is_not_offered_shows_the_automatic_step_and_says_so() {
+        let spot = 2663.4;
+        let mut state = State::new(config(3), NOW);
+        okx_index(&mut state, spot, NOW - 800);
+        surface(&mut state);
+        let snapshot = snapshot(&state, NOW);
+        let probability = &snapshot["probability"];
+        assert_eq!(probability["gridDivisor"], 1);
+        assert_eq!(probability["gridStep"].as_f64(), implied::nice_step(spot, GRID_FRACTION));
+        assert_grid(probability, spot, 100.0);
+        assert!(snapshot["events"].as_array().unwrap().iter().any(|e| e["message"].as_str().unwrap().contains("档宽细分 3")));
+    }
+
+    #[test]
+    fn without_the_okx_index_the_grid_still_sits_on_round_prices() {
+        // Spot falls back to Deribit's index. The grid used to take spot
+        // itself as its anchor then, and every edge came out unrounded.
+        let spot = 2663.4;
+        let mut state = State::new(config(5), NOW);
+        deribit_index(&mut state, spot, NOW - 800);
+        surface(&mut state);
+        let snapshot = snapshot(&state, NOW);
+        assert_grid(&snapshot["probability"], spot, 20.0);
+    }
+
+    /// Two events of one topic, the second listing its deadlines out of
+    /// order and one already settled.
+    const GAMMA_BODY: &str = r#"[
+        {"title":"First?","endDate":"2026-10-29T03:59:00Z","volume24hr":1000,"liquidity":5000,"markets":[
+            {"groupItemTitle":"Yes-ish","bestBid":0.6,"bestAsk":0.62,"lastTradePrice":0.61,"oneDayPriceChange":-0.02,"volume24hr":800,"endDate":"2026-10-29T03:59:00Z"}]},
+        {"title":"Second?","endDate":"2026-12-31T23:59:00Z","volume24hr":300,"liquidity":700,"markets":[
+            {"groupItemTitle":"December 31","bestBid":0.3,"bestAsk":0.32,"endDate":"2026-12-31T23:59:00Z"},
+            {"groupItemTitle":"September 25","closed":true,"bestBid":0.999,"bestAsk":1,"endDate":"2026-09-25T23:59:00Z"},
+            {"groupItemTitle":"October 31","bestBid":0.1,"bestAsk":0.12,"endDate":"2026-11-01T03:59:00Z"}]}]"#;
+
+    #[test]
+    fn every_declared_topic_reaches_the_snapshot_in_its_layout() {
+        let mut state = state();
+        let before = snapshot(&state, NOW);
+        let topics = before["predictions"]["topics"].as_array().unwrap();
+        assert_eq!(topics.iter().map(|t| t["id"].as_str().unwrap()).collect::<Vec<_>>(),
+                   polymarket::TOPICS.iter().map(|t| t.id).collect::<Vec<_>>(), "never-read topics still show, in declaration order");
+        assert!(topics.iter().all(|t| t["fetchedMs"].is_null() && t["lines"].as_array().unwrap().is_empty()));
+        assert_eq!(before["predictions"]["staleAfterMs"], Feed::Polymarket.stale_after_ms());
+
+        for topic in polymarket::TOPICS.iter() {
+            state.ingest(&format!("rest.polymarket.{}", topic.id), GAMMA_BODY, NOW).unwrap();
+        }
+        let after = snapshot(&state, NOW);
+        for (view, topic) in after["predictions"]["topics"].as_array().unwrap().iter().zip(polymarket::TOPICS.iter()) {
+            assert_eq!(view["fetchedMs"], NOW);
+            let lines = view["lines"].as_array().unwrap();
+            let cells = |line: &Value| line["cells"].as_array().unwrap().clone();
+            match topic.layout {
+                polymarket::Layout::Outcomes => {
+                    assert_eq!(lines.len(), 2, "{}: one line per event", topic.id);
+                    assert_eq!(lines[0]["deadline"], "2026-10-28");
+                    assert_eq!(lines[1]["deadline"], "2026-12-31");
+                    assert!(lines.iter().flat_map(cells).all(|c| c["deadline"].is_null()));
+                    let first = &cells(&lines[0])[0];
+                    assert_eq!((first["bid"].as_f64(), first["ask"].as_f64(), first["lastTrade"].as_f64()), (Some(0.6), Some(0.62), Some(0.61)));
+                    assert_eq!((first["change1d"].as_f64(), first["volume24h"].as_f64()), (Some(-0.02), Some(800.0)));
+                }
+                polymarket::Layout::Deadlines => {
+                    assert_eq!(lines.len(), 1, "{}: one line for the topic", topic.id);
+                    let days: Vec<String> = cells(&lines[0]).iter().map(|c| c["deadline"].as_str().unwrap()[5..].to_string()).collect();
+                    assert_eq!(days, ["10-28", "10-31", "12-31"], "{}: every open deadline, earliest first, settled ones gone", topic.id);
+                    assert_eq!(lines[0]["volume24h"], 1300.0);
+                }
+            }
+        }
+        assert!(state.ingest("rest.polymarket.nope", GAMMA_BODY, NOW).is_err(), "an undeclared topic is refused, not dropped");
+    }
+
+    #[test]
+    fn a_failed_poll_keeps_the_last_reading_and_says_so_once() {
+        let mut state = state();
+        state.ingest("rest.polymarket.fomc", GAMMA_BODY, NOW).unwrap();
+        for later in [1_000, 2_000] {
+            state.apply(Update::Rest(RestUpdate::Prediction { topic: "fomc", result: Err("超时".into()), ms: NOW + later }), NOW + later);
+        }
+        let failed = snapshot(&state, NOW + 2_000);
+        let fomc = &failed["predictions"]["topics"][0];
+        assert_eq!(fomc["error"], "超时");
+        assert_eq!(fomc["fetchedMs"], NOW, "the age is the last good reading's");
+        assert_eq!(fomc["lines"].as_array().unwrap().len(), 2, "the last reading stays");
+        let lines = |s: &Value| s["events"].as_array().unwrap().iter().filter(|e| e["message"].as_str().unwrap().contains("Polymarket")).count();
+        assert_eq!(lines(&failed), 1, "one line for the failure, not one per poll");
+        state.ingest("rest.polymarket.fomc", GAMMA_BODY, NOW + 3_000).unwrap();
+        let recovered = snapshot(&state, NOW + 3_000);
+        assert!(recovered["predictions"]["topics"][0]["error"].is_null());
+        assert_eq!(lines(&recovered), 2, "and one for the recovery");
     }
 }

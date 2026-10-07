@@ -23,6 +23,7 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
     public let gravity: Gravity
     public let probability: Probability
     public let macro: Macro
+    public let predictions: Predictions
 
     public struct Clock: Decodable, Sendable, Equatable {
         /// Local minus venue, in milliseconds.
@@ -284,6 +285,13 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
         public let surfaceMs: Int64?
         public let indexMs: Int64?
         public let spot: Double?
+        /// The divisor in force: the one asked for, or 1 when the kernel
+        /// does not offer that one.
+        public let gridDivisor: Int
+        /// The width of each range between `edges`.
+        public let gridStep: Double?
+        /// Every width the table can be cut to, coarsest first.
+        public let gridChoices: [GridChoice]
         /// Ascending price edges; `columns[i].probabilities` has one more
         /// entry: below the first edge, each range, above the last.
         public let edges: [Double]
@@ -292,6 +300,14 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
         /// index; `approximate` when one was not.
         public let forwardAnchor: String?
         public let columns: [Column]
+    }
+
+    /// One width the probability table offers: the automatic step divided
+    /// by `divisor`.
+    public struct GridChoice: Decodable, Sendable, Equatable, Identifiable {
+        public let divisor: Int
+        public let step: Double
+        public var id: Int { divisor }
     }
 
     public struct Column: Decodable, Sendable, Equatable, Identifiable {
@@ -319,6 +335,55 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
         public let source: String
         public let note: String?
         public let rows: [MacroRow]
+    }
+
+    // MARK: Predictions
+
+    /// Polymarket's prices for the events behind the macro inputs, one topic
+    /// per entry the kernel declares — read or not.
+    public struct Predictions: Decodable, Sendable, Equatable {
+        public let staleAfterMs: Double
+        public let topics: [PredictionTopic]
+    }
+
+    public struct PredictionTopic: Decodable, Sendable, Equatable, Identifiable {
+        public let id: String
+        public let label: String
+        public let meaning: String
+        /// The last good reading, on the venues' clock; nil until one.
+        public let fetchedMs: Int64?
+        /// The latest poll's error, while the last good reading stays.
+        public let error: String?
+        public let lines: [PredictionLine]
+    }
+
+    /// One event of mutually exclusive outcomes (with its `deadline`), or
+    /// one question across its deadlines (each cell has one).
+    public struct PredictionLine: Decodable, Sendable, Equatable {
+        public let title: String
+        /// `YYYY-MM-DD`, a New York day.
+        public let deadline: String?
+        public let volume24h: Double
+        public let liquidity: Double
+        public let cells: [PredictionCell]
+    }
+
+    public struct PredictionCell: Decodable, Sendable, Equatable {
+        public let label: String
+        /// `YYYY-MM-DD`, a New York day, for a deadline cell.
+        public let deadline: String?
+        /// The price, which is the probability; nil where the book makes none.
+        public let probability: Double?
+        /// The price is the last trade: the book is too wide for a midpoint.
+        public let fromLastTrade: Bool
+        public let bid: Double?
+        public let ask: Double?
+        public let lastTrade: Double?
+        /// In price units (0.03 is three points); nil where not reported.
+        public let change1h: Double?
+        public let change1d: Double?
+        public let change1w: Double?
+        public let volume24h: Double
     }
 
     public struct MacroRow: Decodable, Sendable, Equatable, Identifiable {

@@ -100,6 +100,12 @@ extension E2EMain {
                          row.maxPain.map { String($0.strike) } ?? "—", row.maxPain.map { String($0.weak) } ?? "—",
                          row.pBeyondMaxPain.map { String(format: "%.2f%%", $0 * 100) } ?? "—"))
         }
+        for topic in s.predictions.topics {
+            let cells = topic.lines.flatMap(\.cells).map { cell in
+                "\(cell.deadline ?? cell.label) \(cell.probability.map { String(format: "%.1f%%", $0 * 100) } ?? "无报价")"
+            }
+            print("  polymarket \(topic.label) (\(age(s, topic.fetchedMs)))\(topic.error.map { " error: \($0)" } ?? ""): " + cells.joined(separator: " · "))
+        }
         let risk = s.risk
         print("  risk: source \(risk.source) read \(risk.wasRead) held \(risk.held) stops \(age(s, risk.stopsMs))")
         if let position = risk.position {

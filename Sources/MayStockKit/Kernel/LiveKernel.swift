@@ -29,11 +29,15 @@ public final class LiveKernel: @unchecked Sendable {
         public var network: Bool
         /// Offline only: a fixed clock, for reproducible time-to-expiry.
         public var nowOverrideMs: Int64?
+        /// How many ranges the probability table cuts each automatic step
+        /// into. The kernel declares which it offers
+        /// (`Probability.gridChoices`); any other shows the automatic step.
+        public var gridDivisor: Int
 
         public init(
             instId: String, followsHeldPosition: Bool, mode: TradingMode,
             okxProfile: String?, okxConfigPath: String?, schwabctlPath: String?,
-            network: Bool = true, nowOverrideMs: Int64? = nil
+            network: Bool = true, nowOverrideMs: Int64? = nil, gridDivisor: Int = 1
         ) {
             self.instId = instId
             self.followsHeldPosition = followsHeldPosition
@@ -43,6 +47,7 @@ public final class LiveKernel: @unchecked Sendable {
             self.schwabctlPath = schwabctlPath
             self.network = network
             self.nowOverrideMs = nowOverrideMs
+            self.gridDivisor = gridDivisor
         }
     }
 

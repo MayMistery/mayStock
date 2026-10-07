@@ -4,7 +4,7 @@
 //! market socket and read-only private account socket, Deribit's option
 //! surface, Binance's mark stream, Schwab's quote stream, and the REST reads
 //! that have no stream (open interest across four option venues, positioning
-//! history) — and feeds them into the same pure functions the rest of the
+//! history, Polymarket's prices for the macro events) — and feeds them into the same pure functions the rest of the
 //! kernel is made of (`implied`, `gravity`).
 //!
 //! Shape:
@@ -28,6 +28,7 @@ mod binance;
 mod deribit;
 pub(crate) mod net;
 pub(crate) mod okx;
+mod polymarket;
 mod rest;
 mod schwab;
 mod socket;
@@ -75,10 +76,18 @@ pub struct LiveConfig {
     /// Offline only: a fixed clock, so time-to-expiry is reproducible.
     #[serde(default)]
     pub now_override_ms: Option<i64>,
+    /// How many ranges the probability table cuts each automatic step into:
+    /// one of `state::GRID_DIVISORS`, 1 keeping the automatic step. Any other
+    /// value shows the automatic step and says so in the event log.
+    #[serde(default = "one")]
+    pub grid_divisor: u32,
 }
 
 fn yes() -> bool {
     true
+}
+fn one() -> u32 {
+    1
 }
 fn live_mode() -> String {
     "live".to_string()
@@ -108,6 +117,7 @@ pub enum Feed {
     BinanceOpenInterest,
     Clock,
     Yahoo,
+    Polymarket,
 }
 
 impl Feed {
@@ -126,6 +136,7 @@ impl Feed {
             Feed::BinanceOpenInterest => "binance.oi",
             Feed::Clock => "clock",
             Feed::Yahoo => "yahoo",
+            Feed::Polymarket => "polymarket",
         }
     }
 
@@ -144,6 +155,7 @@ impl Feed {
             Feed::BinanceOpenInterest => "Binance 持仓量",
             Feed::Clock => "时钟校准",
             Feed::Yahoo => "Yahoo 分钟线（回落）",
+            Feed::Polymarket => "Polymarket 预测市场",
         }
     }
 
@@ -185,6 +197,9 @@ impl Feed {
             // Yahoo's chart API rate-limits hard and the block sticks for a
             // day, so this is a slow, sequential poll.
             Feed::Yahoo => Duration::from_secs(120),
+            // A handful of light requests per round; the prices are context
+            // for the page, not a timing signal, so a minute is plenty.
+            Feed::Polymarket => Duration::from_secs(60),
         }
     }
 
@@ -452,6 +467,7 @@ fn follow(
 fn spawn_fixed(tasks: &mut Tasks, updates: &mpsc::Sender<Update>, http: Option<reqwest::Client>, config: &LiveConfig, state: &State) {
     let Some(http) = http else { return };
     tasks.fixed.push(tokio::spawn(rest::clock(http.clone(), updates.clone())).abort_handle());
+    tasks.fixed.push(tokio::spawn(rest::polymarket(http.clone(), updates.clone())).abort_handle());
     match config.schwabctl_path.as_deref().filter(|p| !p.is_empty()) {
         Some(path) => {
             let dialect = schwab::Dialect::new(path.to_string(), http.clone());

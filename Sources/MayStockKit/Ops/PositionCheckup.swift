@@ -37,6 +37,7 @@ public final class CheckupModel {
     public private(set) var gravity: LiveSnapshot.Gravity?
     public private(set) var structure: [LiveSnapshot.VenueStructure] = []
     public private(set) var macro: LiveSnapshot.Macro?
+    public private(set) var predictions: LiveSnapshot.Predictions?
     /// Why the live layer could not start. Shown instead of data, never
     /// alongside stale data.
     public private(set) var failure: String?
@@ -54,6 +55,11 @@ public final class CheckupModel {
     }
     public var mode: TradingMode {
         didSet { if mode != oldValue { reconfigure() } }
+    }
+    /// How finely the probability table cuts its automatic step; see
+    /// `LiveKernel.Config.gridDivisor`.
+    public var gridDivisor: Int {
+        didSet { if gridDivisor != oldValue { reconfigure() } }
     }
     /// Whether anyone can see the page. While not — its window covered,
     /// minimised, on another Space, or the app hidden — the pump drops to
@@ -100,7 +106,8 @@ public final class CheckupModel {
         okxConfigPath: String? = OKXProfileCatalog.defaultFileURL().path,
         schwabctlPath: String? = nil,
         network: Bool = true,
-        nowOverrideMs: Int64? = nil
+        nowOverrideMs: Int64? = nil,
+        gridDivisor: Int = 1
     ) {
         self.venue = venue
         self.mode = mode
@@ -111,13 +118,15 @@ public final class CheckupModel {
         self.schwabctlPath = schwabctlPath
         self.network = network
         self.nowOverrideMs = nowOverrideMs
+        self.gridDivisor = gridDivisor
     }
 
     private var config: LiveKernel.Config {
         LiveKernel.Config(
             instId: instId, followsHeldPosition: followsHeldPosition, mode: mode,
             okxProfile: profile(mode), okxConfigPath: okxConfigPath,
-            schwabctlPath: schwabctlPath, network: network, nowOverrideMs: nowOverrideMs)
+            schwabctlPath: schwabctlPath, network: network, nowOverrideMs: nowOverrideMs,
+            gridDivisor: gridDivisor)
     }
 
     // MARK: - Lifecycle
@@ -199,6 +208,7 @@ public final class CheckupModel {
         update(\.gravity, decoded.gravity)
         update(\.structure, decoded.structure)
         update(\.macro, decoded.macro)
+        update(\.predictions, decoded.predictions)
     }
 
     /// Hand a document to the kernel: the CLI fallback's positions and

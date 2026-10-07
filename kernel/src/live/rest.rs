@@ -1,6 +1,6 @@
 //! The reads that have no stream: open interest across the four option venues,
 //! five-minute positioning history, Binance's live open interest, the clock,
-//! and Yahoo minute bars when Schwab's stream is down.
+//! Polymarket's macro odds, and Yahoo minute bars when Schwab's stream is down.
 //!
 //! Each poll fails on its own and says so; none of them blanks another. Every
 //! parser here is also what `ingest` uses, so a recorded body and a live one
@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use super::socket::health;
 use crate::trade::reads::{Read, WorkingOrder, WorkingOrders};
 use crate::trade::{Access, Answered, Delivery, ReadReply, ReadRequest};
-use super::{binance, deribit, net, now_ms, okx, Feed, FeedState, Update};
+use super::{binance, deribit, net, now_ms, okx, polymarket, Feed, FeedState, Update};
 
 // MARK: - Option book
 
@@ -123,6 +123,8 @@ pub enum RestUpdate {
     /// what the read took beyond one request.
     Stops(Result<Vec<WorkingOrder>, String>, i64, Delivery),
     Yahoo(Result<Vec<MacroQuote>, String>),
+    /// One of `polymarket::TOPICS`, and when it was read (local).
+    Prediction { topic: &'static str, result: Result<Vec<polymarket::Event>, String>, ms: i64 },
 }
 
 impl RestUpdate {
@@ -137,6 +139,7 @@ impl RestUpdate {
             RestUpdate::Clock(_) => Feed::Clock,
             RestUpdate::Stops(..) => Feed::OkxStops,
             RestUpdate::Yahoo(_) => Feed::Yahoo,
+            RestUpdate::Prediction { .. } => Feed::Polymarket,
         }
     }
 
@@ -149,6 +152,7 @@ impl RestUpdate {
             RestUpdate::Clock(result) => result.is_ok(),
             RestUpdate::Stops(result, ..) => result.is_ok(),
             RestUpdate::Yahoo(result) => result.is_ok(),
+            RestUpdate::Prediction { result, .. } => result.is_ok(),
         }
     }
 }
@@ -440,6 +444,30 @@ async fn sample_clock(http: &reqwest::Client, url: &str) -> Result<(i64, i64, i6
         }
     }
     best.ok_or_else(|| last_error.unwrap_or_else(|| "时钟校准失败".into()))
+}
+
+// MARK: - Polymarket
+
+/// Every topic in `polymarket::TOPICS`, one after another, at
+/// `Feed::Polymarket`'s cadence. A topic that fails keeps its last reading
+/// (labelled with its age and the error); the others carry on.
+pub async fn polymarket(http: reqwest::Client, updates: mpsc::Sender<Update>) {
+    loop {
+        let mut failures = Vec::new();
+        for topic in polymarket::TOPICS.iter() {
+            let result = match net::get_text(&http, &polymarket::url(&topic.source), None).await {
+                Ok(body) => polymarket::events(&body),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = &result {
+                failures.push(format!("{}：{e}", topic.label));
+            }
+            send(&updates, RestUpdate::Prediction { topic: topic.id, result, ms: now_ms() }).await;
+        }
+        let state = if failures.is_empty() { FeedState::Live } else { FeedState::Degraded(failures.join("；")) };
+        health(&updates, Feed::Polymarket, state).await;
+        tokio::time::sleep(Feed::Polymarket.cadence()).await;
+    }
 }
 
 // MARK: - Yahoo fallback

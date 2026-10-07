@@ -190,4 +190,48 @@ struct LiveKernelGoldenTests {
         defer { model.stop() }
         #expect(!model.pull(), "nothing moved since the last ingest")
     }
+
+    @Test("Polymarket topics decode with their book, and a topic not yet read says so")
+    func predictionsDecode() throws {
+        let model = try startedModel()
+        defer { model.stop() }
+        let unread = try #require(model.snapshot?.predictions)
+        #expect(!unread.topics.isEmpty && unread.topics.allSatisfy { $0.fetchedMs == nil && $0.lines.isEmpty })
+        let topic = try #require(unread.topics.first).id
+        try model.ingest(topic: "rest.polymarket.\(topic)", payload: json([[
+            "title": "Fed Decision in October?", "endDate": "2026-10-29T03:59:00Z", "volume24hr": 572_701.0, "liquidity": 2_252_949.0,
+            "markets": [
+                ["groupItemTitle": "25 bps increase", "bestBid": 0.66, "bestAsk": 0.67, "lastTradePrice": 0.67,
+                 "oneHourPriceChange": 0.01, "oneDayPriceChange": -0.03, "oneWeekPriceChange": 0.14, "volume24hr": 146_586.8,
+                 "endDate": "2026-10-29T03:59:00Z"],
+                ["groupItemTitle": "No change", "bestBid": 0.01, "bestAsk": 0.89, "endDate": "2026-10-29T03:59:00Z"],
+            ],
+        ]]))
+        let predictions = try #require(model.snapshot?.predictions)
+        let read = try #require(predictions.topics.first { $0.id == topic })
+        #expect(read.fetchedMs != nil && read.error == nil)
+        let cells = read.lines.flatMap(\.cells)
+        let hike = try #require(cells.first { $0.label == "25 bps increase" })
+        #expect(abs((hike.probability ?? 0) - 0.665) < 1e-9 && hike.bid == 0.66 && hike.ask == 0.67 && hike.lastTrade == 0.67)
+        #expect(hike.change1h == 0.01 && hike.change1d == -0.03 && hike.change1w == 0.14)
+        #expect(cells.first { $0.label == "No change" }?.probability == nil, "an untraded 0.01/0.89 book has no price")
+        #expect(predictions.topics.filter { $0.id != topic }.allSatisfy { $0.fetchedMs == nil })
+    }
+
+    @Test("every width the kernel offers cuts the probability table to that width")
+    func everyOfferedWidthApplies() throws {
+        let model = try startedModel()
+        defer { model.stop() }
+        let choices = try #require(model.snapshot?.probability.gridChoices)
+        #expect(choices.count > 1 && choices.first?.divisor == 1, "the automatic width first, finer ones after")
+        for choice in choices.reversed() + choices {
+            model.gridDivisor = choice.divisor
+            let probability = try #require(model.snapshot?.probability)
+            #expect(probability.gridDivisor == choice.divisor && probability.gridStep == choice.step)
+            let gaps = zip(probability.edges.dropFirst(), probability.edges).map { $0 - $1 }
+            #expect(!gaps.isEmpty && gaps.allSatisfy { abs($0 - choice.step) < 1e-9 }, "edges \(probability.edges)")
+            let column = try #require(probability.columns.first)
+            #expect(abs(column.probabilities.reduce(0, +) - 1) < 1e-6)
+        }
+    }
 }
