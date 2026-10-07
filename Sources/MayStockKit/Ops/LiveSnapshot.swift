@@ -402,6 +402,8 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
         public let meaning: String
         /// `outcomes`, `deadlines` or `daily`.
         public let layout: String
+        /// How these outcomes have mapped to ETH; nil for a topic not measured.
+        public let reaction: Reaction?
         /// When its first shown market inside the coming week settles; nil
         /// when none does.
         public let upcomingMs: Int64?
@@ -412,6 +414,63 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
         /// The latest poll's error, while the last good reading stays.
         public let error: String?
         public let lines: [PredictionLine]
+    }
+
+    /// What an outcome has meant for ETH, measured by
+    /// `Scripts/event-reactions.py`.
+    public struct Reaction: Decodable, Sendable, Equatable {
+        /// `surprise` (measured on settled history) or `oil-chain` (an
+        /// estimate through Brent).
+        public let kind: String
+        /// What the columns are conditioned on: "若是这一档", "若当天发生" …
+        public let eventLabel: String
+        public let windows: [ReactionWindow]
+        public let source: String
+        /// Why the sample is what it is.
+        public let why: String?
+        public let analog: ReactionAnalog?
+        /// `YYYY-MM-DD`, when the history was measured.
+        public let measured: String
+    }
+
+    public struct ReactionWindow: Decodable, Sendable, Equatable {
+        public let label: String
+        public let n: Int
+        /// ETH's move per `stepLabel` of surprise, in percent.
+        public let perStep: Double
+        public let perStepSe: Double
+        public let stepLabel: String
+        /// Clears `significance` standard errors; otherwise none is applied.
+        public let significant: Bool
+        /// The critical |t|: a two-sided 5% test shared (Bonferroni) across
+        /// every relation measured in the same run.
+        public let significance: Double
+    }
+
+    public struct ReactionAnalog: Decodable, Sendable, Equatable {
+        public let label: String
+        public let n: Int
+        /// Brent's move beyond an ordinary span of the same length, percent.
+        public let oilExcess: Double?
+        public let oilExcessSe: Double?
+        public let oilSignificant: Bool
+        /// ETH's move per 1% of Brent over the span.
+        public let beta: Double
+        public let betaSe: Double
+        public let betaSignificant: Bool
+        /// "2 天": the day before an event and its own.
+        public let spanLabel: String
+        public let since: String
+        public let significance: Double
+    }
+
+    public struct CellReaction: Decodable, Sendable, Equatable {
+        /// ETH's expected move over the window if this outcome happens, percent.
+        public let median: Double?
+        /// The probability ETH ends the window higher.
+        public let up: Double?
+        /// The outcome's surprise is beyond any in the history.
+        public let extrapolated: Bool
     }
 
     /// One event of mutually exclusive outcomes (with its `deadline`), or
@@ -431,6 +490,8 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
         public let deadline: String?
         /// Settles within the coming week.
         public let upcoming: Bool
+        /// ETH if this outcome happens, one per the topic's reaction window.
+        public let reactions: [CellReaction]
         /// The price, which is the probability; nil where the book makes none.
         public let probability: Double?
         /// The price is the last trade: the book is too wide for a midpoint.

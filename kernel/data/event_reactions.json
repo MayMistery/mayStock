@@ -1,0 +1,333 @@
+{
+  "measured": "2026-10-07",
+  "significance": 2.891,
+  "tests": 13,
+  "alpha": 0.05,
+  "oil": {
+    "source": "Hyperliquid xyz:BRENTOIL 与 Binance ETHUSDT 小时线",
+    "since": "2026-03-15",
+    "betaHour": {
+      "n": 5000,
+      "intercept": 0.0062,
+      "slope": -0.251,
+      "slopeSe": 0.0118,
+      "sigma": 0.5253,
+      "hours": 1,
+      "label": "1 小时",
+      "xMin": -9.5825,
+      "xMax": 6.4129,
+      "significant": true
+    },
+    "betaDay": {
+      "n": 206,
+      "intercept": 0.1533,
+      "slope": -0.2681,
+      "slopeSe": 0.0618,
+      "sigma": 2.5909,
+      "hours": 24,
+      "label": "24 小时",
+      "xMin": -15.4116,
+      "xMax": 9.7805,
+      "significant": true
+    },
+    "betaEvent": {
+      "n": 103,
+      "intercept": 0.3335,
+      "slope": -0.1619,
+      "slopeSe": 0.0979,
+      "sigma": 3.9809,
+      "hours": 48,
+      "label": "2 天",
+      "xMin": -14.2825,
+      "xMax": 8.9175,
+      "significant": false
+    },
+    "daysBefore": 1,
+    "oilSpanMean": 0.0769,
+    "analogs": {
+      "escalation": {
+        "label": "停火破裂、战事升级",
+        "days": [
+          "2026-06-07",
+          "2026-07-08"
+        ],
+        "n": 2,
+        "oilExcess": 4.7114,
+        "oilExcessSe": 3.8369,
+        "significant": false
+      },
+      "de-escalation": {
+        "label": "停火、协议、通航恢复",
+        "days": [
+          "2026-04-08",
+          "2026-04-21",
+          "2026-06-12",
+          "2026-06-17",
+          "2026-06-28"
+        ],
+        "n": 5,
+        "oilExcess": -5.2644,
+        "oilExcessSe": 3.046,
+        "significant": false
+      },
+      "tanker-attack": {
+        "label": "海湾与霍尔木兹船只遇袭",
+        "days": [
+          "2026-03-17",
+          "2026-03-18",
+          "2026-03-22",
+          "2026-03-30",
+          "2026-04-22",
+          "2026-05-06",
+          "2026-05-08",
+          "2026-05-10",
+          "2026-05-14",
+          "2026-05-29",
+          "2026-06-02",
+          "2026-06-08",
+          "2026-06-09",
+          "2026-06-10",
+          "2026-07-06",
+          "2026-07-12",
+          "2026-07-14",
+          "2026-09-05",
+          "2026-09-08",
+          "2026-09-14"
+        ],
+        "n": 20,
+        "oilExcess": 0.7468,
+        "oilExcessSe": 1.0508,
+        "significant": false
+      },
+      "houthi-saudi": {
+        "label": "胡塞打沙特能源设施",
+        "days": [
+          "2026-08-09",
+          "2026-08-13",
+          "2026-08-18",
+          "2026-09-08",
+          "2026-09-14",
+          "2026-10-07"
+        ],
+        "n": 5,
+        "oilExcess": 1.198,
+        "oilExcessSe": 1.2756,
+        "significant": false
+      },
+      "saudi-yemen": {
+        "label": "沙特空袭也门",
+        "days": [
+          "2026-09-07",
+          "2026-09-10",
+          "2026-09-11",
+          "2026-09-12",
+          "2026-09-13",
+          "2026-09-14"
+        ],
+        "n": 6,
+        "oilExcess": 1.4014,
+        "oilExcessSe": 1.5558,
+        "significant": false
+      }
+    }
+  },
+  "topics": {
+    "core-cpi": {
+      "kind": "surprise",
+      "unit": "pp",
+      "source": "Kalshi 核心 CPI 环比阶梯盘，公布前 5 分钟的报价还原预期",
+      "event": "outcome",
+      "why": "2022 年超预期和波动都大一倍，斜率被拉大一倍；2023 年起各子区间斜率一致，取 2023 年起",
+      "windows": [
+        {
+          "n": 41,
+          "intercept": 0.1565,
+          "slope": -9.7062,
+          "slopeSe": 2.9297,
+          "sigma": 1.3979,
+          "hours": 1,
+          "label": "1 小时",
+          "xMin": -0.2275,
+          "xMax": 0.127,
+          "significant": true
+        },
+        {
+          "n": 41,
+          "intercept": 1.1517,
+          "slope": 0.7502,
+          "slopeSe": 7.3873,
+          "sigma": 3.5248,
+          "hours": 24,
+          "label": "24 小时",
+          "xMin": -0.2275,
+          "xMax": 0.127,
+          "significant": false
+        }
+      ],
+      "sampleSince": "2023-01-01",
+      "settled": 51,
+      "skipped": [
+        "CPICORE-24OCT",
+        "CPICORE-24JUN",
+        "CPICORE-23DEC",
+        "CPICORE-23AUG"
+      ]
+    },
+    "fomc": {
+      "kind": "surprise",
+      "unit": "bp",
+      "source": "Kalshi 联邦基金利率上限阶梯盘，决议前 5 分钟的报价还原预期",
+      "event": "outcome",
+      "why": "议息几乎从不出意外（会前定价与结果之差几乎都在 6 个基点内），没有分段的理由，用全部样本",
+      "windows": [
+        {
+          "n": 27,
+          "intercept": 0.0738,
+          "slope": -0.0401,
+          "slopeSe": 0.0815,
+          "sigma": 2.0666,
+          "hours": 1,
+          "label": "1 小时",
+          "xMin": -24.0,
+          "xMax": 3.375,
+          "significant": false
+        },
+        {
+          "n": 27,
+          "intercept": 0.1396,
+          "slope": -0.072,
+          "slopeSe": 0.2566,
+          "sigma": 6.5045,
+          "hours": 24,
+          "label": "24 小时",
+          "xMin": -24.0,
+          "xMax": 3.375,
+          "significant": false
+        }
+      ],
+      "sampleSince": "2021-01-01",
+      "settled": 41,
+      "skipped": [
+        "FED-25MAR",
+        "FED-24JUL",
+        "FED-24MAY",
+        "FED-24MAR",
+        "FED-24JAN",
+        "FED-23NOV",
+        "FED-23SEP",
+        "FED-23JUL",
+        "FED-23MAY",
+        "FED-22DEC",
+        "FED-22JAN",
+        "FED-21DEC",
+        "FED-21SEP",
+        "FED-21JUL"
+      ]
+    },
+    "israel-lebanon": {
+      "kind": "surprise",
+      "unit": "probability",
+      "source": "Polymarket 已结算的每日盘，纽约零点的价格作为当天的预期",
+      "event": "yes",
+      "why": "每天一问",
+      "windows": [
+        {
+          "n": 31,
+          "intercept": 0.8393,
+          "slope": -2.9925,
+          "slopeSe": 1.4895,
+          "sigma": 1.9383,
+          "hours": 24,
+          "label": "当天",
+          "xMin": -0.95,
+          "xMax": 0.525,
+          "significant": false
+        }
+      ],
+      "yesShare": 0.968
+    },
+    "russia-kyiv": {
+      "kind": "surprise",
+      "unit": "probability",
+      "source": "Polymarket 已结算的每日盘，纽约零点的价格作为当天的预期",
+      "event": "yes",
+      "why": "每天一问",
+      "windows": [
+        {
+          "n": 50,
+          "intercept": 0.7976,
+          "slope": 0.7854,
+          "slopeSe": 1.4939,
+          "sigma": 3.3133,
+          "hours": 24,
+          "label": "当天",
+          "xMin": -0.957,
+          "xMax": 0.58,
+          "significant": false
+        }
+      ],
+      "yesShare": 0.76
+    },
+    "hormuz-ships": {
+      "kind": "surprise",
+      "unit": "ships",
+      "source": "Polymarket 已结算的每周盘，周一零点各档价格的加权平均作为预期",
+      "event": "outcome",
+      "why": "每周一问",
+      "windows": [
+        {
+          "n": 20,
+          "intercept": 2.862,
+          "slope": 0.0329,
+          "slopeSe": 0.079,
+          "sigma": 8.6013,
+          "hours": 168,
+          "label": "本周",
+          "xMin": -66.5446,
+          "xMax": 36.7812,
+          "significant": false
+        }
+      ]
+    },
+    "hormuz-attacks": {
+      "kind": "oil-chain",
+      "analog": "tanker-attack",
+      "event": "yes"
+    },
+    "houthi-saudi": {
+      "kind": "oil-chain",
+      "analog": "houthi-saudi",
+      "event": "yes"
+    },
+    "saudi-yemen": {
+      "kind": "oil-chain",
+      "analog": "saudi-yemen",
+      "event": "yes"
+    },
+    "israel-iran": {
+      "kind": "oil-chain",
+      "analog": "escalation",
+      "event": "no"
+    },
+    "ceasefire": {
+      "kind": "oil-chain",
+      "analog": "escalation",
+      "event": "no"
+    },
+    "hormuz-deal": {
+      "kind": "oil-chain",
+      "analog": "de-escalation",
+      "event": "yes"
+    },
+    "deal": {
+      "kind": "oil-chain",
+      "analog": "de-escalation",
+      "event": "yes"
+    },
+    "hormuz": {
+      "kind": "oil-chain",
+      "analog": "de-escalation",
+      "event": "yes"
+    }
+  }
+}

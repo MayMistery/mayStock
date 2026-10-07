@@ -29,6 +29,7 @@ mod deribit;
 pub(crate) mod net;
 pub(crate) mod okx;
 mod polymarket;
+mod reactions;
 mod rest;
 mod schwab;
 mod socket;

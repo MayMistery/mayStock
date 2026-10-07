@@ -19,6 +19,7 @@ use super::binance::{self, MarkUpdate};
 use super::deribit::{self, SurfaceQuote};
 use super::okx::{self, PositionRow, PrivateEvent, PublicEvent};
 use super::polymarket;
+use super::reactions::{self, CellReaction, Side, TopicReaction};
 use super::rest::{self, HistoryKind, Leg, MacroQuote, OptionVenue, RestUpdate};
 use super::schwab::{self, SchwabSource};
 use super::{Effect, Feed, FeedState, LiveConfig, Update};
@@ -1362,6 +1363,7 @@ impl State {
                     label: m.label.clone(),
                     deadline: if deadline { polymarket::deadline_day(m.end_ms) } else { None },
                     upcoming: polymarket::is_upcoming(m.end_ms, now),
+                    reactions: Vec::new(),
                     probability: m.probability,
                     from_last_trade: m.from_last_trade,
                     bid: m.bid,
@@ -1397,6 +1399,17 @@ impl State {
                     polymarket::Layout::Deadlines => vec![one_line(ahead_markets.iter().map(|m| cell(m, true)).collect())],
                     polymarket::Layout::Daily => vec![one_line(vec![cell(ahead_markets[0], true)])],
                 };
+                let mapping = reactions::topic(topic.id, |side| event_label(&topic.layout, side));
+                let mut lines = lines;
+                if let Some((_, applier)) = &mapping {
+                    for line in &mut lines {
+                        let outcomes: Vec<(&str, Option<f64>)> = line.cells.iter().map(|c| (c.label.as_str(), c.probability)).collect();
+                        let readings = applier.apply(&outcomes);
+                        for (cell, reading) in line.cells.iter_mut().zip(readings) {
+                            cell.reactions = reading;
+                        }
+                    }
+                }
                 let shown: Vec<i64> = match topic.layout {
                     polymarket::Layout::Daily => ahead_markets.first().map(|m| m.end_ms).into_iter().collect(),
                     _ => ahead_markets.iter().map(|m| m.end_ms).collect(),
@@ -1406,6 +1419,7 @@ impl State {
                     label: topic.label,
                     meaning: topic.meaning,
                     layout: topic.layout.id(),
+                    reaction: mapping.map(|(reaction, _)| reaction),
                     upcoming_ms: shown.into_iter().filter(|ms| polymarket::is_upcoming(*ms, now)).min(),
                     settling: events.iter().flat_map(|e| &e.markets).filter(|m| m.end_ms <= now).count(),
                     fetched_ms: reading.and_then(|r| r.fetched_ms).map(|ms| self.to_server(ms)),
@@ -1706,6 +1720,17 @@ struct ProtectiveView {
     pos_side: Option<String>,
 }
 
+/// What a topic's ETH columns are conditioned on.
+fn event_label(layout: &polymarket::Layout, side: Side) -> &'static str {
+    match (layout, side) {
+        (_, Side::Outcome) => "若是这一档",
+        (polymarket::Layout::Daily, Side::Yes) => "若当天发生",
+        (polymarket::Layout::Daily, Side::No) => "若当天没发生",
+        (_, Side::Yes) => "若截止前成真",
+        (_, Side::No) => "若截止前破裂",
+    }
+}
+
 /// A standalone conditional order as the risk card lists it.
 fn order_view(order: &WorkingOrder) -> ProtectiveView {
     ProtectiveView {
@@ -1948,6 +1973,9 @@ struct PredictionTopicView {
     meaning: &'static str,
     /// `outcomes`, `deadlines` or `daily` (`polymarket::Layout`).
     layout: &'static str,
+    /// How this topic's outcomes have mapped to ETH (`reactions`); each
+    /// cell carries one reading per window.
+    reaction: Option<TopicReaction>,
     /// When the first shown market inside the coming week settles; none
     /// when nothing shown settles that soon.
     upcoming_ms: Option<i64>,
@@ -1980,6 +2008,8 @@ struct PredictionCellView {
     deadline: Option<String>,
     /// Settles within the coming week.
     upcoming: bool,
+    /// ETH if this outcome happens, one per the topic's reaction windows.
+    reactions: Vec<CellReaction>,
     /// None where the book makes no price (see `polymarket`).
     probability: Option<f64>,
     from_last_trade: bool,

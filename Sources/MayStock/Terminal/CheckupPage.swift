@@ -163,6 +163,35 @@ enum CheckupText {
         }
     }
 
+    /// Where a topic's ETH columns come from, and how strong the relation is.
+    static func reactionBasis(_ reaction: LiveSnapshot.Reaction) -> String {
+        if let analog = reaction.analog {
+            let head = "ETH 推算（\(reaction.eventLabel)，经油价）："
+            guard let excess = analog.oilExcess, let se = analog.oilExcessSe, let window = reaction.windows.first else {
+                return head + "\(analog.since) 以来只有 \(analog.n) 次\(analog.label)可量，样本不足，不推算。"
+            }
+            let oil = String(format: "%@ 以来 %d 次%@，事发前一天到当天布伦特比平常多 %+.1f%%（±%.1f，t %.1f）",
+                             analog.since, analog.n, analog.label, excess, se, se > 0 ? excess / se : 0)
+            let beta = String(format: "ETH 对布伦特 %@ β %+.2f（±%.2f，t %.1f）", analog.spanLabel, analog.beta, analog.betaSe,
+                              analog.betaSe > 0 ? analog.beta / analog.betaSe : 0)
+            guard window.significant else {
+                let weak = [analog.oilSignificant ? nil : "油价反应", analog.betaSignificant ? nil : "β"].compactMap { $0 }.joined(separator: "和")
+                return head + oil + "；" + beta + String(format: "。%@不到 %.1f 倍标准误，看不出稳定方向，不给概率。", weak, analog.significance)
+            }
+            return head + oil + "；" + beta + String(format: "。一次完全出乎意料的事件约让 ETH %+.2f%%，已被价格计入的部分按概率扣掉。", window.perStep)
+        }
+        let parts = reaction.windows.map { window -> String in
+            let t = window.perStepSe > 0 ? window.perStep / window.perStepSe : 0
+            guard window.significant else {
+                return String(format: "%@看不出关系（%d 次，t %.1f，门槛 %.1f）", window.label, window.n, t, window.significance)
+            }
+            return String(format: "%@内每超预期%@，ETH %+.2f%%（±%.2f，t %.1f，%d 次）", window.label, window.stepLabel, window.perStep, window.perStepSe, t, window.n)
+        }
+        let why = reaction.why.map { "样本：\($0)。" } ?? ""
+        return "ETH 对照（\(reaction.eventLabel)）：\(reaction.source)。" + parts.joined(separator: "；")
+            + "。" + why + "只算事件本身的影响，不含样本期的整体涨势；\(reaction.measured) 测。"
+    }
+
     /// The machine-wide outage, in one sentence and what to do about it.
     static func network(_ network: LiveSnapshot.Network) -> String {
         var text = "\(network.unreachable.joined(separator: "、")) 同时连不上。几家交易所不会一起出事，断的是这台机器到它们的网络（公司 VPN 的线路）。"
@@ -900,6 +929,11 @@ private struct PredictionCard: View {
                 if let ms = topic.fetchedMs { AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: staleAfterMs) }
                 Text(topic.meaning).font(Theme.Text.caption).foregroundStyle(.secondary)
             }
+            if let reaction = topic.reaction {
+                Text(CheckupText.reactionBasis(reaction))
+                    .font(Theme.Text.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if let error = topic.error {
                 InlineNotice(kind: .warning, message: "最近一次读取失败，下面是上一次读数：\(error)")
             }
@@ -909,7 +943,7 @@ private struct PredictionCard: View {
             }
             ForEach(Array(topic.lines.enumerated()), id: \.offset) { _, line in
                 Text(summary(line, of: topic)).font(Theme.Text.caption).foregroundStyle(.secondary)
-                grid(line, layout: topic.layout)
+                grid(line, layout: topic.layout, reaction: topic.reaction)
             }
             if topic.settling > 0 {
                 Text("另有 \(topic.settling) 个盘已过截止、等待结算，不显示")
@@ -926,20 +960,25 @@ private struct PredictionCard: View {
         return "\(title)\(when)24h 成交 $\(PriceFormatter.compact(line.volume24h)) · 挂单深度 $\(PriceFormatter.compact(line.liquidity))"
     }
 
-    private func grid(_ line: LiveSnapshot.PredictionLine, layout: String) -> some View {
+    private func grid(_ line: LiveSnapshot.PredictionLine, layout: String, reaction: LiveSnapshot.Reaction?) -> some View {
         let rows = line.cells.enumerated().map { index, cell in
             Row(id: index, cell: cell, label: Self.rowLabel(cell, layout: layout, title: line.title))
         }
+        let windows = reaction?.windows ?? []
+        let head: [GridColumn] = [
+            GridColumn(title: layout == "daily" ? "日期" : (layout == "deadlines" ? "截止" : "结果")),
+            GridColumn(title: "概率", alignment: .trailing),
+        ]
+        let eth: [GridColumn] = windows.map { GridColumn(title: "ETH·\($0.label)", alignment: .trailing) }
+        let book: [GridColumn] = [
+            GridColumn(title: "买一", alignment: .trailing), GridColumn(title: "卖一", alignment: .trailing),
+            GridColumn(title: "最新成交", alignment: .trailing),
+            GridColumn(title: "1 小时", alignment: .trailing), GridColumn(title: "24 小时", alignment: .trailing),
+            GridColumn(title: "1 周", alignment: .trailing),
+            GridColumn(title: "24h 成交", alignment: .trailing),
+        ]
         return DataGrid(
-            columns: [
-                .init(title: layout == "daily" ? "日期" : (layout == "deadlines" ? "截止" : "结果")),
-                .init(title: "概率", alignment: .trailing),
-                .init(title: "买一", alignment: .trailing), .init(title: "卖一", alignment: .trailing),
-                .init(title: "最新成交", alignment: .trailing),
-                .init(title: "1 小时", alignment: .trailing), .init(title: "24 小时", alignment: .trailing),
-                .init(title: "1 周", alignment: .trailing),
-                .init(title: "24h 成交", alignment: .trailing),
-            ],
+            columns: head + eth + book,
             rows: rows
         ) { row in
             let cell = row.cell
@@ -950,6 +989,9 @@ private struct PredictionCard: View {
                          weight: probability >= 0.2 ? .semibold : .regular)
             } else {
                 GridText("无有效报价", tint: .secondary, alignment: .trailing)
+            }
+            ForEach(Array(windows.enumerated()), id: \.offset) { index, window in
+                Self.ethCell(index < cell.reactions.count ? cell.reactions[index] : nil, window: window)
             }
             GridText(Self.cents(cell.bid), tint: .secondary, alignment: .trailing)
             GridText(Self.cents(cell.ask), tint: .secondary, alignment: .trailing)
@@ -965,6 +1007,28 @@ private struct PredictionCard: View {
         guard let value else { return GridText("—", tint: .secondary, alignment: .trailing) }
         return GridText(String(format: "%+.1f", value * 100),
                         tint: value > 0 ? Theme.up : (value < 0 ? Theme.down : .secondary), alignment: .trailing)
+    }
+
+    /// "涨 59% · +0.3%": the chance ETH ends the window higher if this
+    /// outcome happens, and its expected move. "无关" where history shows no
+    /// relation; "—" where this outcome has no price to read a surprise from;
+    /// "外推" past the largest surprise on record.
+    @ViewBuilder
+    private static func ethCell(_ reading: LiveSnapshot.CellReaction?, window: LiveSnapshot.ReactionWindow) -> some View {
+        if !window.significant {
+            GridText("无关", tint: .secondary, alignment: .trailing)
+        } else if let reading, let up = reading.up, let median = reading.median {
+            let side = up >= 0.5 ? up : 1 - up
+            let odds = side > 0.99 ? ">99%" : String(format: "%.0f%%", side * 100)
+            let tint = up >= 0.5 ? Theme.up : Theme.down
+            // Beyond the largest surprise on record the line is carried past
+            // its data: said in the cell, and drawn faint.
+            GridText(String(format: "%@ %@ · %+.1f%%", up >= 0.5 ? "涨" : "跌", odds, median) + (reading.extrapolated ? " · 外推" : ""),
+                     tint: reading.extrapolated ? tint.opacity(0.55) : tint, alignment: .trailing,
+                     weight: !reading.extrapolated && abs(up - 0.5) >= 0.2 ? .semibold : .regular)
+        } else {
+            GridText("—", tint: .secondary, alignment: .trailing)
+        }
     }
 
     /// `10/9 前` for a deadline, `10/8 当天` for a day's question, the
