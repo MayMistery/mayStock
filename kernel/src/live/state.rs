@@ -97,13 +97,23 @@ struct FeedHealth {
     /// The last time the feed delivered data: a socket frame, or a poll that
     /// returned without error.
     last_frame_ms: Option<LocalMs>,
+    /// The last time it reported a failure.
+    failed_ms: Option<LocalMs>,
     frames: u64,
 }
 
 impl FeedHealth {
     /// A feed first heard of at `at`, before it has said how it is.
     fn new(at: LocalMs) -> FeedHealth {
-        FeedHealth { state: FeedState::Connecting, since_ms: at, last_frame_ms: None, frames: 0 }
+        FeedHealth { state: FeedState::Connecting, since_ms: at, last_frame_ms: None, failed_ms: None, frames: 0 }
+    }
+
+    /// Its latest news is a failure: not live, not deliberately off, and a
+    /// failure reported since the last data — a reconnect attempt between
+    /// two failures still counts.
+    fn is_failing(&self) -> bool {
+        !matches!(self.state, FeedState::Live | FeedState::Off(_))
+            && self.failed_ms.is_some_and(|failed| self.last_frame_ms.is_none_or(|frame| failed >= frame))
     }
 }
 
@@ -165,6 +175,9 @@ pub struct State {
     equity: Option<(f64, LocalMs)>,
     risk_source: RiskSource,
     private_down_since: Option<i64>,
+    /// Whether a machine-wide outage is in force, so its start and end are
+    /// each logged once (`note_outage`).
+    network_outage: bool,
     stops: Option<(Vec<WorkingOrder>, LocalMs)>,
     stops_error: Option<String>,
     // Deribit
@@ -237,6 +250,7 @@ impl State {
             equity: None,
             risk_source: RiskSource::None("正在连接".into()),
             private_down_since: Some(now),
+            network_outage: false,
             stops: None,
             stops_error: None,
             surface: HashMap::new(),
@@ -351,8 +365,57 @@ impl State {
             _ => {}
         }
         let entry = self.feeds.entry(feed).or_insert_with(|| FeedHealth::new(LocalMs(now)));
+        if matches!(state, FeedState::Degraded(_) | FeedState::Refused(_)) {
+            entry.failed_ms = Some(LocalMs(now));
+        }
         entry.state = state;
         entry.since_ms = LocalMs(now);
+        self.note_outage(now);
+    }
+
+    /// Operators whose every running feed is failing, and those still
+    /// answering. An operator with nothing running is neither.
+    fn operators(&self) -> (Vec<&'static str>, Vec<&'static str>) {
+        let mut by_operator: BTreeMap<&'static str, Vec<&FeedHealth>> = BTreeMap::new();
+        for (feed, health) in &self.feeds {
+            if let (Some(operator), false) = (feed.operator(), matches!(health.state, FeedState::Off(_))) {
+                by_operator.entry(operator).or_default().push(health);
+            }
+        }
+        let (mut down, mut up) = (Vec::new(), Vec::new());
+        for (operator, feeds) in by_operator {
+            if feeds.iter().all(|h| h.is_failing()) { down.push(operator) } else { up.push(operator) }
+        }
+        (down, up)
+    }
+
+    /// Several operators failing at once is this machine's network, not
+    /// theirs; said once when it starts and once when it ends.
+    fn note_outage(&mut self, now: i64) {
+        let (down, _) = self.operators();
+        let outage = down.len() >= super::NETWORK_OUTAGE_OPERATORS;
+        if outage != self.network_outage {
+            self.network_outage = outage;
+            self.event(now, if outage {
+                format!("本机同时连不上 {}：是这台机器的网络或 VPN，不是交易所或 App", down.join("、"))
+            } else {
+                "多家同时断线的情况已解除".to_string()
+            });
+        }
+    }
+
+    fn network_view(&self) -> Option<NetworkView> {
+        let (down, up) = self.operators();
+        if down.len() < super::NETWORK_OUTAGE_OPERATORS {
+            return None;
+        }
+        let last_heard = self
+            .feeds
+            .iter()
+            .filter(|(feed, _)| feed.operator().is_some_and(|o| down.contains(&o)))
+            .filter_map(|(_, h)| h.last_frame_ms)
+            .max();
+        Some(NetworkView { unreachable: down, reachable: up, last_heard_ms: last_heard.map(|ms| self.to_server(ms)) })
     }
 
     fn apply_frame(&mut self, feed: Feed, text: &str, received_ms: i64, now: i64) -> Vec<Effect> {
@@ -758,6 +821,7 @@ impl State {
                 .map(|(feed, h)| FeedView {
                     id: feed.id(),
                     label: feed.label(),
+                    operator: feed.operator(),
                     state: match h.state {
                         FeedState::Connecting => "connecting",
                         FeedState::Live => "live",
@@ -775,6 +839,7 @@ impl State {
                     frames: h.frames,
                 })
                 .collect(),
+            network: self.network_view(),
             events: self.events.iter().map(|e| EventView { id: e.id, ms: self.to_server(e.ms), message: e.message.clone() }).collect(),
             spot: spot.map(|(value, ms, source)| SpotView { value, ms, source }),
             risk: self.risk_view(now, &smiles),
@@ -1468,6 +1533,8 @@ struct Snapshot {
     clock: Option<ClockView>,
     instrument: InstrumentView,
     feeds: Vec<FeedView>,
+    /// Several operators unreachable at once: this machine's network.
+    network: Option<NetworkView>,
     events: Vec<EventView>,
     spot: Option<SpotView>,
     risk: RiskView,
@@ -1477,6 +1544,18 @@ struct Snapshot {
     #[serde(rename = "macro")]
     macro_tape: MacroView,
     predictions: PredictionView,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkView {
+    /// Operators whose every running feed is failing.
+    unreachable: Vec<&'static str>,
+    /// Operators still answering: a path that reaches some venues and not
+    /// others points at the VPN's routes rather than the line itself.
+    reachable: Vec<&'static str>,
+    /// When anything last arrived from the unreachable ones.
+    last_heard_ms: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -1500,6 +1579,8 @@ struct InstrumentView {
 struct FeedView {
     id: &'static str,
     label: &'static str,
+    /// Whose servers it reaches (`Feed::operator`).
+    operator: Option<&'static str>,
     state: &'static str,
     detail: Option<String>,
     since_ms: i64,
@@ -2246,5 +2327,80 @@ mod tests {
         assert_eq!(legs.len(), 1);
         assert_eq!(legs[0]["protective"][0]["algoId"], "STOP", "a buy closes a net short");
         assert_eq!(snapshot["risk"]["unattachedOrders"][0]["algoId"], "ADD", "a sell adds to it, with or without a posSide");
+    }
+
+    /// A variant missing here fails to compile, and the arm says where it
+    /// has to be listed.
+    fn listed(feed: Feed) -> bool {
+        match feed {
+            Feed::OkxPublic | Feed::OkxPrivate | Feed::OkxStops | Feed::OkxBook | Feed::Deribit | Feed::BinanceStream
+            | Feed::Schwab | Feed::OptionBook | Feed::OkxHistory | Feed::BinanceHistory | Feed::BinanceOpenInterest
+            | Feed::Clock | Feed::Yahoo | Feed::Polymarket => Feed::ALL.contains(&feed),
+        }
+    }
+
+    fn operators() -> Vec<(&'static str, Vec<Feed>)> {
+        let mut by: BTreeMap<&'static str, Vec<Feed>> = BTreeMap::new();
+        for feed in Feed::ALL {
+            assert!(listed(feed));
+            if let Some(operator) = feed.operator() {
+                by.entry(operator).or_default().push(feed);
+            }
+        }
+        by.into_iter().collect()
+    }
+
+    fn outage_lines(snapshot: &Value) -> usize {
+        snapshot["events"].as_array().unwrap().iter().filter(|e| e["message"].as_str().unwrap().contains("本机同时连不上")).count()
+    }
+
+    #[test]
+    fn several_operators_failing_at_once_is_called_the_network() {
+        let operators = operators();
+        assert!(operators.len() > super::super::NETWORK_OUTAGE_OPERATORS, "enough operators declared to tell the cases apart");
+        let mut state = state();
+        for feed in Feed::ALL {
+            state.apply(Update::Health { feed, state: FeedState::Live }, NOW);
+        }
+        let threshold = super::super::NETWORK_OUTAGE_OPERATORS;
+        for (count, (operator, feeds)) in operators.iter().enumerate() {
+            for feed in feeds {
+                state.apply(Update::Health { feed: *feed, state: FeedState::Degraded("连不上".into()) }, NOW + 1);
+            }
+            let snapshot = snapshot(&state, NOW + 2);
+            if count + 1 < threshold {
+                assert!(snapshot["network"].is_null(), "{operator}: {} operators down could be theirs", count + 1);
+            } else {
+                let down: Vec<&str> = snapshot["network"]["unreachable"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+                let expected: Vec<&str> = operators[..=count].iter().map(|(o, _)| *o).collect();
+                assert_eq!(down, expected, "every operator whose feeds all fail, and only those");
+                assert_eq!(outage_lines(&snapshot), 1, "said once when it starts");
+            }
+        }
+        // One feed coming back is enough to show its operator answers.
+        let (_, first) = &operators[0];
+        for (_, feeds) in &operators[1..] {
+            for feed in feeds {
+                state.apply(Update::Health { feed: *feed, state: FeedState::Live }, NOW + 3);
+            }
+        }
+        state.apply(Update::Health { feed: first[0], state: FeedState::Live }, NOW + 3);
+        let recovered = snapshot(&state, NOW + 4);
+        assert!(recovered["network"].is_null());
+        assert!(recovered["events"].as_array().unwrap().iter().any(|e| e["message"] == "多家同时断线的情况已解除"));
+    }
+
+    #[test]
+    fn a_reconnect_between_failures_is_still_a_failure_and_data_ends_it() {
+        let mut state = state();
+        let (_, feeds) = &operators()[0];
+        let feed = feeds[0];
+        state.apply(Update::Health { feed, state: FeedState::Degraded("连不上".into()) }, NOW);
+        state.apply(Update::Health { feed, state: FeedState::Connecting }, NOW + 1);
+        assert!(state.feeds[&feed].is_failing(), "retrying is not recovering");
+        state.note_frame(feed, LocalMs(NOW + 2));
+        assert!(!state.feeds[&feed].is_failing(), "data after the failure is");
+        state.apply(Update::Health { feed, state: FeedState::Off("未配置".into()) }, NOW + 3);
+        assert!(!state.feeds[&feed].is_failing(), "a feed switched off on purpose says nothing about the network");
     }
 }

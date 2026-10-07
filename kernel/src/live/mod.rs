@@ -121,6 +121,24 @@ pub enum Feed {
 }
 
 impl Feed {
+    /// Every feed, for anything that has to cover them all.
+    pub const ALL: [Feed; 14] = [
+        Feed::OkxPublic,
+        Feed::OkxPrivate,
+        Feed::OkxStops,
+        Feed::OkxBook,
+        Feed::Deribit,
+        Feed::BinanceStream,
+        Feed::Schwab,
+        Feed::OptionBook,
+        Feed::OkxHistory,
+        Feed::BinanceHistory,
+        Feed::BinanceOpenInterest,
+        Feed::Clock,
+        Feed::Yahoo,
+        Feed::Polymarket,
+    ];
+
     pub fn id(self) -> &'static str {
         match self {
             Feed::OkxPublic => "okx.public",
@@ -156,6 +174,22 @@ impl Feed {
             Feed::Clock => "时钟校准",
             Feed::Yahoo => "Yahoo 分钟线（回落）",
             Feed::Polymarket => "Polymarket 预测市场",
+        }
+    }
+
+    /// Whose servers this feed reaches, for telling one venue's outage from
+    /// this machine's: when several operators fail at once, the fault is the
+    /// path between them and here. None for a feed that reads several venues
+    /// at once (the four-venue option book), which says nothing about any one.
+    pub fn operator(self) -> Option<&'static str> {
+        match self {
+            Feed::OkxPublic | Feed::OkxPrivate | Feed::OkxStops | Feed::OkxBook | Feed::OkxHistory | Feed::Clock => Some("OKX"),
+            Feed::Deribit => Some("Deribit"),
+            Feed::BinanceStream | Feed::BinanceHistory | Feed::BinanceOpenInterest => Some("Binance"),
+            Feed::Schwab => Some("嘉信"),
+            Feed::Yahoo => Some("Yahoo"),
+            Feed::Polymarket => Some("Polymarket"),
+            Feed::OptionBook => None,
         }
     }
 
@@ -208,6 +242,14 @@ impl Feed {
         (self.cadence() * STALE_AFTER).as_millis() as i64
     }
 }
+
+/// How many operators must be failing at once before the fault is called
+/// this machine's network rather than theirs. Venues fail independently and
+/// rarely together; on 2026-10-07 the VPN path dropped about 70% of TCP
+/// connects to OKX, Binance and Deribit at once while Bybit and Polymarket
+/// still answered. Two could be coincidence (Yahoo's rate limit is routine);
+/// three is not.
+pub const NETWORK_OUTAGE_OPERATORS: usize = 3;
 
 /// How many of its own intervals a feed may miss before its age turns amber.
 pub const STALE_AFTER: u32 = 3;

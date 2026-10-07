@@ -31,6 +31,8 @@ public final class CheckupModel {
     public private(set) var clock: LiveSnapshot.Clock?
     public private(set) var instrument: LiveSnapshot.Instrument?
     public private(set) var feeds: [LiveSnapshot.Feed] = []
+    /// Several venues unreachable at once; see `LiveSnapshot.network`.
+    public private(set) var outage: LiveSnapshot.Network?
     public private(set) var spot: LiveSnapshot.Spot?
     public private(set) var risk: LiveSnapshot.Risk?
     public private(set) var probability: LiveSnapshot.Probability?
@@ -202,6 +204,7 @@ public final class CheckupModel {
         update(\.clock, decoded.clock)
         update(\.instrument, decoded.instrument)
         update(\.feeds, decoded.feeds)
+        update(\.outage, decoded.network)
         update(\.spot, decoded.spot)
         update(\.risk, decoded.risk)
         update(\.probability, decoded.probability)

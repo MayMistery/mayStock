@@ -87,6 +87,9 @@ extension E2EMain {
         for feed in s.feeds {
             print("  \(feed.state.padding(toLength: 10, withPad: " ", startingAt: 0)) \(feed.label)  last frame \(age(s, feed.lastFrameMs))  \(feed.detail ?? "")")
         }
+        if let network = s.network {
+            print("  NETWORK: unreachable \(network.unreachable.joined(separator: ", ")) · reachable \(network.reachable.joined(separator: ", ")) · last heard \(age(s, network.lastHeardMs))")
+        }
         if let spot = s.spot { print("  spot \(spot.value) (\(spot.source), \(age(s, spot.ms)))") }
         let p = s.probability
         print("  probability: surface \(age(s, p.surfaceMs)) · index \(age(s, p.indexMs)) · anchor \(p.forwardAnchor ?? "—")")

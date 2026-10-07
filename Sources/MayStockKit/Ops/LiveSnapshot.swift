@@ -16,6 +16,9 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
     public let clock: Clock?
     public let instrument: Instrument
     public let feeds: [Feed]
+    /// Several operators unreachable at once: this machine's network, not
+    /// theirs. Nil while it is not the case.
+    public let network: Network?
     public let events: [Event]
     public let spot: Spot?
     public let risk: Risk
@@ -43,6 +46,8 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
     public struct Feed: Decodable, Sendable, Equatable, Identifiable {
         public let id: String
         public let label: String
+        /// Whose servers it reaches; nil for one that reads several venues.
+        public let `operator`: String?
         /// `connecting`, `live`, `degraded`, `refused` or `off`.
         public let state: String
         public let detail: String?
@@ -55,6 +60,15 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
         public let staleAfterMs: Double
         public let frames: UInt64
         public var isLive: Bool { state == "live" }
+    }
+
+    public struct Network: Decodable, Sendable, Equatable {
+        /// Operators whose every running feed is failing.
+        public let unreachable: [String]
+        /// Operators still answering.
+        public let reachable: [String]
+        /// When anything last arrived from the unreachable ones.
+        public let lastHeardMs: Int64?
     }
 
     public struct Event: Decodable, Sendable, Equatable, Identifiable {

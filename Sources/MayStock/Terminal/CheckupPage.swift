@@ -163,6 +163,16 @@ enum CheckupText {
         }
     }
 
+    /// The machine-wide outage, in one sentence and what to do about it.
+    static func network(_ network: LiveSnapshot.Network) -> String {
+        var text = "\(network.unreachable.joined(separator: "、")) 同时连不上。几家交易所不会一起出事，断的是这台机器到它们的网络（公司 VPN 的线路）。"
+        if !network.reachable.isEmpty {
+            text += "\(network.reachable.joined(separator: "、")) 还能连上，说明网没全断，是去这几家的线路断了。"
+        }
+        text += "各个源会自己重连，下面的数都是最后读到的、带着年龄。要下单或调仓，请以交易所 App 为准。"
+        return text
+    }
+
     /// A leg's heading: side, size, and whether its liquidation is its own.
     static func legTitle(_ position: LiveSnapshot.Position) -> String {
         let side = position.isShort ? "空头腿" : "多头腿"
@@ -255,7 +265,22 @@ private struct FeedsCard: View {
                         .help(feed.detail ?? CheckupText.state(feed.state))
                     }
                 }
-                ForEach(model.feeds.filter { $0.state == "degraded" || $0.state == "refused" }) { feed in
+                if let network = model.outage {
+                    InlineNotice(kind: .danger, title: "本机网络断了，不是交易所或 App", message: CheckupText.network(network))
+                    if let ms = network.lastHeardMs {
+                        HStack(spacing: 6) {
+                            Text("最后一次收到它们的数据").font(Theme.Text.caption).foregroundStyle(.secondary)
+                            AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: 0)
+                        }
+                    }
+                }
+                // Under a machine-wide outage the unreachable operators' own
+                // lines say the same thing a dozen times; their details stay
+                // in each dot's tooltip and the event log.
+                ForEach(model.feeds.filter { feed in
+                    (feed.state == "degraded" || feed.state == "refused")
+                        && !(model.outage?.unreachable.contains(feed.operator ?? "") ?? false)
+                }) { feed in
                     InlineNotice(kind: .warning, message: "\(feed.label)\(CheckupText.state(feed.state))：\(feed.detail ?? "")")
                 }
             }
