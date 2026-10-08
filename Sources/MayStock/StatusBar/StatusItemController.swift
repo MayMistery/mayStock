@@ -293,7 +293,7 @@ final class StatusItemController: NSObject {
         let venue = watchItem.venue
         guard let ticker else { return "\(watchItem.instId) · \(venue.displayName) — 连接中 (\(connection.rawValue))" }
         let phase = ticker.phase.map { " · \($0.displayName)" } ?? ""
-        let period = ticker.basis.periodLabel
+        let period = ticker.rangeLabel
         return """
         \(watchItem.instId) · \(venue.displayName)\(phase)
         最新 \(PriceFormatter.auto(ticker.last))   \(ticker.basis.changeLabel) \(PriceFormatter.signedPercent(ticker.changePct))

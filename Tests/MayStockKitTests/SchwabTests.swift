@@ -85,6 +85,18 @@ private enum Fixture {
       "transferItems":[{"instrument":{"assetType":"EQUITY","symbol":"QQQ"},"amount":-4,"cost":2050.0,"price":512.5,"positionEffect":"CLOSING"}]},
      {"activityId":9003,"time":"2026-09-14T15:30:00+0000","type":"DIVIDEND_OR_INTEREST","status":"VALID","netAmount":1.0,"transferItems":[]}]
     """
+
+    /// What `schwabctl transfers` merges: one listing per movement type, in
+    /// no particular order.
+    static let transfers = """
+    [{"activityId":7001,"time":"2026-10-05T14:00:00+0000","type":"ACH_RECEIPT","status":"VALID","netAmount":500.0,
+      "transferItems":[{"instrument":{"assetType":"CURRENCY","symbol":"CURRENCY_USD"},"amount":500.0,"cost":500.0}]},
+     {"activityId":7004,"time":"2026-10-07T14:00:00+0000","type":"ACH_DISBURSEMENT","status":"VALID","netAmount":-200.0,"transferItems":[]},
+     {"activityId":7002,"time":"2026-10-06T14:00:00+0000","type":"RECEIVE_AND_DELIVER","status":"VALID","netAmount":0,
+      "transferItems":[{"instrument":{"assetType":"EQUITY","symbol":"TSLA"},"amount":10,"price":180.0}]},
+     {"activityId":7003,"time":"2026-10-06T15:00:00+0000","type":"JOURNAL","status":"VALID","netAmount":0,
+      "transferItems":[{"instrument":{"assetType":"EQUITY","symbol":"TSLA"},"amount":1}]}]
+    """
 }
 
 private func newYork(_ year: Int, _ month: Int, _ day: Int, _ hour: Int, _ minute: Int) -> Date {
@@ -289,6 +301,21 @@ struct SchwabWireTests {
         let booked = try #require(StrategyFill(exchange: buy, strategyId: "s", mode: .live, venue: .schwab))
         #expect(abs(booked.feeQuote - 2.02) < 1e-9)
         #expect(booked.venue == .schwab)
+    }
+
+    @Test("资金进出：现金看 netAmount，证券按每项的价格估值，两样都没有的记作未识别、金额 0")
+    func transfers() throws {
+        let transfers = try SchwabWire.transfers(from: Data(Fixture.transfers.utf8))
+        #expect(transfers.map(\.id) == ["7004", "7003", "7002", "7001"], "newest first")
+        #expect(transfers.allSatisfy { $0.ccy == "USD" && $0.isLeftOut })
+        let deposit = try #require(transfers.first { $0.id == "7001" })
+        #expect(deposit.amount == 500 && deposit.kind == .principal && deposit.venueType == "ACH_RECEIPT")
+        let withdrawal = try #require(transfers.first { $0.id == "7004" })
+        #expect(withdrawal.amount == -200 && withdrawal.kind == .principal)
+        let shares = try #require(transfers.first { $0.id == "7002" })
+        #expect(shares.amount == 1_800 && shares.kind == .principal, "ten shares moved in at the stated 180")
+        let unpriced = try #require(transfers.first { $0.id == "7003" })
+        #expect(unpriced.amount == 0 && unpriced.kind == .unrecognised && unpriced.venueType == "JOURNAL")
     }
 
     @Test("订单拼写：四种指令按持仓决定，括号单挂在开仓腿上")
@@ -744,5 +771,48 @@ struct SchwabOrderFailureTests {
             #expect((error as? TradeError)?.refusal == nil, "a refusal would say nothing is on the book")
             #expect(String(describing: error).contains("111"), "the leg that went through is named")
         }
+    }
+}
+
+@Suite("Schwab account reading")
+struct SchwabAccountReadingTests {
+
+    /// Each `schwabctl` invocation appends its command to `calls`.
+    private func venue(in dir: URL, calls: URL) throws -> SchwabVenue {
+        let cli = dir.appendingPathComponent("schwabctl")
+        let account = Fixture.account.replacingOccurrences(of: "\n", with: " ")
+        try """
+        #!/bin/sh
+        echo "$1" >> "\(calls.path)"
+        case "$1" in
+          account) echo '\(account)' ;;
+        esac
+        """.write(to: cli, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cli.path)
+        return SchwabVenue(
+            data: SchwabMarketDataSource(schwab: SchwabRESTClient(tokens: SchwabStaticToken("x"))),
+            bridge: SchwabBridge(explicitCLIPath: cli.path, commandTimeout: 5),
+            shadow: ShadowBook(venue: .schwab, fileURL: nil, startingCash: 0),
+            tags: SchwabOrderTags(fileURL: nil),
+            economics: ShadowBook.Economics(schedule: SchwabFeeSchedule()))
+    }
+
+    @Test("一次读数只调一次 account：权益和持股出自同一份文档、同一时刻")
+    func oneDocumentPerReading() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("maystock-schwab-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let calls = dir.appendingPathComponent("calls")
+        let venue = try venue(in: dir, calls: calls)
+
+        let reading = try await venue.accountReading(mode: .live, source: .polled)
+        let invoked = try String(contentsOf: calls, encoding: .utf8).split(separator: "\n").map(String.init)
+        #expect(invoked == ["account"], "the piecewise default asked twice: \(invoked)")
+        #expect(reading.snapshot.totalEquity == 13839.25)
+        #expect(reading.shareHoldings.map(\.instId).sorted() == ["QQQ", "TSLA"])
+        #expect(reading.positions == [], "Schwab holds no contract this app values")
+        #expect(reading.positionsAt == reading.equityAt)
+        #expect(reading.source == .polled)
+        #expect(reading.pollInterval(quoteCurrency: Venue.schwab.quoteCurrency) == AccountReading.pricedPollInterval)
     }
 }

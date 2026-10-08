@@ -5,13 +5,32 @@ import MayStockKit
 /// strategy's return", so the panel, the overview and the studio can never
 /// disagree about it.
 extension AppState {
-    /// Latest known price for an instrument: any runner's poll, else a live
-    /// watchlist session.
+    /// The price an instrument's position is valued at — one rule for every
+    /// screen and the ledger alike.
+    ///
+    /// A contract the account holds is valued at the mark the account itself
+    /// is valued at (`ExchangePosition.markPrice`, streamed on OKX): that is
+    /// the price the exchange's own floating profit is taken at, so a
+    /// strategy's book and the exchange cannot disagree about the same
+    /// position by the gap between a last trade and the mark. Anything else
+    /// takes the freshest traded price on hand. It used to be "any runner's
+    /// poll, else the live ticker" — a fixed order, so a twenty-second-old
+    /// poll beat a ticker streamed a moment ago.
     func mark(for instId: String) -> Double? {
-        for runner in runners {
-            if let mark = runner.mark(for: instId) { return mark }
+        let venue = venue(of: instId)
+        if let held = books(for: venue).contractPositions.first(where: { $0.instId == instId && $0.markPrice != nil }) {
+            return held.markPrice
         }
-        return hub.session(for: instId)?.ticker?.last
+        var freshest: (price: Double, at: Date)?
+        for runner in runners {
+            if let reading = runner.markReading(for: instId), reading.at > (freshest?.at ?? .distantPast) {
+                freshest = reading
+            }
+        }
+        if let ticker = hub.session(for: instId)?.ticker, ticker.ts > (freshest?.at ?? .distantPast) {
+            freshest = (ticker.last, ticker.ts)
+        }
+        return freshest?.price
     }
 
     func netPnL(for strategyId: String) -> Double {

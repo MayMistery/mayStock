@@ -329,7 +329,7 @@ private struct InstrumentDetail: View {
     private var statsRow: some View {
         let ticker = session.ticker
         let book = session.liveBook
-        let period = (ticker?.basis ?? venue.changeBasis).periodLabel
+        let period = ticker?.rangeLabel ?? (venue.tradesContinuously ? "24h" : "今日")
         return HStack(spacing: Theme.itemSpacing) {
             if venue.hasOrderBook {
                 StatTile(label: "\(period) 最高", value: ticker.map { PriceFormatter.price($0.high, decimals: decimals) } ?? "—")
@@ -356,7 +356,7 @@ private struct InstrumentDetail: View {
 
     private var alertsCard: some View {
         let rules = appState.alerts.rules(for: instId)
-        let basis = venue.changeBasis
+        let basis = appState.changeBasis(for: instId)
         return Card(title: "告警", subtitle: rules.isEmpty ? "本标的暂无规则" : "\(rules.count) 条规则") {
             if let price = session.ticker?.last {
                 Menu {

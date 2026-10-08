@@ -83,14 +83,14 @@ public final class QuoteBook: CloseBookFeed, @unchecked Sendable {
     ///   - spec: the instrument's tick and lot, as the kernel reads them.
     ///   - interval: how often the quote is read.
     public init(instId: String, spec: BookDocument.Spec, interval: Duration = .seconds(1), read: @escaping Read) {
-        publish(BookDocument.quote(instId: instId, spec: spec, ticker: nil, error: nil))
+        publish(BookDocument.quote(instId: instId, spec: spec, ticker: nil, error: nil, interval: interval))
         task = Task { [weak self] in
             while !Task.isCancelled {
                 let document: BookDocument
                 do {
-                    document = BookDocument.quote(instId: instId, spec: spec, ticker: try await read(), error: nil)
+                    document = BookDocument.quote(instId: instId, spec: spec, ticker: try await read(), error: nil, interval: interval)
                 } catch {
-                    document = BookDocument.quote(instId: instId, spec: spec, ticker: nil, error: String(describing: error))
+                    document = BookDocument.quote(instId: instId, spec: spec, ticker: nil, error: String(describing: error), interval: interval)
                 }
                 guard let self else { return }
                 self.publish(document)
@@ -220,6 +220,9 @@ public struct BookDocument: Codable, Sendable, Equatable {
     public var seqId: Int64?
     public var exchangeMs: Int64?
     public var receivedMs: Int64?
+    /// Past this age `exchangeMs` reads stale: a few intervals of whatever
+    /// renews the book, the kernel's socket or a quote poll.
+    public var staleAfterMs: Double?
     public var last: Stamped?
     public var spec: Spec?
     public var specError: String?
@@ -229,7 +232,7 @@ public struct BookDocument: Codable, Sendable, Equatable {
     public var sizesKnown: Bool
 
     private enum CodingKeys: String, CodingKey {
-        case instId, mode, state, detail, asks, bids, seqId, exchangeMs, receivedMs, last, spec, specError, stats
+        case instId, mode, state, detail, asks, bids, seqId, exchangeMs, receivedMs, staleAfterMs, last, spec, specError, stats
         case topIsNewer, sizesKnown
     }
 
@@ -244,6 +247,7 @@ public struct BookDocument: Codable, Sendable, Equatable {
         seqId = try c.decodeIfPresent(Int64.self, forKey: .seqId)
         exchangeMs = try c.decodeIfPresent(Int64.self, forKey: .exchangeMs)
         receivedMs = try c.decodeIfPresent(Int64.self, forKey: .receivedMs)
+        staleAfterMs = try c.decodeIfPresent(Double.self, forKey: .staleAfterMs)
         last = try c.decodeIfPresent(Stamped.self, forKey: .last)
         spec = try c.decodeIfPresent(Spec.self, forKey: .spec)
         specError = try c.decodeIfPresent(String.self, forKey: .specError)
@@ -254,7 +258,7 @@ public struct BookDocument: Codable, Sendable, Equatable {
 
     init(
         instId: String?, state: String, detail: String?, asks: [Level], bids: [Level], receivedMs: Int64?,
-        exchangeMs: Int64?, last: Stamped?, spec: Spec?, sizesKnown: Bool
+        exchangeMs: Int64?, staleAfterMs: Double?, last: Stamped?, spec: Spec?, sizesKnown: Bool
     ) {
         self.instId = instId
         self.mode = nil
@@ -265,6 +269,7 @@ public struct BookDocument: Codable, Sendable, Equatable {
         self.seqId = nil
         self.exchangeMs = exchangeMs
         self.receivedMs = receivedMs
+        self.staleAfterMs = staleAfterMs
         self.last = last
         self.spec = spec
         self.specError = nil
@@ -273,8 +278,8 @@ public struct BookDocument: Codable, Sendable, Equatable {
         self.sizesKnown = sizesKnown
     }
 
-    /// A quote as a one-level book without sizes.
-    static func quote(instId: String, spec: Spec, ticker: Ticker?, error: String?) -> BookDocument {
+    /// A quote as a one-level book without sizes, read every `interval`.
+    static func quote(instId: String, spec: Spec, ticker: Ticker?, error: String?, interval: Duration) -> BookDocument {
         let text = { (price: Double?) -> [Level] in
             guard let price, price > 0 else { return [] }
             return [Level(px: PriceFormatter.wire(price), sz: "0", orders: 0)]
@@ -287,6 +292,8 @@ public struct BookDocument: Codable, Sendable, Equatable {
             asks: text(ticker?.ask), bids: text(ticker?.bid),
             receivedMs: ticker != nil ? now : nil,
             exchangeMs: ticker.map { Int64($0.ts.timeIntervalSince1970 * 1_000) },
+            staleAfterMs: (Double(interval.components.seconds) + Double(interval.components.attoseconds) / 1e18)
+                * 1_000 * LiveKernel.staleAfterIntervals,
             last: ticker.flatMap { $0.last > 0 ? Stamped(px: PriceFormatter.wire($0.last), ms: Int64($0.ts.timeIntervalSince1970 * 1_000)) : nil },
             spec: spec, sizesKnown: false)
     }

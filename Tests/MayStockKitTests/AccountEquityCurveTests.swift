@@ -144,7 +144,10 @@ struct TrailingReturnTests {
         let change = try! #require(curve.change(over: .day1, now: at(1_410), latest: 1_020))
         #expect(change.spannedSeconds >= 86_400 * 0.9)
         #expect(!change.isComplete, "a day with 22 hours missing is not a day")
-        #expect(change.hasGaps, "spanned but empty in the middle is an outage")
+        // The outage spans midnight, so the only reference is the sample
+        // before it, nearly a day earlier: the figure includes yesterday, and
+        // says so — it is not a gappy "today", it is not today at all.
+        #expect(change.startsEarly && !change.isAnchored)
         // The Singapore day is ~5.7h old at this instant, and all but the last
         // half hour of it went unobserved.
         #expect(change.missingSeconds > 4 * 3_600)

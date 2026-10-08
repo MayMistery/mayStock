@@ -35,7 +35,7 @@ struct CloseTicketTests {
         var document = BookDocument(
             instId: "X", state: "live", detail: nil,
             asks: prices.asks.map(level), bids: prices.bids.map(level),
-            receivedMs: Int64(Date().timeIntervalSince1970 * 1_000), exchangeMs: nil,
+            receivedMs: Int64(Date().timeIntervalSince1970 * 1_000), exchangeMs: nil, staleAfterMs: nil,
             last: BookDocument.Stamped(px: family == .option ? "0.0505" : "2653.25", ms: 1),
             spec: spec, sizesKnown: sizesKnown)
         document.seqId = 7

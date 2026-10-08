@@ -8,12 +8,14 @@ import Foundation
 /// the option market let price settle, who is crowded, is the macro tape
 /// helping. Every one of them shaped a decision.
 ///
-/// All of it now streams through the kernel's live layer (`LiveKernel`): the
-/// model only asks for the kernel's snapshot once a frame and publishes it
-/// when it changed. Two things stay here because they are the app's, not the
-/// kernel's: writing the kernel's event lines to the engine log, and — when
-/// the read-only account socket is down — reading positions through the
-/// `okx` CLI and handing the documents back to the kernel to parse.
+/// All of it streams through the kernel's live layer (`LiveKernel`), which
+/// the app runs for its whole life because the account part of it is what
+/// every screen values the account with (`LiveAccountFeed`). This model
+/// borrows that layer: opening the page switches the market analytics on,
+/// closing it switches them off, and in between it asks for the snapshot
+/// once a frame and publishes it when it changed. The account's own duties —
+/// the engine log, the CLI fallback while the private socket is down — are
+/// the account feed's, so they keep running whether or not this page is open.
 ///
 /// Read-only by construction: nothing here, or in the live layer, places,
 /// amends or cancels an order.
@@ -40,11 +42,9 @@ public final class CheckupModel {
     public private(set) var structure: [LiveSnapshot.VenueStructure] = []
     public private(set) var macro: LiveSnapshot.Macro?
     public private(set) var predictions: LiveSnapshot.Predictions?
-    /// Why the live layer could not start. Shown instead of data, never
-    /// alongside stale data.
+    /// Why the analytics could not be switched on. Shown instead of data,
+    /// never alongside stale data.
     public private(set) var failure: String?
-    /// The last CLI fallback read that failed, while the fallback is running.
-    public private(set) var fallbackError: String?
 
     /// The instrument asked for. The kernel follows the held perpetual when
     /// `followsHeldPosition` is on, so the snapshot's own instrument is the
@@ -55,9 +55,6 @@ public final class CheckupModel {
     public var followsHeldPosition: Bool {
         didSet { if followsHeldPosition != oldValue { reconfigure() } }
     }
-    public var mode: TradingMode {
-        didSet { if mode != oldValue { reconfigure() } }
-    }
     /// How finely the probability table cuts its automatic step; see
     /// `LiveKernel.Config.gridDivisor`.
     public var gridDivisor: Int {
@@ -66,9 +63,8 @@ public final class CheckupModel {
     /// Whether anyone can see the page. While not — its window covered,
     /// minimised, on another Space, or the app hidden — the pump drops to
     /// `hiddenInterval` and publishes nothing: the kernel keeps every feed
-    /// live, events still reach the engine log and the CLI fallback still
-    /// follows the account socket, but no card is redrawn for nobody. Shown
-    /// again, the latest snapshot is published at once.
+    /// live, but no card is redrawn for nobody. Shown again, the latest
+    /// snapshot is published at once.
     public var isVisible = true {
         didSet {
             guard isVisible != oldValue else { return }
@@ -78,71 +74,46 @@ public final class CheckupModel {
         }
     }
 
-    private let venue: any ExchangeVenue
-    private let profile: @Sendable (TradingMode) -> String?
-    private let okxConfigPath: String?
-    private let schwabctlPath: String?
-    private let network: Bool
-    private let nowOverrideMs: Int64?
-    private var kernel: LiveKernel?
+    private let kernel: LiveKernel
     private var pump: Task<Void, Never>?
-    private var fallback: Task<Void, Never>?
     private var seq: UInt64 = 0
-    private var loggedEventId: UInt64 = 0
 
     /// One display frame: the snapshot is asked for this often, and costs a
     /// lock and nothing else when unchanged.
     public static let frameInterval: TimeInterval = 1.0 / 60.0
-    /// While the page cannot be seen, the snapshot is still read this often,
-    /// for the engine log and the CLI fallback.
+    /// While the page cannot be seen, the snapshot is still read this often.
     public static let hiddenInterval: TimeInterval = 1
-    /// While the account socket is down, the CLI is read this often.
-    public static let fallbackInterval: TimeInterval = 10
 
     public init(
-        venue: any ExchangeVenue,
-        mode: TradingMode,
+        kernel: LiveKernel,
         instId: String = "ETH-USDT-SWAP",
         followsHeldPosition: Bool = true,
-        okxProfile: @escaping @Sendable (TradingMode) -> String? = { _ in nil },
-        okxConfigPath: String? = OKXProfileCatalog.defaultFileURL().path,
-        schwabctlPath: String? = nil,
-        network: Bool = true,
-        nowOverrideMs: Int64? = nil,
         gridDivisor: Int = 1
     ) {
-        self.venue = venue
-        self.mode = mode
+        self.kernel = kernel
         self.instId = instId
         self.followsHeldPosition = followsHeldPosition
-        self.profile = okxProfile
-        self.okxConfigPath = okxConfigPath
-        self.schwabctlPath = schwabctlPath
-        self.network = network
-        self.nowOverrideMs = nowOverrideMs
         self.gridDivisor = gridDivisor
-    }
-
-    private var config: LiveKernel.Config {
-        LiveKernel.Config(
-            instId: instId, followsHeldPosition: followsHeldPosition, mode: mode,
-            okxProfile: profile(mode), okxConfigPath: okxConfigPath,
-            schwabctlPath: schwabctlPath, network: network, nowOverrideMs: nowOverrideMs,
-            gridDivisor: gridDivisor)
     }
 
     // MARK: - Lifecycle
 
-    /// Start the live layer and the frame pump. Safe to call again; it
-    /// restarts both.
+    /// Switch the analytics on for this page's instrument and start the
+    /// frame pump. Safe to call again.
     public func start() {
-        stop()
+        pump?.cancel()
+        seq = 0
         do {
-            kernel = try LiveKernel(config: config)
+            try kernel.update { config in
+                config.instId = instId
+                config.followsHeldPosition = followsHeldPosition
+                config.gridDivisor = gridDivisor
+                config.analytics = true
+            }
             failure = nil
         } catch {
             failure = String(describing: error)
-            Log.warn("checkup: 实时层启动失败：\(error)")
+            Log.warn("checkup: 打开实时分析失败：\(error)")
             return
         }
         pull()
@@ -162,28 +133,29 @@ public final class CheckupModel {
         }
     }
 
+    /// Stop the pump and switch the analytics off. The account part of the
+    /// layer runs on: the rest of the app reads it.
     public func stop() {
         pump?.cancel()
         pump = nil
-        fallback?.cancel()
-        fallback = nil
-        kernel?.stop()
-        kernel = nil
         seq = 0
+        do {
+            try kernel.update { $0.analytics = false }
+        } catch {
+            Log.warn("checkup: 关闭实时分析失败：\(error)")
+        }
     }
 
     /// Take the kernel's snapshot if it changed since the last one. Called
     /// every frame by the pump; exposed so tests can step it.
     @discardableResult
     public func pull() -> Bool {
-        guard let kernel, let (next, json) = kernel.snapshot(since: seq) else { return false }
+        guard let (next, json) = kernel.snapshot(since: seq) else { return false }
         do {
             let decoded = try JSONDecoder().decode(LiveSnapshot.self, from: json)
             seq = next
             snapshot = decoded
             if isVisible { publish(decoded) }
-            log(decoded.events)
-            followFallback(needed: decoded.risk.fallbackNeeded)
             return true
         } catch {
             // The kernel and the app disagree about the snapshot's shape — a
@@ -214,65 +186,23 @@ public final class CheckupModel {
         update(\.predictions, decoded.predictions)
     }
 
-    /// Hand a document to the kernel: the CLI fallback's positions and
-    /// balance, and recorded frames in tests.
+    /// Hand a recorded frame or document to the kernel (tests).
     public func ingest(topic: String, payload: String) throws {
-        guard let kernel else { throw KernelError.kernel("实时层没有运行") }
         try kernel.ingest(topic: topic, payload: payload)
         pull()
     }
 
     private func reconfigure() {
-        guard let kernel else { return }
+        guard pump != nil else { return }
         do {
-            try kernel.configure(config)
+            try kernel.update { config in
+                config.instId = instId
+                config.followsHeldPosition = followsHeldPosition
+                config.gridDivisor = gridDivisor
+            }
         } catch {
             Log.warn("checkup: 实时层重新配置失败：\(error)")
         }
         pull()
-    }
-
-    /// The kernel's event lines — a feed lost or refused, a fallback taken, an
-    /// instrument followed — go to the engine log once each, so a degraded
-    /// reading can be reconstructed afterwards.
-    private func log(_ events: [LiveSnapshot.Event]) {
-        for event in events where event.id > loggedEventId {
-            Log.warn("checkup: \(event.message)")
-            loggedEventId = event.id
-        }
-    }
-
-    // MARK: - CLI fallback
-
-    private func followFallback(needed: Bool) {
-        if needed, network, fallback == nil {
-            Log.warn("checkup: 账户推送不可用，改由 okx CLI 读取持仓")
-            let interval = UInt64(Self.fallbackInterval * 1_000_000_000)
-            fallback = Task { @MainActor [weak self] in
-                while !Task.isCancelled {
-                    await self?.readThroughCLI()
-                    try? await Task.sleep(nanoseconds: interval)
-                }
-            }
-        } else if !needed, let task = fallback {
-            task.cancel()
-            fallback = nil
-            fallbackError = nil
-            Log.warn("checkup: 账户推送恢复，停止 CLI 读取")
-        }
-    }
-
-    private func readThroughCLI() async {
-        do {
-            let documents = try await venue.accountDocuments(mode: mode)
-            try kernel?.ingest(topic: "cli.positions", payload: documents.positions)
-            try kernel?.ingest(topic: "cli.account", payload: documents.balance)
-            fallbackError = nil
-            pull()
-        } catch {
-            let message = (error as? TradeError)?.description ?? String(describing: error)
-            fallbackError = message
-            Log.warn("checkup: CLI 读取持仓失败：\(message)")
-        }
     }
 }

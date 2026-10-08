@@ -1237,6 +1237,43 @@ pub unsafe extern "C" fn ms_live_snapshot(handle: *const MSLive, since_seq: u64,
     })
 }
 
+/// The latest account document (JSON) if it is newer than `since_seq`, else
+/// null — every holding valued at the account's freshest mark, the equity
+/// valued with them, transfers, and the account feeds' health. Its sequence
+/// moves only when the account does, so every screen can ask every frame.
+#[no_mangle]
+pub unsafe extern "C" fn ms_live_account(handle: *const MSLive, since_seq: u64, seq_out: *mut u64) -> *mut c_char {
+    guarded(ptr::null_mut(), ptr::null_mut(), || {
+        let live = handle.as_ref().and_then(|h| h.engine.as_ref()).ok_or("实时层句柄无效")?;
+        match live.account(since_seq) {
+            Some((seq, json)) => {
+                if !seq_out.is_null() {
+                    *seq_out = seq;
+                }
+                Ok(to_c_string(json.as_ref().clone()))
+            }
+            None => Ok(ptr::null_mut()),
+        }
+    })
+}
+
+/// How many of its own intervals a feed may miss before its age reads stale
+/// (`live::STALE_AFTER`) — for the clocks the app runs itself, the CLI
+/// fallback and a venue it polls, so every age on screen turns amber by the
+/// one rule the kernel's own feeds follow.
+#[no_mangle]
+pub extern "C" fn ms_live_stale_after_intervals() -> u32 {
+    crate::live::STALE_AFTER
+}
+
+/// How often the app reads the account through the CLI while the private
+/// socket is down, in milliseconds — the interval the kernel ages those
+/// readings by (`Renewal::CliFallback`), so the loop and the ages agree.
+#[no_mangle]
+pub extern "C" fn ms_live_cli_fallback_ms() -> u64 {
+    crate::live::Renewal::CliFallback.interval().as_millis() as u64
+}
+
 /// Stop the live layer and release the handle. Null is a no-op.
 #[no_mangle]
 pub unsafe extern "C" fn ms_live_stop(handle: *mut MSLive) {
@@ -1266,27 +1303,21 @@ pub unsafe extern "C" fn ms_okx_account_document(kind: *const c_char, json: *con
         let kind = borrow_str(kind).ok_or("kind 不是 UTF-8")?;
         let value: serde_json::Value = borrow_str(json).and_then(|text| serde_json::from_str(text).ok()).unwrap_or(serde_json::Value::Null);
         let out = match kind {
-            "positions" => serde_json::Value::Array(
+            // The shapes of the live account document (`ms_live_account`), so
+            // a REST read and the stream are decoded by one reader.
+            "positions" => serde_json::to_value(
                 crate::live::okx_positions_in(&value)
-                    .into_iter()
+                    .iter()
                     .filter(|r| r.contracts != 0.0)
-                    .map(|r| serde_json::json!({
-                        "instId": r.inst_id, "instType": r.inst_type, "posSide": r.pos_side,
-                        "contracts": r.contracts, "averagePrice": r.average_price, "markPrice": r.mark_price,
-                        "unrealisedPnl": r.unrealised_pnl, "leverage": r.leverage, "liquidationPrice": r.liquidation_price,
-                        "notionalUsd": r.notional_usd, "margin": r.margin, "maintenanceMargin": r.maintenance_margin,
-                        "marginRatio": r.margin_ratio, "settlementCurrency": r.settlement_currency, "usdRate": r.usd_rate,
-                        "marginMode": r.margin_mode,
-                    }))
-                    .collect(),
-            ),
+                    .map(crate::live::HoldingView::as_pushed)
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|e| e.to_string())?,
             "equity" => serde_json::json!({"totalEquity": crate::live::okx_total_equity_in(&value)}),
-            "balances" => serde_json::Value::Array(
-                crate::live::okx_balances_in(&value)
-                    .into_iter()
-                    .map(|b| serde_json::json!({"ccy": b.ccy, "available": b.available, "total": b.total, "valuationUsd": b.valuation_usd}))
-                    .collect(),
-            ),
+            "balances" => serde_json::to_value(
+                crate::live::okx_balances_in(&value).iter().map(crate::live::BalanceView::as_read).collect::<Vec<_>>(),
+            )
+            .map_err(|e| e.to_string())?,
             other => return Err(format!("未知的账户文档类型：{other}")),
         };
         Ok(to_c_string(out.to_string()))

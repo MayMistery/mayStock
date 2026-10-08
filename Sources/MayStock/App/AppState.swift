@@ -134,11 +134,22 @@ final class AppState {
     @ObservationIgnored let schwabTags: SchwabOrderTags
 
     @ObservationIgnored private var venueBooks: [Venue: VenueBooks] = [:]
-    /// Every venue's account is re-read on a clock, not only on a button:
-    /// positions opened by hand, stops firing and bills settling all happen
-    /// on the exchange with no word to this app.
+    /// The kernel's live layer, for the app's whole life: its account part is
+    /// what OKX's account is read from on every screen (`accountFeed`), and
+    /// the checkup page switches its market analytics on while it is open.
+    /// Nil only when it could not start, which `liveLayerError` says.
+    @ObservationIgnored private(set) var liveLayer: LiveKernel?
+    private(set) var liveLayerError: String?
+    /// OKX's account, valued as the mark streams.
+    @ObservationIgnored private(set) var accountFeed: LiveAccountFeed?
+    /// What a venue keeps on the exchange that has no stream — open orders,
+    /// fills, the bill ledger, and a venue's whole account where it has no
+    /// stream — is re-read on this clock as well as on demand: positions
+    /// opened by hand, stops firing and bills settling all happen on the
+    /// exchange with no word to this app.
     static let accountRefreshInterval: TimeInterval = 300
     @ObservationIgnored private var accountRefreshLoop: Task<Void, Never>?
+    @ObservationIgnored private var polledAccountLoop: Task<Void, Never>?
     @ObservationIgnored private var lastLoggedAccountError: [Venue: String] = [:]
     @ObservationIgnored private(set) var panel: HoverPanelController!
     @ObservationIgnored private var statusItems: StatusItemManager?
@@ -182,6 +193,7 @@ final class AppState {
         }
 
         wire()
+        startLiveLayer()
         reloadStrategies()
         applyConfig()
         Task {
@@ -197,6 +209,7 @@ final class AppState {
         if !options.isSnapshot {
             runners.forEach { $0.start() }
             startAccountRefreshLoop()
+            startPolledAccountLoop()
         }
         intelligence.start(watchlist: { [weak self] in
             self?.store.config.watchlist.map(\.instId) ?? []
@@ -254,17 +267,70 @@ final class AppState {
 
     /// How a day's change is measured for an instrument, for alert summaries.
     func changeBasis(for instId: String) -> ChangeBasis {
-        venue(of: instId).changeBasis
+        hub.changeBasis(for: venue(of: instId))
     }
 
     /// Push the current config into hub / status bar / alert engine.
     func applyConfig() {
+        syncLiveLayer()
+        hub.setChangeBasis(store.config.general.changeBasis)
         hub.setWatchlist(store.config.watchlist)
         statusItems?.sync(watchlist: store.config.watchlist)
         if alerts.rules != store.config.alerts {
             alerts.setRules(store.config.alerts)
         }
         LaunchAtLogin.set(enabled: store.config.general.launchAtLogin)
+    }
+
+    // MARK: The live layer
+
+    /// The account the live layer reads, from the settings: the active mode
+    /// and its profile. The checkup page's part of the config (instrument,
+    /// grid, analytics) is the page's own.
+    private func liveAccountConfig(_ config: inout LiveKernel.Config) {
+        let mode = tradingMode
+        config.mode = mode.isDemo ? "demo" : "live"
+        config.okxProfile = tradeBridge.profile(for: mode)
+        config.okxConfigPath = OKXProfileCatalog.defaultFileURL().path
+        config.schwabctlPath = schwabBridge.resolveCLIPath()
+    }
+
+    private func startLiveLayer() {
+        var config = LiveKernel.Config(
+            instId: "ETH-USDT-SWAP", followsHeldPosition: true, mode: tradingMode,
+            okxProfile: nil, okxConfigPath: nil, schwabctlPath: nil,
+            gridDivisor: max(UserDefaults.standard.integer(forKey: "checkup.gridDivisor"), 1),
+            analytics: false)
+        liveAccountConfig(&config)
+        do {
+            let kernel = try LiveKernel(config: config)
+            liveLayer = kernel
+            let feed = LiveAccountFeed(
+                kernel: kernel,
+                venue: { [weak self] in self?.exchangeVenue(for: .okx) },
+                mode: { [weak self] in self?.tradingMode })
+            feed.onChange = { [weak self] account in
+                guard let self else { return }
+                self.books(for: .okx).adopt(account, mode: self.tradingMode)
+            }
+            accountFeed = feed
+            feed.start()
+            Log.warn("live: 实时层启动（账户常驻，\(config.mode) · profile \(config.okxProfile ?? "<默认>")）")
+        } catch {
+            liveLayerError = String(describing: error)
+            Log.warn("live: 实时层启动失败，账户改为定时读取：\(error)")
+        }
+    }
+
+    /// Point the live layer at the account the settings name. Nothing is
+    /// sent when nothing changed.
+    private func syncLiveLayer() {
+        guard let liveLayer else { return }
+        do {
+            try liveLayer.update { self.liveAccountConfig(&$0) }
+        } catch {
+            Log.warn("live: 实时层切换账户失败：\(error)")
+        }
     }
 
     // MARK: Trading plumbing
@@ -360,9 +426,24 @@ final class AppState {
 
     // MARK: Account figures, per venue
 
-    /// Live account equity on a venue, in its quote currency, sampled by
-    /// that venue's runner.
-    func accountEquity(for venue: Venue) -> Double? { runner(for: venue).accountEquity }
+    /// A venue's account equity now, in the currency it is shown in
+    /// (`equityCurrency(for:)`) — the books' reading, which on OKX is valued
+    /// as the mark streams.
+    func accountEquity(for venue: Venue) -> Double? {
+        books(for: venue).accountSnapshot?.displayEquity(in: venue.quoteCurrency)?.amount
+    }
+
+    /// The unit `accountEquity(for:)` is in: the venue's quote currency when
+    /// the venue published a rate into it, else what the venue stated —
+    /// never a label borrowed from the venue while the number is in another.
+    func equityCurrency(for venue: Venue) -> String {
+        books(for: venue).accountSnapshot?.displayEquity(in: venue.quoteCurrency)?.currency ?? venue.quoteCurrency
+    }
+
+    /// Dollars per unit of the venue's quote currency, in the current reading.
+    func quoteUsdRate(for venue: Venue) -> Double? {
+        books(for: venue).accountSnapshot?.usdRate(for: venue.quoteCurrency)
+    }
 
     /// Every account added up, in dollars, from the same readings the
     /// per-venue pages show. Accounts that could not be read are named in the
@@ -372,7 +453,7 @@ final class AppState {
             let books = books(for: venue)
             return CombinedPortfolio.Reading(
                 venue: venue, snapshot: books.accountSnapshot,
-                error: books.accountError, readAt: books.accountRefreshedAt)
+                error: books.accountError, readAt: books.equityAt)
         })
     }
 
@@ -443,8 +524,9 @@ final class AppState {
     func nonStableExposurePct(for venue: Venue) -> Double? { runner(for: venue).nonStableExposurePct }
 
     /// What the exchange's bills say a venue's account realised over a
-    /// window. Nil until the ledger has been read, and on a venue that
-    /// publishes no bill ledger — see `Venue.periodFigure`.
+    /// window — the realised part of the window's result, shown as its
+    /// breakdown. Nil until the ledger has been read, and on a venue that
+    /// publishes no bill ledger (`Venue.publishesBills`).
     func billedPnL(_ window: EquityWindow, venue: Venue) -> BilledPnL? {
         books(for: venue).exchangeBills.map { BilledPnL.over(window, listing: $0) }
     }
@@ -458,8 +540,16 @@ final class AppState {
     /// want `exchangeUnrealisedPnLUsd`.
     func exchangeUnrealisedPnL(for venue: Venue) -> Double? {
         let books = books(for: venue)
-        guard books.accountRefreshedAt != nil else { return nil }
+        guard books.positionsAt != nil else { return nil }
         return books.exchangePositions.reduce(0) { $0 + $1.unrealisedPnL }
+    }
+
+    /// When the floating profit above is as of: the oldest mark any position
+    /// was valued at, else when the list was read.
+    func exchangeUnrealisedPnLAt(for venue: Venue) -> Date? {
+        let books = books(for: venue)
+        guard let listed = books.positionsAt else { return nil }
+        return books.exchangePositions.compactMap(\.markAt).min() ?? listed
     }
 
     /// The same figure in dollars, or nil when some position could not be
@@ -470,7 +560,7 @@ final class AppState {
     /// is a confidently wrong one.
     func exchangeUnrealisedPnLUsd(for venue: Venue) -> Double? {
         let books = books(for: venue)
-        guard books.accountRefreshedAt != nil else { return nil }
+        guard books.positionsAt != nil else { return nil }
         var total = 0.0
         for position in books.exchangePositions {
             guard let usd = position.unrealisedPnLUsd else { return nil }
@@ -514,13 +604,11 @@ final class AppState {
     private func sumOpenPnL(
         for venue: Venue, convert: (Double, String) -> Double?
     ) -> Double? {
-        let runner = runner(for: venue)
         let positions = ledger(for: venue).positions.values.filter { !$0.isFlat || $0.realisedPnL != 0 }
         guard !positions.isEmpty else { return nil }
         var total = 0.0
         for position in positions {
-            let marked = position.netPnL(
-                mark: runner.mark(for: position.instId) ?? mark(for: position.instId))
+            let marked = position.netPnL(mark: mark(for: position.instId))
             guard let value = convert(marked, position.instId) else { return nil }
             total += value
         }
@@ -538,10 +626,45 @@ final class AppState {
         return pnl / committed * 100
     }
 
-    /// Trailing return for the panel, endpoint pinned to the live equity rather
-    /// than the last stored sample.
+    /// What the account made over a window, the way the exchange's own app
+    /// counts 「今日盈亏」: equity now, less equity at the window's start, less
+    /// the money moved in. In the currency the account is shown in, with the
+    /// endpoint pinned to the live equity rather than the last stored sample.
     func equityChange(_ window: EquityWindow, venue: Venue) -> EquityChange? {
-        equityCurve(for: venue).change(over: window, latest: accountEquity(for: venue))
+        let books = books(for: venue)
+        let rate = quoteUsdRate(for: venue)
+        return equityCurve(for: venue).change(
+            over: window, latest: books.accountSnapshot?.totalEquity,
+            quoteUsd: rate, transfers: transfers(on: venue, quoteUsd: rate))
+    }
+
+    /// Money moved into (negative: out of) a venue's account, in its quote
+    /// currency, by when it landed — the movements a result leaves out. Nil
+    /// listing, nothing to leave out; the windows say so (`transfersKnown`).
+    func transfers(on venue: Venue, quoteUsd: Double?) -> [(at: Date, amount: Double)] {
+        let books = books(for: venue)
+        guard let listing = books.transfers, let snapshot = books.accountSnapshot else { return [] }
+        return listing.items.filter(\.isLeftOut).compactMap { transfer in
+            let amount: Double
+            if transfer.ccy == venue.quoteCurrency {
+                amount = transfer.amount
+            } else if let usd = snapshot.usdRate(for: transfer.ccy), let quote = quoteUsd ?? (venue.quoteCurrency == AccountSnapshot.usdCode ? 1 : nil) {
+                amount = transfer.amount * usd / quote
+            } else {
+                // A coin moved that the reading has no rate for: it cannot be
+                // stated in the quote, so the window carrying it is marked
+                // rather than adjusted by a guess.
+                Log.warn("account: 划转 \(transfer.id)（\(transfer.amount) \(transfer.ccy)）没有汇率，未从收益中扣除")
+                return nil
+            }
+            return (transfer.at, amount)
+        }
+    }
+
+    /// Whether a venue's windows have its transfers taken out: true where the
+    /// venue publishes them and they were read.
+    func transfersKnown(on venue: Venue) -> Bool {
+        books(for: venue).transfers != nil
     }
 
     // MARK: Readiness
@@ -619,35 +742,20 @@ final class AppState {
             // Nothing on this account may be read, so nothing read from it may
             // stay on screen — otherwise a logout leaves the previous account's
             // orders and fills looking current.
-            books.accountSnapshot = nil
-            books.exchangePositions = []
-            books.openOrders = []
-            books.openOrdersNote = nil
-            books.openOrdersError = nil
-            books.exchangeFills = []
-            books.exchangeFillsNote = nil
-            books.exchangeFillsError = nil
-            books.accountError = tradingBlocker(for: venue)
+            books.clearAccount(reason: tradingBlocker(for: venue))
             return
         }
         let exchange = exchangeVenue(for: venue)
         let mode = tradingMode
-        do {
-            books.accountSnapshot = try await exchange.accountSnapshot(mode: mode)
-            // Every position the venue holds, contracts and shares alike. A
-            // failed listing is an error on screen, not an empty list that
-            // reads as "nothing held".
-            books.exchangePositions = try await exchange.heldPositions(mode: mode)
-            books.accountError = nil
-            books.accountRefreshedAt = Date()
-        } catch {
-            books.accountError = String(describing: error)
-            return
-        }
+        await readAccount(venue)
+        // A venue whose account could not be read at all has nothing further
+        // worth asking; the error is on screen.
+        guard books.accountSnapshot != nil else { return }
         // What the venue is holding open, and its own ledger where it keeps
         // one. Kept apart from `accountError`: a refused order book must not
-        // blank the equity and positions that were read fine.
-        do {
+        // blank the equity and positions that were read fine. OKX's listing
+        // comes with the live account while that is current.
+        if !books.ordersStreamed { do {
             switch venue {
             case .okx:
                 let listing = try await KernelTradeClient(bridge: tradeBridge).workingOrders(mode: mode)
@@ -659,11 +767,12 @@ final class AppState {
                 books.openOrdersNote = nil
             }
             books.openOrdersError = nil
+            books.ordersAt = Date()
         } catch {
             books.openOrders = []
             books.openOrdersNote = nil
             books.openOrdersError = String(describing: error)
-        }
+        } }
         // What the venue has filled lately, whoever placed it. Its own block,
         // for the same reason the order book has one: a refused fill read must
         // not blank the equity and positions that were read fine — and, read
@@ -684,13 +793,15 @@ final class AppState {
                     ? nil : "未能读取：" + listing.unavailable.joined(separator: "、") + "的成交。"
             }
             books.exchangeFillsError = nil
+            books.fillsAt = Date()
         } catch {
             books.exchangeFills = []
             books.exchangeFillsNote = nil
             books.exchangeFillsError = String(describing: error)
         }
-        switch venue.periodFigure {
-        case .exchangeBills:
+        // The venue's own ledger, where it keeps one: what a window realised,
+        // shown beside the window's result as its breakdown.
+        if venue.publishesBills {
             do {
                 books.exchangeBills = try await tradeBridge.bills(mode: mode)
                 books.billsError = nil
@@ -698,14 +809,60 @@ final class AppState {
                 books.exchangeBills = nil
                 books.billsError = String(describing: error)
             }
-        case .equityCurve:
-            books.exchangeBills = nil
-            books.billsError = nil
         }
-        // Equity is the runner's figure — marked with the same prices the
-        // engine trades on — so a refresh asks it to sample, rather than
-        // computing a second, slightly different number here.
+        // The trading loop's equity and exposure are samples of the reading
+        // just taken, not a second read of their own.
         await books.runner.sampleEquityNow()
+    }
+
+    /// The account's equity and positions over REST — for a venue with no
+    /// stream, and for OKX while its stream is not delivering. While the
+    /// stream is, it is the reading and this asks for nothing: a second
+    /// reading of the same account on another clock is how the screens came
+    /// to disagree with each other and with the exchange.
+    func readAccount(_ venue: Venue) async {
+        let books = books(for: venue)
+        if books.isStreamed { return }
+        guard tradingReady(for: venue) else {
+            books.clearAccount(reason: tradingBlocker(for: venue))
+            return
+        }
+        let source: AccountReading.Source = venue == .okx && liveLayer != nil ? .fallback : .polled
+        if venue == .okx, liveLayer != nil, books.accountSource == .stream {
+            Log.warn("account: \(venue.displayName)账户推送没有新数据，改用 REST 读取")
+        }
+        let heldBefore = books.heldCounts
+        do {
+            books.adopt(try await exchangeVenue(for: venue).accountReading(mode: tradingMode, source: source))
+        } catch {
+            books.accountError = String(describing: error)
+        }
+        await readTransfers(venue, holdingsMoved: books.heldCounts != heldBefore)
+    }
+
+    /// Money moved into or out of a venue with no account stream — Schwab's;
+    /// OKX's come with its stream. Read again as soon as a reading shows the
+    /// holdings changed — a deposit moves the cash, securities moved in move
+    /// a count — so a transfer is left out of the result by the reading that
+    /// first shows it rather than counted as profit; otherwise once a
+    /// minute, because the listing costs a request per movement type and a
+    /// priced account is read every ten seconds. The shadow book is not an
+    /// account anyone can move money into.
+    private func readTransfers(_ venue: Venue, holdingsMoved: Bool) async {
+        guard venue == .schwab, tradingMode == .live, tradingReady(for: venue) else { return }
+        let books = books(for: venue)
+        let now = Date()
+        if !holdingsMoved, books.transfersError == nil, let readAt = books.transfers?.readAt,
+           now.timeIntervalSince(readAt) < AccountReading.cashPollInterval { return }
+        // A week back from the start of the week, at most eight days.
+        let since = EquityWindow.day7.anchor(now: now, venue: venue).addingTimeInterval(-86_400)
+        do {
+            let items = try await schwabBridge.transfers(from: since, to: now)
+            books.transfers = AccountTransferListing(items: items, complete: true, readAt: now)
+            books.transfersError = nil
+        } catch {
+            books.transfersError = String(describing: error)
+        }
     }
 
     /// Pull the OKX account's real fee rates into the schedule the backtester
@@ -981,7 +1138,11 @@ final class AppState {
         for venue in Venue.allCases {
             let books = books(for: venue)
             if books.isRefreshingAccount { continue }
-            if let at = books.accountRefreshedAt, Date().timeIntervalSince(at) < maxAge { continue }
+            // Every part the refresh reads, each by its own age: a fresh
+            // equity must not vouch for a stale order book.
+            let parts: [Date?] = [books.isStreamed ? Date() : books.positionsAt,
+                                  books.ordersStreamed ? Date() : books.ordersAt, books.fillsAt]
+            if parts.allSatisfy({ $0.map { Date().timeIntervalSince($0) < maxAge } ?? false }) { continue }
             Task { await refreshAccount(venue) }
         }
     }
@@ -1004,6 +1165,39 @@ final class AppState {
             Log.warn("clock: 本机与交易所相差 \(PriceFormatter.decimals(reading.offset, 3)) 秒"
                      + "（往返 \(PriceFormatter.decimals(reading.roundTrip, 3)) 秒）"
                      + (drifted ? " —— 超过容差，已在总览提示" : " —— 已回到容差内"))
+        }
+    }
+
+    /// How often a venue with no account stream is read: the reading's own
+    /// rule (`AccountReading.pollInterval`), the one clock its figures are
+    /// labelled with and the one `startPolledAccountLoop` keeps. Before the
+    /// first reading, the shorter.
+    func polledAccountInterval(for venue: Venue) -> TimeInterval {
+        books(for: venue).reading?.pollInterval(quoteCurrency: venue.quoteCurrency)
+            ?? AccountReading.pricedPollInterval
+    }
+
+    /// Read every venue its stream does not cover as often as
+    /// `polledAccountInterval` says. It used to be read when the trading
+    /// loop sampled equity — a clock chosen for the equity curve, once a
+    /// minute — so a Schwab account holding shares showed a figure up to a
+    /// minute behind the one Schwab's own app was showing. Checked every two
+    /// seconds, so a ten-second interval is kept to within two.
+    func startPolledAccountLoop() {
+        polledAccountLoop?.cancel()
+        polledAccountLoop = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                guard !Task.isCancelled, let self else { return }
+                for venue in Venue.allCases {
+                    let books = self.books(for: venue)
+                    guard !books.isStreamed, !books.isRefreshingAccount, self.tradingReady(for: venue) else { continue }
+                    if let at = books.equityAt, Date().timeIntervalSince(at) < self.polledAccountInterval(for: venue) {
+                        continue
+                    }
+                    await self.readAccount(venue)
+                }
+            }
         }
     }
 

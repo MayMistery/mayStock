@@ -35,9 +35,6 @@ use tokio::task::AbortHandle;
 use super::socket::{self, Keepalive, Plan, Step};
 use super::{net, now_ms, okx, Feed, FeedState, Update};
 
-const PUBLIC_WS: &str = "wss://ws.okx.com:8443/ws/v5/public";
-const PUBLIC_WS_DEMO: &str = "wss://wspap.okx.com:8443/ws/v5/public";
-
 /// Levels published per side. The ticket offers any level up to this; the
 /// book behind it keeps all 400.
 pub const PUBLISHED_DEPTH: usize = 50;
@@ -394,15 +391,20 @@ pub fn parse_spec(body: &str, inst_id: &str) -> Result<Spec, String> {
 }
 
 fn spec_path(config: &BookConfig) -> String {
-    let inst_type = config.inst_type.to_ascii_uppercase();
+    spec_path_for(&config.inst_type, &config.inst_id)
+}
+
+/// Where an instrument's specification is listed.
+pub(crate) fn spec_path_for(inst_type: &str, inst_id: &str) -> String {
+    let inst_type = inst_type.to_ascii_uppercase();
     // Options are listed by family only: `instId` alone is refused (50015).
     let family = if inst_type == "OPTION" {
-        let parts: Vec<&str> = config.inst_id.split('-').collect();
+        let parts: Vec<&str> = inst_id.split('-').collect();
         format!("&instFamily={}", parts.get(..2).map(|p| p.join("-")).unwrap_or_default())
     } else {
         String::new()
     };
-    format!("/api/v5/public/instruments?instType={inst_type}{family}&instId={}", config.inst_id)
+    format!("/api/v5/public/instruments?instType={inst_type}{family}&instId={inst_id}")
 }
 
 // MARK: - The socket
@@ -424,7 +426,7 @@ impl socket::Dialect for BookDialect {
             {"channel": "tickers", "instId": inst},
         ]})
         .to_string();
-        let url = if self.demo { PUBLIC_WS_DEMO } else { PUBLIC_WS };
+        let url = okx::public_ws(self.demo);
         Ok(Plan { url: url.to_string(), steps: vec![Step { frame, await_ack: false }] })
     }
     fn ack(&self, _text: &str) -> Option<Result<(), String>> {
@@ -550,6 +552,7 @@ impl Runner {
         object.insert("spec".into(), json!(self.spec));
         object.insert("specError".into(), json!(self.spec_error));
         object.insert("receivedMs".into(), json!((self.received_ms > 0).then_some(self.received_ms)));
+        object.insert("staleAfterMs".into(), json!(Feed::OkxBook.stale_after_ms()));
         object.insert("stats".into(), json!({
             "updates": self.book.updates, "tops": self.book.tops,
             "resyncs": self.resyncs, "lastResync": self.last_resync,
@@ -675,7 +678,7 @@ async fn run(config: BookConfig, mut control: mpsc::UnboundedReceiver<Control>, 
 
 /// Read the specification, retrying until it is read: without the tick and
 /// lot no order can be planned.
-async fn fetch_spec(path: String, inst_id: String, demo: bool, out: mpsc::Sender<Result<Spec, String>>) {
+pub(crate) async fn fetch_spec(path: String, inst_id: String, demo: bool, out: mpsc::Sender<Result<Spec, String>>) {
     let http = match net::http_client() {
         Ok(http) => http,
         Err(reason) => {

@@ -39,29 +39,26 @@ struct CheckupPage: View {
         }
         .background(WindowVisibilityReader { visible in model?.isVisible = visible })
         .task {
-            if model == nil {
+            if let model {
+                model.start()
+            } else if let kernel = appState.liveLayer {
                 // A deep link may have named an instrument; otherwise the
-                // kernel follows whatever perpetual the account holds.
+                // kernel follows whatever perpetual the account holds. The
+                // account it reads is the app's (`AppState.syncLiveLayer`).
                 let requested = appState.requestedCheckupInstId
-                let bridge = appState.tradeBridge
                 let created = CheckupModel(
-                    venue: appState.exchangeVenue(for: appState.venue(of: Self.fallbackInstId)),
-                    mode: appState.tradingMode,
+                    kernel: kernel,
                     instId: requested ?? Self.fallbackInstId,
                     followsHeldPosition: requested == nil,
-                    okxProfile: { bridge.profile(for: $0) },
-                    okxConfigPath: OKXProfileCatalog.defaultFileURL().path,
-                    schwabctlPath: appState.schwabBridge.resolveCLIPath(),
                     gridDivisor: gridDivisor)
                 appState.pendingCheckupInstId = nil
                 model = created
                 created.start()
             }
         }
+        // Closing the page switches the market analytics off; the account
+        // part of the layer runs on for every other screen.
         .onDisappear { model?.stop() }
-        .onChange(of: appState.tradingMode) { _, mode in
-            model?.mode = mode
-        }
         .onChange(of: gridDivisor) { _, divisor in
             model?.gridDivisor = divisor
         }
@@ -77,7 +74,11 @@ struct CheckupPage: View {
 
     @ViewBuilder
     private var content: some View {
-        if let model {
+        if let failure = appState.liveLayerError {
+            Card {
+                InlineNotice(kind: .danger, title: "实时层没有运行", message: failure)
+            }
+        } else if let model {
             if let failure = model.failure {
                 Card {
                     InlineNotice(kind: .danger, title: "实时层没有运行", message: failure)
@@ -117,6 +118,12 @@ enum CheckupText {
     /// A price as a trader reads it: two decimals, whatever the venue sent.
     static func price(_ value: Double) -> String {
         String(format: "%.2f", value)
+    }
+
+    /// The venue's margin ratio as its app writes it: `mgnRatio` 23.17 is
+    /// 2,317.20%, and 100% is liquidation.
+    static func marginRatio(_ ratio: Double) -> String {
+        PriceFormatter.decimals(ratio * 100, 2) + "%"
     }
 
     static func pnlTint(_ value: Double) -> Color {
@@ -209,11 +216,27 @@ enum CheckupText {
         return ([side, "\(PriceFormatter.plain(abs(position.contracts))) 张", mode].compactMap { $0 }).joined(separator: " · ")
     }
 
-    /// Net notional with its direction, e.g. `净空 $3,955`.
-    static func netNotional(_ exposure: LiveSnapshot.Exposure, hedged: Bool) -> String {
-        let amount = PriceFormatter.money(abs(exposure.netNotional))
+    /// A figure in the currency it is stated in, labelled.
+    static func money(_ amount: Double, _ currency: String?) -> String {
+        PriceFormatter.money(amount) + (currency.map { " " + $0 } ?? "")
+    }
+
+    /// A dollar figure — the kernel measures exposure in dollars — stated in
+    /// the account's quote currency at the account reading's own rate: the
+    /// unit every other screen states the account in. The page used to show
+    /// these dollars unlabelled beside a floating profit in USDT (2026-10-08).
+    /// Dollars, labelled, when the reading gives no rate.
+    static func dollars(_ usd: Double, reading: AccountSnapshot?) -> String {
+        let quote = Venue.okx.quoteCurrency
+        if let amount = reading?.amount(usd: usd, in: quote) { return money(amount, quote) }
+        return money(usd, AccountSnapshot.usdCode)
+    }
+
+    /// Net notional with its direction, e.g. `净空 3,955.00 USDT`.
+    static func netNotional(_ exposure: LiveSnapshot.Exposure, hedged: Bool, reading: AccountSnapshot?) -> String {
+        let amount = dollars(abs(exposure.netNotional), reading: reading)
         guard hedged else { return amount }
-        if exposure.netNotional == 0 { return "完全对冲 $0" }
+        if exposure.netNotional == 0 { return "完全对冲" }
         return (exposure.netNotional > 0 ? "净多 " : "净空 ") + amount
     }
 
@@ -299,6 +322,7 @@ private struct FeedsCard: View {
                     if let ms = network.lastHeardMs {
                         HStack(spacing: 6) {
                             Text("最后一次收到它们的数据").font(Theme.Text.caption).foregroundStyle(.secondary)
+                            // Stale by definition: nothing has arrived since.
                             AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: 0)
                         }
                     }
@@ -340,7 +364,7 @@ private struct RiskCard: View {
             ) {
                 HStack(spacing: 6) {
                     Text(CheckupText.source(risk.source)).font(Theme.Text.caption).foregroundStyle(.secondary)
-                    if let ms = risk.positionsMs { AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: 10_000) }
+                    if let ms = risk.positionsMs { AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: risk.positionsStaleAfterMs ?? 0) }
                     // One ticket per leg: closing a long/short account's short
                     // must not open on its long.
                     ForEach(risk.positions) { position in
@@ -353,8 +377,8 @@ private struct RiskCard: View {
                 }
             } content: {
                 VStack(alignment: .leading, spacing: 10) {
-                    if let fallbackError = model.fallbackError {
-                        InlineNotice(kind: .warning, message: "账户推送不可用，CLI 读取也失败了：\(fallbackError)")
+                    if let fallbackError = appState.accountFeed?.fallbackError {
+                        InlineNotice(kind: .warning, message: "账户推送不可用，REST 读取也失败了：\(fallbackError)")
                     }
                     if !risk.positions.isEmpty {
                         instrumentTiles(risk, offset: offset)
@@ -384,6 +408,7 @@ private struct RiskCard: View {
     @ViewBuilder
     private func instrumentTiles(_ risk: LiveSnapshot.Risk, offset: Double) -> some View {
         let single = risk.positions.count == 1 ? risk.positions.first : nil
+        let reading = model.snapshot?.account.snapshot
         HStack(spacing: 8) {
             StatTile(
                 label: "实际杠杆",
@@ -395,12 +420,12 @@ private struct RiskCard: View {
             if let exposure = risk.exposure {
                 StatTile(
                     label: risk.isHedged ? "净敞口（名义）" : "敞口（名义）",
-                    value: CheckupText.netNotional(exposure, hedged: risk.isHedged),
+                    value: CheckupText.netNotional(exposure, hedged: risk.isHedged, reading: reading),
                     caption: risk.isHedged
-                        ? "多 \(PriceFormatter.money(exposure.longNotional)) · 空 \(PriceFormatter.money(exposure.shortNotional))"
-                        : "权益 \(PriceFormatter.money(exposure.equity))")
+                        ? "多 \(CheckupText.dollars(exposure.longNotional, reading: reading)) · 空 \(CheckupText.dollars(exposure.shortNotional, reading: reading))"
+                        : "权益 \(CheckupText.dollars(exposure.equity, reading: reading))")
                 StatTile(
-                    label: "标的每涨 1%", value: PriceFormatter.money(exposure.pnlPerOnePercentRise),
+                    label: "标的每涨 1%", value: CheckupText.dollars(exposure.pnlPerOnePercentRise, reading: reading),
                     tint: CheckupText.pnlTint(exposure.pnlPerOnePercentRise),
                     caption: String(format: "权益的 %.1f%%", exposure.onePercentAsEquityPct))
             }
@@ -408,12 +433,10 @@ private struct RiskCard: View {
                 label: "标记价", value: risk.mark.map { CheckupText.price($0.price) } ?? "—",
                 caption: risk.mark?.source == "okx.mark-price" ? "实时标记价推送" : "来自最近一次持仓推送")
         }
-        if let ms = risk.mark?.ms {
+        if let mark = risk.mark, let ms = mark.ms {
             HStack(spacing: 6) {
                 Text("标记价").font(Theme.Text.caption).foregroundStyle(.secondary)
-                AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: 8_000)
-                Text("· OKX 标记价的时间戳本身约晚 4 秒（2026-09-23 实测），不是本机延迟")
-                    .font(Theme.Text.caption).foregroundStyle(.tertiary)
+                AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: mark.staleAfterMs ?? 0)
             }
         }
     }
@@ -433,9 +456,14 @@ private struct RiskCard: View {
                 value: "\(position.isShort ? "空" : "多") \(PriceFormatter.plain(abs(position.contracts)))",
                 caption: String(format: "%.3f 个标的", abs(position.baseQuantity)))
             StatTile(
-                label: "浮动盈亏", value: position.unrealisedPnl.map { PriceFormatter.money($0) } ?? "—",
+                label: "浮动盈亏", value: position.unrealisedPnl.map { CheckupText.money($0, position.settlementCurrency) } ?? "—",
                 tint: CheckupText.pnlTint(position.unrealisedPnl ?? 0),
-                caption: position.averagePrice.map { "均价 \(CheckupText.price($0))" })
+                caption: [position.unrealisedRatio.map { "收益率 " + PriceFormatter.signedPercent($0 * 100) },
+                          position.averagePrice.map { "均价 \(CheckupText.price($0))" }]
+                    .compactMap { $0 }.joined(separator: " · "),
+                help: position.remarked
+                    ? "在上方的实时标记价上按交易所的公式计算，与 OKX App 同口径；收益率是交易所口径（浮盈 ÷ 开仓保证金）"
+                    : "交易所最近一次持仓推送里的数")
             StatTile(
                 label: "强平缓冲",
                 value: position.liquidationBufferPct.map { String(format: "%.2f%%", $0) } ?? "—",
@@ -443,17 +471,18 @@ private struct RiskCard: View {
                 caption: position.liquidationPrice.map { "强平 \(CheckupText.price($0))" },
                 help: "标记价要走多远才触发强平，按实时标记价算")
             StatTile(
-                label: "资金费累计", value: position.fundingFee.map { PriceFormatter.money($0) } ?? "—",
+                label: "资金费累计", value: position.fundingFee.map { CheckupText.money($0, position.settlementCurrency) } ?? "—",
                 tint: CheckupText.pnlTint(position.fundingFee ?? 0), caption: "这个仓位至今")
         }
         if let ratio = position.marginRatio {
-            // The exchange's own health figure — the one it would act on.
+            // The exchange's own health figure — the one it would act on —
+            // as its app writes it: a percentage, liquidation at 100%.
             StatTile(
-                label: "交易所保证金率", value: String(format: "%.2f", ratio),
+                label: "交易所保证金率", value: CheckupText.marginRatio(ratio),
                 tint: ratio < 15 ? Theme.warning : .primary,
-                caption: "交易所自己的口径，越低越接近强平"
-                    + (position.maintenanceMargin.map { " · 维持保证金 \(PriceFormatter.money($0))" } ?? ""),
-                help: "与「强平缓冲」不同：缓冲是价格距离，这是保证金健康度")
+                caption: "交易所自己的口径，100% 触发强平"
+                    + (position.maintenanceMargin.map { " · 维持保证金 \(CheckupText.money($0, position.settlementCurrency))" } ?? ""),
+                help: "与「强平缓冲」不同：缓冲是价格距离，这是保证金健康度。交易所按 2 秒一次的持仓推送给出，低于 1500% 标黄")
         }
         if !position.liquidationOdds.isEmpty {
             Text("强平概率（在这条腿的强平价处读期权曲线；触及按 put–call 对称静态复制）")
@@ -554,9 +583,9 @@ private struct ProbabilityCard: View {
             ) {
                 HStack(spacing: 6) {
                     Text("曲面").font(Theme.Text.caption).foregroundStyle(.secondary)
-                    if let ms = probability.surfaceMs { AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: 5_000) }
+                    if let ms = probability.surfaceMs { AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: probability.surfaceStaleAfterMs) }
                     Text("指数").font(Theme.Text.caption).foregroundStyle(.secondary)
-                    if let ms = probability.indexMs { AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: 3_000) }
+                    if let ms = probability.indexMs { AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: probability.indexStaleAfterMs) }
                 }
             } content: {
                 VStack(alignment: .leading, spacing: 10) {
@@ -785,12 +814,13 @@ private struct StructureCard: View {
     }
 
     /// A number with its age beside it, sized like any other numeric cell:
-    /// exactly as wide as it needs, right-aligned in its column.
-    private func stamped(_ value: String, ms: Int64?, staleAfterMs: Double) -> AnyView {
+    /// exactly as wide as it needs, right-aligned in its column. The stale
+    /// age is the one the kernel stamped the value with.
+    private func stamped(_ value: String, ms: Int64?, staleAfterMs: Double?) -> AnyView {
         let offset = model.clock?.offsetMs ?? 0
         return AnyView(HStack(spacing: 6) {
             Text(value).font(.system(size: 11)).monospacedDigit()
-            if let ms { AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: staleAfterMs) }
+            if let ms { AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: staleAfterMs ?? 0) }
         }
         .fixedSize()
         .gridColumnAlignment(.trailing))
@@ -798,41 +828,40 @@ private struct StructureCard: View {
 
     private func rows() -> [Row] {
         let base = model.instrument?.base ?? ""
-        let bucketStale: Double = 7 * 60_000
         return [
             Row(id: "price", label: "价格", meaning: "OKX 为最新成交，Binance 为标记价") { v in
-                stamped(v.price.map { CheckupText.price($0.value) } ?? "—", ms: v.price?.ms, staleAfterMs: 5_000)
+                stamped(v.price.map { CheckupText.price($0.value) } ?? "—", ms: v.price?.ms, staleAfterMs: v.price?.staleAfterMs)
             },
             Row(id: "funding", label: "资金费率", meaning: "正=多头付给空头") { v in
-                stamped(v.fundingRate.map { String(format: "%.4f%%", $0.value * 100) } ?? "—", ms: v.fundingRate?.ms, staleAfterMs: 120_000)
+                stamped(v.fundingRate.map { String(format: "%.4f%%", $0.value * 100) } ?? "—", ms: v.fundingRate?.ms, staleAfterMs: v.fundingRate?.staleAfterMs)
             },
             Row(id: "oi", label: "未平仓量", meaning: "实时（OKX 推送 / Binance 3 秒）") { v in
-                stamped(v.openInterest.map { String(format: "%.0fk %@", $0.base / 1_000, base) } ?? "—", ms: v.openInterest?.ms, staleAfterMs: 15_000)
+                stamped(v.openInterest.map { String(format: "%.0fk %@", $0.base / 1_000, base) } ?? "—", ms: v.openInterest?.ms, staleAfterMs: v.openInterest?.staleAfterMs)
             },
             // The change is as fresh as its live end; the reference is the
             // five-minute bucket an hour (four hours) before it.
             Row(id: "oi1h", label: "OI 1 小时", meaning: "实时持仓量对比 1 小时前的 5 分钟桶") { v in
-                stamped(CheckupText.signedPercent(v.oiChange1h?.pct), ms: v.oiChange1h?.currentMs, staleAfterMs: 15_000)
+                stamped(CheckupText.signedPercent(v.oiChange1h?.pct), ms: v.oiChange1h?.currentMs, staleAfterMs: v.oiChange1h?.staleAfterMs)
             },
             Row(id: "oi4h", label: "OI 4 小时", meaning: "涨=新钱进场，跌=平仓离场") { v in
-                stamped(CheckupText.signedPercent(v.oiChange4h?.pct), ms: v.oiChange4h?.currentMs, staleAfterMs: 15_000)
+                stamped(CheckupText.signedPercent(v.oiChange4h?.pct), ms: v.oiChange4h?.currentMs, staleAfterMs: v.oiChange4h?.staleAfterMs)
             },
             Row(id: "top-pos", label: "大户·按金额", meaning: "前 20% 账户，按仓位规模，>1 偏多") { v in
-                stamped(v.topByPosition.map { String(format: "%.2f", $0.value) } ?? "—", ms: v.topByPosition?.ms, staleAfterMs: bucketStale)
+                stamped(v.topByPosition.map { String(format: "%.2f", $0.value) } ?? "—", ms: v.topByPosition?.ms, staleAfterMs: v.topByPosition?.staleAfterMs)
             },
             Row(id: "top-acc", label: "大户·按人头", meaning: "同一批账户，每户算一次") { v in
-                stamped(v.topByAccount.map { String(format: "%.2f", $0.value) } ?? "—", ms: v.topByAccount?.ms, staleAfterMs: bucketStale)
+                stamped(v.topByAccount.map { String(format: "%.2f", $0.value) } ?? "—", ms: v.topByAccount?.ms, staleAfterMs: v.topByAccount?.staleAfterMs)
             },
             Row(id: "all-acc", label: "全体账户", meaning: "人头比，不是仓位比") { v in
-                stamped(v.allAccounts.map { String(format: "%.2f", $0.value) } ?? "—", ms: v.allAccounts?.ms, staleAfterMs: bucketStale)
+                stamped(v.allAccounts.map { String(format: "%.2f", $0.value) } ?? "—", ms: v.allAccounts?.ms, staleAfterMs: v.allAccounts?.staleAfterMs)
             },
             Row(id: "taker", label: "主动买卖（5 分钟桶）", meaning: "吃单买/卖，<1 卖方主动") { v in
-                stamped(v.takerBuySell.map { String(format: "%.2f", $0.value) } ?? "—", ms: v.takerBuySell?.ms, staleAfterMs: bucketStale)
+                stamped(v.takerBuySell.map { String(format: "%.2f", $0.value) } ?? "—", ms: v.takerBuySell?.ms, staleAfterMs: v.takerBuySell?.staleAfterMs)
             },
             Row(id: "live-taker", label: "主动买卖（实时）", meaning: "逐笔成交滚动 5 分钟") { v in
-                guard let live = v.liveTaker else { return stamped("—", ms: nil, staleAfterMs: 0) }
+                guard let live = v.liveTaker else { return stamped("—", ms: nil, staleAfterMs: nil) }
                 let note = live.windowSeconds < 300 ? String(format: "（已累积 %.0f 秒）", live.windowSeconds) : ""
-                return stamped(String(format: "%.2f%@", live.ratio, note), ms: live.ms, staleAfterMs: 30_000)
+                return stamped(String(format: "%.2f%@", live.ratio, note), ms: live.ms, staleAfterMs: live.staleAfterMs)
             },
         ]
     }
@@ -867,7 +896,7 @@ private struct MacroCard: View {
                         GridText(CheckupText.signedPercent(row.changePct),
                                  tint: (row.changePct ?? 0) >= 0 ? Theme.up : Theme.down, alignment: .trailing)
                         if let ms = row.ms {
-                            AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: 60_000)
+                            AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: row.staleAfterMs)
                         } else {
                             GridText("—", tint: .secondary, alignment: .trailing)
                         }

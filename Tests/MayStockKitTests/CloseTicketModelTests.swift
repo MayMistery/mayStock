@@ -349,7 +349,8 @@ final class QuoteVenue: ExchangeVenue, @unchecked Sendable {
             instId: instId, last: 120.05, bid: 120.00, ask: 120.10, reference: 119, open: nil,
             high: 121, low: 118, volume: 1_000, basis: .previousClose, phase: nil, ts: Date())
         return StaticBook(BookDocument.quote(
-            instId: instId, spec: .shares(SchwabMarketDataSource.equityMeta(instId)), ticker: ticker, error: nil))
+            instId: instId, spec: .shares(SchwabMarketDataSource.equityMeta(instId)), ticker: ticker, error: nil,
+            interval: .seconds(1)))
     }
 }
 

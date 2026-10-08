@@ -42,6 +42,11 @@ public protocol StrategyRunnerHost: AnyObject {
     /// The exchange this portfolio trades on. A protocol, not a concrete
     /// client, so a second venue is one conformance rather than an edit here.
     var venue: any ExchangeVenue { get }
+    /// The venue's current account reading, no older than `maxAge` — the
+    /// one every screen shows. The runner never reads the account on a clock
+    /// of its own: its equity and exposure are the reading the panel shows,
+    /// sampled.
+    func accountReading(maxAge: TimeInterval) async throws -> AccountReading
 
     func runnerDidChange()
     /// A tick completed. Persisted as a heartbeat, so an app that was killed,
@@ -63,6 +68,13 @@ public protocol StrategyRunnerHost: AnyObject {
         _ strategyId: String, equity: Double, basis: Double, at ts: Date)
 }
 
+extension StrategyRunnerHost {
+    /// A host with no account of its own to share reads the venue directly.
+    public func accountReading(maxAge: TimeInterval) async throws -> AccountReading {
+        try await venue.accountReading(mode: portfolio.mode, source: .polled)
+    }
+}
+
 // MARK: - Runner
 
 /// Drives live strategies: one evaluation per closed bar, orders sized against
@@ -77,8 +89,18 @@ public protocol StrategyRunnerHost: AnyObject {
 @MainActor
 public final class StrategyRunner {
     public private(set) var states: [String: StrategyRuntimeState] = [:]
-    /// Latest traded price per instrument, for marking positions.
+    /// Latest traded price per instrument, for marking positions — and when
+    /// each was taken, so a reader can tell a poll from twenty seconds ago
+    /// from a fresher price somewhere else (`markTimes`).
     public private(set) var marks: [String: Double] = [:]
+    /// When each of `marks` was taken, on this machine's clock. Written only
+    /// by `setMark`, with the mark.
+    public private(set) var markTimes: [String: Date] = [:]
+
+    private func setMark(_ instId: String, _ price: Double?, at: Date = Date()) {
+        marks[instId] = price
+        markTimes[instId] = price == nil ? nil : at
+    }
     public private(set) var isTicking = false
     public private(set) var lastTickAt: Date?
     /// When the in-flight tick began, for the stall watchdog below.
@@ -301,6 +323,12 @@ public final class StrategyRunner {
     }
 
     public func mark(for instId: String) -> Double? { marks[instId] }
+
+    /// A mark and when it was taken.
+    public func markReading(for instId: String) -> (price: Double, at: Date)? {
+        guard let price = marks[instId], let at = markTimes[instId] else { return nil }
+        return (price, at)
+    }
 
     /// Candles the runner already holds for an instrument and interval.
     ///
@@ -788,7 +816,7 @@ public final class StrategyRunner {
             // the exchange's mark converted at the index, in the currency the
             // book keeps.
             if let price = try? await host.venue.valuationPrice(instId: instId, mode: host.portfolio.mode), price > 0 {
-                marks[instId] = price
+                setMark(instId, price)
             }
             guard let size = await contractSize(for: instId, host: host) else {
                 Log.warn("runner: 合约面值未知，本轮不改写 \(instId) 的面值（沿用账上已有值）")
@@ -853,13 +881,44 @@ public final class StrategyRunner {
         if let last = lastEquitySampleAt,
            now.timeIntervalSince(last) < Self.equitySampleInterval { return }
 
-        guard let snapshot = try? await host.venue.accountSnapshot(mode: host.portfolio.mode)
+        guard let reading = try? await host.accountReading(maxAge: Self.equitySampleInterval)
         else { return }
+        let snapshot = reading.snapshot
         lastEquitySampleAt = now
         accountSnapshot = snapshot
 
+        // The venue's own total when it states one; pricing every balance
+        // here only when it does not. It used to price them all on every
+        // sample regardless — on the live account, a REST ticker read for
+        // each of thirty dust coins, every minute, to compute a number that
+        // was then thrown away (2026-10-08).
+        let equity: Double?
+        if let stated = snapshot.totalEquity {
+            equity = stated
+        } else {
+            equity = await priceBalances(snapshot, host: host)
+        }
+        guard let equity, equity > 0 else { return }
+        accountEquity = equity
+        // Which of the two branches above produced it decides the unit. The
+        // venue's own total comes with the venue's declared currency; the
+        // locally priced fallback is marks from the venue's quote pair, so it
+        // is quote currency — USDT on OKX — and saying otherwise would make
+        // the ratio below silently wrong rather than absent.
+        accountEquityCurrency = snapshot.totalEquity != nil
+            ? snapshot.equityCurrency : host.venue.venue.quoteCurrency
+        let measured = await measureNonStableExposure(reading: reading, host: host)
+        nonStableExposure = measured.exposure
+        exposureIsComplete = measured.complete
+        host.runnerDidSampleEquity(equity, at: now)
+    }
+
+    /// The account valued here, balance by balance, at the venue's last
+    /// trades — for a venue that states no total. Nil when any holding could
+    /// not be priced: skipping it would understate equity and read as a loss
+    /// that never happened.
+    private func priceBalances(_ snapshot: AccountSnapshot, host: StrategyRunnerHost) async -> Double? {
         var total = 0.0
-        var pricedEverything = true
         let venue = host.venue.venue
         // Signed: a short's negative share count and a borrowed coin's
         // negative balance both come off the equity, as the cash they
@@ -872,32 +931,14 @@ public final class StrategyRunner {
             let instId = venue.spotInstId(base: balance.ccy)
             // Always re-read: a mark cached from an earlier tick would freeze
             // this holding's contribution and flatten the curve.
-            if let quoted = try? await host.venue.lastPrice(instId: instId, mode: host.portfolio.mode), quoted > 0 {
-                marks[instId] = quoted
-                total += balance.total * quoted
-            } else {
-                // Skipping the holding would understate equity and read as a
-                // loss that never happened. Fall back to the exchange's own
-                // valuation for the whole snapshot, or record nothing at all.
-                pricedEverything = false
-                break
+            guard let quoted = try? await host.venue.lastPrice(instId: instId, mode: host.portfolio.mode), quoted > 0 else {
+                Log.warn("runner: \(balance.ccy) 读不到价格，这次不记录权益")
+                return nil
             }
+            setMark(instId, quoted)
+            total += balance.total * quoted
         }
-
-        guard let equity = snapshot.totalEquity ?? (pricedEverything ? total : nil),
-              equity > 0 else { return }
-        accountEquity = equity
-        // Which of the two branches above produced it decides the unit. The
-        // venue's own total comes with the venue's declared currency; the
-        // locally priced fallback is marks from the venue's quote pair, so it
-        // is quote currency — USDT on OKX — and saying otherwise would make
-        // the ratio below silently wrong rather than absent.
-        accountEquityCurrency = snapshot.totalEquity != nil
-            ? snapshot.equityCurrency : host.venue.venue.quoteCurrency
-        let measured = await measureNonStableExposure(snapshot: snapshot, host: host)
-        nonStableExposure = measured.exposure
-        exposureIsComplete = measured.complete
-        host.runnerDidSampleEquity(equity, at: now)
+        return total
     }
 
     /// Record each allocated strategy's own equity.
@@ -935,8 +976,9 @@ public final class StrategyRunner {
     /// to Schwab's dollars. A holding the venue would not value is counted as
     /// missing rather than valued by this app's own guess.
     private func measureNonStableExposure(
-        snapshot: AccountSnapshot, host: StrategyRunnerHost
+        reading: AccountReading, host: StrategyRunnerHost
     ) async -> (exposure: Double, complete: Bool) {
+        let snapshot = reading.snapshot
         var exposure = 0.0
         var complete = true
 
@@ -961,19 +1003,18 @@ public final class StrategyRunner {
         // incomplete rather than quietly reported lower.
         // One unfiltered listing, so a delivery future or a margin position
         // — families this app never trades — counts like the perpetuals do.
-        do {
-            for position in try await host.venue.allPositions(mode: host.portfolio.mode)
-            where position.quantity != 0 {
-                if let risk = await priceRisk(of: position, host: host) {
-                    exposure += risk
-                } else {
-                    complete = false
-                    Log.warn("runner: \(position.instId) 无法估值，敞口按已知部分计算")
-                }
+        // The same listing the screens show, valued at the same mark.
+        guard let positions = reading.positions else {
+            Log.warn("runner: 读取交易所持仓失败，敞口按已知部分计算：\(reading.positionsError ?? "原因不明")")
+            return (exposure, false)
+        }
+        for position in positions where position.quantity != 0 {
+            if let risk = await priceRisk(of: position, host: host) {
+                exposure += risk
+            } else {
+                complete = false
+                Log.warn("runner: \(position.instId) 无法估值，敞口按已知部分计算")
             }
-        } catch {
-            complete = false
-            Log.warn("runner: 读取交易所持仓失败，敞口按已知部分计算：\(error)")
         }
         return (exposure, complete)
     }
@@ -1052,7 +1093,8 @@ public final class StrategyRunner {
             return
         }
         candleCache[key] = candles
-        if let last = candles.last { marks[market.instId] = last.close }
+        // The close of the bar still forming: as of the candle read.
+        if let last = candles.last { setMark(market.instId, last.close) }
 
         let confirmed = candles.filter(\.confirmed)
         guard let latestBar = confirmed.last else { return }
@@ -1458,7 +1500,7 @@ public final class StrategyRunner {
         // session, so there may be no cached mark — fetch one rather than
         // silently doing nothing with the user's open position.
         if marks[market.instId] == nil {
-            marks[market.instId] = try? await host.venue.lastPrice(instId: market.instId, mode: host.portfolio.mode)
+            setMark(market.instId, try? await host.venue.lastPrice(instId: market.instId, mode: host.portfolio.mode))
         }
         guard let price = marks[market.instId], price > 0 else {
             update(strategy.id) { $0.message = "取不到行情价，未能下单" }

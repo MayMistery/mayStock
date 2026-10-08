@@ -480,40 +480,8 @@ public struct KernelTradeClient: Sendable {
         return data
     }
 
-    private struct Row: Decodable {
-        let id: String
-        let book: String
-        let instId: String
-        let instType: String?
-        let ordType: String
-        let side: String
-        let posSide: String?
-        let price: Double?
-        let triggerPrice: Double?
-        let stopTriggerPrice: Double?
-        let takeProfitTriggerPrice: Double?
-        let size: Double?
-        let closeFraction: Double?
-        let filledSize: Double?
-        let state: String?
-        let reduceOnly: Bool?
-        let clientId: String?
-        let createdMs: Double?
-
-        var order: ExchangeOpenOrder? {
-            guard let side = OrderSide(rawValue: side) else { return nil }
-            return ExchangeOpenOrder(
-                id: id, book: book == "algo" ? .algo : .order, instId: instId, ordType: ordType, side: side,
-                posSide: posSide.flatMap(PositionSide.init(rawValue:)), price: price, triggerPrice: triggerPrice,
-                stopTriggerPrice: stopTriggerPrice, takeProfitTriggerPrice: takeProfitTriggerPrice, size: size,
-                closeFraction: closeFraction, filledSize: filledSize ?? 0, state: state ?? "",
-                reduceOnly: reduceOnly ?? false, clOrdId: clientId,
-                createdAt: createdMs.map { Date(timeIntervalSince1970: $0 / 1_000) })
-        }
-    }
-
     private struct Listing: Decodable {
-        let orders: [Row]
+        let orders: [WorkingOrderRow]
         let unavailable: [String]
     }
 
@@ -660,10 +628,10 @@ public struct KernelTradeClient: Sendable {
     public func verifyConnection(mode: TradingMode) async throws -> VenueConnectionReport {
         async let snapshot = accountSnapshot(mode: mode)
         async let config = try? accountConfigInfo(mode: mode)
+        let read = try await snapshot
         return VenueConnectionReport(
             mode: mode, profile: mode == .demo ? demoProfile : liveProfile, checkedAt: Date(),
-            totalEquity: try await snapshot.totalEquity, balanceCount: try await snapshot.balances.count,
-            account: await config)
+            snapshot: read, balanceCount: read.balances.count, account: await config)
     }
 
     /// The positions and balance documents, unparsed, for the live layer's

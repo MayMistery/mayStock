@@ -64,6 +64,10 @@ pub enum Read {
     /// Funding settled on perpetuals: bill type 8, asked for by type so a
     /// busy week of trades cannot push it off the page.
     FundingBills,
+    /// Every transfer bill (type 1) since `since_ms`, asked for by type for
+    /// the same reason, newest first, paged back until past `since_ms`.
+    #[serde(rename_all = "camelCase")]
+    Transfers { since_ms: i64 },
     /// The account's fee rates: for one instrument, or — without `inst_id` —
     /// the family's standard rates.
     #[serde(rename_all = "camelCase")]
@@ -168,7 +172,6 @@ pub fn listings(families: &[Family], inst_id: Option<&str>) -> Result<Vec<Listin
     Ok(out)
 }
 
-/// The one listing that holds a position's stops and targets.
 /// The one listing that holds stops and targets: for a family, an
 /// instrument, or — naming neither — the whole account.
 pub fn protection_listing(family: Option<Family>, inst_id: Option<&str>) -> Result<Listing, String> {
@@ -429,6 +432,88 @@ pub fn funding_bills_target() -> Target {
     Target::new(Route::Bills, "instType=SWAP&type=8&limit=100")
 }
 
+/// One page of transfer bills, newest first, older than the bill `after`
+/// when paging on. No `begin`: given one, OKX answered with the oldest page
+/// after it and the newest three days never arrived (2026-10-08) — so the
+/// listing pages back from now and stops once it is past the start.
+pub fn transfers_target(after: Option<&str>) -> Target {
+    let cursor = after.map(|id| format!("&after={id}")).unwrap_or_default();
+    Target::new(Route::Bills, format!("type=1&limit={PAGE}{cursor}"))
+}
+
+/// The most pages a transfer listing reads: a week of hourly auto-earn
+/// credits is about two.
+pub const TRANSFER_PAGES: usize = 10;
+
+/// What a type-1 bill is to a period's result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TransferKind {
+    /// Money moved in or out by its owner — 转入 (11) and 转出 (12). Not a
+    /// result: a period's result leaves it out.
+    Principal,
+    /// What the account earned, booked as a transfer — auto earn (381),
+    /// credited every hour. A result like any other.
+    Income,
+    /// A movement this rule does not name. Left out of the result as if it
+    /// were principal — counting an unknown inflow as profit is the worse
+    /// mistake — and said so wherever the result is explained.
+    Unrecognised,
+}
+
+/// The one place a transfer bill is told apart, by OKX's `subType`.
+pub fn transfer_kind(sub_type: Option<&str>) -> TransferKind {
+    match sub_type {
+        Some("11") | Some("12") => TransferKind::Principal,
+        Some("381") => TransferKind::Income,
+        _ => TransferKind::Unrecognised,
+    }
+}
+
+/// Money moved between the trading account and another one: positive in,
+/// negative out, in the currency it moved in.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Transfer {
+    /// The venue's bill id.
+    pub id: String,
+    /// When it landed, on the venue's clock.
+    pub ms: i64,
+    pub ccy: String,
+    pub amount: f64,
+    /// The venue's own word for the movement (`subType`).
+    #[serde(default)]
+    pub sub_type: Option<String>,
+    pub kind: TransferKind,
+}
+
+/// The transfer bills since a start, and whether the listing reached it.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferListing {
+    pub items: Vec<Transfer>,
+    /// False when the page limit ran out before the start was reached.
+    pub complete: bool,
+}
+
+/// A page of transfer bills. A row without its id, time, currency or amount
+/// is an error, not a skipped line: a transfer left out is profit invented.
+pub fn parse_transfers(body: &str) -> Result<Vec<Transfer>, String> {
+    let value = envelope(body)?;
+    let rows = value.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
+    rows.iter()
+        .map(|row| {
+            let text = |key: &str| row.get(key).and_then(Value::as_str).filter(|s| !s.is_empty());
+            let id = text("billId").ok_or("划转账单缺少 billId")?.to_string();
+            let ms = text("ts").and_then(|t| t.parse::<i64>().ok()).ok_or_else(|| format!("划转账单 {id} 缺少时间"))?;
+            let ccy = text("ccy").ok_or_else(|| format!("划转账单 {id} 缺少币种"))?.to_string();
+            let amount = text("balChg").and_then(|t| t.parse::<f64>().ok()).filter(|v| v.is_finite()).ok_or_else(|| format!("划转账单 {id} 缺少金额"))?;
+            let sub_type = text("subType").map(str::to_string);
+            Ok(Transfer { id, ms, ccy, amount, kind: transfer_kind(sub_type.as_deref()), sub_type })
+        })
+        .collect()
+}
+
 pub fn fills_target(family: Family, inst_id: Option<&str>) -> Result<Target, String> {
     if family == Family::Stock {
         return Err("OKX 不交易股票".into());
@@ -569,6 +654,23 @@ fn head(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transfers_are_read_whole_or_not_at_all() {
+        let body = r#"{"code":"0","data":[{"billId":"9","ts":"1790160000000","ccy":"USDT","balChg":"-250.5","type":"1","subType":"12"}]}"#;
+        assert_eq!(parse_transfers(body).unwrap(), vec![Transfer {
+            id: "9".into(), ms: 1_790_160_000_000, ccy: "USDT".into(), amount: -250.5, sub_type: Some("12".into()), kind: TransferKind::Principal,
+        }]);
+        assert_eq!(transfer_kind(Some("381")), TransferKind::Income, "auto earn, credited hourly");
+        assert_eq!(transfer_kind(Some("392")), TransferKind::Unrecognised);
+        assert_eq!(transfer_kind(None), TransferKind::Unrecognised);
+        // A line the venue sent without its amount is an error: a transfer
+        // left out of the sum would be counted as profit.
+        assert!(parse_transfers(r#"{"code":"0","data":[{"billId":"9","ts":"1","ccy":"USDT","balChg":""}]}"#).is_err());
+        assert!(parse_transfers(r#"{"code":"50011","msg":"Too Many Requests"}"#).unwrap_err().contains("50011"));
+        assert_eq!(transfers_target(None).path_and_query(), "/api/v5/account/bills?type=1&limit=100");
+        assert_eq!(transfers_target(Some("77")).path_and_query(), "/api/v5/account/bills?type=1&limit=100&after=77");
+    }
 
     #[test]
     fn the_listing_asks_every_book_of_every_family() {

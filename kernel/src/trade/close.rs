@@ -17,8 +17,11 @@
 use serde::{Deserialize, Serialize};
 
 use super::reads::{FeeRates, WorkingOrder};
+use super::terms::{self, Terms};
 use super::wire::{self, Action, AlgoKind, AlgoSpec, Family, OrderKind, OrderSpec, PosSide, Side, WireRequest};
 use crate::live::book::{Px, Spec, PUBLISHED_DEPTH};
+
+pub use super::terms::Money;
 
 // MARK: - What can be done
 
@@ -459,7 +462,7 @@ impl Market {
             bids,
             sizes_known: view.sizes_known,
             last,
-            terms: view.spec.as_ref().map(Terms::read).transpose()?,
+            terms: view.spec.as_ref().map(Terms::read).transpose().map_err(CloseError::BadBook)?,
             seq: view.seq_id,
             exchange_ms: view.exchange_ms,
             received_ms: view.received_ms,
@@ -495,67 +498,10 @@ impl Market {
     }
 }
 
-/// Contract terms as numbers.
-#[derive(Debug, Clone, PartialEq)]
-struct Terms {
-    tick: f64,
-    lot: f64,
-    min: f64,
-    price_decimals: usize,
-    /// Base units per contract (`ctVal × ctMult`); 1 for spot and shares.
-    contract_value: f64,
-    ct_type: String,
-    ct_val_ccy: String,
-    settle_ccy: String,
-    quote_ccy: String,
-    inst_type: String,
-}
-
-fn decimals(text: &str) -> usize {
-    text.split_once('.').map(|(_, f)| f.trim_end_matches('0').len()).unwrap_or(0)
-}
-
-fn positive(text: &str, what: &str) -> Result<f64, CloseError> {
-    let value = Px::parse(text).map(Px::as_f64).filter(|v| *v > 0.0);
-    value.ok_or_else(|| CloseError::BadBook(format!("合约规格的 {what} 不合法：{text:?}")))
-}
-
-impl Terms {
-    fn read(spec: &Spec) -> Result<Terms, CloseError> {
-        let ct_val = Px::parse(&spec.ct_val).map(Px::as_f64).filter(|v| *v > 0.0);
-        let ct_mult = Px::parse(&spec.ct_mult).map(Px::as_f64).filter(|v| *v > 0.0).unwrap_or(1.0);
-        Ok(Terms {
-            tick: positive(&spec.tick_sz, "tickSz")?,
-            lot: positive(&spec.lot_sz, "lotSz")?,
-            min: positive(&spec.min_sz, "minSz")?,
-            price_decimals: decimals(&spec.tick_sz),
-            contract_value: ct_val.map_or(1.0, |v| v * ct_mult),
-            ct_type: spec.ct_type.clone(),
-            ct_val_ccy: spec.ct_val_ccy.clone(),
-            settle_ccy: spec.settle_ccy.clone(),
-            quote_ccy: spec.quote_ccy.clone(),
-            inst_type: spec.inst_type.clone(),
-        })
-    }
-}
-
 // MARK: - The plan
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Money {
-    pub amount: f64,
-    pub ccy: String,
-    /// As it reads, written once here (`money_text`) for every screen.
-    #[serde(default)]
-    pub text: String,
-}
-
+/// Money as the confirmation reads it: the text written once, here.
 impl Money {
-    pub fn of(amount: f64, ccy: impl Into<String>) -> Money {
-        Money { amount, ccy: ccy.into(), text: String::new() }
-    }
-
     fn written(mut self, with_sign: bool) -> Money {
         self.text = money_text(&self, with_sign);
         self
@@ -841,10 +787,10 @@ pub fn plan(input: &PlanInput, book: &BookView) -> Result<ClosePlan, CloseError>
             let start = market.same(side).first().map(|l| l.px);
             if let Some(start) = start {
                 estimate.maker = Some(Resting { size, price: start });
-                estimate.notional = value(holding, market.terms.as_ref(), size, start);
-                estimate.pnl = pnl(holding, market.terms.as_ref(), size, start);
+                estimate.notional = terms::value(holding.family, market.terms.as_ref(), size, start);
+                estimate.pnl = terms::pnl(holding.family, holding.is_long, holding.average_price, market.terms.as_ref(), size, start);
                 if let Some(rates) = fees {
-                    estimate.fee = fee(holding, market.terms.as_ref(), size, start, rates.maker);
+                    estimate.fee = terms::fee(holding.family, holding.closing_side() == Side::Sell, market.terms.as_ref(), size, start, rates.maker);
                     estimate.fee_basis = Some(format!("maker {}", rate_text(rates.maker)));
                 }
             }
@@ -911,12 +857,12 @@ pub fn plan(input: &PlanInput, book: &BookView) -> Result<ClosePlan, CloseError>
                     label: label.into(),
                     trigger,
                     distance_pct: Some((trigger - reference) / reference * 100.0),
-                    pnl: pnl(holding, market.terms.as_ref(), size, trigger),
+                    pnl: terms::pnl(holding.family, holding.is_long, holding.average_price, market.terms.as_ref(), size, trigger),
                 });
             }
             if let Some(rates) = fees {
                 let at = stop.or(target).unwrap_or(reference);
-                estimate.fee = fee(holding, market.terms.as_ref(), size, at, rates.taker);
+                estimate.fee = terms::fee(holding.family, holding.closing_side() == Side::Sell, market.terms.as_ref(), size, at, rates.taker);
                 estimate.fee_basis = Some(format!("触发后按 taker {} 成交", rate_text(rates.taker)));
             }
             let tied = holding.family == Family::Swap && input.account.as_ref().is_some_and(Account::stops_follow_position);
@@ -1257,16 +1203,16 @@ fn estimate_order(
         estimate.slippage_bps = Some((mid - fill.average) / mid * 1e4 * direction);
     }
     let terms = market.terms.as_ref();
-    let taker_pnl = estimate.taker.as_ref().and_then(|f| pnl(holding, terms, f.size, f.average));
-    let maker_pnl = estimate.maker.as_ref().and_then(|r| pnl(holding, terms, r.size, r.price));
+    let taker_pnl = estimate.taker.as_ref().and_then(|f| terms::pnl(holding.family, holding.is_long, holding.average_price, terms, f.size, f.average));
+    let maker_pnl = estimate.maker.as_ref().and_then(|r| terms::pnl(holding.family, holding.is_long, holding.average_price, terms, r.size, r.price));
     estimate.pnl = sum_money(estimate.taker.as_ref().map(|_| taker_pnl.clone()), estimate.maker.as_ref().map(|_| maker_pnl.clone()));
     estimate.notional = sum_money(
-        estimate.taker.as_ref().map(|f| value(holding, terms, f.size, f.average)),
-        estimate.maker.as_ref().map(|r| value(holding, terms, r.size, r.price)),
+        estimate.taker.as_ref().map(|f| terms::value(holding.family, terms, f.size, f.average)),
+        estimate.maker.as_ref().map(|r| terms::value(holding.family, terms, r.size, r.price)),
     );
     if let Some(rates) = fees {
-        let taker_fee = estimate.taker.as_ref().map(|f| fee(holding, terms, f.size, f.average, rates.taker));
-        let maker_fee = estimate.maker.as_ref().map(|r| fee(holding, terms, r.size, r.price, rates.maker));
+        let taker_fee = estimate.taker.as_ref().map(|f| terms::fee(holding.family, holding.closing_side() == Side::Sell, terms, f.size, f.average, rates.taker));
+        let maker_fee = estimate.maker.as_ref().map(|r| terms::fee(holding.family, holding.closing_side() == Side::Sell, terms, r.size, r.price, rates.maker));
         estimate.fee = sum_money(taker_fee, maker_fee);
         estimate.fee_basis = Some(match (&estimate.taker, &estimate.maker) {
             (Some(_), Some(_)) => format!("taker {} · maker {}", rate_text(rates.taker), rate_text(rates.maker)),
@@ -1334,94 +1280,6 @@ fn sum_money(a: Option<Option<Money>>, b: Option<Option<Money>>) -> Option<Money
 
 fn rate_text(rate: f64) -> String {
     format!("{}%", wire::number((rate * 100.0 * 1e6).round() / 1e6))
-}
-
-/// Profit booked by closing `size` at `exit`, before fees — where the
-/// arithmetic is exact: linear and inverse perpetuals from their terms,
-/// options on their premium, shares. A coin balance has no cost here.
-fn pnl(holding: &Holding, terms: Option<&Terms>, size: f64, exit: f64) -> Option<Money> {
-    let average = holding.average_price.filter(|p| *p > 0.0)?;
-    if !(exit > 0.0) {
-        return None;
-    }
-    let direction = if holding.is_long { 1.0 } else { -1.0 };
-    match holding.family {
-        Family::Swap => {
-            let terms = terms?;
-            let amount = match terms.ct_type.as_str() {
-                // Settled in the quote: the move times the base covered.
-                "linear" => (exit - average) * size * terms.contract_value,
-                // Settled in the coin: contracts are worth a fixed number of
-                // dollars, and profit is the change in coins those buy.
-                "inverse" => (1.0 / average - 1.0 / exit) * size * terms.contract_value,
-                _ => return None,
-            };
-            Some(Money::of(amount * direction, terms.settle_ccy.clone())).filter(|m| !m.ccy.is_empty())
-        }
-        // Quoted in the settlement coin per unit of the underlying.
-        Family::Option => {
-            let terms = terms?;
-            Some(Money::of((exit - average) * size * terms.contract_value * direction, terms.settle_ccy.clone()))
-                .filter(|m| !m.ccy.is_empty())
-        }
-        Family::Stock => Some(Money::of((exit - average) * size * direction, "USD")),
-        Family::Spot => None,
-    }
-}
-
-/// The fee on `size` filled at `price`, in the currency it is charged in.
-fn fee(holding: &Holding, terms: Option<&Terms>, size: f64, price: f64, rate: f64) -> Option<Money> {
-    let terms = terms?;
-    if !(price > 0.0) {
-        return None;
-    }
-    match holding.family {
-        Family::Swap => match terms.ct_type.as_str() {
-            "linear" => Some(Money::of(rate * size * terms.contract_value * price, terms.settle_ccy.clone())),
-            "inverse" => Some(Money::of(rate * size * terms.contract_value / price, terms.settle_ccy.clone())),
-            _ => None,
-        },
-        // OKX charges an option the lesser of the rate on the underlying
-        // covered and 12.5% of the premium.
-        Family::Option => {
-            let underlying = rate * size * terms.contract_value;
-            let cap = 0.125 * price * size * terms.contract_value;
-            Some(Money::of(underlying.min(cap), terms.settle_ccy.clone()))
-        }
-        // A sale is charged in what it receives: the quote.
-        Family::Spot => (!terms.quote_ccy.is_empty() && holding.closing_side() == Side::Sell)
-            .then(|| Money::of(rate * size * price, terms.quote_ccy.clone())),
-        Family::Stock => None,
-    }
-    .filter(|m| !m.ccy.is_empty() && m.amount.is_finite())
-}
-
-/// What `size` filled at `price` is worth, in the currency it settles in.
-fn value(holding: &Holding, terms: Option<&Terms>, size: f64, price: f64) -> Option<Money> {
-    if !(price > 0.0) {
-        return None;
-    }
-    match holding.family {
-        Family::Swap => {
-            let terms = terms?;
-            match terms.ct_type.as_str() {
-                "linear" => Some(Money::of(size * terms.contract_value * price, terms.settle_ccy.clone())),
-                // A contract is a fixed number of dollars, whatever the price.
-                "inverse" => Some(Money::of(size * terms.contract_value, terms.ct_val_ccy.clone())),
-                _ => None,
-            }
-        }
-        Family::Option => {
-            let terms = terms?;
-            Some(Money::of(size * terms.contract_value * price, terms.settle_ccy.clone()))
-        }
-        Family::Spot => {
-            let terms = terms?;
-            Some(Money::of(size * price, terms.quote_ccy.clone()))
-        }
-        Family::Stock => Some(Money::of(size * price, "USD")),
-    }
-    .filter(|m| !m.ccy.is_empty() && m.amount.is_finite())
 }
 
 // MARK: - Text
@@ -1732,34 +1590,6 @@ mod tests {
         for bad in [0.0, -1.0, 10.5, f64::NAN] {
             assert!(matches!(super::plan(&input(long_swap(10.0), chase(bad)), &eth_book()), Err(CloseError::ChaseOutOfRange(_))), "{bad}");
         }
-    }
-
-    #[test]
-    fn inverse_and_option_arithmetic() {
-        let holding = Holding {
-            inst_id: "BTC-USD-SWAP".into(), family: Family::Swap, is_long: true, quantity: 10.0, unit: "张".into(),
-            pos_side: Some(PosSide::Long), margin_mode: Some("cross".into()), average_price: Some(80_000.0), liquidation_price: None,
-        };
-        let terms = Terms::read(&spec("INVERSE")).unwrap();
-        let profit = pnl(&holding, Some(&terms), 10.0, 84_000.0).unwrap();
-        // 10 contracts of $100: $1,000, bought at 80k and sold at 84k.
-        assert!((profit.amount - 1_000.0 * (1.0 / 80_000.0 - 1.0 / 84_000.0)).abs() < 1e-12 && profit.ccy == "BTC");
-        let paid = fee(&holding, Some(&terms), 10.0, 84_000.0, 0.0005).unwrap();
-        assert!((paid.amount - 0.0005 * 1_000.0 / 84_000.0).abs() < 1e-15);
-
-        let option = Holding {
-            inst_id: "ETH-USD-261009-2750-P".into(), family: Family::Option, is_long: true, quantity: 5.0, unit: "张".into(),
-            pos_side: None, margin_mode: Some("cross".into()), average_price: Some(0.05), liquidation_price: None,
-        };
-        let terms = Terms::read(&spec("OPTION")).unwrap();
-        let profit = pnl(&option, Some(&terms), 5.0, 0.06).unwrap();
-        assert!((profit.amount - 0.01 * 5.0 * 0.1).abs() < 1e-12 && profit.ccy == "ETH");
-        // The fee is the lesser of the rate on 0.5 ETH covered and 12.5% of
-        // the premium.
-        let cheap = fee(&option, Some(&terms), 5.0, 0.001, 0.0003).unwrap();
-        assert!((cheap.amount - 0.125 * 0.001 * 0.5).abs() < 1e-15);
-        let dear = fee(&option, Some(&terms), 5.0, 0.06, 0.0003).unwrap();
-        assert!((dear.amount - 0.0003 * 0.5).abs() < 1e-15);
     }
 
     #[test]

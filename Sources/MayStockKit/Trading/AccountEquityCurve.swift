@@ -3,10 +3,17 @@ import Observation
 
 // MARK: - Records
 
-/// One observation of total account equity, in the quote currency.
+/// One observation of total account equity, as the venue stated it — in
+/// dollars on both venues today (`AccountSnapshot.equityCurrency`).
 public struct AccountEquityPoint: Codable, Sendable, Equatable {
     public let ts: Date
     public let equity: Double
+    /// Dollars per unit of the venue's quote currency at this instant, as the
+    /// venue valued it in the same reading (USDT read 0.99924 on 2026-10-08).
+    /// The curve is shown in the quote, and a rate taken from another moment
+    /// would put that rate's drift into the result as profit. Nil for points
+    /// recorded before it was kept, and on a venue that quotes in dollars.
+    public let quoteUsd: Double?
     /// Capital backing this curve at this instant, when the curve has one.
     ///
     /// A per-strategy curve is *budget plus P&L*, so re-sizing a strategy from
@@ -23,10 +30,18 @@ public struct AccountEquityPoint: Codable, Sendable, Equatable {
     /// that would make the arithmetic silently wrong.
     public let basis: Double?
 
-    public init(ts: Date, equity: Double, basis: Double? = nil) {
+    public init(ts: Date, equity: Double, basis: Double? = nil, quoteUsd: Double? = nil) {
         self.ts = ts
         self.equity = equity
         self.basis = basis
+        self.quoteUsd = quoteUsd
+    }
+
+    /// The equity in the quote currency: at this point's own rate, or at
+    /// `fallback` for a point recorded without one.
+    public func equity(quoteUsd fallback: Double?) -> Double {
+        guard let rate = quoteUsd ?? fallback, rate > 0 else { return equity }
+        return equity / rate
     }
 }
 
@@ -117,8 +132,23 @@ public enum EquityWindow: String, CaseIterable, Sendable, Identifiable {
 /// it doesn't — so the caveats travel with it rather than replacing it.
 public struct EquityChange: Sendable, Equatable {
     public let window: EquityWindow
+    /// Both in the quote currency the account is shown in.
     public let startEquity: Double
     public let endEquity: Double
+    /// Money moved into the account (negative: out) between the reference
+    /// sample and the endpoint, in the same currency. Not a result: the
+    /// change leaves it out, as the exchange's own 「今日盈亏」 does
+    /// (current assets − assets at 00:00 − net transfers in).
+    public let transfers: Double
+    public let transferCount: Int
+    /// The reference sample was recorded without its own rate, so it was
+    /// stated in the quote at the endpoint's — off by however far the rate
+    /// moved in between (a few hundredths of a percent of the equity).
+    public let rateApproximated: Bool
+    /// How far before the anchor the reference may sit and still be the
+    /// anchor's: the curve's continuity limit at the reference's age (a
+    /// thinned region's samples are a quarter of an hour apart by design).
+    public let referenceTolerance: TimeInterval
     /// The instant the window asked to measure from.
     public let anchor: Date
     /// The sample actually used. Later than `anchor` when history does not
@@ -141,11 +171,17 @@ public struct EquityChange: Sendable, Equatable {
         window: EquityWindow, startEquity: Double, endEquity: Double,
         anchor: Date, referenceTs: Date,
         coveredSeconds: TimeInterval, spannedSeconds: TimeInterval,
-        windowSeconds: TimeInterval
+        windowSeconds: TimeInterval,
+        transfers: Double = 0, transferCount: Int = 0, rateApproximated: Bool = false,
+        referenceTolerance: TimeInterval = AccountEquityCurve.continuityTolerance
     ) {
         self.window = window
         self.startEquity = startEquity
         self.endEquity = endEquity
+        self.transfers = transfers
+        self.transferCount = transferCount
+        self.rateApproximated = rateApproximated
+        self.referenceTolerance = referenceTolerance
         self.anchor = anchor
         self.referenceTs = referenceTs
         self.coveredSeconds = coveredSeconds
@@ -153,16 +189,32 @@ public struct EquityChange: Sendable, Equatable {
         self.windowSeconds = windowSeconds
     }
 
-    public var changeQuote: Double { endEquity - startEquity }
+    /// What the account made over the window: the change in equity, less
+    /// the money moved in.
+    public var changeQuote: Double { endEquity - startEquity - transfers }
 
     public var changePct: Double? {
         guard startEquity > 0 else { return nil }
         return changeQuote / startEquity * 100
     }
 
-    /// True when the reference sample predates the anchor, so this really is
-    /// "since 00:00" and not "since whenever we happened to start looking".
-    public var isAnchored: Bool { referenceTs <= anchor }
+    /// True when the reference sample sits at the anchor — at or just before
+    /// it, within the gap the curve calls sampling jitter — so this really is
+    /// "since 00:00": not "since whenever we happened to start looking"
+    /// (`startsLate`), and not "since the last sample before an outage that
+    /// spanned the anchor" (`startsEarly`). The second used to count as
+    /// anchored: on 2026-10-08 the week was measured from Saturday 01:00,
+    /// the last sample before Monday, Sunday's transfer included.
+    public var isAnchored: Bool { !startsLate && !startsEarly }
+
+    /// The reference is after the anchor: the curve begins inside the window.
+    public var startsLate: Bool { referenceTs > anchor }
+
+    /// The reference is well before the anchor — further than the curve's
+    /// own continuity rule allows at that age (`referenceTolerance`) — so
+    /// nothing was recorded across the anchor, and the figure includes what
+    /// happened between the two.
+    public var startsEarly: Bool { anchor.timeIntervalSince(referenceTs) > referenceTolerance }
 
     /// Fraction of the window backed by recorded history.
     public var coverage: Double {
@@ -188,15 +240,31 @@ public struct EquityChange: Sendable, Equatable {
 
     /// Human description of the caveat, empty when there is none.
     public var coverageNote: String {
-        if !isAnchored {
-            return "记录从 \(EquityChange.clock(referenceTs)) 才开始，"
-                + "这不是完整的\(window.label)"
+        var notes: [String] = []
+        if startsLate {
+            notes.append("记录从 \(EquityChange.clock(referenceTs)) 才开始，这不是完整的\(window.label)")
+        } else if startsEarly {
+            notes.append("\(window.label)起点前后没有记录，只能从 \(EquityChange.clock(referenceTs)) 的记录算起，包含了那之后到起点之间的盈亏")
+        } else if hasGaps {
+            // Only the two ends enter the figure, so a hole does not make it
+            // wrong — but nobody was watching the account through it.
+            notes.append("\(window.longLabel)里有 \(AccountEquityCurve.describe(missingSeconds))没有记录 —— 引擎当时没在跑")
         }
-        if hasGaps {
-            return "\(window.longLabel)里有 \(AccountEquityCurve.describe(missingSeconds))"
-                + "没有记录 —— 引擎当时没在跑"
+        if rateApproximated {
+            notes.append("起点按当前汇率折算（那时还没记录汇率）")
         }
-        return ""
+        return notes.joined(separator: "；")
+    }
+
+    /// The transfers left out, in words; empty when there were none.
+    public var transfersNote: String {
+        guard transferCount > 0 else { return "" }
+        let sign = transfers >= 0 ? "转入" : "转出"
+        return "已扣除期间净\(sign) \(Self.amount(abs(transfers)))（\(transferCount) 笔划转）"
+    }
+
+    private static func amount(_ value: Double) -> String {
+        String(format: "%.2f", value)
     }
 
     /// Wall-clock time in the book's own zone.
@@ -259,19 +327,27 @@ public final class AccountEquityCurve {
     /// Change over a trailing window.
     ///
     /// `latest` lets the caller supply a fresher equity reading than the last
-    /// stored sample — the panel marks continuously while the curve only
-    /// records once a minute, and the number on screen should be the live one.
+    /// stored sample — the account is valued as the mark streams while the
+    /// curve records once a minute, and the number on screen should be the
+    /// live one. It is in the curve's own unit (dollars).
+    ///
+    /// `quoteUsd` states the result in the venue's quote currency: each point
+    /// at the rate it was recorded with, the live endpoint at this one. Nil
+    /// leaves the dollars as they are. `transfers` are the money moved into
+    /// (negative: out of) the account, in the quote, by when they landed;
+    /// those after the reference sample are left out of the result.
     public func change(
-        over window: EquityWindow, now: Date = Date(), latest liveEquity: Double? = nil
+        over window: EquityWindow, now: Date = Date(), latest liveEquity: Double? = nil,
+        quoteUsd: Double? = nil, transfers: [(at: Date, amount: Double)] = []
     ) -> EquityChange? {
         let endTs: Date
         let endEquity: Double
         if let liveEquity, liveEquity > 0 {
             endTs = now
-            endEquity = liveEquity
+            endEquity = AccountEquityPoint(ts: now, equity: liveEquity, quoteUsd: quoteUsd).equity(quoteUsd: nil)
         } else if let last = points.last {
             endTs = last.ts
-            endEquity = last.equity
+            endEquity = last.equity(quoteUsd: quoteUsd)
         } else {
             return nil
         }
@@ -287,10 +363,11 @@ public final class AccountEquityCurve {
         let anchor = window.anchor(now: endTs, venue: venue)
         let start = points.last(where: { $0.ts <= anchor }) ?? points.first
         guard let start, start.equity > 0 else { return nil }
+        let moved = transfers.filter { $0.at > start.ts && $0.at <= endTs }
 
         return EquityChange(
             window: window,
-            startEquity: start.equity,
+            startEquity: start.equity(quoteUsd: quoteUsd),
             endEquity: endEquity,
             anchor: anchor,
             referenceTs: start.ts,
@@ -300,7 +377,20 @@ public final class AccountEquityCurve {
             coveredSeconds: coveredSeconds(
                 from: Swift.max(anchor, start.ts), to: endTs, now: endTs),
             spannedSeconds: Swift.max(endTs.timeIntervalSince(start.ts), 0),
-            windowSeconds: Swift.max(endTs.timeIntervalSince(anchor), 0))
+            windowSeconds: Swift.max(endTs.timeIntervalSince(anchor), 0),
+            transfers: moved.reduce(0) { $0 + $1.amount },
+            transferCount: moved.count,
+            rateApproximated: quoteUsd != nil && start.quoteUsd == nil,
+            referenceTolerance: Self.continuityLimit(after: start.ts, now: endTs))
+    }
+
+    /// The points stated in the quote currency, for drawing: each at its own
+    /// rate, and at `quoteUsd` where it has none.
+    public func points(quoteUsd: Double?) -> [AccountEquityPoint] {
+        guard quoteUsd != nil else { return points }
+        return points.map {
+            AccountEquityPoint(ts: $0.ts, equity: $0.equity(quoteUsd: quoteUsd), basis: $0.basis)
+        }
     }
 
     /// Seconds between `from` and `to` that recorded samples actually back.
@@ -386,7 +476,7 @@ public final class AccountEquityCurve {
     /// `basis` is the capital backing the curve, for the curves that have one;
     /// see `AccountEquityPoint.basis`.
     @discardableResult
-    public func record(equity: Double, at ts: Date = Date(), basis: Double? = nil) -> Bool {
+    public func record(equity: Double, at ts: Date = Date(), basis: Double? = nil, quoteUsd: Double? = nil) -> Bool {
         guard equity.isFinite, equity > 0 else { return false }
         if let last = points.last {
             // A clock that jumps backwards (NTP correction, sleep/wake) must
@@ -395,7 +485,8 @@ public final class AccountEquityCurve {
                   ts.timeIntervalSince(last.ts) >= Self.minimumSampleInterval else { return false }
         }
         let cleanBasis = (basis?.isFinite == true && (basis ?? 0) > 0) ? basis : nil
-        points.append(AccountEquityPoint(ts: ts, equity: equity, basis: cleanBasis))
+        let cleanRate = (quoteUsd?.isFinite == true && (quoteUsd ?? 0) > 0) ? quoteUsd : nil
+        points.append(AccountEquityPoint(ts: ts, equity: equity, basis: cleanBasis, quoteUsd: cleanRate))
         compact(now: ts)
         onChanged?()
         return true

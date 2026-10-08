@@ -17,7 +17,11 @@ public struct CombinedPortfolio: Sendable, Equatable {
     /// One account's contribution, already converted to dollars.
     public struct Share: Sendable, Equatable, Identifiable {
         public let venue: Venue
-        /// The venue's own equity figure, in `nativeCurrency`.
+        /// The account's equity as its own pages show it, in `nativeCurrency`:
+        /// the venue's quote currency at the reading's own rate, else the unit
+        /// the venue stated. It used to be the venue's statement as such —
+        /// dollars for OKX — beside the USDT every other screen shows for the
+        /// same account (2026-10-08).
         public let nativeEquity: Double?
         public let nativeCurrency: String
         /// `nativeEquity` in dollars, when it could be stated in dollars.
@@ -136,6 +140,7 @@ public struct CombinedPortfolio: Sendable, Equatable {
         CombinedPortfolio(shares: readings.map { reading in
             let currency = reading.snapshot?.equityCurrency ?? reading.venue.quoteCurrency
             let native = reading.snapshot?.totalEquity
+            let shown = reading.snapshot?.displayEquity(in: reading.venue.quoteCurrency)
             let absence: Absence?
             var usd: Double?
             if let error = reading.error, reading.snapshot == nil {
@@ -151,7 +156,7 @@ public struct CombinedPortfolio: Sendable, Equatable {
                 absence = .unconvertible(currency: currency)
             }
             return Share(
-                venue: reading.venue, nativeEquity: native, nativeCurrency: currency,
+                venue: reading.venue, nativeEquity: shown?.amount ?? native, nativeCurrency: shown?.currency ?? currency,
                 usdEquity: usd, absence: absence, readAt: reading.readAt)
         })
     }

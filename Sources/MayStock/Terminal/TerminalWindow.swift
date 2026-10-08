@@ -297,10 +297,15 @@ struct EnvironmentBar: View {
     var body: some View {
         HStack(spacing: 12) {
             TradingModeSwitch(appState: appState)
+            // One item per venue: whether it is connected, and what the
+            // account is worth now — two accounts, two currencies, never one
+            // number, and never a second copy of either.
             ForEach(Venue.allCases) { venue in
-                ConnectionChip(appState: appState, mode: appState.tradingMode, venue: venue)
+                HStack(spacing: 6) {
+                    ConnectionChip(appState: appState, mode: appState.tradingMode, venue: venue, namesVenue: true)
+                    equity(for: venue)
+                }
             }
-            equityChip
             Spacer(minLength: 8)
             if appState.store.config.strategy.emergencyStop {
                 Button("解除急停") { appState.clearEmergencyStop() }
@@ -321,24 +326,20 @@ struct EnvironmentBar: View {
         .background(.bar)
     }
 
-    /// One chip per venue: two accounts, two currencies, never one number.
-    private var equityChip: some View {
-        HStack(spacing: 14) {
-            ForEach(Venue.allCases) { venue in
-                HStack(spacing: 5) {
-                    Text(venue.displayName).font(Theme.Text.caption).foregroundStyle(.secondary)
-                    Text(Format.money(appState.accountEquity(for: venue)))
-                        .font(Theme.Text.secondaryMedium).numeric()
-                        .contentTransition(.numericText())
-                    Text(venue.quoteCurrency).font(Theme.Text.caption).foregroundStyle(.tertiary)
-                    if let pct = appState.openPnLPct(for: venue), let pnl = appState.openPnL(for: venue) {
-                        Text("\(PriceFormatter.signedMoney(pnl, decimals: 0)) (\(PriceFormatter.signedPercent(pct)))")
-                            .font(Theme.Text.captionMedium).numeric()
-                            .foregroundStyle(Theme.signed(pnl))
-                    }
-                }
-                .help("\(venue.displayName)账户权益（\(venue.quoteCurrency) 计）与当前持仓盈亏")
+    /// The venue's equity now, in its own currency, and the open result of
+    /// what its strategies hold.
+    private func equity(for venue: Venue) -> some View {
+        HStack(spacing: 5) {
+            Text(Format.money(appState.accountEquity(for: venue)))
+                .font(Theme.Text.secondaryMedium).numeric()
+                .contentTransition(.numericText())
+            Text(venue.quoteCurrency).font(Theme.Text.caption).foregroundStyle(.tertiary)
+            if let pct = appState.openPnLPct(for: venue), let pnl = appState.openPnL(for: venue) {
+                Text("\(PriceFormatter.signedMoney(pnl, decimals: 0)) (\(PriceFormatter.signedPercent(pct)))")
+                    .font(Theme.Text.captionMedium).numeric()
+                    .foregroundStyle(Theme.signed(pnl))
             }
         }
+        .help("\(venue.displayName)账户权益（\(venue.quoteCurrency) 计）与当前持仓盈亏\n" + appState.equityHelp(for: venue))
     }
 }

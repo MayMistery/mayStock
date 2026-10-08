@@ -154,11 +154,6 @@ public enum Venue: String, Codable, Sendable, CaseIterable, Identifiable, Hashab
         }
     }
 
-    /// What "change" means on this venue's tickers.
-    public var changeBasis: ChangeBasis {
-        tradesContinuously ? .rolling24h : .previousClose
-    }
-
     /// The clock the venue's day runs on.
     public var timeZone: TimeZone {
         switch self {
@@ -210,23 +205,10 @@ public enum Venue: String, Codable, Sendable, CaseIterable, Identifiable, Hashab
         self == .okx ? "" : "-" + rawValue
     }
 
-    /// What a window's result on this venue is measured from.
-    public enum PeriodFigure: Sendable, Equatable {
-        /// The exchange's own bill ledger — the one period figure it vouches
-        /// for, on a venue that publishes neither period P&L nor an equity
-        /// history.
-        case exchangeBills
-        /// This app's equity curve, on a venue whose account it values at
-        /// the venue's own liquidation value — or whose demo book is exact.
-        case equityCurve
-    }
-
-    public var periodFigure: PeriodFigure {
-        switch self {
-        case .okx: return .exchangeBills
-        case .schwab: return .equityCurve
-        }
-    }
+    /// Whether the venue keeps a bill ledger the app reads: what a window
+    /// realised, shown as the breakdown of the window's result. OKX does;
+    /// Schwab's transactions are read for fills alone.
+    public var publishesBills: Bool { self == .okx }
 
     /// The capital a fresh portfolio starts with on this venue, in its
     /// quote currency. Only a starting point for the settings page.

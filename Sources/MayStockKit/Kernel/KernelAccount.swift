@@ -9,56 +9,18 @@ import CMayStockKernel
 /// reader, in the kernel, and the trading path calls it too.
 enum KernelAccount {
 
-    private struct PositionRow: Decodable {
-        let instId: String
-        let instType: String
-        let posSide: String
-        let contracts: Double
-        let averagePrice: Double?
-        let markPrice: Double?
-        let unrealisedPnl: Double?
-        let leverage: Double?
-        let liquidationPrice: Double?
-        let notionalUsd: Double?
-        let margin: Double?
-        let maintenanceMargin: Double?
-        let marginRatio: Double?
-        let settlementCurrency: String?
-        let usdRate: Double?
-        let marginMode: String?
-    }
-
     private struct Equity: Decodable {
         let totalEquity: Double?
     }
 
-    private struct BalanceRow: Decodable {
-        let ccy: String
-        let available: Double
-        let total: Double
-        let valuationUsd: Double?
-    }
-
-    /// Non-zero positions, short legs negative.
-    static func positions(_ json: String) -> [ExchangePosition] {
-        read([PositionRow].self, "positions", json)?.map { row in
-            ExchangePosition(
-                instId: row.instId,
-                posSide: PositionSide(rawValue: row.posSide) ?? .net,
-                quantity: row.contracts,
-                averagePrice: row.averagePrice ?? 0,
-                markPrice: row.markPrice,
-                unrealisedPnL: row.unrealisedPnl ?? 0,
-                leverage: row.leverage,
-                liquidationPrice: row.liquidationPrice,
-                notionalUsd: row.notionalUsd,
-                instType: row.instType,
-                margin: row.margin,
-                maintenanceMargin: row.maintenanceMargin,
-                marginRatio: row.marginRatio,
-                settlementCurrency: row.settlementCurrency,
-                usdRate: row.usdRate,
-                marginMode: row.marginMode.flatMap(MarginMode.init(rawValue:)))
+    /// Non-zero positions, short legs negative — in the live account
+    /// document's shape, mapped by its one function, so a position read over
+    /// REST means exactly what the same position streamed means. A REST read
+    /// carries no push time: its mark is as of this machine's clock now.
+    static func positions(_ json: String, readAt: Date = Date()) -> [ExchangePosition] {
+        read([LiveAccount.Holding].self, "positions", json)?.map { holding in
+            let position = holding.exchangePosition(offsetMs: nil)
+            return position.markAt == nil ? position.marked(at: readAt) : position
         } ?? []
     }
 
@@ -67,9 +29,7 @@ enum KernelAccount {
     }
 
     static func balances(_ json: String) -> [AccountBalance] {
-        read([BalanceRow].self, "balances", json)?.map {
-            AccountBalance(ccy: $0.ccy, available: $0.available, total: $0.total, valuationUsd: $0.valuationUsd)
-        } ?? []
+        read([LiveAccount.Balance].self, "balances", json)?.map(\.accountBalance) ?? []
     }
 
     /// A kernel refusal here is a programming error (an unknown kind), never

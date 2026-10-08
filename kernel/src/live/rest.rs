@@ -14,8 +14,11 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use super::socket::health;
-use crate::trade::reads::{Read, WorkingOrder, WorkingOrders};
+use tokio::sync::Notify;
+
+use crate::trade::reads::{Read, TransferListing, WorkingOrders};
 use crate::trade::{Access, Answered, Delivery, ReadReply, ReadRequest};
+use super::book::{self, Spec};
 use super::{binance, deribit, net, now_ms, okx, polymarket, Feed, FeedState, Update};
 
 // MARK: - Option book
@@ -119,27 +122,37 @@ pub enum RestUpdate {
     BinanceOpenInterest(Result<(f64, i64), String>),
     /// Server time and the local instants the request left and returned.
     Clock(Result<(i64, i64, i64), String>),
-    /// Pending stops and take-profits, when they were read (local), and
+    /// Every working order on the account, when it was read (local), and
     /// what the read took beyond one request.
-    Stops(Result<Vec<WorkingOrder>, String>, i64, Delivery),
+    Orders(Result<WorkingOrders, String>, i64, Delivery),
     Yahoo(Result<Vec<MacroQuote>, String>),
     /// One of `polymarket::TOPICS`, and when it was read (local).
     Prediction { topic: &'static str, result: Result<Vec<polymarket::Event>, String>, ms: i64 },
+    /// Money moved into or out of the trading account over the lookback,
+    /// when it was read (local), and what the read took beyond one request.
+    Transfers(Result<TransferListing, String>, i64, Delivery),
+    /// A held instrument's specification, read from the public listing.
+    Spec { inst_id: String, result: Result<Spec, String> },
 }
 
 impl RestUpdate {
     /// The feed this update arrived on. Exhaustive, so a new kind of update
     /// cannot be added without saying whose freshness it proves.
-    pub fn feed(&self) -> Feed {
+    /// The feed whose age a successful read renews. None for a one-off read
+    /// with no cadence to age against — a contract's terms are read once —
+    /// whose failure is reported where it is used instead.
+    pub fn feed(&self) -> Option<Feed> {
         match self {
-            RestUpdate::VenueBook { .. } => Feed::OptionBook,
-            RestUpdate::OkxHistory { .. } => Feed::OkxHistory,
-            RestUpdate::BinanceHistory { .. } => Feed::BinanceHistory,
-            RestUpdate::BinanceOpenInterest(_) => Feed::BinanceOpenInterest,
-            RestUpdate::Clock(_) => Feed::Clock,
-            RestUpdate::Stops(..) => Feed::OkxStops,
-            RestUpdate::Yahoo(_) => Feed::Yahoo,
-            RestUpdate::Prediction { .. } => Feed::Polymarket,
+            RestUpdate::VenueBook { .. } => Some(Feed::OptionBook),
+            RestUpdate::OkxHistory { .. } => Some(Feed::OkxHistory),
+            RestUpdate::BinanceHistory { .. } => Some(Feed::BinanceHistory),
+            RestUpdate::BinanceOpenInterest(_) => Some(Feed::BinanceOpenInterest),
+            RestUpdate::Clock(_) => Some(Feed::Clock),
+            RestUpdate::Orders(..) => Some(Feed::OkxOrders),
+            RestUpdate::Yahoo(_) => Some(Feed::Yahoo),
+            RestUpdate::Prediction { .. } => Some(Feed::Polymarket),
+            RestUpdate::Transfers(..) => Some(Feed::OkxTransfers),
+            RestUpdate::Spec { .. } => None,
         }
     }
 
@@ -150,9 +163,11 @@ impl RestUpdate {
             RestUpdate::OkxHistory { result, .. } | RestUpdate::BinanceHistory { result, .. } => result.is_ok(),
             RestUpdate::BinanceOpenInterest(result) => result.is_ok(),
             RestUpdate::Clock(result) => result.is_ok(),
-            RestUpdate::Stops(result, ..) => result.is_ok(),
+            RestUpdate::Orders(result, ..) => result.is_ok(),
             RestUpdate::Yahoo(result) => result.is_ok(),
             RestUpdate::Prediction { result, .. } => result.is_ok(),
+            RestUpdate::Transfers(result, ..) => result.is_ok(),
+            RestUpdate::Spec { result, .. } => result.is_ok(),
         }
     }
 }
@@ -364,35 +379,45 @@ pub async fn binance_open_interest(http: reqwest::Client, updates: mpsc::Sender<
     }
 }
 
-// MARK: - Pending stops
+// MARK: - Working orders
 
-/// The standalone stops the app places are conditional algo orders, which a
-/// position's `closeOrderAlgo` does not list, so they are read on their own,
-/// at `Feed::OkxStops`'s cadence — the account's whole protection listing,
-/// through the trading client, whose pacer every signed request of the
-/// process shares.
-pub async fn okx_stops(updates: mpsc::Sender<Update>, access: Access) {
-    health(&updates, Feed::OkxStops, FeedState::Connecting).await;
-    let request = ReadRequest { access, read: Read::Protection { family: None, inst_id: None } };
+/// The fewest milliseconds between two reads of the order listing, however
+/// many pushes ask for one: a burst of fills is one read, not one each.
+const ORDERS_MIN_SPACING: Duration = Duration::from_millis(800);
+
+/// Every order working on the account — both books, every family — read
+/// whole through the trading client, whose pacer every signed request of the
+/// process shares. On `Feed::OkxOrders`' cadence, and at once whenever an
+/// order push (`wake`) says something changed: the pushes say *that*
+/// something changed, the listing says *what is armed*, and only the listing
+/// is ever shown. The checkup's stops are the conditional and OCO orders of
+/// this same listing, so the two cannot disagree.
+pub async fn okx_orders(updates: mpsc::Sender<Update>, access: Access, wake: Arc<Notify>) {
+    health(&updates, Feed::OkxOrders, FeedState::Connecting).await;
+    let request = ReadRequest { access, read: Read::WorkingOrders { families: Vec::new(), inst_id: None } };
     loop {
+        let started = tokio::time::Instant::now();
         let answered = match crate::trade::shared() {
             Ok(client) => client.read_async(request.clone()).await,
             Err(reason) => Answered::local(ReadReply::Failed { reason }),
         };
         let read_at = now_ms();
         let result = match answered.reply {
-            ReadReply::Ok { data } => {
-                serde_json::from_value::<WorkingOrders>(data).map(|listing| listing.orders).map_err(|e| format!("条件单回复无法读取：{e}"))
-            }
+            ReadReply::Ok { data } => serde_json::from_value::<WorkingOrders>(data).map_err(|e| format!("挂单回复无法读取：{e}")),
             ReadReply::Failed { reason } | ReadReply::Refused { reason, .. } => Err(reason),
         };
         let state = match &result {
-            Ok(_) => FeedState::Live,
+            Ok(listing) if listing.unavailable.is_empty() => FeedState::Live,
+            Ok(listing) => FeedState::Degraded(format!("部分簿未读到：{}", listing.unavailable.join("；"))),
             Err(e) => FeedState::Degraded(e.clone()),
         };
-        send(&updates, RestUpdate::Stops(result, read_at, answered.delivery)).await;
-        health(&updates, Feed::OkxStops, state).await;
-        tokio::time::sleep(Feed::OkxStops.cadence()).await;
+        send(&updates, RestUpdate::Orders(result, read_at, answered.delivery)).await;
+        health(&updates, Feed::OkxOrders, state).await;
+        tokio::select! {
+            _ = tokio::time::sleep(Feed::OkxOrders.cadence()) => {}
+            _ = wake.notified() => {}
+        }
+        tokio::time::sleep_until(started + ORDERS_MIN_SPACING).await;
     }
 }
 
@@ -401,6 +426,50 @@ pub async fn okx_stops(updates: mpsc::Sender<Update>, access: Access) {
 /// Every age on screen is the venue's timestamp against this machine's clock,
 /// so the clock's own offset has to be known — and re-measured, since it
 /// drifts.
+/// Money moved into or out of the trading account over the last week —
+/// what a period's result has to leave out to be a result. Read on the
+/// feed's cadence, and at once whenever the account says cash moved
+/// (`wake`), so a transfer is accounted for within a round trip of landing
+/// rather than counted as profit until the next poll.
+pub async fn okx_transfers(updates: mpsc::Sender<Update>, access: Access, wake: Arc<Notify>) {
+    health(&updates, Feed::OkxTransfers, FeedState::Connecting).await;
+    loop {
+        let since = now_ms() - super::state::TRANSFER_LOOKBACK_MS;
+        let request = ReadRequest { access: access.clone(), read: Read::Transfers { since_ms: since } };
+        let answered = match crate::trade::shared() {
+            Ok(client) => client.read_async(request).await,
+            Err(reason) => Answered::local(ReadReply::Failed { reason }),
+        };
+        let read_at = now_ms();
+        let result = match answered.reply {
+            ReadReply::Ok { data } => serde_json::from_value::<TransferListing>(data).map_err(|e| format!("划转记录无法读取：{e}")),
+            ReadReply::Failed { reason } | ReadReply::Refused { reason, .. } => Err(reason),
+        };
+        let state = match &result {
+            Ok(_) => FeedState::Live,
+            Err(e) => FeedState::Degraded(e.clone()),
+        };
+        send(&updates, RestUpdate::Transfers(result, read_at, answered.delivery)).await;
+        health(&updates, Feed::OkxTransfers, state).await;
+        tokio::select! {
+            _ = tokio::time::sleep(Feed::OkxTransfers.cadence()) => {}
+            _ = wake.notified() => {}
+        }
+    }
+}
+
+/// A held instrument's terms, in the account's environment, retried until
+/// read: without them its floating profit cannot be taken at the stream's
+/// mark, and stays the venue's last pushed figure.
+pub async fn okx_spec(updates: mpsc::Sender<Update>, inst_id: String, inst_type: String, demo: bool) {
+    let (tx, mut rx) = mpsc::channel::<Result<Spec, String>>(4);
+    let fetch = tokio::spawn(book::fetch_spec(book::spec_path_for(&inst_type, &inst_id), inst_id.clone(), demo, tx));
+    while let Some(result) = rx.recv().await {
+        send(&updates, RestUpdate::Spec { inst_id: inst_id.clone(), result }).await;
+    }
+    fetch.abort();
+}
+
 pub async fn clock(http: reqwest::Client, updates: mpsc::Sender<Update>) {
     let url = format!("{}/api/v5/public/time", okx::REST);
     loop {

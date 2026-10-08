@@ -21,6 +21,9 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
     public let network: Network?
     public let events: [Event]
     public let spot: Spot?
+    /// The whole account valued now — the same document every other screen
+    /// reads through `LiveAccountFeed`.
+    public let account: LiveAccount
     public let risk: Risk
     public let structure: [VenueStructure]
     public let gravity: Gravity
@@ -87,6 +90,9 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
     public struct Stamped: Decodable, Sendable, Equatable {
         public let value: Double
         public let ms: Int64
+        /// Past this age the value reads stale: the stale age of whatever
+        /// renews it, as the kernel declares it.
+        public let staleAfterMs: Double
     }
 
     // MARK: Risk
@@ -102,6 +108,9 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
         public let fallbackNeeded: Bool
         public let instId: String
         public let positionsMs: Int64?
+        /// Past this age `positionsMs` reads stale: the private socket's, or
+        /// the CLI fallback's while that is the source.
+        public let positionsStaleAfterMs: Double?
         /// Every instrument the account holds, each once.
         public let held: [String]
         /// Every leg held on `instId`, longs first: one on a one-way account,
@@ -133,6 +142,8 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
         public let ms: Int64?
         /// `okx.mark-price` (the live stream) or `position` (the last push).
         public let source: String
+        /// The stale age of whatever renews the mark.
+        public let staleAfterMs: Double?
     }
 
     public struct Position: Decodable, Sendable, Equatable, Identifiable {
@@ -146,7 +157,13 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
         public let baseQuantity: Double
         public let isShort: Bool
         public let averagePrice: Double?
+        /// At `Risk.mark`, the same mark the buffer is read at.
         public let unrealisedPnl: Double?
+        /// The venue's return on the leg (`uplRatio`, a fraction), at that mark.
+        public let unrealisedRatio: Double?
+        /// Whether the two above were taken at the streamed mark rather than
+        /// the venue's last push.
+        public let remarked: Bool
         public let liquidationPrice: Double?
         public let liquidationBufferPct: Double?
         public let liquidationOdds: [Odds]
@@ -156,6 +173,8 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
         public let leverageSetting: Double?
         public let notionalUsd: Double?
         public let fundingFee: Double?
+        /// What the leg's profit, margin and funding are stated in.
+        public let settlementCurrency: String?
         public let protective: [Protective]
         public let updatedMs: Int64?
         public var id: String { key }
@@ -238,6 +257,7 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
         public let base: Double
         public let usd: Double?
         public let ms: Int64
+        public let staleAfterMs: Double
     }
 
     public struct Change: Decodable, Sendable, Equatable {
@@ -245,6 +265,8 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
         /// The history bucket the change is measured from.
         public let referenceMs: Int64
         public let currentMs: Int64
+        /// The stale age of the live end, `currentMs`.
+        public let staleAfterMs: Double
     }
 
     public struct LiveTaker: Decodable, Sendable, Equatable {
@@ -252,6 +274,7 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
         public let windowSeconds: Double
         public let trades: Int
         public let ms: Int64
+        public let staleAfterMs: Double
     }
 
     // MARK: Gravity
@@ -327,7 +350,9 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
     public struct Probability: Decodable, Sendable, Equatable {
         public let smileVenue: String
         public let surfaceMs: Int64?
+        public let surfaceStaleAfterMs: Double
         public let indexMs: Int64?
+        public let indexStaleAfterMs: Double
         public let spot: Double?
         /// The divisor in force: the one asked for, or 1 when the kernel
         /// does not offer that one.
@@ -513,6 +538,7 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
         public let price: Double?
         public let changePct: Double?
         public let ms: Int64?
+        public let staleAfterMs: Double
         public let delayed: Bool
         public let source: String
     }

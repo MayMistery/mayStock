@@ -206,11 +206,36 @@ public struct GeneralPrefs: Codable, Sendable, Equatable {
     public var hoverDelayMs: Int
     /// Grace period before the panel hides after the pointer leaves.
     public var hideDelayMs: Int
+    /// What a market that never closes measures its change from — one of
+    /// `ChangeBasis.continuous` — so the menu bar reads the way the phone
+    /// does. Beijing midnight unless set (May, 2026-10-08: 「不确定，做成开关」).
+    public var changeBasis: ChangeBasis
 
-    public init(launchAtLogin: Bool = false, hoverDelayMs: Int = 150, hideDelayMs: Int = 350) {
+    public init(
+        launchAtLogin: Bool = false, hoverDelayMs: Int = 150, hideDelayMs: Int = 350,
+        changeBasis: ChangeBasis = .sinceUtc8Midnight
+    ) {
         self.launchAtLogin = launchAtLogin
         self.hoverDelayMs = hoverDelayMs
         self.hideDelayMs = hideDelayMs
+        self.changeBasis = changeBasis
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case launchAtLogin, hoverDelayMs, hideDelayMs, changeBasis
+    }
+
+    /// Every field has a default: a file written before a field existed must
+    /// load — a failed decode here would replace the whole config with the
+    /// defaults, watchlist and strategies included.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let defaults = GeneralPrefs()
+        launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? defaults.launchAtLogin
+        hoverDelayMs = try c.decodeIfPresent(Int.self, forKey: .hoverDelayMs) ?? defaults.hoverDelayMs
+        hideDelayMs = try c.decodeIfPresent(Int.self, forKey: .hideDelayMs) ?? defaults.hideDelayMs
+        let basis = (try? c.decodeIfPresent(ChangeBasis.self, forKey: .changeBasis)) ?? nil
+        changeBasis = basis.flatMap { ChangeBasis.continuous.contains($0) ? $0 : nil } ?? defaults.changeBasis
     }
 }
 

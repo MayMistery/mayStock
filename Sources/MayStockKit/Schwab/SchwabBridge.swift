@@ -148,6 +148,13 @@ public struct SchwabBridge: Sendable {
         return try SchwabWire.fills(from: try await run(args))
     }
 
+    /// Money moved into or out of the account in a window: deposits,
+    /// withdrawals, wires, journals, securities in or out — the types
+    /// `schwabctl` declares (`MONEY_MOVEMENT_TYPES`).
+    public func transfers(from: Date, to: Date) async throws -> [AccountTransfer] {
+        try SchwabWire.transfers(from: try await run(["transfers", "--from", SchwabAPI.stamp(from), "--to", SchwabAPI.stamp(to)]))
+    }
+
     public func hours(on date: Date) async throws -> USSessionHours {
         let day = SchwabAPI.newYorkDay(date)
         return try SchwabWire.sessionHours(from: try await run(["hours", "--date", day]), day: day)

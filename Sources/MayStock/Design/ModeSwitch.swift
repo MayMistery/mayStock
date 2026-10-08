@@ -40,6 +40,9 @@ struct ConnectionChip: View {
     let mode: TradingMode
     var venue: Venue = .okx
     var showsMode = false
+    /// Say whose connection this is, where chips for several venues sit side
+    /// by side and the status word alone would not.
+    var namesVenue = false
 
     private var status: VenueConnectionStatus { appState.connectionStatus(for: mode, venue: venue) }
 
@@ -78,17 +81,16 @@ struct ConnectionChip: View {
     }
 
     private var text: String {
+        let name = namesVenue ? venue.displayName : nil
         switch status {
-        case .unknown: return "未验证连接"
+        case .unknown: return [name, "未验证连接"].compactMap { $0 }.joined(separator: " ")
         case .checking: return "验证中…"
-        case .connected(let report):
-            var parts = ["已连接"]
-            if let equity = report.totalEquity {
-                parts.append(PriceFormatter.money(equity, decimals: 0)
-                             + " " + venue.quoteCurrency)
-            }
-            return parts.joined(separator: " · ")
-        case .failed: return "连接失败"
+        // No figure here: the verification's equity is a reading frozen at
+        // the moment of the check, and beside the live one on the same bar it
+        // made one account show two numbers (2026-10-08). It is in the help,
+        // with the time it was true.
+        case .connected: return name ?? "已连接"
+        case .failed: return [name, "连接失败"].compactMap { $0 }.joined(separator: " ")
         }
     }
 
@@ -100,6 +102,9 @@ struct ConnectionChip: View {
             var lines = ["\(venue.displayName)\(mode.displayName) · " + (report.profile.map { venue == .okx ? "profile \($0)" : $0 } ?? "CLI 默认 profile")]
             if let account = report.account {
                 lines.append("\(account.accountLevelName) · \(account.positionModeName) · 权限 \(account.permissions)")
+            }
+            if let equity = report.snapshot?.displayEquity(in: venue.quoteCurrency) {
+                lines.append("验证时权益 \(PriceFormatter.money(equity.amount)) \(equity.currency)")
             }
             lines.append("验证于 " + Format.clock(report.checkedAt) + "，点击重新验证")
             return lines.joined(separator: "\n")

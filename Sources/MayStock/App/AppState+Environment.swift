@@ -142,7 +142,7 @@ extension AppState {
                     let account = try await bridge.account()
                     status = .connected(VenueConnectionReport(
                         mode: mode, profile: credential.accountSuffix.map { "账户 …\($0)" },
-                        checkedAt: Date(), totalEquity: account.equity,
+                        checkedAt: Date(), snapshot: account.snapshot,
                         balanceCount: account.positions.count, account: nil))
                     Log.warn("connection: schwab live verified, \(account.positions.count) positions")
                 case .demo:
@@ -151,7 +151,7 @@ extension AppState {
                     let snapshot = await shadowBook.snapshot()
                     status = .connected(VenueConnectionReport(
                         mode: mode, profile: credential.loggedIn ? "影子账户 · 嘉信行情" : "影子账户 · Yahoo 行情",
-                        checkedAt: Date(), totalEquity: snapshot.totalEquity,
+                        checkedAt: Date(), snapshot: snapshot,
                         balanceCount: snapshot.balances.count, account: nil))
                 }
             } catch {
@@ -222,20 +222,7 @@ extension AppState {
         }
         runners.forEach { $0.start() }
         Log.warn("mode: switched to \(mode.rawValue); disarmed \(armed.isEmpty ? "nothing" : armed.joined(separator: ", "))")
-        for venue in Venue.allCases {
-            let books = books(for: venue)
-            books.accountSnapshot = nil
-            books.exchangePositions = []
-            books.openOrders = []
-            books.openOrdersNote = nil
-            books.openOrdersError = nil
-            books.exchangeFills = []
-            books.exchangeFillsNote = nil
-            books.exchangeFillsError = nil
-            books.exchangeBills = nil
-            books.billsError = nil
-            books.accountError = nil
-        }
+        for venue in Venue.allCases { books(for: venue).clearAccount() }
         Task {
             await refreshAccount()
             for venue in Venue.allCases { await verifyConnection(mode, venue: venue) }
@@ -288,8 +275,8 @@ extension AppState {
             lines.append("\(mode.displayName)账户台账上有 \(held) 个持仓，切换后由这边的策略接管。")
         }
         for (venue, report) in reports {
-            guard let equity = report.totalEquity else { continue }
-            lines.append("\(venue.displayName)\(mode.displayName)账户权益 \(PriceFormatter.money(equity)) \(venue.quoteCurrency)"
+            guard let equity = report.snapshot?.displayEquity(in: venue.quoteCurrency) else { continue }
+            lines.append("\(venue.displayName)\(mode.displayName)账户权益 \(PriceFormatter.money(equity.amount)) \(equity.currency)"
                 + (report.profile.map { "，\($0)" } ?? "") + "。")
         }
         if mode == .demo, venues.contains(.schwab) {

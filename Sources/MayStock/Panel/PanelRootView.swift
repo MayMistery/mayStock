@@ -179,7 +179,7 @@ struct PanelRootView: View {
     private func statsRow(_ session: InstrumentSession) -> some View {
         let ticker = session.ticker
         let decimals = watchItem?.decimals ?? session.priceDecimals
-        let period = (ticker?.basis ?? session.venue.changeBasis).periodLabel
+        let period = ticker?.rangeLabel ?? (session.venue.tradesContinuously ? "24h" : "今日")
         return HStack(spacing: 0) {
             if session.venue.hasOrderBook {
                 stat("\(period) 高", ticker.map { PriceFormatter.price($0.high, decimals: decimals) })
@@ -215,7 +215,7 @@ struct PanelRootView: View {
 
     private func alertsRow(_ session: InstrumentSession) -> some View {
         let rules = appState.alerts.rules(for: instId)
-        let basis = session.venue.changeBasis
+        let basis = appState.changeBasis(for: instId)
         return HStack(spacing: 6) {
             Image(systemName: "bell").font(.system(size: 10)).foregroundStyle(.secondary)
             if rules.isEmpty {

@@ -24,6 +24,33 @@ public final class MarketHub {
     /// Called on every ticker update — alert evaluation hooks in here.
     public var onTick: ((InstrumentSession, Ticker) -> Void)?
 
+    /// What a market that never closes measures its change from
+    /// (`GeneralPrefs.changeBasis`). Every ticker from such a venue is
+    /// measured on it before anything sees it, so the menu bar, the panel,
+    /// the alerts and the markets page all read one change.
+    public private(set) var continuousChangeBasis: ChangeBasis = .sinceUtc8Midnight
+
+    /// The basis a venue's changes are shown on.
+    public func changeBasis(for venue: Venue) -> ChangeBasis {
+        venue.tradesContinuously ? continuousChangeBasis : .previousClose
+    }
+
+    /// Measure every continuous market's change on `basis` from now on, and
+    /// re-measure the tickers already on screen.
+    public func setChangeBasis(_ basis: ChangeBasis) {
+        guard ChangeBasis.continuous.contains(basis), basis != continuousChangeBasis else { return }
+        continuousChangeBasis = basis
+        for session in sessions.values where session.venue.tradesContinuously {
+            if let ticker = session.ticker { session.apply(ticker: ticker.rebased(to: basis)) }
+        }
+    }
+
+    /// A ticker as the screens show it: on the basis its venue's changes are
+    /// shown on, when the venue published that reference.
+    private func shown(_ ticker: Ticker, venue: Venue) -> Ticker {
+        ticker.rebased(to: changeBasis(for: venue))
+    }
+
     private let feeds: [Venue: any MarketFeed]
     private let sources: [Venue: any MarketDataSource]
     private var depthPollTasks: [String: Task<Void, Never>] = [:]
@@ -126,7 +153,7 @@ public final class MarketHub {
                 if let meta { session.apply(meta: meta) }
                 if let coarseSeed { session.seedSparkline(from: coarseSeed) }
                 if let fineSeed { session.seedSparkline(from: fineSeed) }
-                if let ticker, session.ticker == nil { session.apply(ticker: ticker) }
+                if let ticker, session.ticker == nil { session.apply(ticker: self.shown(ticker, venue: session.venue)) }
                 if let candles {
                     session.finishBackfill(candles, for: bar)
                 } else {
@@ -202,8 +229,9 @@ public final class MarketHub {
             for session in sessions.values where session.venue == venue {
                 session.apply(connection: state)
             }
-        case .ticker(let ticker):
-            guard let session = sessions[ticker.instId], session.venue == venue else { return }
+        case .ticker(let raw):
+            guard let session = sessions[raw.instId], session.venue == venue else { return }
+            let ticker = shown(raw, venue: venue)
             session.apply(ticker: ticker)
             onTick?(session, ticker)
         case .candles(let instId, let bar, let candles):

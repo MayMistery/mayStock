@@ -33,9 +33,11 @@ struct PositionCheckupTests {
     private let balance = #"{"data":[{"totalEq":"7130.97","details":[{"ccy":"USDT","eq":"7000"}]}]}"#
 
     private func model(instId: String = "ETH-USDT-SWAP", follows: Bool = true) -> CheckupModel {
-        let model = CheckupModel(
-            venue: FakeVenue(), mode: .live, instId: instId, followsHeldPosition: follows,
-            okxConfigPath: nil, network: false, nowOverrideMs: 1_790_164_800_000)
+        let kernel = try! LiveKernel(config: LiveKernel.Config(
+            instId: "ETH-USDT-SWAP", followsHeldPosition: true, mode: .live,
+            okxProfile: nil, okxConfigPath: nil, schwabctlPath: nil,
+            network: false, nowOverrideMs: 1_790_164_800_000, analytics: false))
+        let model = CheckupModel(kernel: kernel, instId: instId, followsHeldPosition: follows)
         model.start()
         return model
     }

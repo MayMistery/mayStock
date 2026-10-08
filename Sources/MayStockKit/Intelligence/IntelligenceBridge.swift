@@ -8,8 +8,9 @@ public struct IntelligenceQuote: Codable, Sendable {
     public init(ticker: Ticker) {
         instId = ticker.instId
         price = ticker.last
-        // A stock's change is against the previous close, not 24 hours ago.
-        change24h = ticker.basis == .rolling24h ? ticker.changePct : nil
+        // Twenty-four hours, whatever the screen measures from; a stock
+        // publishes no such reference and sends none.
+        change24h = ticker.changePct(on: .rolling24h)
         asOf = ticker.ts
     }
 }

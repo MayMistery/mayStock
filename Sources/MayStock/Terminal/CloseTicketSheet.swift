@@ -180,7 +180,7 @@ private struct BookStatus: View {
             StatusDot(color: color)
             Text(label).font(Theme.Text.caption).foregroundStyle(.secondary)
             if let ms = book?.exchangeMs, book?.isLive == true {
-                AgeLabel(ms: ms, offsetMs: 0, staleAfterMs: 3_000)
+                AgeLabel(ms: ms, offsetMs: 0, staleAfterMs: book?.staleAfterMs ?? 0)
             }
         }
         .help(help)

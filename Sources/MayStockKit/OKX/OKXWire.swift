@@ -41,6 +41,9 @@ public enum OKXWireDecoder {
         let low24h: String
         let vol24h: String
         let ts: String
+        /// The open at 00:00 UTC+8 and at 00:00 UTC.
+        let sodUtc8: String?
+        let sodUtc0: String?
     }
 
     struct BookRow: Decodable {
@@ -138,8 +141,17 @@ public enum OKXWireDecoder {
             low: low,
             volume: Double(row.vol24h) ?? 0,
             basis: .rolling24h,
-            ts: Date(timeIntervalSince1970: tsMs / 1000)
+            ts: Date(timeIntervalSince1970: tsMs / 1000),
+            references: OKXWireDecoder.references(open24h: open, sodUtc8: row.sodUtc8, sodUtc0: row.sodUtc0)
         )
+    }
+
+    /// Every reference an OKX ticker carries, by the basis it measures from.
+    static func references(open24h: Double, sodUtc8: String?, sodUtc0: String?) -> [ChangeBasis: Double] {
+        var references: [ChangeBasis: Double] = [.rolling24h: open24h]
+        if let value = sodUtc8.flatMap(Double.init), value > 0 { references[.sinceUtc8Midnight] = value }
+        if let value = sodUtc0.flatMap(Double.init), value > 0 { references[.sinceUtcMidnight] = value }
+        return references
     }
 
     /// Candle row: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]

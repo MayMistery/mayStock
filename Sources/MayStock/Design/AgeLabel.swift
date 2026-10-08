@@ -172,3 +172,17 @@ final class AgeClock {
         }
     }
 }
+
+/// The age of a reading taken on this machine's clock, drawn like every other
+/// age (`AgeLabel`). Nothing at all before the first reading.
+struct ReadingAge: View {
+    let date: Date?
+    /// Past this the age turns amber.
+    var staleAfter: TimeInterval
+
+    var body: some View {
+        if let date {
+            AgeLabel(ms: Int64((date.timeIntervalSince1970 * 1000).rounded()), offsetMs: 0, staleAfterMs: staleAfter * 1000)
+        }
+    }
+}

@@ -113,6 +113,12 @@ public protocol ExchangeVenue: Sendable {
 
     func accountSnapshot(mode: TradingMode) async throws -> AccountSnapshot
 
+    /// The account's equity and every holding, as one reading. The default
+    /// reads them one after another (`AccountReading.piecewise`); a venue
+    /// whose account states all of them in one document reads it once, so
+    /// the equity and the holdings describe the same moment.
+    func accountReading(mode: TradingMode, source: AccountReading.Source) async throws -> AccountReading
+
     /// How much of a coin an order can sell right now: the trading account's
     /// available balance, not the account's total holding of it.
     func sellableBalance(ccy: String, mode: TradingMode) async throws -> Double
@@ -238,6 +244,10 @@ extension ExchangeVenue {
         throw ExchangeVenueError.unsupported(venue.displayName, "账户文档")
     }
 
+    public func accountReading(mode: TradingMode, source: AccountReading.Source) async throws -> AccountReading {
+        try await AccountReading.piecewise(from: self, mode: mode, source: source)
+    }
+
     /// A venue with one account: what it reports available.
     public func sellableBalance(ccy: String, mode: TradingMode) async throws -> Double {
         try await accountSnapshot(mode: mode).balance(of: ccy)?.available ?? 0
@@ -249,11 +259,16 @@ extension ExchangeVenue {
     /// finds a holding in. The runner asks `allPositions` alone, because it
     /// values shares through the balances and would count them twice.
     public func heldPositions(mode: TradingMode) async throws -> [ExchangePosition] {
-        var positions = try await allPositions(mode: mode)
+        try await allPositions(mode: mode) + shareHoldings(mode: mode)
+    }
+
+    /// Each family held as a position without being a contract — shares.
+    public func shareHoldings(mode: TradingMode) async throws -> [ExchangePosition] {
+        var holdings: [ExchangePosition] = []
         for instType in venue.instrumentTypes where !instType.isDerivative && instType != .spot {
-            positions += try await self.positions(mode: mode, instType: instType)
+            holdings += try await positions(mode: mode, instType: instType)
         }
-        return positions
+        return holdings
     }
 
     /// A venue with no single listing answers with the union of the families

@@ -48,6 +48,24 @@ struct SettingsPage: View {
                     }
                 }
 
+                Card(title: "行情", subtitle: "加密货币全天交易，「今日涨跌」从哪一刻算是个选择；和手机上用同一个基准，两边的涨跌幅才对得上") {
+                    Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+                        GridRow {
+                            label("涨跌幅基准")
+                            Picker("", selection: Binding(
+                                get: { general.changeBasis },
+                                set: { value in appState.store.update { $0.general.changeBasis = value } })) {
+                                ForEach(ChangeBasis.continuous, id: \.self) { basis in
+                                    Text(basis.settingName).tag(basis)
+                                }
+                            }
+                            .labelsHidden().frame(width: 160)
+                        }
+                    }
+                    Text("菜单栏、悬浮面板、行情页与告警都按这个基准；美股始终较昨收。高低价与成交量仍是 24 小时。")
+                        .font(Theme.Text.caption).foregroundStyle(.tertiary)
+                }
+
                 Card(title: "数据") {
                     VStack(alignment: .leading, spacing: 6) {
                         ForEach(Venue.allCases) { venue in

@@ -17,15 +17,17 @@ use serde_json::Value;
 
 use super::binance::{self, MarkUpdate};
 use super::deribit::{self, SurfaceQuote};
-use super::okx::{self, PositionRow, PrivateEvent, PublicEvent};
+
+use super::okx::{self, AccountRow, CurrencyEquity, PositionRow, PrivateEvent, PublicEvent};
 use super::polymarket;
 use super::reactions::{self, CellReaction, Side, TopicReaction};
 use super::rest::{self, HistoryKind, Leg, MacroQuote, OptionVenue, RestUpdate};
 use super::schwab::{self, SchwabSource};
-use super::{Effect, Feed, FeedState, LiveConfig, Update};
+use super::{Effect, Feed, FeedState, LiveConfig, Renewal, Update};
 use crate::gravity::{self, StrikeInterest};
-use crate::trade::reads::{self, Book, WorkingOrder};
-use crate::trade::wire::PosSide;
+use crate::trade::reads::{self, Book, TransferListing, WorkingOrder, WorkingOrders};
+use crate::trade::terms::{self, Terms};
+use crate::trade::wire::{Family, PosSide};
 use crate::trade::Delivery;
 use crate::implied::{self, Smile, SmilePoint};
 
@@ -54,6 +56,9 @@ pub(crate) const GRID_DIVISORS: [u32; 4] = [1, 2, 5, 10];
 /// The private socket counts as down after this long out of service, and the
 /// app is asked to fall back to reading positions through the CLI.
 const PRIVATE_GRACE_MS: i64 = 20_000;
+/// How far back transfers are read: the venue's bill listing reaches seven
+/// days, which covers the week the period figures measure from.
+pub(crate) const TRANSFER_LOOKBACK_MS: i64 = 7 * 86_400_000;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Stamp {
@@ -164,6 +169,9 @@ pub struct State {
     index: Option<Stamp>,
     index_trail: VecDeque<Stamp>,
     okx_last: Option<Stamp>,
+    /// The reviewed instrument's mark on the real market, for the structure
+    /// card. Positions are never valued at it: a demo account's marks are its
+    /// own (`account_marks`).
     okx_mark: Option<Stamp>,
     okx_funding: Option<Funding>,
     okx_oi: Option<OpenInterest>,
@@ -173,14 +181,26 @@ pub struct State {
     positions: BTreeMap<String, PositionRow>,
     positions_local_ms: Option<LocalMs>,
     pending_pages: Vec<PositionRow>,
-    equity: Option<(f64, LocalMs)>,
+    /// The trading account as last pushed (or read through the CLI).
+    account: AccountState,
+    /// The mark of every held instrument, streamed in the account's own
+    /// environment (`Feed::OkxMarks`). Every position is valued at these.
+    account_marks: BTreeMap<String, Stamp>,
+    /// Each held instrument's contract terms, or why they could not be read.
+    terms: BTreeMap<String, Result<Terms, String>>,
+    /// Money moved into or out of the trading account this week, and when it
+    /// was read; the error of the last read if it failed.
+    transfers: Option<(TransferListing, LocalMs)>,
+    transfers_error: Option<String>,
     risk_source: RiskSource,
     private_down_since: Option<i64>,
     /// Whether a machine-wide outage is in force, so its start and end are
     /// each logged once (`note_outage`).
     network_outage: bool,
-    stops: Option<(Vec<WorkingOrder>, LocalMs)>,
-    stops_error: Option<String>,
+    /// Every working order on the account as last read, and when; the error
+    /// of the last read if it failed — the list stays, labelled.
+    orders: Option<(WorkingOrders, LocalMs)>,
+    orders_error: Option<String>,
     // Deribit
     surface: HashMap<String, SurfaceQuote>,
     deribit_index: Option<Stamp>,
@@ -213,6 +233,18 @@ struct PredictionReading {
     events: Vec<polymarket::Event>,
     fetched_ms: Option<LocalMs>,
     error: Option<String>,
+}
+
+/// The trading account as the venue last stated it, per currency, so a push
+/// carrying only the currencies that changed updates just those.
+#[derive(Debug, Clone, Default)]
+struct AccountState {
+    total_usd: Option<f64>,
+    currencies: BTreeMap<String, CurrencyEquity>,
+    /// Pages of a snapshot still arriving.
+    pending: Option<AccountRow>,
+    /// When the last complete reading arrived.
+    local_ms: Option<LocalMs>,
 }
 
 /// Where the price grid was last laid, and on which step: an anchor laid on
@@ -248,12 +280,16 @@ impl State {
             positions: BTreeMap::new(),
             positions_local_ms: None,
             pending_pages: Vec::new(),
-            equity: None,
+            account: AccountState::default(),
+            account_marks: BTreeMap::new(),
+            terms: BTreeMap::new(),
+            transfers: None,
+            transfers_error: None,
             risk_source: RiskSource::None("正在连接".into()),
             private_down_since: Some(now),
             network_outage: false,
-            stops: None,
-            stops_error: None,
+            orders: None,
+            orders_error: None,
             surface: HashMap::new(),
             deribit_index: None,
             fits: BTreeMap::new(),
@@ -434,11 +470,40 @@ impl State {
                         PrivateEvent::Positions { rows, snapshot, last_page, ms } => {
                             effects.extend(self.apply_positions(rows, snapshot, last_page, ms, RiskSource::Private, now));
                         }
-                        PrivateEvent::Account { equity, ms } => self.equity = Some((equity, LocalMs(ms))),
+                        PrivateEvent::Account { row, snapshot, last_page, ms } => {
+                            effects.extend(self.apply_account(row, snapshot, last_page, ms));
+                        }
+                        PrivateEvent::OrdersChanged => effects.push(Effect::OrdersChanged),
                         PrivateEvent::Error(why) => self.event(now, format!("OKX 账户推送报错：{why}")),
                     }
                 }
                 effects
+            }
+            Feed::OkxOrderEvents => {
+                // Any data on the business socket is an algo order changing;
+                // what changed is read from the listing.
+                match serde_json::from_str::<Value>(text) {
+                    Ok(value) if value.get("event").and_then(Value::as_str) == Some("error") => {
+                        self.event(now, format!("OKX 策略委托推送报错：{} {}",
+                            value.get("code").and_then(Value::as_str).unwrap_or("?"),
+                            value.get("msg").and_then(Value::as_str).unwrap_or("")));
+                        Vec::new()
+                    }
+                    Ok(value) if value.get("data").is_some() => vec![Effect::OrdersChanged],
+                    _ => Vec::new(),
+                }
+            }
+            Feed::OkxMarks => {
+                for event in okx::decode_public(text) {
+                    match event {
+                        PublicEvent::Mark { inst_id, price, ms } => {
+                            self.account_marks.insert(inst_id, Stamp { value: price, ms });
+                        }
+                        PublicEvent::Error(why) => self.event(now, format!("OKX 持仓标记价推送报错：{why}")),
+                        _ => {}
+                    }
+                }
+                Vec::new()
             }
             Feed::Deribit => {
                 match deribit::decode(text) {
@@ -551,6 +616,7 @@ impl State {
     }
 
     fn apply_positions(&mut self, rows: Vec<PositionRow>, snapshot: bool, last_page: bool, ms: i64, source: RiskSource, now: i64) -> Vec<Effect> {
+        let held_before = self.held_instruments();
         if snapshot {
             self.pending_pages.extend(rows);
             if !last_page {
@@ -569,7 +635,64 @@ impl State {
         }
         self.positions_local_ms = Some(LocalMs(ms));
         self.risk_source = source;
-        self.follow_held_position(now)
+        let mut effects = self.follow_held_position(now);
+        if self.held_instruments() != held_before {
+            effects.push(Effect::HeldChanged);
+        }
+        effects
+    }
+
+    /// Every instrument the account holds, each once, with the family the
+    /// venue files it under — what the held-marks socket streams and whose
+    /// terms are read.
+    pub(crate) fn held_instruments(&self) -> Vec<(String, String)> {
+        let mut held: Vec<(String, String)> = self.positions.values().map(|r| (r.inst_id.clone(), r.inst_type.clone())).collect();
+        held.sort();
+        held.dedup();
+        held
+    }
+
+    /// Held instruments whose terms have not been read yet.
+    pub(crate) fn terms_wanted(&self) -> Vec<(String, String)> {
+        self.held_instruments().into_iter().filter(|(inst_id, _)| !matches!(self.terms.get(inst_id), Some(Ok(_)))).collect()
+    }
+
+    /// Fold an account push into the per-currency reading. A snapshot (paged
+    /// like positions) replaces it; an event push updates the currencies it
+    /// names.
+    fn apply_account(&mut self, row: AccountRow, snapshot: bool, last_page: bool, ms: i64) -> Vec<Effect> {
+        let reading = if snapshot {
+            let pending = self.account.pending.get_or_insert_with(AccountRow::default);
+            if row.total_usd.is_some() {
+                pending.total_usd = row.total_usd;
+            }
+            pending.currencies.extend(row.currencies);
+            if !last_page {
+                return Vec::new();
+            }
+            self.account.pending.take().unwrap_or_default()
+        } else {
+            row
+        };
+        // Cash and margin: equity less the floating profit inside it. It
+        // moves only when something happens on the account.
+        let base = |line: &CurrencyEquity| line.equity - line.floating;
+        let before: BTreeMap<String, f64> = self.account.currencies.iter().map(|(ccy, line)| (ccy.clone(), base(line))).collect();
+        if snapshot {
+            self.account.currencies = reading.currencies.into_iter().map(|line| (line.ccy.clone(), line)).collect();
+            self.account.total_usd = reading.total_usd;
+        } else {
+            for line in reading.currencies {
+                self.account.currencies.insert(line.ccy.clone(), line);
+            }
+            if reading.total_usd.is_some() {
+                self.account.total_usd = reading.total_usd;
+            }
+        }
+        self.account.local_ms = Some(LocalMs(ms));
+        let moved = !before.is_empty()
+            && self.account.currencies.iter().any(|(ccy, line)| before.get(ccy).is_none_or(|was| (was - base(line)).abs() > 1e-9));
+        if moved { vec![Effect::BalanceMoved] } else { Vec::new() }
     }
 
     /// Risk lives in positions, so the instrument under review is whatever
@@ -632,10 +755,13 @@ impl State {
             // must not survive a switch.
             self.positions.clear();
             self.pending_pages.clear();
-            self.equity = None;
+            self.account = AccountState::default();
+            self.account_marks.clear();
+            self.transfers = None;
+            self.transfers_error = None;
             self.positions_local_ms = None;
-            self.stops = None;
-            self.stops_error = None;
+            self.orders = None;
+            self.orders_error = None;
             self.risk_source = RiskSource::None("切换账户中".into());
             self.private_down_since = Some(now);
             self.event(now, format!("切换到{}账户", if self.config.mode == "demo" { "模拟盘" } else { "实盘" }));
@@ -653,8 +779,8 @@ impl State {
     }
 
     fn apply_rest(&mut self, update: RestUpdate, now: i64) {
-        if update.is_ok() {
-            self.note_frame(update.feed(), LocalMs(now));
+        if let (true, Some(feed)) = (update.is_ok(), update.feed()) {
+            self.note_frame(feed, LocalMs(now));
         }
         match update {
             RestUpdate::VenueBook { venue, result, ms } => {
@@ -686,22 +812,47 @@ impl State {
                     });
                 }
             }
-            RestUpdate::Stops(result, read_at, delivery) => {
+            RestUpdate::Orders(result, read_at, delivery) => {
                 if let Some(note) = delivery.note {
-                    self.event(now, format!("OKX 条件单：{note}"));
+                    self.event(now, format!("OKX 挂单：{note}"));
                 }
                 match result {
-                    Ok(orders) => {
-                        self.stops = Some((orders, LocalMs(read_at)));
-                        self.stops_error = None;
+                    Ok(listing) => {
+                        self.orders = Some((listing, LocalMs(read_at)));
+                        self.orders_error = None;
                     }
-                    Err(why) => self.stops_error = Some(why),
+                    Err(why) => self.orders_error = Some(why),
                 }
             }
             RestUpdate::Yahoo(result) => match result {
                 Ok(quotes) => self.yahoo = quotes,
                 Err(why) => self.event(now, format!("Yahoo：{why}")),
             },
+            RestUpdate::Transfers(result, read_at, delivery) => {
+                if let Some(note) = delivery.note {
+                    self.event(now, format!("OKX 划转记录：{note}"));
+                }
+                match result {
+                    Ok(mut listing) => {
+                        listing.items.sort_by(|a, b| b.ms.cmp(&a.ms));
+                        self.transfers = Some((listing, LocalMs(read_at)));
+                        self.transfers_error = None;
+                    }
+                    // The last good list stays, labelled with its age and the error.
+                    Err(why) => self.transfers_error = Some(why),
+                }
+            }
+            RestUpdate::Spec { inst_id, result } => {
+                let terms = result.and_then(|spec| Terms::read(&spec));
+                if let Err(why) = &terms {
+                    // Said once per instrument and reason: the read is retried
+                    // with backoff until it succeeds.
+                    if self.terms.get(&inst_id).and_then(|t| t.as_ref().err()) != Some(why) {
+                        self.event(now, format!("{inst_id} 合约规格读取失败，浮动盈亏暂按持仓推送：{why}"));
+                    }
+                }
+                self.terms.insert(inst_id, terms);
+            }
             RestUpdate::Prediction { topic, result, ms } => {
                 let label = polymarket::topic(topic).map(|t| t.label).unwrap_or(topic);
                 let reading = self.predictions.entry(topic).or_default();
@@ -771,19 +922,30 @@ impl State {
                 self.apply_rest(RestUpdate::Prediction { topic: topic.id, result: polymarket::events(payload), ms: now }, now);
                 Vec::new()
             }
-            "rest.okx.stops" => {
-                let orders = reads::parse_page(payload, Book::Algo).map(|(orders, _, _)| orders);
-                self.apply_rest(RestUpdate::Stops(orders, now, Delivery::default()), now);
+            "rest.okx.orders" => {
+                // One page of the algo book stands for the whole listing.
+                let listing = reads::parse_page(payload, Book::Algo)
+                    .map(|(orders, _, _)| WorkingOrders { orders, unavailable: Vec::new() }.finish());
+                self.apply_rest(RestUpdate::Orders(listing, now, Delivery::default()), now);
                 Vec::new()
             }
             "cli.positions" => {
                 let rows = okx::positions_in(&parsed()?);
                 self.apply_positions(rows, true, true, now, RiskSource::Cli, now)
             }
-            "cli.account" => {
-                if let Some(equity) = okx::total_equity_in(&parsed()?) {
-                    self.equity = Some((equity, LocalMs(now)));
-                }
+            "cli.account" => match okx::account_in(&parsed()?) {
+                Some(row) => self.apply_account(row, true, true, now),
+                None => Vec::new(),
+            },
+            "okx.marks" => self.apply(frame(Feed::OkxMarks), now),
+            "rest.okx.transfers" => {
+                let listing = reads::parse_transfers(payload).map(|items| TransferListing { items, complete: true });
+                self.apply_rest(RestUpdate::Transfers(listing, now, Delivery::default()), now);
+                Vec::new()
+            }
+            other if other.starts_with("rest.okx.spec.") => {
+                let inst_id = &other["rest.okx.spec.".len()..];
+                self.apply_rest(RestUpdate::Spec { inst_id: inst_id.to_string(), result: super::book::parse_spec(payload, inst_id) }, now);
                 Vec::new()
             }
             other => {
@@ -814,35 +976,13 @@ impl State {
         let snapshot = Snapshot {
             seq,
             generated_ms: now,
-            clock: self.clock.map(|c| ClockView { offset_ms: c.offset_ms, round_trip_ms: c.round_trip_ms, measured_ms: self.to_server(c.measured_ms) }),
+            clock: self.clock_view(),
             instrument: InstrumentView { inst_id: self.inst_id.clone(), base: self.base.clone(), mode: self.config.mode.clone() },
-            feeds: self
-                .feeds
-                .iter()
-                .map(|(feed, h)| FeedView {
-                    id: feed.id(),
-                    label: feed.label(),
-                    operator: feed.operator(),
-                    state: match h.state {
-                        FeedState::Connecting => "connecting",
-                        FeedState::Live => "live",
-                        FeedState::Degraded(_) => "degraded",
-                        FeedState::Refused(_) => "refused",
-                        FeedState::Off(_) => "off",
-                    },
-                    detail: match &h.state {
-                        FeedState::Degraded(d) | FeedState::Refused(d) | FeedState::Off(d) => Some(d.clone()),
-                        _ => None,
-                    },
-                    since_ms: self.to_server(h.since_ms),
-                    last_frame_ms: h.last_frame_ms.map(|ms| self.to_server(ms)),
-                    stale_after_ms: feed.stale_after_ms(),
-                    frames: h.frames,
-                })
-                .collect(),
+            feeds: self.feed_views(),
             network: self.network_view(),
-            events: self.events.iter().map(|e| EventView { id: e.id, ms: self.to_server(e.ms), message: e.message.clone() }).collect(),
+            events: self.event_views(),
             spot: spot.map(|(value, ms, source)| SpotView { value, ms, source }),
+            account: self.account_view(now),
             risk: self.risk_view(now, &smiles),
             structure: vec![self.okx_structure(now), self.binance_structure(now)],
             gravity: self.gravity_view(now, &smiles),
@@ -851,6 +991,40 @@ impl State {
             predictions: self.prediction_view(now),
         };
         serde_json::to_string(&snapshot).unwrap_or_else(|e| format!("{{\"seq\":{seq},\"error\":\"{e}\"}}"))
+    }
+
+    fn clock_view(&self) -> Option<ClockView> {
+        self.clock.map(|c| ClockView { offset_ms: c.offset_ms, round_trip_ms: c.round_trip_ms, measured_ms: self.to_server(c.measured_ms) })
+    }
+
+    fn feed_views(&self) -> Vec<FeedView> {
+        self.feeds
+            .iter()
+            .map(|(feed, h)| FeedView {
+                id: feed.id(),
+                label: feed.label(),
+                operator: feed.operator(),
+                state: match h.state {
+                    FeedState::Connecting => "connecting",
+                    FeedState::Live => "live",
+                    FeedState::Degraded(_) => "degraded",
+                    FeedState::Refused(_) => "refused",
+                    FeedState::Off(_) => "off",
+                },
+                detail: match &h.state {
+                    FeedState::Degraded(d) | FeedState::Refused(d) | FeedState::Off(d) => Some(d.clone()),
+                    _ => None,
+                },
+                since_ms: self.to_server(h.since_ms),
+                last_frame_ms: h.last_frame_ms.map(|ms| self.to_server(ms)),
+                stale_after_ms: feed.stale_after_ms(),
+                frames: h.frames,
+            })
+            .collect()
+    }
+
+    fn event_views(&self) -> Vec<EventView> {
+        self.events.iter().map(|e| EventView { id: e.id, ms: self.to_server(e.ms), message: e.message.clone() }).collect()
     }
 
     /// OKX's index, which OKX's options settle on and which streams fastest;
@@ -941,7 +1115,9 @@ impl State {
         let mut view = ProbabilityView {
             smile_venue: "Deribit",
             surface_ms: self.surface.values().map(|q| q.ms).max(),
+            surface_stale_after_ms: Feed::Deribit.stale_after_ms(),
             index_ms: self.index.map(|s| s.ms),
+            index_stale_after_ms: Feed::OkxPublic.stale_after_ms(),
             spot: spot.map(|s| s.0),
             grid_divisor: self.grid_divisor(),
             grid_step: None,
@@ -1084,17 +1260,299 @@ impl State {
         view
     }
 
-    fn risk_view(&self, now: i64, smiles: &BTreeMap<i64, LiveSmile>) -> RiskView {
-        let (source, note) = match &self.risk_source {
-            RiskSource::Private => ("okx.private", None),
-            RiskSource::Cli => ("cli", Some("私有推送不可用，经 okx CLI 读取".to_string())),
-            RiskSource::None(why) => ("none", Some(why.clone())),
+    // MARK: - Valuing what is held
+
+    /// The stops and targets armed on the account: the conditional and OCO
+    /// orders of the one listing every screen reads.
+    fn protection(&self) -> Vec<&WorkingOrder> {
+        self.orders
+            .iter()
+            .flat_map(|(listing, _)| listing.orders.iter())
+            .filter(|o| o.book == Book::Algo && reads::PROTECTION_LISTING.split(',').any(|kind| kind == o.ord_type))
+            .collect()
+    }
+
+    /// The account's own clock reading of when positions were last read.
+    fn positions_ms(&self) -> Option<i64> {
+        self.positions_local_ms.map(|ms| self.to_server(ms))
+    }
+
+    /// One leg valued at the freshest mark of the account's environment, by
+    /// the same rule the close ticket prices a close with
+    /// (`trade::terms::pnl`). The venue's pushed figures stand — and say
+    /// why — when the stream has nothing newer, or the leg's terms are not
+    /// known.
+    fn value_leg(&self, row: &PositionRow) -> Valued {
+        let pushed_ms = row.pushed_ms.or_else(|| self.positions_ms());
+        let pushed = |note: Option<String>| Valued {
+            mark: row.mark_price.map(|price| MarkView::pushed(price, pushed_ms, self.push_renewal())),
+            upl: row.unrealised_pnl,
+            upl_ratio: row.unrealised_ratio,
+            notional_usd: row.notional_usd,
+            remarked: false,
+            note,
         };
-        let fallback_needed = match self.feeds.get(&Feed::OkxPrivate).map(|h| &h.state) {
+        let Some(live) = self.account_marks.get(&row.inst_id).copied() else {
+            return pushed(Some("还没有这个合约的实时标记价，按最近一次持仓推送".into()));
+        };
+        if pushed_ms.is_some_and(|ms| live.ms < ms) {
+            // The push is newer than the stream's last mark: it already is
+            // the venue's freshest figure.
+            return pushed(None);
+        }
+        let Some(family) = terms::family_of_inst_type(&row.inst_type) else {
+            return pushed(Some(format!("{} 不按标记价重估，按最近一次持仓推送", row.inst_type)));
+        };
+        let terms = match self.terms.get(&row.inst_id) {
+            Some(Ok(terms)) => terms,
+            Some(Err(why)) => return pushed(Some(format!("合约规格读取失败（{why}），按最近一次持仓推送"))),
+            None => return pushed(Some("正在读取合约规格，暂按最近一次持仓推送".into())),
+        };
+        let size = row.contracts.abs();
+        let Some(upl) = terms::pnl(family, row.contracts > 0.0, row.average_price, Some(terms), size, live.value) else {
+            return pushed(Some("持仓缺少均价，按最近一次持仓推送".into()));
+        };
+        // The venue's return is floating profit over a denominator it does
+        // not publish (the margin the position opened with); its pushed pair
+        // states it, so the ratio moves with the profit and nothing else.
+        let upl_ratio = match (row.unrealised_pnl, row.unrealised_ratio) {
+            (Some(p), Some(r)) if p.abs() > 1e-9 && r.abs() > 1e-12 => Some(upl.amount * r / p),
+            _ => None,
+        };
+        // A linear contract's notional moves with its mark; an inverse one is
+        // a fixed number of dollars; an option's notional is the underlying's,
+        // which this mark (the option's own) does not move.
+        let notional_usd = match family {
+            Family::Swap => terms::value(family, Some(terms), size, live.value).and_then(|value| {
+                if value.ccy == "USD" {
+                    Some(value.amount)
+                } else if Some(&value.ccy) == row.settlement_currency.as_ref() {
+                    row.usd_rate.map(|rate| value.amount * rate)
+                } else {
+                    None
+                }
+            }),
+            _ => None,
+        }
+        .or(row.notional_usd);
+        Valued {
+            mark: Some(MarkView::streamed(live.value, live.ms)),
+            upl: Some(upl.amount),
+            upl_ratio,
+            notional_usd,
+            remarked: true,
+            note: None,
+        }
+    }
+
+    /// The account's equity now: per currency, the cash and margin the venue
+    /// last stated (`eq − upl` of that push) plus the floating profit of the
+    /// legs settled in it at the marks just used — the same push supplies
+    /// both halves, so the total never mixes two moments. In dollars at the
+    /// rate the venue valued that currency at in the same push.
+    fn equity_now(&self, legs: &[(&PositionRow, Valued)]) -> (Option<EquityView>, Vec<BalanceView>) {
+        let mut balances = Vec::new();
+        let Some(pushed_ms) = self.account.local_ms.map(|ms| self.to_server(ms)) else { return (None, balances) };
+        let mut total = self.account.total_usd;
+        let mut unmarked: Vec<String> = Vec::new();
+        let mut marked_ms: Option<i64> = None;
+        for (ccy, line) in &self.account.currencies {
+            let settled: Vec<&Valued> = legs
+                .iter()
+                .filter(|(row, _)| row.settlement_currency.as_deref() == Some(ccy.as_str()))
+                .map(|(_, valued)| valued)
+                .collect();
+            let rate = line.equity_usd.filter(|_| line.equity.abs() > 1e-12).map(|usd| usd / line.equity);
+            let equity = if settled.is_empty() {
+                line.equity
+            } else if let Some(floating) = settled.iter().map(|v| v.upl).sum::<Option<f64>>() {
+                for valued in &settled {
+                    match (valued.remarked, valued.mark.as_ref().and_then(|m| m.ms)) {
+                        (true, Some(ms)) => marked_ms = Some(marked_ms.map_or(ms, |m: i64| m.min(ms))),
+                        _ => {
+                            if !unmarked.contains(ccy) {
+                                unmarked.push(ccy.clone());
+                            }
+                        }
+                    }
+                }
+                line.equity - line.floating + floating
+            } else {
+                // A leg with no floating figure at all: the currency stays
+                // exactly as pushed.
+                unmarked.push(ccy.clone());
+                line.equity
+            };
+            match (total.as_mut(), rate) {
+                (Some(total), Some(rate)) => *total += (equity - line.equity) * rate,
+                _ if (equity - line.equity).abs() > 1e-9 => {
+                    if !unmarked.contains(ccy) {
+                        unmarked.push(ccy.clone());
+                    }
+                }
+                _ => {}
+            }
+            balances.push(BalanceView { ccy: ccy.clone(), equity, equity_usd: rate.map(|r| equity * r), available: line.available });
+        }
+        // A leg settled in a currency the push did not list has its floating
+        // profit nowhere in the total.
+        for (row, _) in legs {
+            if let Some(ccy) = &row.settlement_currency {
+                if !self.account.currencies.contains_key(ccy) && !unmarked.contains(ccy) {
+                    unmarked.push(ccy.clone());
+                }
+            }
+        }
+        let equity = match (total, self.account.total_usd) {
+            (Some(usd), Some(pushed_usd)) => Some(EquityView {
+                usd,
+                pushed_usd,
+                pushed_ms,
+                marked_ms,
+                marked_stale_after_ms: Renewal::OkxMark.stale_after_ms(),
+                pushed_stale_after_ms: self.push_renewal().map(Renewal::stale_after_ms),
+                unmarked,
+            }),
+            _ => None,
+        };
+        (equity, balances)
+    }
+
+    /// Whether the app should read positions through the CLI: the private
+    /// socket refused, is off, or has been down past its grace.
+    fn fallback_needed(&self, now: i64) -> bool {
+        match self.feeds.get(&Feed::OkxPrivate).map(|h| &h.state) {
             Some(FeedState::Live) => false,
             Some(FeedState::Refused(_)) | Some(FeedState::Off(_)) | None => true,
             _ => self.private_down_since.is_some_and(|since| now - since > PRIVATE_GRACE_MS),
+        }
+    }
+
+    /// What renews the account's pushed figures: the private socket, or the
+    /// app's CLI reads while it is down. None while nothing is read.
+    fn push_renewal(&self) -> Option<Renewal> {
+        match self.risk_source {
+            RiskSource::Private => Some(Renewal::Frames(Feed::OkxPrivate)),
+            RiskSource::Cli => Some(Renewal::CliFallback),
+            RiskSource::None(_) => None,
+        }
+    }
+
+    fn source(&self) -> (&'static str, Option<String>) {
+        match &self.risk_source {
+            RiskSource::Private => ("okx.private", None),
+            RiskSource::Cli => ("cli", Some("私有推送不可用，经 okx CLI 读取".to_string())),
+            RiskSource::None(why) => ("none", Some(why.clone())),
+        }
+    }
+
+    /// Everything the app shows about the account, valued now. Published on
+    /// its own (`Engine::account`) for every screen, and inside the checkup
+    /// snapshot.
+    fn account_view(&self, now: i64) -> AccountView {
+        let (source, note) = self.source();
+        let legs: Vec<(&PositionRow, Valued)> = self.positions.values().map(|row| (row, self.value_leg(row))).collect();
+        let (equity, balances) = self.equity_now(&legs);
+        let account_feeds = [Feed::OkxPrivate, Feed::OkxMarks, Feed::OkxOrders, Feed::OkxOrderEvents, Feed::OkxTransfers, Feed::Clock];
+        AccountView {
+            mode: self.config.mode.clone(),
+            source,
+            note,
+            fallback_needed: self.fallback_needed(now),
+            positions_ms: self.positions_ms(),
+            positions_stale_after_ms: PRIVATE_GRACE_MS + Renewal::CliFallback.interval().as_millis() as i64,
+            equity,
+            balances,
+            positions: legs.iter().map(|(row, valued)| self.holding_view(row, valued)).collect(),
+            transfers: TransfersView {
+                items: self.transfers.as_ref().map(|(listing, _)| listing.items.clone()).unwrap_or_default(),
+                complete: self.transfers.as_ref().is_none_or(|(listing, _)| listing.complete),
+                read_ms: self.transfers.as_ref().map(|(_, ms)| self.to_server(*ms)),
+                error: self.transfers_error.clone(),
+                stale_after_ms: Feed::OkxTransfers.stale_after_ms(),
+            },
+            orders: OrdersView {
+                items: self.orders.as_ref().map(|(listing, _)| listing.orders.clone()),
+                unavailable: self.orders.as_ref().map(|(listing, _)| listing.unavailable.clone()).unwrap_or_default(),
+                read_ms: self.orders.as_ref().map(|(_, ms)| self.to_server(*ms)),
+                error: self.orders_error.clone(),
+                stale_after_ms: Feed::OkxOrders.stale_after_ms(),
+            },
+            clock: self.clock_view(),
+            feeds: self.feed_views().into_iter().filter(|f| account_feeds.iter().any(|a| a.id() == f.id)).collect(),
+            events: self.event_views(),
+        }
+    }
+
+    fn holding_view(&self, row: &PositionRow, valued: &Valued) -> HoldingView {
+        HoldingView::of(row, valued)
+    }
+
+    /// The account document alone, for `Engine::account`.
+    pub(crate) fn account_json(&self, now: i64) -> String {
+        serde_json::to_string(&self.account_view(now)).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+    }
+}
+
+impl HoldingView {
+    /// A position as the venue pushed it, valued at its own figures — the
+    /// shape every reader of a position document gets, from a REST read as
+    /// much as from the stream.
+    pub(crate) fn as_pushed(row: &PositionRow) -> HoldingView {
+        let valued = Valued {
+            mark: row.mark_price.map(|price| MarkView::pushed(price, row.pushed_ms, None)),
+            upl: row.unrealised_pnl,
+            upl_ratio: row.unrealised_ratio,
+            notional_usd: row.notional_usd,
+            remarked: false,
+            note: None,
         };
+        HoldingView::of(row, &valued)
+    }
+
+    fn of(row: &PositionRow, valued: &Valued) -> HoldingView {
+        HoldingView {
+            key: row.key.clone(),
+            inst_id: row.inst_id.clone(),
+            inst_type: row.inst_type.clone(),
+            pos_side: row.pos_side.clone(),
+            margin_mode: row.margin_mode.clone(),
+            contracts: row.contracts,
+            average_price: row.average_price,
+            mark: valued.mark.clone(),
+            unrealised_pnl: valued.upl,
+            unrealised_ratio: valued.upl_ratio,
+            notional_usd: valued.notional_usd,
+            remarked: valued.remarked,
+            note: valued.note.clone(),
+            pushed_unrealised_pnl: row.unrealised_pnl,
+            leverage: row.leverage,
+            liquidation_price: row.liquidation_price,
+            margin: row.margin,
+            maintenance_margin: row.maintenance_margin,
+            margin_ratio: row.margin_ratio,
+            funding_fee: row.funding_fee,
+            settlement_currency: row.settlement_currency.clone(),
+            usd_rate: row.usd_rate,
+            updated_ms: row.updated_ms,
+        }
+    }
+}
+
+impl BalanceView {
+    /// A balance line as the venue stated it — the shape every reader of a
+    /// balance document gets.
+    pub(crate) fn as_read(balance: &super::okx::Balance) -> BalanceView {
+        BalanceView { ccy: balance.ccy.clone(), equity: balance.total, equity_usd: balance.valuation_usd, available: Some(balance.available) }
+    }
+}
+
+impl State {
+    fn risk_view(&self, now: i64, smiles: &BTreeMap<i64, LiveSmile>) -> RiskView {
+        let (source, note) = self.source();
+        let fallback_needed = self.fallback_needed(now);
+        let valued: Vec<(&PositionRow, Valued)> = self.positions.values().map(|row| (row, self.value_leg(row))).collect();
+        let (equity_now, _) = self.equity_now(&valued);
         let mut held: Vec<String> = Vec::new();
         for row in self.positions.values() {
             if !held.contains(&row.inst_id) {
@@ -1106,51 +1564,49 @@ impl State {
             note,
             fallback_needed,
             inst_id: self.inst_id.clone(),
-            positions_ms: self.positions_local_ms.map(|ms| self.to_server(ms)),
+            positions_ms: self.positions_ms(),
+            positions_stale_after_ms: self.push_renewal().map(Renewal::stale_after_ms),
             held,
             positions: Vec::new(),
             mark: None,
-            equity: self.equity.map(|(value, ms)| StampView { value, ms: self.to_server(ms) }),
+            equity: equity_now.as_ref().and_then(|e| match e.marked_ms {
+                Some(ms) => Some(StampView::new(e.usd, ms, Renewal::OkxMark)),
+                None => self.push_renewal().map(|renewal| StampView::new(e.usd, e.pushed_ms, renewal)),
+            }),
             exposure: None,
             unattached_orders: Vec::new(),
-            stops_ms: self.stops.as_ref().map(|(_, ms)| self.to_server(*ms)),
-            stops_stale_after_ms: Feed::OkxStops.stale_after_ms(),
-            stops_error: self.stops_error.clone(),
+            stops_ms: self.orders.as_ref().map(|(_, ms)| self.to_server(*ms)),
+            stops_stale_after_ms: Feed::OkxOrders.stale_after_ms(),
+            stops_error: self.orders_error.clone(),
         };
         // One instrument can hold more than one leg — a long/short account
         // holds both sides of it at once — and every leg is shown: a page
         // that picked one would hide the other leg's liquidation price.
-        let mut legs: Vec<&PositionRow> = self.positions.values().filter(|r| r.inst_id == self.inst_id).collect();
+        let mut legs: Vec<&(&PositionRow, Valued)> = valued.iter().filter(|(r, _)| r.inst_id == self.inst_id).collect();
         if legs.is_empty() {
             return view;
         }
-        legs.sort_by_key(|r| (r.contracts < 0.0, r.key.clone()));
-        // One instrument, one mark: the live stream, else the last push.
-        view.mark = match self.okx_mark {
-            Some(live) => Some(MarkView { price: live.value, ms: Some(live.ms), source: "okx.mark-price" }),
-            None => legs.iter().find_map(|r| r.mark_price).map(|price| MarkView {
-                price,
-                ms: self.positions_local_ms.map(|ms| self.to_server(ms)),
-                source: "position",
-            }),
-        };
+        legs.sort_by_key(|(r, _)| (r.contracts < 0.0, r.key.clone()));
+        // One instrument, one mark: every leg is valued at the same one, the
+        // account environment's stream, else the last push.
+        view.mark = legs.iter().find_map(|(_, v)| v.mark.clone());
         let mark = view.mark.as_ref().map(|m| m.price);
         // Each horizon reads total variance blended between the expiries
         // either side of it — see `implied::term_smile`.
         let mut by_maturity: Vec<(i64, &Smile)> = smiles.iter().map(|(expiry, live)| (*expiry, &live.smile)).collect();
         by_maturity.sort_by(|a, b| a.1.years().total_cmp(&b.1.years()));
         let orders: Vec<&WorkingOrder> =
-            self.stops.iter().flat_map(|(orders, _)| orders.iter()).filter(|o| o.inst_id == self.inst_id).collect();
+            self.protection().into_iter().filter(|o| o.inst_id == self.inst_id).collect();
         let (mut long_notional, mut short_notional, mut margin) = (0.0, 0.0, 0.0);
-        for row in &legs {
+        for (row, valued) in &legs {
             let is_long = row.contracts > 0.0;
-            let notional = row.notional_usd.unwrap_or(0.0).abs();
+            let notional = valued.notional_usd.unwrap_or(0.0).abs();
             if is_long { long_notional += notional } else { short_notional += notional }
             margin += row.margin.unwrap_or(0.0);
             let leg = PosSide::from_venue(Some(&row.pos_side));
             let closing: Vec<&WorkingOrder> =
                 orders.iter().copied().filter(|o| leg.is_some_and(|leg| o.closes(&row.inst_id, leg, is_long))).collect();
-            view.positions.push(self.leg_view(row, mark, &by_maturity, &closing));
+            view.positions.push(self.leg_view(row, valued, mark, &by_maturity, &closing));
         }
         // Orders on this instrument that close no held leg: an entry trigger,
         // or protection left behind by a leg since closed. Listed, so a stop
@@ -1158,13 +1614,13 @@ impl State {
         view.unattached_orders = orders
             .iter()
             .filter(|o| {
-                !legs.iter().any(|r| {
+                !legs.iter().any(|(r, _)| {
                     PosSide::from_venue(Some(&r.pos_side)).is_some_and(|leg| o.closes(&r.inst_id, leg, r.contracts > 0.0))
                 })
             })
             .map(|o| order_view(o))
             .collect();
-        if let Some((equity, _)) = self.equity {
+        if let Some(equity) = equity_now.map(|e| e.usd) {
             let exposure = gravity::Exposure { long_notional, short_notional, equity, margin };
             view.exposure = Some(ExposureView {
                 long_notional,
@@ -1185,10 +1641,10 @@ impl State {
 
     /// One leg as the page shows it: its own liquidation price, buffer and
     /// odds, and the orders that close it.
-    fn leg_view(&self, row: &PositionRow, mark: Option<f64>, by_maturity: &[(i64, &Smile)], closing: &[&WorkingOrder]) -> PositionView {
+    fn leg_view(&self, row: &PositionRow, valued: &Valued, mark: Option<f64>, by_maturity: &[(i64, &Smile)], closing: &[&WorkingOrder]) -> PositionView {
         let is_short = row.contracts < 0.0;
-        let notional = row.notional_usd.unwrap_or(0.0).abs();
-        let base_quantity = match row.mark_price.or(mark) {
+        let notional = valued.notional_usd.unwrap_or(0.0).abs();
+        let base_quantity = match mark.or(row.mark_price) {
             Some(m) if m > 0.0 => notional / m,
             _ => 0.0,
         };
@@ -1223,7 +1679,9 @@ impl State {
             base_quantity,
             is_short,
             average_price: row.average_price,
-            unrealised_pnl: row.unrealised_pnl,
+            unrealised_pnl: valued.upl,
+            unrealised_ratio: valued.upl_ratio,
+            remarked: valued.remarked,
             liquidation_price: row.liquidation_price,
             liquidation_buffer_pct: match (mark, row.liquidation_price) {
                 (Some(m), Some(liq)) => gravity::liquidation_buffer(m, liq, is_short),
@@ -1234,8 +1692,9 @@ impl State {
             maintenance_margin: row.maintenance_margin,
             margin_ratio: row.margin_ratio,
             leverage_setting: row.leverage,
-            notional_usd: row.notional_usd,
+            notional_usd: valued.notional_usd,
             funding_fee: row.funding_fee,
+            settlement_currency: row.settlement_currency.clone(),
             protective: row
                 .protective
                 .iter()
@@ -1256,13 +1715,18 @@ impl State {
     }
 
     fn okx_structure(&self, now: i64) -> VenueStructure {
-        let live_oi = self.okx_oi.map(|o| (o.base, o.ms));
+        let live_oi = self.okx_oi.map(|o| (o.base, o.ms, Renewal::OkxOpenInterest));
         let mut venue = structure_from(&self.okx_history, live_oi, "OKX", self.inst_id.clone());
-        venue.price = self.okx_last.map(stamp_view);
-        venue.mark = self.okx_mark.map(stamp_view);
-        venue.funding_rate = self.okx_funding.as_ref().map(|f| StampView { value: f.rate, ms: f.ms });
+        venue.price = self.okx_last.map(|s| stamp_view(s, Renewal::Frames(Feed::OkxPublic)));
+        venue.mark = self.okx_mark.map(|s| stamp_view(s, Renewal::OkxMark));
+        venue.funding_rate = self.okx_funding.as_ref().map(|f| StampView::new(f.rate, f.ms, Renewal::OkxFunding));
         venue.next_funding_ms = self.okx_funding.as_ref().and_then(|f| f.next_ms);
-        venue.open_interest = self.okx_oi.map(|o| OiView { base: o.base, usd: o.usd, ms: o.ms });
+        venue.open_interest = self.okx_oi.map(|o| OiView {
+            base: o.base,
+            usd: o.usd,
+            ms: o.ms,
+            stale_after_ms: Renewal::OkxOpenInterest.stale_after_ms(),
+        });
         let window: Vec<&TradePrint> = self.okx_trades.iter().filter(|t| t.ms >= now - TAKER_WINDOW_MS).collect();
         let (buy, sell) = window.iter().fold((0.0, 0.0), |(b, s), t| if t.buy { (b + t.contracts, s) } else { (b, s + t.contracts) });
         if sell > 0.0 {
@@ -1271,26 +1735,29 @@ impl State {
                 window_seconds: ((now - self.trades_since_ms.unwrap_or(now)).min(TAKER_WINDOW_MS) / 1000) as f64,
                 trades: window.len(),
                 ms: window.last().map(|t| t.ms).unwrap_or(now),
+                stale_after_ms: Feed::OkxPublic.stale_after_ms(),
             });
         }
         venue
     }
 
     fn binance_structure(&self, _now: i64) -> VenueStructure {
-        let live_oi = self.binance_oi.map(|o| (o.base, o.ms));
+        let oi_renewal = Renewal::Frames(Feed::BinanceOpenInterest);
+        let live_oi = self.binance_oi.map(|o| (o.base, o.ms, oi_renewal));
         let mut venue = structure_from(&self.binance_history, live_oi, "Binance", binance::symbol_for(&self.inst_id));
+        let stream = Renewal::Frames(Feed::BinanceStream);
         if let Some(mark) = &self.binance_mark {
-            venue.price = Some(StampView { value: mark.mark, ms: mark.ms });
-            venue.mark = Some(StampView { value: mark.mark, ms: mark.ms });
-            venue.funding_rate = mark.funding_rate.map(|r| StampView { value: r, ms: mark.ms });
+            venue.price = Some(StampView::new(mark.mark, mark.ms, stream));
+            venue.mark = Some(StampView::new(mark.mark, mark.ms, stream));
+            venue.funding_rate = mark.funding_rate.map(|r| StampView::new(r, mark.ms, stream));
             venue.next_funding_ms = mark.next_funding_ms;
-            if let Some(oi) = self.binance_oi {
-                venue.open_interest = Some(OiView { base: oi.base, usd: Some(oi.base * mark.mark), ms: oi.ms });
-            }
         }
-        if venue.open_interest.is_none() {
-            venue.open_interest = self.binance_oi.map(|o| OiView { base: o.base, usd: None, ms: o.ms });
-        }
+        venue.open_interest = self.binance_oi.map(|oi| OiView {
+            base: oi.base,
+            usd: self.binance_mark.as_ref().map(|mark| oi.base * mark.mark),
+            ms: oi.ms,
+            stale_after_ms: oi_renewal.stale_after_ms(),
+        });
         venue
     }
 
@@ -1315,6 +1782,7 @@ impl State {
                         _ => None,
                     },
                     ms,
+                    stale_after_ms: Feed::Schwab.stale_after_ms(),
                     delayed,
                     source: "schwab",
                 }
@@ -1336,6 +1804,7 @@ impl State {
                         price: quote.map(|q| q.price * instrument.scale),
                         change_pct: quote.and_then(|q| q.previous_close.filter(|c| *c > 0.0).map(|c| (q.price / c - 1.0) * 100.0)),
                         ms: quote.map(|q| q.ms),
+                        stale_after_ms: Feed::Yahoo.stale_after_ms(),
                         delayed: true,
                         source: "yahoo",
                     }
@@ -1346,10 +1815,9 @@ impl State {
         MacroView { source: "none", note: Some("宏观数据源都还没有数据".into()), rows: schwab_rows }
     }
 
-    /// Every declared topic, read or not: one never read says so rather than
-    /// vanishing from the card.
-    /// Every declared topic, the coming week's first — soonest to settle
-    /// leading — then the rest in declaration order. A market past its
+    /// Every declared topic, read or not — one never read says so rather than
+    /// vanishing from the card — the coming week's first, soonest to settle
+    /// leading, then the rest in declaration order. A market past its
     /// deadline is decided and waiting on the oracle: it is counted, not
     /// shown as a forecast.
     fn prediction_view(&self, now: i64) -> PredictionView {
@@ -1498,21 +1966,26 @@ fn interests(legs: &[&Leg]) -> Vec<StrikeInterest> {
     by_strike.into_values().collect()
 }
 
-fn stamp_view(stamp: Stamp) -> StampView {
-    StampView { value: stamp.value, ms: stamp.ms }
+fn stamp_view(stamp: Stamp, renewal: Renewal) -> StampView {
+    StampView::new(stamp.value, stamp.ms, renewal)
 }
 
 /// A venue's positioning card from its five-minute history and, when one
 /// streams, its live open interest.
-fn structure_from(history: &History, live_oi: Option<(f64, i64)>, venue: &'static str, symbol: String) -> VenueStructure {
-    let latest = |kind: HistoryKind| history.series.get(&kind).and_then(|s| s.last()).map(|(ms, v)| StampView { value: *v, ms: *ms });
+fn structure_from(history: &History, live_oi: Option<(f64, i64, Renewal)>, venue: &'static str, symbol: String) -> VenueStructure {
+    let latest = |kind: HistoryKind| history.series.get(&kind).and_then(|s| s.last()).map(|(ms, v)| StampView::new(*v, *ms, Renewal::Bucket));
     let oi_series = history.series.get(&HistoryKind::OpenInterest);
-    let now_oi = live_oi.or_else(|| oi_series.and_then(|s| s.last()).map(|(ms, v)| (*v, *ms)));
+    let now_oi = live_oi.or_else(|| oi_series.and_then(|s| s.last()).map(|(ms, v)| (*v, *ms, Renewal::Bucket)));
     let change = |hours: i64| -> Option<ChangeView> {
-        let (current, at) = now_oi?;
+        let (current, at, renewal) = now_oi?;
         let target = at - hours * HOUR_MS;
         let (reference_ms, reference) = oi_series?.iter().rev().find(|(ms, _)| *ms <= target)?;
-        (*reference > 0.0).then(|| ChangeView { pct: (current / reference - 1.0) * 100.0, reference_ms: *reference_ms, current_ms: at })
+        (*reference > 0.0).then(|| ChangeView {
+            pct: (current / reference - 1.0) * 100.0,
+            reference_ms: *reference_ms,
+            current_ms: at,
+            stale_after_ms: renewal.stale_after_ms(),
+        })
     };
     let mut errors: Vec<String> = history.errors.iter().map(|(k, e)| format!("{}：{e}", k.topic())).collect();
     errors.sort();
@@ -1567,6 +2040,9 @@ struct Snapshot {
     network: Option<NetworkView>,
     events: Vec<EventView>,
     spot: Option<SpotView>,
+    /// The whole account, valued now — the same document every other screen
+    /// reads (`Engine::account`).
+    account: AccountView,
     risk: RiskView,
     structure: Vec<VenueStructure>,
     gravity: GravityView,
@@ -1574,6 +2050,142 @@ struct Snapshot {
     #[serde(rename = "macro")]
     macro_tape: MacroView,
     predictions: PredictionView,
+}
+
+/// One leg valued now (`State::value_leg`).
+#[derive(Debug, Clone)]
+struct Valued {
+    mark: Option<MarkView>,
+    /// In the leg's settlement currency.
+    upl: Option<f64>,
+    /// The venue's return on the leg, a fraction.
+    upl_ratio: Option<f64>,
+    notional_usd: Option<f64>,
+    /// Taken at the streamed mark, not the venue's last push.
+    remarked: bool,
+    /// Why the venue's pushed figures stand, when they do and should not.
+    note: Option<String>,
+}
+
+/// The account as every screen shows it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountView {
+    /// `live` or `demo`: which account this is.
+    mode: String,
+    /// `okx.private`, `cli`, or `none`.
+    source: &'static str,
+    note: Option<String>,
+    /// The private socket is down: the app should read through the CLI.
+    fallback_needed: bool,
+    /// When positions were last read, on the venue's clock. None means never
+    /// read — which is not the same as holding nothing.
+    positions_ms: Option<i64>,
+    /// Past this age the list of positions is too old to be the account's
+    /// reading, and the app reads the account over REST in its place: the
+    /// socket's grace before the CLI fallback starts, plus one fallback read.
+    positions_stale_after_ms: i64,
+    equity: Option<EquityView>,
+    /// Each currency of the trading account, valued now.
+    balances: Vec<BalanceView>,
+    positions: Vec<HoldingView>,
+    transfers: TransfersView,
+    orders: OrdersView,
+    clock: Option<ClockView>,
+    /// The feeds the account is read through.
+    feeds: Vec<FeedView>,
+    events: Vec<EventView>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+struct EquityView {
+    /// Dollars, now: cash and margin as last pushed plus every leg's
+    /// floating profit at the marks just streamed.
+    usd: f64,
+    /// The venue's own total, as pushed.
+    pushed_usd: f64,
+    /// When the account was last pushed, on the venue's clock.
+    pushed_ms: i64,
+    /// The oldest mark the floating part was taken at; None when no leg was
+    /// valued at a streamed mark.
+    marked_ms: Option<i64>,
+    /// Past these ages `marked_ms` and `pushed_ms` read stale: the marks'
+    /// stream, and whatever renews the push (`Renewal`).
+    marked_stale_after_ms: i64,
+    pushed_stale_after_ms: Option<i64>,
+    /// Currencies whose floating profit stands as pushed.
+    unmarked: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BalanceView {
+    ccy: String,
+    /// Cash plus margin plus floating profit, valued now (`eq`).
+    equity: f64,
+    equity_usd: Option<f64>,
+    available: Option<f64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct HoldingView {
+    key: String,
+    inst_id: String,
+    inst_type: String,
+    pos_side: String,
+    margin_mode: Option<String>,
+    contracts: f64,
+    average_price: Option<f64>,
+    /// The mark the figures below were taken at.
+    mark: Option<MarkView>,
+    /// In `settlement_currency`, at `mark`.
+    unrealised_pnl: Option<f64>,
+    unrealised_ratio: Option<f64>,
+    notional_usd: Option<f64>,
+    remarked: bool,
+    note: Option<String>,
+    /// The venue's own figure as last pushed, for comparison.
+    pushed_unrealised_pnl: Option<f64>,
+    leverage: Option<f64>,
+    liquidation_price: Option<f64>,
+    margin: Option<f64>,
+    maintenance_margin: Option<f64>,
+    margin_ratio: Option<f64>,
+    funding_fee: Option<f64>,
+    settlement_currency: Option<String>,
+    usd_rate: Option<f64>,
+    updated_ms: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OrdersView {
+    /// Every order working on the account, newest first; None until the
+    /// listing has been read — which is not the same as none armed.
+    items: Option<Vec<WorkingOrder>>,
+    /// Books the listing could not read.
+    unavailable: Vec<String>,
+    read_ms: Option<i64>,
+    /// Why the last read failed, if it did; the list above is the last good one.
+    error: Option<String>,
+    stale_after_ms: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TransfersView {
+    /// Every transfer bill of the trading account over the lookback, newest
+    /// first, each with what it is to a period's result (`kind`).
+    items: Vec<reads::Transfer>,
+    /// False when the listing stopped before reaching the lookback's start.
+    complete: bool,
+    /// When the list was read, on the venue's clock; None until it has been.
+    read_ms: Option<i64>,
+    /// Why the last read failed, if it did; the list above is the last good one.
+    error: Option<String>,
+    stale_after_ms: i64,
 }
 
 #[derive(Serialize)]
@@ -1641,6 +2253,14 @@ struct SpotView {
 struct StampView {
     value: f64,
     ms: i64,
+    /// Past this age the value reads stale (`Renewal`).
+    stale_after_ms: i64,
+}
+
+impl StampView {
+    fn new(value: f64, ms: i64, renewal: Renewal) -> StampView {
+        StampView { value, ms, stale_after_ms: renewal.stale_after_ms() }
+    }
 }
 
 #[derive(Serialize)]
@@ -1651,6 +2271,9 @@ struct RiskView {
     fallback_needed: bool,
     inst_id: String,
     positions_ms: Option<i64>,
+    /// Past this age `positions_ms` reads stale: the private socket's, or the
+    /// CLI fallback's while that is the source. None while nothing is read.
+    positions_stale_after_ms: Option<i64>,
     /// Every instrument the account holds, each once.
     held: Vec<String>,
     /// Every leg held on `inst_id`, longs first: one on a one-way account,
@@ -1669,13 +2292,29 @@ struct RiskView {
     stops_error: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 struct MarkView {
     price: f64,
     ms: Option<i64>,
     /// `okx.mark-price` (the live stream) or `position` (the last push).
     source: &'static str,
+    /// Past this age the mark reads stale: the stale age of whatever renews
+    /// it (`Renewal`). None for a document handed in to be parsed, whose
+    /// renewal is the caller's.
+    stale_after_ms: Option<i64>,
+}
+
+impl MarkView {
+    /// A mark the venue's position push carried, renewed as that push is.
+    fn pushed(price: f64, ms: Option<i64>, renewal: Option<Renewal>) -> MarkView {
+        MarkView { price, ms, source: "position", stale_after_ms: renewal.map(Renewal::stale_after_ms) }
+    }
+
+    /// A mark the account's own mark-price stream delivered.
+    fn streamed(price: f64, ms: i64) -> MarkView {
+        MarkView { price, ms: Some(ms), source: "okx.mark-price", stale_after_ms: Some(Renewal::OkxMark.stale_after_ms()) }
+    }
 }
 
 #[derive(Serialize)]
@@ -1691,7 +2330,13 @@ struct PositionView {
     base_quantity: f64,
     is_short: bool,
     average_price: Option<f64>,
+    /// At `RiskView::mark`, the same mark the buffer is read at.
     unrealised_pnl: Option<f64>,
+    /// The venue's return on the leg (a fraction), at that mark.
+    unrealised_ratio: Option<f64>,
+    /// Whether the two above were taken at the streamed mark rather than
+    /// the venue's last push.
+    remarked: bool,
     liquidation_price: Option<f64>,
     liquidation_buffer_pct: Option<f64>,
     liquidation_odds: Vec<OddsView>,
@@ -1701,6 +2346,8 @@ struct PositionView {
     leverage_setting: Option<f64>,
     notional_usd: Option<f64>,
     funding_fee: Option<f64>,
+    /// What the leg's profit, margin and funding are stated in (`ccy`).
+    settlement_currency: Option<String>,
     protective: Vec<ProtectiveView>,
     updated_ms: Option<i64>,
 }
@@ -1807,6 +2454,7 @@ struct OiView {
     base: f64,
     usd: Option<f64>,
     ms: i64,
+    stale_after_ms: i64,
 }
 
 #[derive(Serialize)]
@@ -1815,6 +2463,8 @@ struct ChangeView {
     pct: f64,
     reference_ms: i64,
     current_ms: i64,
+    /// The stale age of the live end, `current_ms`.
+    stale_after_ms: i64,
 }
 
 #[derive(Serialize)]
@@ -1824,6 +2474,7 @@ struct LiveTakerView {
     window_seconds: f64,
     trades: usize,
     ms: i64,
+    stale_after_ms: i64,
 }
 
 #[derive(Serialize)]
@@ -1904,7 +2555,9 @@ struct StrikeRowView {
 struct ProbabilityView {
     smile_venue: &'static str,
     surface_ms: Option<i64>,
+    surface_stale_after_ms: i64,
     index_ms: Option<i64>,
+    index_stale_after_ms: i64,
     spot: Option<f64>,
     /// The divisor in force — the configured one, or 1 when that one is not
     /// on offer.
@@ -2032,6 +2685,7 @@ struct MacroRowView {
     price: Option<f64>,
     change_pct: Option<f64>,
     ms: Option<i64>,
+    stale_after_ms: i64,
     delayed: bool,
     source: &'static str,
 }
@@ -2096,7 +2750,7 @@ mod tests {
             assert_eq!(view["staleAfterMs"], (feed.cadence() * super::super::STALE_AFTER).as_millis() as i64);
         }
         assert_eq!(snapshot["gravity"]["bookStaleAfterMs"], feed(&snapshot, "options.book")["staleAfterMs"], "the book's age and its feed's age go stale together");
-        assert_eq!(snapshot["risk"]["stopsStaleAfterMs"], Feed::OkxStops.stale_after_ms(), "so do the stops' and theirs");
+        assert_eq!(snapshot["risk"]["stopsStaleAfterMs"], Feed::OkxOrders.stale_after_ms(), "so do the stops' and their listing's");
     }
 
     #[test]
@@ -2415,7 +3069,7 @@ mod tests {
             {"algoId":"ADD-SHORT","instId":"ETH-USDT-SWAP","ordType":"conditional","side":"sell","posSide":"short","sz":"10","slTriggerPx":"2500","slOrdPx":"-1","state":"live"},
             {"algoId":"OTHER","instId":"BTC-USDT-SWAP","ordType":"conditional","side":"sell","posSide":"long","sz":"1","slTriggerPx":"80000","slOrdPx":"-1","state":"live"}
         ]}"#;
-        state.ingest("rest.okx.stops", stops, NOW).unwrap();
+        state.ingest("rest.okx.orders", stops, NOW).unwrap();
         let snapshot = snapshot(&state, NOW);
         let ids = |orders: &Value| -> Vec<String> { orders.as_array().unwrap().iter().map(|o| o["algoId"].as_str().unwrap().to_string()).collect() };
         let legs = snapshot["risk"]["positions"].as_array().unwrap();
@@ -2437,7 +3091,7 @@ mod tests {
             {"algoId":"STOP","instId":"ETH-USDT-SWAP","ordType":"conditional","side":"buy","posSide":"net","sz":"12","slTriggerPx":"2700","slOrdPx":"-1","state":"live"},
             {"algoId":"ADD","instId":"ETH-USDT-SWAP","ordType":"conditional","side":"sell","sz":"5","slTriggerPx":"2500","slOrdPx":"-1","state":"live"}
         ]}"#;
-        state.ingest("rest.okx.stops", stops, NOW).unwrap();
+        state.ingest("rest.okx.orders", stops, NOW).unwrap();
         let snapshot = snapshot(&state, NOW);
         let legs = snapshot["risk"]["positions"].as_array().unwrap();
         assert_eq!(legs.len(), 1);
@@ -2449,7 +3103,8 @@ mod tests {
     /// has to be listed.
     fn listed(feed: Feed) -> bool {
         match feed {
-            Feed::OkxPublic | Feed::OkxPrivate | Feed::OkxStops | Feed::OkxBook | Feed::Deribit | Feed::BinanceStream
+            Feed::OkxPublic | Feed::OkxPrivate | Feed::OkxOrders | Feed::OkxOrderEvents | Feed::OkxMarks | Feed::OkxTransfers | Feed::OkxBook
+            | Feed::Deribit | Feed::BinanceStream
             | Feed::Schwab | Feed::OptionBook | Feed::OkxHistory | Feed::BinanceHistory | Feed::BinanceOpenInterest
             | Feed::Clock | Feed::Yahoo | Feed::Polymarket => Feed::ALL.contains(&feed),
         }
@@ -2518,5 +3173,238 @@ mod tests {
         assert!(!state.feeds[&feed].is_failing(), "data after the failure is");
         state.apply(Update::Health { feed, state: FeedState::Off("未配置".into()) }, NOW + 3);
         assert!(!state.feeds[&feed].is_failing(), "a feed switched off on purpose says nothing about the network");
+    }
+
+    // MARK: - The account, valued now
+
+    /// The live account on 2026-10-08, read from `account/positions` and
+    /// `account/balance` at the same moment: one isolated 10× long, settled
+    /// in USDT. The balance line's `upl` is the position's, so the push is
+    /// self-consistent the way a socket push is.
+    const LIVE_LONG: &str = r#"{"data":[{"posId":"3850130992917417984","instId":"ETH-USDT-SWAP","instType":"SWAP","posSide":"long","pos":"214.97","avgPx":"2558.0145621063081902","markPx":"2535.78","upl":"-477.97638159930744","uplRatio":"-0.0869211709568996","lever":"10","liqPx":"2284.477497196275","notionalUsd":"54470.2337963784","mgnMode":"isolated","margin":"6098.9771845241544863","mmr":"218.04665064","mgnRatio":"23.172036702068194","ccy":"USDT","usdPx":"0.99924","pTime":"1790164800000"}]}"#;
+    const LIVE_BALANCE: &str = r#"{"data":[{"totalEq":"8484.733987517242","details":[
+        {"ccy":"USDT","eq":"8491.264868898954","eqUsd":"8484.726594949901","upl":"-477.97638159930744","availBal":"2871.338915974109","cashBal":"2871.338915974109"},
+        {"ccy":"ETH","eq":"0.0000015300209555","eqUsd":"0.0038786796232403","upl":"0","availBal":"0.0000015300209555"}]}]}"#;
+    const ETH_SWAP_SPEC: &str = r#"{"code":"0","data":[{"instId":"ETH-USDT-SWAP","instType":"SWAP","tickSz":"0.01","lotSz":"0.01","minSz":"0.01","ctVal":"0.1","ctMult":"1","ctType":"linear","ctValCcy":"ETH","settleCcy":"USDT","state":"live"}]}"#;
+    const AVERAGE: f64 = 2558.0145621063081902;
+
+    fn mark_frame(price: f64, ms: i64) -> String {
+        format!(r#"{{"arg":{{"channel":"mark-price","instId":"ETH-USDT-SWAP"}},"data":[{{"instType":"SWAP","instId":"ETH-USDT-SWAP","markPx":"{price}","ts":"{ms}"}}]}}"#)
+    }
+
+    fn live_long() -> State {
+        let mut state = state();
+        state.ingest("cli.positions", LIVE_LONG, NOW).unwrap();
+        state.ingest("cli.account", LIVE_BALANCE, NOW).unwrap();
+        state
+    }
+
+    fn account(state: &State, now: i64) -> Value {
+        serde_json::from_str(&state.account_json(now)).unwrap()
+    }
+
+    #[test]
+    fn a_leg_is_valued_at_the_streamed_mark_by_the_close_tickets_rule() {
+        let mut state = live_long();
+        state.ingest("rest.okx.spec.ETH-USDT-SWAP", ETH_SWAP_SPEC, NOW).unwrap();
+        state.ingest("okx.marks", &mark_frame(2545.78, NOW + 400), NOW + 450).unwrap();
+        let account = account(&state, NOW + 450);
+        let leg = &account["positions"][0];
+        let size = 214.97 * 0.1;
+        let upl = (2545.78 - AVERAGE) * size;
+        assert_eq!(leg["remarked"], true);
+        assert_eq!(leg["mark"]["source"], "okx.mark-price");
+        assert_eq!(leg["mark"]["staleAfterMs"], Feed::OkxMarks.stale_after_ms(), "aged by the feed it arrived on");
+        assert_eq!(leg["mark"]["ms"], NOW + 400, "the mark's own stamp, on the venue's clock");
+        assert!((leg["unrealisedPnl"].as_f64().unwrap() - upl).abs() < 1e-9, "{}", leg["unrealisedPnl"]);
+        // The venue's own return denominator, read off its pushed pair.
+        let ratio = upl * -0.0869211709568996 / -477.97638159930744;
+        assert!((leg["unrealisedRatio"].as_f64().unwrap() - ratio).abs() < 1e-12);
+        assert!((leg["notionalUsd"].as_f64().unwrap() - size * 2545.78 * 0.99924).abs() < 1e-6, "|pos| × ctVal × mark × usdPx");
+        assert_eq!(leg["pushedUnrealisedPnl"].as_f64(), Some(-477.97638159930744));
+
+        // Equity: the push's cash and margin, plus the floating profit now,
+        // valued at the push's own USDT rate.
+        let rate = 8484.726594949901 / 8491.264868898954;
+        let usdt = 8491.264868898954 + 477.97638159930744 + upl;
+        let equity = &account["equity"];
+        assert!((equity["usd"].as_f64().unwrap() - (8484.733987517242 + (usdt - 8491.264868898954) * rate)).abs() < 1e-6);
+        assert_eq!(equity["pushedUsd"].as_f64(), Some(8484.733987517242));
+        assert_eq!(equity["markedMs"], NOW + 400);
+        assert_eq!(equity["unmarked"], serde_json::json!([]));
+        let usdt_line = account["balances"].as_array().unwrap().iter().find(|b| b["ccy"] == "USDT").unwrap();
+        assert!((usdt_line["equity"].as_f64().unwrap() - usdt).abs() < 1e-9);
+        let eth_line = account["balances"].as_array().unwrap().iter().find(|b| b["ccy"] == "ETH").unwrap();
+        assert_eq!(eth_line["equity"].as_f64(), Some(0.0000015300209555), "a currency nothing settles in is as pushed");
+    }
+
+    #[test]
+    fn at_the_venues_own_mark_the_valuation_is_the_venues_figure() {
+        let mut state = live_long();
+        state.ingest("rest.okx.spec.ETH-USDT-SWAP", ETH_SWAP_SPEC, NOW).unwrap();
+        state.ingest("okx.marks", &mark_frame(2535.78, NOW + 100), NOW + 100).unwrap();
+        let account = account(&state, NOW + 100);
+        let leg = &account["positions"][0];
+        assert!((leg["unrealisedPnl"].as_f64().unwrap() - -477.97638159930744).abs() < 1e-6);
+        assert!((leg["unrealisedRatio"].as_f64().unwrap() - -0.0869211709568996).abs() < 1e-12);
+        assert!((leg["notionalUsd"].as_f64().unwrap() - 54470.2337963784).abs() < 1e-3);
+        assert!((account["equity"]["usd"].as_f64().unwrap() - 8484.733987517242).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_push_stands_when_the_stream_has_nothing_newer_or_no_terms() {
+        // A mark older than the push is not newer information.
+        let mut state = live_long();
+        state.ingest("rest.okx.spec.ETH-USDT-SWAP", ETH_SWAP_SPEC, NOW).unwrap();
+        state.ingest("okx.marks", &mark_frame(2600.0, NOW - 1), NOW + 10).unwrap();
+        let leg = &account(&state, NOW + 10)["positions"][0];
+        assert_eq!(leg["remarked"], false);
+        assert_eq!(leg["unrealisedPnl"].as_f64(), Some(-477.97638159930744));
+        assert_eq!(leg["mark"]["source"], "position");
+        assert_eq!(leg["mark"]["staleAfterMs"], Renewal::CliFallback.stale_after_ms(), "read through the CLI, aged by its clock");
+        assert!(leg["note"].is_null(), "the venue's own figure is the freshest; nothing to explain");
+
+        // Terms not read: the venue's figure stands, and says why.
+        let mut state = live_long();
+        state.ingest("okx.marks", &mark_frame(2600.0, NOW + 5), NOW + 10).unwrap();
+        let account = account(&state, NOW + 10);
+        let leg = &account["positions"][0];
+        assert_eq!(leg["remarked"], false);
+        assert!(leg["note"].as_str().unwrap().contains("合约规格"), "{}", leg["note"]);
+        assert_eq!(account["equity"]["unmarked"], serde_json::json!(["USDT"]), "and the equity says which part is as pushed");
+        assert!((account["equity"]["usd"].as_f64().unwrap() - 8484.733987517242).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_real_markets_mark_never_values_the_accounts_positions() {
+        // The reviewed instrument's own socket reads the real market; a demo
+        // account's positions are worth its own marks. Only the account
+        // environment's stream may value them.
+        let mut state = live_long();
+        state.ingest("rest.okx.spec.ETH-USDT-SWAP", ETH_SWAP_SPEC, NOW).unwrap();
+        let public = r#"{"arg":{"channel":"mark-price","instId":"ETH-USDT-SWAP"},"data":[{"instId":"ETH-USDT-SWAP","markPx":"3000","ts":"1790164801000"}]}"#;
+        state.ingest("okx.public", public, NOW + 1_000).unwrap();
+        let leg = &account(&state, NOW + 1_000)["positions"][0];
+        assert_eq!(leg["remarked"], false);
+        assert_eq!(leg["unrealisedPnl"].as_f64(), Some(-477.97638159930744));
+        assert_eq!(snapshot(&state, NOW + 1_000)["structure"][0]["mark"]["value"].as_f64(), Some(3000.0), "it is still the structure card's");
+    }
+
+    #[test]
+    fn the_checkup_reads_the_same_valuation_as_every_other_screen() {
+        let mut state = live_long();
+        state.ingest("rest.okx.spec.ETH-USDT-SWAP", ETH_SWAP_SPEC, NOW).unwrap();
+        state.ingest("okx.marks", &mark_frame(2545.78, NOW + 400), NOW + 450).unwrap();
+        let snapshot = snapshot(&state, NOW + 450);
+        let (risk_leg, account_leg) = (&snapshot["risk"]["positions"][0], &snapshot["account"]["positions"][0]);
+        assert_eq!(risk_leg["unrealisedPnl"], account_leg["unrealisedPnl"]);
+        assert_eq!(risk_leg["unrealisedRatio"], account_leg["unrealisedRatio"]);
+        assert_eq!(risk_leg["notionalUsd"], account_leg["notionalUsd"]);
+        assert_eq!(snapshot["risk"]["mark"]["price"].as_f64(), Some(2545.78), "the buffer and the profit are read at one mark");
+        assert_eq!(snapshot["risk"]["equity"]["value"], snapshot["account"]["equity"]["usd"]);
+        assert_eq!(snapshot["risk"]["exposure"]["equity"], snapshot["account"]["equity"]["usd"]);
+    }
+
+    #[test]
+    fn an_event_push_updates_only_the_currencies_it_names() {
+        let mut state = state();
+        let snapshot_push = r#"{"arg":{"channel":"account"},"eventType":"snapshot","lastPage":true,"data":[{"totalEq":"1000","details":[
+            {"ccy":"USDT","eq":"900","eqUsd":"899.3","upl":"0"},{"ccy":"ETH","eq":"0.04","eqUsd":"100.7","upl":"0"}]}]}"#;
+        state.apply(Update::Frame { feed: Feed::OkxPrivate, text: snapshot_push.into(), received_ms: NOW }, NOW);
+        let event_push = r#"{"arg":{"channel":"account"},"eventType":"event_update","data":[{"totalEq":"1100","details":[
+            {"ccy":"USDT","eq":"1000","eqUsd":"999.2","upl":"0"}]}]}"#;
+        let effects = state.apply(Update::Frame { feed: Feed::OkxPrivate, text: event_push.into(), received_ms: NOW + 1 }, NOW + 1);
+        assert!(effects.contains(&Effect::BalanceMoved), "cash moved: ask for transfers now");
+        let account = account(&state, NOW + 1);
+        let ccys: Vec<&str> = account["balances"].as_array().unwrap().iter().map(|b| b["ccy"].as_str().unwrap()).collect();
+        assert_eq!(ccys, ["ETH", "USDT"], "ETH was not in the event, and is still held");
+        assert_eq!(account["equity"]["pushedUsd"].as_f64(), Some(1100.0));
+        // A push that moved nothing asks for nothing.
+        let again = state.apply(Update::Frame { feed: Feed::OkxPrivate, text: event_push.into(), received_ms: NOW + 2 }, NOW + 2);
+        assert!(!again.contains(&Effect::BalanceMoved));
+    }
+
+    #[test]
+    fn what_is_held_changing_restarts_its_marks_and_reads_new_terms() {
+        let mut state = state();
+        let effects = state.ingest("cli.positions", LIVE_LONG, NOW).unwrap();
+        assert!(effects.contains(&Effect::HeldChanged));
+        assert_eq!(state.held_instruments(), [("ETH-USDT-SWAP".to_string(), "SWAP".to_string())]);
+        assert_eq!(state.terms_wanted().len(), 1);
+        state.ingest("rest.okx.spec.ETH-USDT-SWAP", ETH_SWAP_SPEC, NOW).unwrap();
+        assert!(state.terms_wanted().is_empty(), "read once");
+        let effects = state.ingest("cli.positions", LIVE_LONG, NOW + 2_000).unwrap();
+        assert!(!effects.contains(&Effect::HeldChanged), "the same holdings again restart nothing");
+    }
+
+    #[test]
+    fn transfers_are_listed_newest_first_and_a_failed_read_keeps_the_last() {
+        let mut state = live_long();
+        let body = r#"{"code":"0","data":[
+            {"billId":"1","ts":"1790160000000","ccy":"USDT","balChg":"500","type":"1"},
+            {"billId":"2","ts":"1790163000000","ccy":"USDT","balChg":"-120.5","type":"1"}]}"#;
+        state.ingest("rest.okx.transfers", body, NOW).unwrap();
+        let first = account(&state, NOW);
+        let ids: Vec<&str> = first["transfers"]["items"].as_array().unwrap().iter().map(|t| t["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["2", "1"]);
+        assert_eq!(first["transfers"]["items"][0]["amount"].as_f64(), Some(-120.5));
+        assert_eq!(first["transfers"]["readMs"], NOW);
+        state.ingest("rest.okx.transfers", r#"{"code":"50001","msg":"busy"}"#, NOW + 30_000).unwrap();
+        let later = account(&state, NOW + 30_000);
+        assert_eq!(later["transfers"]["items"].as_array().unwrap().len(), 2, "kept");
+        assert!(later["transfers"]["error"].as_str().unwrap().contains("50001"));
+        assert_eq!(later["transfers"]["readMs"], NOW, "and aged from the last good read");
+    }
+
+    #[test]
+    fn a_switch_of_account_forgets_everything_the_other_account_held() {
+        let mut state = live_long();
+        state.ingest("rest.okx.transfers", r#"{"code":"0","data":[{"billId":"1","ts":"1790160000000","ccy":"USDT","balChg":"500"}]}"#, NOW).unwrap();
+        state.ingest("okx.marks", &mark_frame(2545.78, NOW + 400), NOW + 450).unwrap();
+        let mut demo = state.config.clone();
+        demo.mode = "demo".into();
+        state.reconfigure(demo, NOW + 500);
+        let account = account(&state, NOW + 500);
+        assert!(account["positionsMs"].is_null(), "not read, which is not flat");
+        assert!(account["equity"].is_null());
+        assert_eq!(account["transfers"]["items"], serde_json::json!([]));
+        assert!(state.account_marks.is_empty(), "the demo values at its own marks");
+    }
+
+    #[test]
+    fn the_orders_every_screen_shows_are_the_listing_the_stops_come_from() {
+        let mut state = live_long();
+        assert!(account(&state, NOW)["orders"]["items"].is_null(), "not read is not none armed");
+        let page = r#"{"code":"0","data":[
+            {"algoId":"TP","instId":"ETH-USDT-SWAP","ordType":"conditional","side":"sell","posSide":"long","sz":"214.97","tpTriggerPx":"2585","tpOrdPx":"-1","state":"live","cTime":"1790164000000"},
+            {"algoId":"ENTRY","instId":"ETH-USDT-SWAP","ordType":"trigger","side":"buy","posSide":"long","sz":"10","triggerPx":"2400","ordPx":"-1","state":"live","cTime":"1790164100000"}]}"#;
+        state.ingest("rest.okx.orders", page, NOW).unwrap();
+        let read = account(&state, NOW);
+        let ids: Vec<&str> = read["orders"]["items"].as_array().unwrap().iter().map(|o| o["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["ENTRY", "TP"], "newest first, every kind");
+        assert_eq!(read["orders"]["readMs"], NOW);
+        let snapshot = snapshot(&state, NOW);
+        let protective: Vec<&str> = snapshot["risk"]["positions"][0]["protective"].as_array().unwrap().iter().map(|p| p["algoId"].as_str().unwrap()).collect();
+        assert_eq!(protective, ["TP"], "the checkup's stops are the listing's conditional orders");
+        // A failed read keeps the list, labelled.
+        state.apply(Update::Rest(RestUpdate::Orders(Err("OKX 50001".into()), NOW + 5_000, Delivery::default())), NOW + 5_000);
+        let later = account(&state, NOW + 5_000);
+        assert_eq!(later["orders"]["items"].as_array().unwrap().len(), 2);
+        assert_eq!(later["orders"]["error"], "OKX 50001");
+    }
+
+    #[test]
+    fn an_order_push_on_either_socket_asks_for_the_listing_now() {
+        let mut state = state();
+        let private = r#"{"arg":{"channel":"orders","instType":"ANY"},"data":[{"ordId":"1","state":"live"}]}"#;
+        let effects = state.apply(Update::Frame { feed: Feed::OkxPrivate, text: private.into(), received_ms: NOW }, NOW);
+        assert_eq!(effects, [Effect::OrdersChanged]);
+        let business = r#"{"arg":{"channel":"orders-algo","instType":"ANY"},"data":[{"algoId":"9","state":"canceled"}]}"#;
+        let effects = state.apply(Update::Frame { feed: Feed::OkxOrderEvents, text: business.into(), received_ms: NOW }, NOW);
+        assert_eq!(effects, [Effect::OrdersChanged]);
+        let refused = r#"{"event":"error","code":"60018","msg":"channel doesn't exist"}"#;
+        let effects = state.apply(Update::Frame { feed: Feed::OkxOrderEvents, text: refused.into(), received_ms: NOW }, NOW);
+        assert!(effects.is_empty());
+        assert!(snapshot(&state, NOW)["events"].as_array().unwrap().iter().any(|e| e["message"].as_str().unwrap().contains("60018")), "a refusal is said, not swallowed");
     }
 }

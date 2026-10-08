@@ -26,7 +26,13 @@ final class VenueBooks {
     /// When this venue's engine last finished a full tick. Nil until the first.
     private(set) var lastCompletedTickAt: Date?
 
-    // The latest reading of the venue's account, as the UI shows it.
+    // The venue's account as every screen and the trading loop read it. The
+    // one copy: OKX's is the live account document, valued at the mark as it
+    // streams; a venue with no stream is read on a clock. Each part keeps its
+    // own stamp, because they are not always read together — one stamp for
+    // all of them let a five-minute-old position table borrow the age of a
+    // twenty-second-old equity sample (2026-10-08).
+
     /// The whole reading, not just its balance lines: the aggregate view needs
     /// the venue's own `totalEquity` — the one figure that is already in USD
     /// and already counts what no balance line carries (a derivative's
@@ -34,9 +40,32 @@ final class VenueBooks {
     /// describing different moments.
     var accountSnapshot: AccountSnapshot?
     var accountBalances: [AccountBalance] { accountSnapshot?.balances ?? [] }
-    var exchangePositions: [ExchangePosition] = []
+    /// How much of each currency and share the account holds, whatever it is
+    /// worth: what a transfer or a trade changes and a price never does.
+    var heldCounts: [String: Double] {
+        Dictionary(accountBalances.map { ($0.ccy, $0.total) }, uniquingKeysWith: +)
+    }
+    /// When `accountSnapshot`'s equity was true.
+    var equityAt: Date?
+    /// Past this age `equityAt` reads stale: set with each reading, from the
+    /// clock that renews it — a few of its intervals, by the kernel's rule.
+    var equityStaleAfter: TimeInterval?
+    /// Every holding the venue lists — contracts, then shares — as every
+    /// screen shows them.
+    var exchangePositions: [ExchangePosition] { contractPositions + shareHoldings }
+    /// Contract positions: what the account's contract risk is measured from.
+    var contractPositions: [ExchangePosition] = []
+    /// Shares, valued through the balances.
+    var shareHoldings: [ExchangePosition] = []
+    /// When the list of positions was last confirmed; each position carries
+    /// the time of its own mark.
+    var positionsAt: Date?
+    /// Where equity and positions came from.
+    var accountSource: AccountReading.Source?
+    /// The live account document last adopted, for what it says about
+    /// itself — its feeds, transfers, why a figure is as pushed.
+    var liveAccount: LiveAccount?
     var accountError: String?
-    var accountRefreshedAt: Date?
     /// Everything the venue is holding open on the active account, whoever
     /// placed it. Kept apart from `accountError`: a refused order book must
     /// not blank the equity and positions that were read fine.
@@ -44,6 +73,7 @@ final class VenueBooks {
     /// Books the listing could not read, in words; nil when it read them all.
     var openOrdersNote: String?
     var openOrdersError: String?
+    var ordersAt: Date?
     /// Everything the venue has filled on this account lately, whoever placed
     /// it — newest first.
     ///
@@ -63,10 +93,17 @@ final class VenueBooks {
     /// Fill books that could not be read, in words; nil when all were read.
     var exchangeFillsNote: String?
     var exchangeFillsError: String?
+    var fillsAt: Date?
     /// The venue's own ledger of the active account, as last read, where the
-    /// venue keeps one — see `Venue.periodFigure`.
+    /// venue keeps one (`Venue.publishesBills`) — the realised breakdown of a
+    /// window's result.
     var exchangeBills: ExchangeBillListing?
     var billsError: String?
+    /// Money moved into or out of the account over the last week, as last
+    /// read: what a window's result leaves out. Nil until read — which is not
+    /// the same as none moved.
+    var transfers: AccountTransferListing?
+    var transfersError: String?
     var isRefreshingAccount = false
     /// One connection verdict per environment.
     var connections: [TradingMode: VenueConnectionStatus] = [:]
@@ -118,10 +155,114 @@ final class VenueBooks {
         heartbeatStore.record(ts)
     }
 
-    func didSampleEquity(_ equity: Double, mode: TradingMode, at ts: Date) {
-        equityCurve(for: mode).record(equity: equity, at: ts)
-        accountSnapshot = runner.accountSnapshot
-        accountRefreshedAt = ts
+    func didSampleEquity(_ equity: Double, rate: Double?, mode: TradingMode, at ts: Date) {
+        equityCurve(for: mode).record(equity: equity, at: ts, quoteUsd: rate)
+    }
+
+    // MARK: The account reading
+
+    /// Forget everything read from the account: on a switch to the other
+    /// account, and when the account may no longer be read at all — a figure
+    /// from the previous account must never stay on screen looking current.
+    func clearAccount(reason: String? = nil) {
+        accountSnapshot = nil
+        equityAt = nil
+        equityStaleAfter = nil
+        contractPositions = []
+        shareHoldings = []
+        positionsAt = nil
+        accountSource = nil
+        liveAccount = nil
+        openOrders = []
+        openOrdersNote = nil
+        openOrdersError = nil
+        ordersAt = nil
+        exchangeFills = []
+        exchangeFillsNote = nil
+        exchangeFillsError = nil
+        fillsAt = nil
+        exchangeBills = nil
+        billsError = nil
+        transfers = nil
+        transfersError = nil
+        accountError = reason
+    }
+
+    /// The current reading, as the trading loop takes it.
+    var reading: AccountReading? {
+        guard let accountSnapshot, let equityAt, let accountSource else { return nil }
+        return AccountReading(
+            snapshot: accountSnapshot, equityAt: equityAt,
+            positions: positionsAt == nil ? nil : contractPositions, shareHoldings: shareHoldings,
+            positionsError: positionsAt == nil ? accountError : nil,
+            positionsAt: positionsAt, source: accountSource)
+    }
+
+    /// Take a REST reading as the account's current one.
+    func adopt(_ reading: AccountReading) {
+        accountSnapshot = reading.snapshot
+        equityAt = reading.equityAt
+        equityStaleAfter = reading.pollInterval(quoteCurrency: venue.quoteCurrency) * LiveKernel.staleAfterIntervals
+        if let positions = reading.positions {
+            contractPositions = positions
+            shareHoldings = reading.shareHoldings
+            positionsAt = reading.positionsAt
+        }
+        accountSource = reading.source
+        accountError = reading.positionsError
+    }
+
+    /// Take the live account document as the account's current reading — if
+    /// it is this account's. A document for the other environment (the layer
+    /// has not caught up with a switch yet) is not this account's figures.
+    func adopt(_ account: LiveAccount, mode: TradingMode) {
+        guard account.mode == (mode.isDemo ? "demo" : "live") else { return }
+        liveAccount = account
+        guard account.source != "none" else { return }
+        let source: AccountReading.Source = account.source == "cli" ? .fallback : .stream
+        if account.wasRead, let positionsMs = account.positionsMs {
+            contractPositions = account.exchangePositions
+            shareHoldings = []
+            positionsAt = account.date(ms: positionsMs)
+        }
+        if let snapshot = account.snapshot, let asOf = account.equityAsOf() {
+            accountSnapshot = snapshot
+            equityAt = account.date(ms: asOf.ms)
+            equityStaleAfter = asOf.staleAfterMs / 1000
+        }
+        // Every working order, read whole and again the moment a push says
+        // one changed. A failed read keeps the last good list, labelled.
+        if let listing = account.orders.listing, let readMs = account.orders.readMs {
+            openOrders = listing.orders
+            openOrdersNote = listing.unavailable.isEmpty
+                ? nil : "未能读取：" + listing.unavailable.joined(separator: "、") + "。这些簿上若有挂单，这里不会显示。"
+            openOrdersError = account.orders.error.map { "最近一次读取失败（显示的是上一次读到的）：\($0)" }
+            ordersAt = account.date(ms: readMs)
+        }
+        if let listing = account.transferListing {
+            transfers = listing
+            transfersError = account.transfers.error
+        }
+        accountSource = source
+        accountError = nil
+    }
+
+    /// Whether the live document's order listing is current — read within a
+    /// few of its own intervals — so the account refresh need not read it.
+    var ordersStreamed: Bool {
+        guard let orders = liveAccount?.orders, orders.wasRead, let readMs = orders.readMs,
+              let account = liveAccount else { return false }
+        return Date().timeIntervalSince(account.date(ms: readMs)) * 1000 <= orders.staleAfterMs
+    }
+
+    /// Whether the live document is what the account is read from right now:
+    /// it is this account's, it has read the positions, and the list is no
+    /// older than the stream's own stale age. Otherwise the account is read
+    /// over REST in its place.
+    var isStreamed: Bool {
+        guard let account = liveAccount, account.wasRead, account.source != "none",
+              let positionsAt else { return false }
+        return Date().timeIntervalSince(positionsAt) * 1000 <= account.positionsStaleAfterMs
     }
 
     func didSampleStrategyEquity(_ strategyId: String, equity: Double, basis: Double, mode: TradingMode, at ts: Date) {
@@ -215,7 +356,23 @@ final class VenueRunnerHost: StrategyRunnerHost {
 
     func runnerDidSampleEquity(_ equity: Double, at ts: Date) {
         // The curve is per mode; the runner only ever samples the active one.
-        books.didSampleEquity(equity, mode: app.tradingMode, at: ts)
+        // Each point keeps the venue's own rate into its quote currency at
+        // that instant, so the curve can be stated in the quote exactly.
+        let rate = books.accountSnapshot?.usdRate(for: books.venue.quoteCurrency)
+        books.didSampleEquity(equity, rate: rate, mode: app.tradingMode, at: ts)
+    }
+
+    /// The books' reading — the one every screen shows — when it is fresh
+    /// enough; otherwise the account is read again and the books take that.
+    func accountReading(maxAge: TimeInterval) async throws -> AccountReading {
+        if let reading = books.reading, Date().timeIntervalSince(reading.equityAt) <= maxAge {
+            return reading
+        }
+        await app.readAccount(books.venue)
+        guard let reading = books.reading else {
+            throw AccountReading.Unavailable(books.accountError ?? "账户读数不可用")
+        }
+        return reading
     }
 
     func runnerDidSampleStrategyEquity(_ strategyId: String, equity: Double, basis: Double, at ts: Date) {

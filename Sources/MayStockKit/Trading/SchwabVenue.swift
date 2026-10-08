@@ -299,6 +299,23 @@ public struct SchwabVenue: ExchangeVenue {
         }
     }
 
+    /// One `schwabctl account` states the equity and every share together,
+    /// so a live reading reads it once. The piecewise default asked twice —
+    /// the equity from one call, the shares from the next — which put the
+    /// two halves of one reading a subprocess apart (2026-10-08).
+    public func accountReading(mode: TradingMode, source: AccountReading.Source) async throws -> AccountReading {
+        switch mode {
+        case .demo:
+            return try await AccountReading.piecewise(from: self, mode: mode, source: source)
+        case .live:
+            let account = try await bridge.account()
+            let at = Date()
+            return AccountReading(
+                snapshot: account.snapshot, equityAt: at, positions: [],
+                shareHoldings: account.exchangePositions, positionsAt: at, source: source)
+        }
+    }
+
     // MARK: Open orders
 
     /// Everything the account is holding open — resting limits and armed

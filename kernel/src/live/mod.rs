@@ -1,5 +1,13 @@
 //! The live data layer: the one part of the kernel that does I/O.
 //!
+//! **The account part runs for the whole app**: OKX's read-only private
+//! socket, the mark of every held instrument in the account's own
+//! environment, each held instrument's terms, transfers, every working order
+//! and the clock. Every screen that shows what the account holds or is worth
+//! reads it from here (`account`), valued at the mark the moment it streams —
+//! not from a slower poll of its own. The checkup's market analytics run on
+//! top of it only while the page is open (`LiveConfig::analytics`).
+//!
 //! It holds every real-time connection the checkup screen reads — OKX's public
 //! market socket and read-only private account socket, Deribit's option
 //! surface, Binance's mark stream, Schwab's quote stream, and the REST reads
@@ -40,10 +48,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::AbortHandle;
 
 pub use state::State;
+pub(crate) use state::{BalanceView, HoldingView};
 
 // The account-document readers the FFI exposes to the trading path, so there
 // is one reader of OKX's position and balance fields.
@@ -82,6 +91,13 @@ pub struct LiveConfig {
     /// value shows the automatic step and says so in the event log.
     #[serde(default = "one")]
     pub grid_divisor: u32,
+    /// Whether the checkup's market analytics run — option surfaces and
+    /// books, positioning, macro, prediction markets, and the reviewed
+    /// instrument's own socket. The account part runs either way. The app
+    /// turns this on while the checkup page is open; a caller that says
+    /// nothing gets the whole layer, as it always has.
+    #[serde(default = "yes")]
+    pub analytics: bool,
 }
 
 fn yes() -> bool {
@@ -106,7 +122,17 @@ impl LiveConfig {
 pub enum Feed {
     OkxPublic,
     OkxPrivate,
-    OkxStops,
+    /// Every order working on the account, both books, every family — read
+    /// whole, again the moment an order push says something changed.
+    OkxOrders,
+    /// The algo-order pushes on OKX's business socket: nothing but a signal
+    /// to read the orders again.
+    OkxOrderEvents,
+    /// The mark of every instrument the account holds, in the account's own
+    /// environment — what every position is valued at.
+    OkxMarks,
+    /// Money moved into or out of the trading account (bill type 1).
+    OkxTransfers,
     /// One instrument's order book, for the close ticket (`book`).
     OkxBook,
     Deribit,
@@ -123,10 +149,13 @@ pub enum Feed {
 
 impl Feed {
     /// Every feed, for anything that has to cover them all.
-    pub const ALL: [Feed; 14] = [
+    pub const ALL: [Feed; 17] = [
         Feed::OkxPublic,
         Feed::OkxPrivate,
-        Feed::OkxStops,
+        Feed::OkxOrders,
+        Feed::OkxOrderEvents,
+        Feed::OkxMarks,
+        Feed::OkxTransfers,
         Feed::OkxBook,
         Feed::Deribit,
         Feed::BinanceStream,
@@ -144,7 +173,10 @@ impl Feed {
         match self {
             Feed::OkxPublic => "okx.public",
             Feed::OkxPrivate => "okx.private",
-            Feed::OkxStops => "okx.stops",
+            Feed::OkxOrders => "okx.orders",
+            Feed::OkxOrderEvents => "okx.order-events",
+            Feed::OkxMarks => "okx.marks",
+            Feed::OkxTransfers => "okx.transfers",
             Feed::OkxBook => "okx.book",
             Feed::Deribit => "deribit",
             Feed::BinanceStream => "binance.stream",
@@ -163,7 +195,10 @@ impl Feed {
         match self {
             Feed::OkxPublic => "OKX 行情推送",
             Feed::OkxPrivate => "OKX 账户推送（只读）",
-            Feed::OkxStops => "OKX 条件单（只读）",
+            Feed::OkxOrders => "OKX 挂单（只读）",
+            Feed::OkxOrderEvents => "OKX 策略委托推送（只读）",
+            Feed::OkxMarks => "OKX 持仓标记价推送",
+            Feed::OkxTransfers => "OKX 划转记录（只读）",
             Feed::OkxBook => "OKX 盘口推送",
             Feed::Deribit => "Deribit 波动率曲面推送",
             Feed::BinanceStream => "Binance 标记价推送",
@@ -184,7 +219,8 @@ impl Feed {
     /// at once (the four-venue option book), which says nothing about any one.
     pub fn operator(self) -> Option<&'static str> {
         match self {
-            Feed::OkxPublic | Feed::OkxPrivate | Feed::OkxStops | Feed::OkxBook | Feed::OkxHistory | Feed::Clock => Some("OKX"),
+            Feed::OkxPublic | Feed::OkxPrivate | Feed::OkxOrders | Feed::OkxOrderEvents | Feed::OkxMarks | Feed::OkxTransfers | Feed::OkxBook
+            | Feed::OkxHistory | Feed::Clock => Some("OKX"),
             Feed::Deribit => Some("Deribit"),
             Feed::BinanceStream | Feed::BinanceHistory | Feed::BinanceOpenInterest => Some("Binance"),
             Feed::Schwab => Some("嘉信"),
@@ -205,9 +241,17 @@ impl Feed {
             Feed::OkxPublic => Duration::from_secs(2),
             // `positions` and `account` snapshots every two seconds (`updateInterval`).
             Feed::OkxPrivate => Duration::from_secs(2),
-            // Stops change only when someone acts; every two seconds keeps the
-            // list current without holding up the private socket's channels.
-            Feed::OkxStops => Duration::from_secs(2),
+            // Orders change only when someone acts, and an order push wakes
+            // the read at once; the poll catches what no push announced.
+            Feed::OkxOrders => Duration::from_secs(5),
+            // Pushes only when an algo order changes: a quiet hour is a quiet
+            // account, not a dead socket — its health says whether it is up.
+            Feed::OkxOrderEvents => Duration::from_secs(3_600),
+            // The `mark-price` channel's own clock.
+            Feed::OkxMarks => Renewal::OkxMark.interval(),
+            // A transfer is also asked for the moment the account says cash
+            // moved; the poll only catches one that said nothing.
+            Feed::OkxTransfers => Duration::from_secs(30),
             // `books` every 100 ms while the book moves; a quiet demo book
             // can sit for seconds.
             Feed::OkxBook => Duration::from_secs(2),
@@ -240,7 +284,57 @@ impl Feed {
 
     /// Past this age the feed's last frame reads as stale.
     pub fn stale_after_ms(self) -> i64 {
-        (self.cadence() * STALE_AFTER).as_millis() as i64
+        Renewal::Frames(self).stale_after_ms()
+    }
+}
+
+/// How often a value the layer shows is normally renewed: with every frame
+/// of its feed, or on a slower clock of its own inside that feed. Every
+/// stamped value carries `STALE_AFTER` of these as its stale age — the rule
+/// each feed's health follows — so no screen writes a threshold of its own.
+/// The page used to: three seconds for an index, fifteen for open interest
+/// that OKX pushes up to sixteen apart, seven minutes for a five-minute
+/// bucket whose age runs past ten every cycle (2026-10-08).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Renewal {
+    /// Every frame of a feed (`Feed::cadence`).
+    Frames(Feed),
+    /// OKX `mark-price`: every 200 ms while the mark moves (202 ms apart at
+    /// the median, measured 2026-10-08), every 10 s while it does not.
+    OkxMark,
+    /// OKX `funding-rate`: every 30 to 90 s (58–72 s measured 2026-10-08).
+    OkxFunding,
+    /// OKX `open-interest`: only when the figure changes — 6 s apart at the
+    /// median and up to 16 s, over 150 s of an active market (2026-10-08).
+    OkxOpenInterest,
+    /// A five-minute statistics bucket, stamped with its start.
+    Bucket,
+    /// The app's read of the account through the CLI while the private
+    /// socket is down (`ms_live_cli_fallback_ms`, which the app's loop
+    /// sleeps by).
+    CliFallback,
+}
+
+impl Renewal {
+    /// Every renewal that is not a feed's frames, for anything that has to
+    /// cover them all alongside `Feed::ALL`.
+    pub const OWN_CLOCKS: [Renewal; 5] =
+        [Renewal::OkxMark, Renewal::OkxFunding, Renewal::OkxOpenInterest, Renewal::Bucket, Renewal::CliFallback];
+
+    pub fn interval(self) -> Duration {
+        match self {
+            Renewal::Frames(feed) => feed.cadence(),
+            Renewal::OkxMark => Duration::from_secs(10),
+            Renewal::OkxFunding => Duration::from_secs(90),
+            Renewal::OkxOpenInterest => Duration::from_secs(16),
+            Renewal::Bucket => Duration::from_secs(300),
+            Renewal::CliFallback => Duration::from_secs(10),
+        }
+    }
+
+    /// Past this age a value renewed this way reads stale.
+    pub fn stale_after_ms(self) -> i64 {
+        (self.interval() * STALE_AFTER).as_millis() as i64
     }
 }
 
@@ -283,17 +377,28 @@ enum Control {
     Shutdown,
 }
 
-/// What `snapshot` hands out: the latest JSON and its sequence number.
+/// What `snapshot` and `account` hand out: the latest JSON and its sequence
+/// number.
 struct Published {
     seq: u64,
     json: Arc<String>,
+}
+
+/// Both publications, under one lock so they are always of the same state.
+/// The account document is published apart from the whole snapshot because
+/// every screen of the app reads it, many times a second, and only the
+/// checkup page wants the rest: its sequence moves only when the account
+/// does.
+struct Publications {
+    snapshot: Published,
+    account: Published,
 }
 
 /// A running live layer. Dropping it without `stop` leaks its thread; the FFI
 /// wrapper always calls `stop`.
 pub struct Engine {
     control: mpsc::UnboundedSender<Control>,
-    published: Arc<Mutex<Published>>,
+    published: Arc<Mutex<Publications>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -310,7 +415,8 @@ impl Engine {
             .build()
             .map_err(|e| format!("实时层启动失败：{e}"))?;
         let (control_tx, control_rx) = mpsc::unbounded_channel();
-        let published = Arc::new(Mutex::new(Published { seq: 0, json: Arc::new(String::new()) }));
+        let empty = || Published { seq: 0, json: Arc::new(String::new()) };
+        let published = Arc::new(Mutex::new(Publications { snapshot: empty(), account: empty() }));
         let publisher = Arc::clone(&published);
         let thread = std::thread::Builder::new()
             .name("maystock-live-supervisor".into())
@@ -328,7 +434,7 @@ impl Engine {
 
     fn wait_for_first_snapshot(&self) {
         for _ in 0..200 {
-            if self.published.lock().map(|p| p.seq > 0).unwrap_or(true) {
+            if self.published.lock().map(|p| p.snapshot.seq > 0).unwrap_or(true) {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -338,7 +444,15 @@ impl Engine {
     /// The latest snapshot if it is newer than `since`.
     pub fn snapshot(&self, since: u64) -> Option<(u64, Arc<String>)> {
         let published = self.published.lock().ok()?;
-        (published.seq > since).then(|| (published.seq, Arc::clone(&published.json)))
+        let snapshot = &published.snapshot;
+        (snapshot.seq > since).then(|| (snapshot.seq, Arc::clone(&snapshot.json)))
+    }
+
+    /// The latest account document if it is newer than `since`.
+    pub fn account(&self, since: u64) -> Option<(u64, Arc<String>)> {
+        let published = self.published.lock().ok()?;
+        let account = &published.account;
+        (account.seq > since).then(|| (account.seq, Arc::clone(&account.json)))
     }
 
     pub fn configure(&self, config: LiveConfig) -> Result<(), String> {
@@ -368,10 +482,21 @@ impl Engine {
 /// change of instrument restarts only what reads the instrument.
 #[derive(Default)]
 struct Tasks {
+    // Analytics: only while the checkup page is open.
     instrument: Vec<AbortHandle>,
     base: Vec<AbortHandle>,
-    account: Vec<AbortHandle>,
     fixed: Vec<AbortHandle>,
+    // The account: always.
+    account: Vec<AbortHandle>,
+    /// The held instruments' marks and terms, restarted when what is held
+    /// changes.
+    held: Vec<AbortHandle>,
+    clock: Vec<AbortHandle>,
+    /// Wakes the transfers poller when the account says cash moved.
+    transfers_wake: Option<Arc<Notify>>,
+    /// Wakes the orders poller when an order push or a cash move says the
+    /// listing may have changed.
+    orders_wake: Option<Arc<Notify>>,
 }
 
 impl Tasks {
@@ -380,30 +505,38 @@ impl Tasks {
             handle.abort();
         }
     }
-    fn abort_all(&mut self) {
+    fn abort_analytics(&mut self) {
         Self::abort(&mut self.instrument);
         Self::abort(&mut self.base);
-        Self::abort(&mut self.account);
         Self::abort(&mut self.fixed);
+    }
+    fn abort_all(&mut self) {
+        self.abort_analytics();
+        Self::abort(&mut self.account);
+        Self::abort(&mut self.held);
+        Self::abort(&mut self.clock);
+        self.transfers_wake = None;
+        self.orders_wake = None;
     }
 }
 
 async fn supervise(
     config: LiveConfig,
     mut control: mpsc::UnboundedReceiver<Control>,
-    published: Arc<Mutex<Published>>,
+    published: Arc<Mutex<Publications>>,
 ) {
     let (updates_tx, mut updates) = mpsc::channel::<Update>(4096);
     let http = net::http_client().ok();
     let mut state = State::new(config.clone(), now_for(&config));
     let mut tasks = Tasks::default();
-    let mut seq: u64 = 0;
+    let mut seq = Sequences::default();
 
     if config.network {
-        spawn_fixed(&mut tasks, &updates_tx, http.clone(), &config, &state);
+        spawn_clock(&mut tasks, &updates_tx, http.clone());
         spawn_account(&mut tasks, &updates_tx, &mut state, &config);
-        spawn_base(&mut tasks, &updates_tx, http.clone(), &state);
-        spawn_instrument(&mut tasks, &updates_tx, http.clone(), &state);
+        if config.analytics {
+            spawn_analytics(&mut tasks, &updates_tx, http.clone(), &config, &state);
+        }
     } else {
         state.note_offline();
     }
@@ -429,14 +562,21 @@ async fn supervise(
                     let previous = state.config.clone();
                     let effects = state.reconfigure(next.clone(), now_for(&next));
                     if next.network {
+                        if !previous.network {
+                            spawn_clock(&mut tasks, &updates_tx, http.clone());
+                        }
                         if next.mode != previous.mode || next.okx_profile != previous.okx_profile
-                            || next.okx_config_path != previous.okx_config_path {
-                            Tasks::abort(&mut tasks.account);
+                            || next.okx_config_path != previous.okx_config_path || !previous.network {
                             spawn_account(&mut tasks, &updates_tx, &mut state, &next);
                         }
-                        if next.schwabctl_path != previous.schwabctl_path || !previous.network {
-                            Tasks::abort(&mut tasks.fixed);
-                            spawn_fixed(&mut tasks, &updates_tx, http.clone(), &next, &state);
+                        match (previous.analytics && previous.network, next.analytics) {
+                            (false, true) => spawn_analytics(&mut tasks, &updates_tx, http.clone(), &next, &state),
+                            (true, false) => tasks.abort_analytics(),
+                            (true, true) if next.schwabctl_path != previous.schwabctl_path => {
+                                Tasks::abort(&mut tasks.fixed);
+                                spawn_analytics_fixed(&mut tasks, &updates_tx, http.clone(), &next, &state);
+                            }
+                            _ => {}
                         }
                     } else {
                         tasks.abort_all();
@@ -469,12 +609,31 @@ fn now_for(config: &LiveConfig) -> i64 {
     }
 }
 
-fn publish(state: &State, config: &LiveConfig, published: &Arc<Mutex<Published>>, seq: &mut u64) {
-    *seq += 1;
-    let json = state.snapshot_json(*seq, now_for(config));
+/// The two publications' sequence numbers, and the account document last
+/// published, so an update that did not touch the account does not wake
+/// every screen reading it.
+#[derive(Default)]
+struct Sequences {
+    snapshot: u64,
+    account: u64,
+    account_json: Arc<String>,
+}
+
+fn publish(state: &State, config: &LiveConfig, published: &Arc<Mutex<Publications>>, seq: &mut Sequences) {
+    let now = now_for(config);
+    seq.snapshot += 1;
+    let json = state.snapshot_json(seq.snapshot, now);
+    let account = state.account_json(now);
+    let account_changed = *seq.account_json != account;
+    if account_changed {
+        seq.account += 1;
+        seq.account_json = Arc::new(account);
+    }
     if let Ok(mut slot) = published.lock() {
-        slot.seq = *seq;
-        slot.json = Arc::new(json);
+        slot.snapshot = Published { seq: seq.snapshot, json: Arc::new(json) };
+        if account_changed {
+            slot.account = Published { seq: seq.account, json: Arc::clone(&seq.account_json) };
+        }
     }
 }
 
@@ -485,6 +644,15 @@ pub(crate) enum Effect {
     InstrumentChanged,
     /// The underlying coin changed: restart the option feeds too.
     BaseChanged,
+    /// The set of instruments the account holds changed: stream their marks
+    /// and read the terms of any new one.
+    HeldChanged,
+    /// Cash or margin moved on the account — a fill, a fee, funding, or a
+    /// transfer — so the transfers and the orders are asked for now rather
+    /// than at the next poll.
+    BalanceMoved,
+    /// An order push said something changed: read the orders now.
+    OrdersChanged,
 }
 
 fn follow(
@@ -497,6 +665,22 @@ fn follow(
     if !state.config.network {
         return;
     }
+    if effects.contains(&Effect::HeldChanged) {
+        spawn_held(tasks, updates, state);
+    }
+    if effects.contains(&Effect::BalanceMoved) {
+        if let Some(wake) = &tasks.transfers_wake {
+            wake.notify_one();
+        }
+    }
+    if effects.contains(&Effect::BalanceMoved) || effects.contains(&Effect::OrdersChanged) {
+        if let Some(wake) = &tasks.orders_wake {
+            wake.notify_one();
+        }
+    }
+    if !state.config.analytics {
+        return;
+    }
     if effects.contains(&Effect::BaseChanged) {
         Tasks::abort(&mut tasks.base);
         spawn_base(tasks, updates, http.clone(), state);
@@ -507,9 +691,24 @@ fn follow(
     }
 }
 
-fn spawn_fixed(tasks: &mut Tasks, updates: &mpsc::Sender<Update>, http: Option<reqwest::Client>, config: &LiveConfig, state: &State) {
+/// The clock every age is read against: the account's as much as the
+/// checkup's.
+fn spawn_clock(tasks: &mut Tasks, updates: &mpsc::Sender<Update>, http: Option<reqwest::Client>) {
+    Tasks::abort(&mut tasks.clock);
     let Some(http) = http else { return };
-    tasks.fixed.push(tokio::spawn(rest::clock(http.clone(), updates.clone())).abort_handle());
+    tasks.clock.push(tokio::spawn(rest::clock(http, updates.clone())).abort_handle());
+}
+
+/// Everything the checkup page reads beyond the account.
+fn spawn_analytics(tasks: &mut Tasks, updates: &mpsc::Sender<Update>, http: Option<reqwest::Client>, config: &LiveConfig, state: &State) {
+    tasks.abort_analytics();
+    spawn_analytics_fixed(tasks, updates, http.clone(), config, state);
+    spawn_base(tasks, updates, http.clone(), state);
+    spawn_instrument(tasks, updates, http, state);
+}
+
+fn spawn_analytics_fixed(tasks: &mut Tasks, updates: &mpsc::Sender<Update>, http: Option<reqwest::Client>, config: &LiveConfig, state: &State) {
+    let Some(http) = http else { return };
     tasks.fixed.push(tokio::spawn(rest::polymarket(http.clone(), updates.clone())).abort_handle());
     match config.schwabctl_path.as_deref().filter(|p| !p.is_empty()) {
         Some(path) => {
@@ -525,6 +724,12 @@ fn spawn_fixed(tasks: &mut Tasks, updates: &mpsc::Sender<Update>, http: Option<r
 }
 
 fn spawn_account(tasks: &mut Tasks, updates: &mpsc::Sender<Update>, state: &mut State, config: &LiveConfig) {
+    Tasks::abort(&mut tasks.account);
+    tasks.transfers_wake = None;
+    tasks.orders_wake = None;
+    // The held instruments' marks are the account environment's own, so
+    // they follow the account wherever it is pointed.
+    spawn_held(tasks, updates, state);
     let Some(path) = config.okx_config_path.as_deref().filter(|p| !p.is_empty()) else {
         state.private_off("没有 OKX CLI 配置文件路径");
         return;
@@ -549,11 +754,33 @@ fn spawn_account(tasks: &mut Tasks, updates: &mpsc::Sender<Update>, state: &mut 
                 config_path: path.to_string(),
                 profile: config.okx_profile.clone(),
             };
-            tasks.account.push(tokio::spawn(rest::okx_stops(updates.clone(), access)).abort_handle());
+            let orders = Arc::new(Notify::new());
+            tasks.account.push(tokio::spawn(rest::okx_orders(updates.clone(), access.clone(), Arc::clone(&orders))).abort_handle());
+            tasks.orders_wake = Some(orders);
+            let transfers = Arc::new(Notify::new());
+            tasks.account.push(tokio::spawn(rest::okx_transfers(updates.clone(), access, Arc::clone(&transfers))).abort_handle());
+            tasks.transfers_wake = Some(transfers);
+            let business = okx::PrivateDialect::business(credentials.clone(), demo);
+            tasks.account.push(tokio::spawn(socket::run(business, updates.clone())).abort_handle());
             let dialect = okx::PrivateDialect::new(credentials, demo);
             tasks.account.push(tokio::spawn(socket::run(dialect, updates.clone())).abort_handle());
         }
         Err(reason) => state.private_off(&reason),
+    }
+}
+
+/// Stream the mark of every instrument the account holds, in its own
+/// environment, and read the terms of any whose terms are not yet known.
+/// Nothing held, nothing streamed.
+fn spawn_held(tasks: &mut Tasks, updates: &mpsc::Sender<Update>, state: &State) {
+    Tasks::abort(&mut tasks.held);
+    let demo = state.config.mode == "demo";
+    let held: Vec<String> = state.held_instruments().into_iter().map(|(inst_id, _)| inst_id).collect();
+    if !held.is_empty() {
+        tasks.held.push(tokio::spawn(socket::run(okx::MarksDialect::new(held, demo), updates.clone())).abort_handle());
+    }
+    for (inst_id, inst_type) in state.terms_wanted() {
+        tasks.held.push(tokio::spawn(rest::okx_spec(updates.clone(), inst_id, inst_type, demo)).abort_handle());
     }
 }
 
@@ -577,5 +804,63 @@ fn spawn_instrument(tasks: &mut Tasks, updates: &mpsc::Sender<Update>, http: Opt
         tasks.instrument.push(tokio::spawn(rest::okx_history(http.clone(), updates.clone(), inst_id)).abort_handle());
         tasks.instrument.push(tokio::spawn(rest::binance_history(http.clone(), updates.clone(), symbol.clone())).abort_handle());
         tasks.instrument.push(tokio::spawn(rest::binance_open_interest(http, updates.clone(), symbol)).abort_handle());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every renewal — each feed's frames and each clock of its own — ages
+    /// by the one rule, and none is so short that a value at its normal age
+    /// already reads stale.
+    #[test]
+    fn every_renewal_ages_by_the_one_rule() {
+        let all: Vec<Renewal> = Feed::ALL.iter().map(|f| Renewal::Frames(*f)).chain(Renewal::OWN_CLOCKS).collect();
+        for renewal in all {
+            let interval = renewal.interval().as_millis() as i64;
+            assert!(interval > 0, "{renewal:?}");
+            assert_eq!(renewal.stale_after_ms(), interval * i64::from(STALE_AFTER), "{renewal:?}");
+            assert!(renewal.stale_after_ms() > interval, "{renewal:?} reads stale at its own normal age");
+        }
+        for feed in Feed::ALL {
+            assert_eq!(feed.stale_after_ms(), Renewal::Frames(feed).stale_after_ms(), "{feed:?}");
+        }
+        assert_eq!(Feed::OkxMarks.cadence(), Renewal::OkxMark.interval(), "the account's marks are the mark-price channel");
+    }
+
+    fn offline() -> (State, LiveConfig) {
+        let config: LiveConfig = serde_json::from_str(r#"{"instId":"ETH-USDT-SWAP","network":false,"nowOverrideMs":1790164800000}"#).unwrap();
+        (State::new(config.clone(), 1_790_164_800_000), config)
+    }
+
+    #[test]
+    fn the_account_document_moves_only_when_the_account_does() {
+        let (mut state, config) = offline();
+        let empty = || Published { seq: 0, json: Arc::new(String::new()) };
+        let published = Arc::new(Mutex::new(Publications { snapshot: empty(), account: empty() }));
+        let mut seq = Sequences::default();
+        publish(&state, &config, &published, &mut seq);
+        let first = published.lock().unwrap().account.seq;
+        assert_eq!(first, 1);
+        // An index tick is the checkup's news, not the account's.
+        let index = r#"{"arg":{"channel":"index-tickers","instId":"ETH-USD"},"data":[{"instId":"ETH-USD","idxPx":"2500","ts":"1790164800100"}]}"#;
+        state.ingest("okx.public", index, 1_790_164_800_100).unwrap();
+        publish(&state, &config, &published, &mut seq);
+        let slot = published.lock().unwrap();
+        assert_eq!(slot.snapshot.seq, 2);
+        assert_eq!(slot.account.seq, first, "unchanged");
+        drop(slot);
+        state.ingest("cli.account", r#"{"data":[{"totalEq":"7000"}]}"#, 1_790_164_800_200).unwrap();
+        publish(&state, &config, &published, &mut seq);
+        assert_eq!(published.lock().unwrap().account.seq, first + 1);
+    }
+
+    #[test]
+    fn a_config_that_says_nothing_about_analytics_gets_the_whole_layer() {
+        let config: LiveConfig = serde_json::from_str(r#"{"instId":"ETH-USDT-SWAP"}"#).unwrap();
+        assert!(config.analytics);
+        let config: LiveConfig = serde_json::from_str(r#"{"instId":"ETH-USDT-SWAP","analytics":false}"#).unwrap();
+        assert!(!config.analytics);
     }
 }

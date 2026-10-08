@@ -23,6 +23,7 @@
 //!   between orders, so an order pays one round trip, not a TLS handshake.
 
 pub mod close;
+pub mod terms;
 pub mod reads;
 pub mod route;
 pub mod wire;
@@ -311,6 +312,22 @@ impl TradeClient {
                     reads::document(&session.get(&reads::fills_target(*family, inst_id.as_deref())?).await?)
                 }
                 Read::FundingBills => reads::document(&session.get(&reads::funding_bills_target()).await?),
+                Read::Transfers { since_ms } => {
+                    let mut listing = reads::TransferListing::default();
+                    let mut after: Option<String> = None;
+                    for _ in 0..reads::TRANSFER_PAGES {
+                        let page = reads::parse_transfers(&session.get(&reads::transfers_target(after.as_deref())).await?)?;
+                        let full = page.len() >= reads::PAGE;
+                        let reached = page.iter().any(|t| t.ms < *since_ms);
+                        after = page.last().map(|t| t.id.clone());
+                        listing.items.extend(page.into_iter().filter(|t| t.ms >= *since_ms));
+                        if !full || reached || after.is_none() {
+                            listing.complete = true;
+                            break;
+                        }
+                    }
+                    serde_json::to_value(listing).map_err(|e| e.to_string())
+                }
                 Read::FeeRates { family, inst_id, group_id } => {
                     let body = session.get(&reads::fee_target(*family, inst_id.as_deref())?).await?;
                     serde_json::to_value(reads::parse_fee_rates(&body, group_id.as_deref())?).map_err(|e| e.to_string())

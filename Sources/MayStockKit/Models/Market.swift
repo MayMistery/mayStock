@@ -38,19 +38,35 @@ public enum BarInterval: String, Codable, CaseIterable, Sendable, Identifiable, 
 // MARK: - Ticker
 
 /// What a ticker's change is measured from — what "up 1.2%" is up from.
-public enum ChangeBasis: String, Sendable, Codable, Equatable {
-    /// Against the price 24 hours ago: a market that never closes has no
-    /// session to measure a day from.
+///
+/// A market that never closes has no session to measure a day from, so its
+/// "day" is a choice, and exchanges' apps let it be made: OKX publishes all
+/// three references on every ticker (`open24h`, `sodUtc8`, `sodUtc0`), and
+/// the same instant read −0.82%, −1.20% and −1.33% on them (ETH-USDT,
+/// 2026-10-08). A figure that is to agree with the phone has to be measured
+/// on the phone's basis, so for such markets it is a setting
+/// (`GeneralPrefs.changeBasis`).
+public enum ChangeBasis: String, Sendable, Codable, Equatable, CaseIterable {
+    /// Against the price 24 hours ago.
     case rolling24h
     /// Against the previous session's close: what a stock's daily change
     /// means everywhere it is quoted.
     case previousClose
+    /// Against the price at 00:00 Beijing time (UTC+8).
+    case sinceUtc8Midnight
+    /// Against the price at 00:00 UTC.
+    case sinceUtcMidnight
 
-    /// The period the high, low and volume cover: "24h" or "今日".
+    /// The bases a market that never closes can be measured on, in the order
+    /// the setting offers them.
+    public static let continuous: [ChangeBasis] = [.sinceUtc8Midnight, .rolling24h, .sinceUtcMidnight]
+
+    /// The period the change covers, for the chip beside it.
     public var periodLabel: String {
         switch self {
         case .rolling24h: return "24h"
-        case .previousClose: return "今日"
+        case .previousClose, .sinceUtc8Midnight: return "今日"
+        case .sinceUtcMidnight: return "UTC 日"
         }
     }
 
@@ -59,6 +75,18 @@ public enum ChangeBasis: String, Sendable, Codable, Equatable {
         switch self {
         case .rolling24h: return "较 24h 前"
         case .previousClose: return "较昨收"
+        case .sinceUtc8Midnight: return "较北京时间 0 点"
+        case .sinceUtcMidnight: return "较 UTC 0 点"
+        }
+    }
+
+    /// The basis as the setting names it.
+    public var settingName: String {
+        switch self {
+        case .rolling24h: return "24 小时滚动"
+        case .previousClose: return "较昨收"
+        case .sinceUtc8Midnight: return "北京时间 0 点起"
+        case .sinceUtcMidnight: return "UTC 0 点起"
         }
     }
 }
@@ -101,6 +129,12 @@ public struct Ticker: Sendable, Equatable {
     /// In base units — coins, shares.
     public let volume: Double
     public let basis: ChangeBasis
+    /// Every reference the venue published with this ticker, by basis —
+    /// `reference` is the one `basis` names. What `rebased(to:)` reads.
+    public let references: [ChangeBasis: Double]
+    /// The period `high`, `low` and `volume` cover: "24h" on OKX whatever the
+    /// change is measured from, "今日" on a stock exchange.
+    public let rangeLabel: String
     /// Session phase on a market that has sessions; nil on a continuous one.
     public let phase: MarketPhase?
     public let ts: Date
@@ -108,8 +142,11 @@ public struct Ticker: Sendable, Equatable {
     public init(
         instId: String, last: Double, bid: Double?, ask: Double?,
         reference: Double, open: Double? = nil, high: Double, low: Double, volume: Double,
-        basis: ChangeBasis, phase: MarketPhase? = nil, ts: Date
+        basis: ChangeBasis, phase: MarketPhase? = nil, ts: Date,
+        references: [ChangeBasis: Double] = [:], rangeLabel: String? = nil
     ) {
+        self.references = references.merging([basis: reference]) { _, stated in stated }
+        self.rangeLabel = rangeLabel ?? (basis == .previousClose ? "今日" : "24h")
         self.instId = instId
         self.last = last
         self.bid = bid
@@ -125,6 +162,23 @@ public struct Ticker: Sendable, Equatable {
     }
 
     public var change: Double { last - reference }
+
+    /// The same ticker measured on another basis, when the venue published
+    /// that reference; unchanged when it did not.
+    public func rebased(to target: ChangeBasis) -> Ticker {
+        guard target != basis, let reference = references[target], reference > 0 else { return self }
+        return Ticker(
+            instId: instId, last: last, bid: bid, ask: ask, reference: reference, open: open,
+            high: high, low: low, volume: volume, basis: target, phase: phase, ts: ts,
+            references: references, rangeLabel: rangeLabel)
+    }
+
+    /// The change in percent on a given basis, when the venue published its
+    /// reference.
+    public func changePct(on target: ChangeBasis) -> Double? {
+        guard let reference = references[target], reference > 0 else { return nil }
+        return (last - reference) / reference * 100
+    }
 
     /// Change in percent against `reference`, e.g. `1.24` for +1.24%.
     public var changePct: Double {

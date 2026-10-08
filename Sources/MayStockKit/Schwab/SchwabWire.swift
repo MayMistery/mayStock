@@ -669,6 +669,41 @@ public enum SchwabWire {
         return out.sorted { $0.ts < $1.ts }
     }
 
+    /// Money movements as `schwabctl transfers` lists them. A cash movement
+    /// is its `netAmount`; securities moved in or out carry no cash, so they
+    /// are valued at the price each item states — and a movement with
+    /// neither is kept as unrecognised, so the result says it could not take
+    /// it out rather than counting it.
+    public static func transfers(from data: Data) throws -> [AccountTransfer] {
+        guard let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            throw SchwabAPIError.decoding("transfers 不是 JSON 数组")
+        }
+        return rows.compactMap { row in
+            let type = row["type"] as? String
+            let id = (row["activityId"] as? Int64).map(String.init)
+                ?? (row["activityId"] as? Int).map(String.init)
+                ?? (row["activityId"] as? Double).map { String(Int64($0)) }
+                ?? (row["activityId"] as? String)
+            guard let id else { return nil }
+            let at = (row["time"] as? String).flatMap(date(_:)) ?? (row["tradeDate"] as? String).flatMap(date(_:))
+            guard let at else { return nil }
+            let cash = number(row, "netAmount") ?? 0
+            if cash != 0 {
+                return AccountTransfer(id: id, at: at, ccy: Venue.schwab.quoteCurrency, amount: cash, kind: .principal, venueType: type)
+            }
+            let items = (row["transferItems"] as? [[String: Any]]) ?? []
+            let securities = items.compactMap { item -> Double? in
+                guard let shares = number(item, "amount"), let price = number(item, "price") else { return nil }
+                return shares * price
+            }
+            if !securities.isEmpty {
+                return AccountTransfer(id: id, at: at, ccy: Venue.schwab.quoteCurrency, amount: securities.reduce(0, +), kind: .principal, venueType: type)
+            }
+            return AccountTransfer(id: id, at: at, ccy: Venue.schwab.quoteCurrency, amount: 0, kind: .unrecognised, venueType: type)
+        }
+        .sorted { $0.at > $1.at }
+    }
+
     // MARK: Helpers
 
     static func number(_ dict: [String: Any], _ key: String) -> Double? {

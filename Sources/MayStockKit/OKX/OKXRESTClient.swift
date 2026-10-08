@@ -106,6 +106,8 @@ public struct OKXRESTClient: Sendable {
         let low24h: String
         let vol24h: String
         let ts: String
+        let sodUtc8: String?
+        let sodUtc0: String?
     }
 
     public func ticker(instId: String) async throws -> Ticker {
@@ -124,7 +126,8 @@ public struct OKXRESTClient: Sendable {
             reference: open, high: high, low: low,
             volume: Double(row.vol24h) ?? 0,
             basis: .rolling24h,
-            ts: Date(timeIntervalSince1970: tsMs / 1000))
+            ts: Date(timeIntervalSince1970: tsMs / 1000),
+            references: OKXWireDecoder.references(open24h: open, sodUtc8: row.sodUtc8, sodUtc0: row.sodUtc0))
     }
 
     /// Backfill up to `target` candles (newest last), paginating the REST API

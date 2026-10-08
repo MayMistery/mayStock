@@ -60,10 +60,19 @@ struct LiveKernelGoldenTests {
 
     private func rubik(_ rows: [[String]]) -> String { json(["code": "0", "data": rows]) }
 
+    /// The account as pushed, and the mark the account's stream carries
+    /// after the push.
+    private let usdtUsd = 0.9996
+    private let accountUsdt = 6776.61
+    private var accountUsd: Double { accountUsdt * usdtUsd }
+    private let streamedMark = 2721.3
+
     private func startedModel() throws -> CheckupModel {
-        let model = CheckupModel(
-            venue: FakeVenue(), mode: .live, instId: "ETH-USDT-SWAP",
-            okxConfigPath: nil, network: false, nowOverrideMs: now)
+        let kernel = try LiveKernel(config: LiveKernel.Config(
+            instId: "ETH-USDT-SWAP", followsHeldPosition: true, mode: .live,
+            okxProfile: nil, okxConfigPath: nil, schwabctlPath: nil,
+            network: false, nowOverrideMs: now, analytics: false))
+        let model = CheckupModel(kernel: kernel, instId: "ETH-USDT-SWAP")
         model.start()
         try model.ingest(topic: "rest.clock", payload: json([
             "server": json(["code": "0", "data": [["ts": "\(now - 40)"]]]), "sentMs": now - 100, "receivedMs": now + 100,
@@ -102,17 +111,28 @@ struct LiveKernelGoldenTests {
         try model.ingest(topic: "rest.binance.history.accounts", payload: json([["longShortRatio": "2.52", "timestamp": now - 300_000]]))
         try model.ingest(topic: "rest.binance.oi", payload: json(["openInterest": "2341129", "time": now - 1_500]))
         try model.ingest(topic: "binance.stream", payload: json(["e": "markPriceUpdate", "E": now - 700, "p": "2720.9", "i": "2721.2", "r": "0.00004745", "T": now + 3_600_000]))
-        // The account: a long with a position-attached stop, plus a standalone stop.
+        // The account: a long with a position-attached stop, plus a standalone
+        // stop, settled in USDT at OKX's own USDT price.
         try model.ingest(topic: "okx.private", payload: json([
             "arg": ["channel": "positions", "instType": "ANY"], "eventType": "snapshot", "curPage": 1, "lastPage": true,
             "data": [["instId": "ETH-USDT-SWAP", "instType": "SWAP", "posId": "1", "posSide": "net", "pos": "187.75",
-                      "avgPx": "2687.5", "markPx": "2721.0", "upl": "630", "lever": "20", "liqPx": "2564.69",
+                      "avgPx": "2687.5", "markPx": "2721.0", "upl": "630", "uplRatio": "0.2467", "lever": "20", "liqPx": "2564.69",
                       "notionalUsd": "51090", "margin": "", "imr": "2554", "mmr": "204", "mgnRatio": "31",
-                      "fundingFee": "-1.2", "uTime": "\(now - 60_000)",
+                      "fundingFee": "-1.2", "uTime": "\(now - 60_000)", "ccy": "USDT", "usdPx": "\(usdtUsd)",
                       "closeOrderAlgo": [["algoId": "p1", "slTriggerPx": "2600", "tpTriggerPx": "", "closeFraction": "1"]]]],
         ]))
-        try model.ingest(topic: "okx.private", payload: json(["arg": ["channel": "account"], "data": [["totalEq": "6773.9", "uTime": "\(now - 100)"]]]))
-        try model.ingest(topic: "rest.okx.stops", payload: json(["code": "0", "data": [
+        try model.ingest(topic: "okx.private", payload: json(["arg": ["channel": "account"], "eventType": "snapshot", "data": [[
+            "totalEq": "\(accountUsd)", "uTime": "\(now - 100)",
+            "details": [["ccy": "USDT", "eq": "\(accountUsdt)", "eqUsd": "\(accountUsd)", "upl": "630", "availBal": "4219.9"]],
+        ]]]))
+        // The account environment's own mark stream, and the terms that
+        // value the position at it.
+        try model.ingest(topic: "rest.okx.spec.ETH-USDT-SWAP", payload: json(["code": "0", "data": [[
+            "instId": "ETH-USDT-SWAP", "instType": "SWAP", "tickSz": "0.01", "lotSz": "0.01", "minSz": "0.01",
+            "ctVal": "0.1", "ctMult": "1", "ctType": "linear", "ctValCcy": "ETH", "settleCcy": "USDT", "state": "live",
+        ]]]))
+        try model.ingest(topic: "okx.marks", payload: okx("mark-price", ["instId": "ETH-USDT-SWAP", "markPx": "\(streamedMark)", "ts": "\(now - 10)"]))
+        try model.ingest(topic: "rest.okx.orders", payload: json(["code": "0", "data": [
             ["algoId": "s1", "instId": "ETH-USDT-SWAP", "instType": "SWAP", "ordType": "conditional", "side": "sell", "posSide": "net",
              "sz": "187.75", "slTriggerPx": "2580", "slOrdPx": "-1", "tpTriggerPx": "", "reduceOnly": "true", "state": "live"],
         ]]))
@@ -159,15 +179,33 @@ struct LiveKernelGoldenTests {
         #expect(risk.positions.count == 1)
         let position = try #require(risk.positions.first)
         #expect(risk.source == "okx.private" && risk.wasRead)
-        #expect(risk.mark?.source == "okx.mark-price" && risk.mark?.price == 2721.3)
+        // Valued at the account environment's streamed mark, by the venue's
+        // rule, and the buffer read at the same mark.
+        #expect(risk.mark?.source == "okx.mark-price" && risk.mark?.price == streamedMark)
+        let upl = (streamedMark - 2687.5) * 187.75 * 0.1
+        #expect(position.remarked)
+        #expect(abs((position.unrealisedPnl ?? 0) - upl) < 1e-9)
+        #expect(abs((position.unrealisedRatio ?? 0) - upl * 0.2467 / 630) < 1e-12, "the venue's own denominator")
+        let notional = 187.75 * 0.1 * streamedMark * usdtUsd
+        #expect(abs((position.notionalUsd ?? 0) - notional) < 1e-6)
+        // The account document says the same, with the equity valued at it.
+        let account = snapshot.account
+        let holding = try #require(account.positions.first)
+        #expect(holding.unrealisedPnl == position.unrealisedPnl && holding.remarked)
+        let equity = try #require(account.equity)
+        let equityUsd = accountUsd + (upl - 630) * usdtUsd
+        #expect(abs(equity.usd - equityUsd) < 1e-6)
+        #expect(equity.pushedUsd == accountUsd && equity.unmarked.isEmpty)
+        let reading = try #require(account.snapshot)
+        #expect(abs((reading.equity(in: "USDT") ?? 0) - equityUsd / usdtUsd) < 1e-6, "stated in USDT at the push's own rate")
         #expect(Set(position.protective.map(\.kind)) == ["仓位止盈止损", "条件单"])
         let standalone = try #require(position.protective.first { $0.algoId == "s1" })
         #expect(standalone.stopPrice == 2580 && standalone.takeProfitPrice == nil && standalone.size == 187.75)
         #expect(risk.unattachedOrders.isEmpty)
         #expect(position.liquidationOdds.count == 3)
         #expect(position.liquidationOdds.allSatisfy { $0.touching >= $0.atHorizon })
-        #expect(abs((risk.exposure?.effectiveLeverage ?? 0) - 51_090 / 6773.9) < 1e-9)
-        #expect(risk.exposure?.netNotional == 51_090 && risk.exposure?.grossNotional == 51_090)
+        #expect(abs((risk.exposure?.effectiveLeverage ?? 0) - notional / equityUsd) < 1e-9)
+        #expect(abs((risk.exposure?.netNotional ?? 0) - notional) < 1e-6 && risk.exposure?.grossNotional == risk.exposure?.netNotional)
 
         let okxVenue = try #require(snapshot.structure.first { $0.venue == "OKX" })
         #expect(okxVenue.fundingRate?.value == 0.0001)
@@ -185,6 +223,40 @@ struct LiveKernelGoldenTests {
         let expected = 50.14348112 * pow(1.12, -0.576) * pow(150.0, 0.136) * pow(1.30, -0.119)
             * pow(1.38, 0.091) * pow(10.4, 0.042) * pow(0.86, 0.036)
         #expect(abs(dollar - expected) / expected < 1e-6)
+    }
+
+    /// Walks every field of the decoded snapshot rather than naming them, so
+    /// a stamped value added later is held to the same rule the day it lands:
+    /// its stale age is the kernel's, and a real one.
+    @Test("every stale age in the snapshot is one the kernel declared, and positive")
+    func everyStaleAgeIsDeclared() throws {
+        let model = try startedModel()
+        defer { model.stop() }
+        let snapshot = try #require(model.snapshot)
+        var found: [String] = []
+        func walk(_ value: Any, path: String) {
+            let mirror = Mirror(reflecting: value)
+            if mirror.displayStyle == .optional {
+                if let inner = mirror.children.first { walk(inner.value, path: path) }
+                return
+            }
+            for child in mirror.children {
+                let here = path + "." + (child.label ?? "[]")
+                guard let label = child.label, label == "staleAfterMs" || label.hasSuffix("StaleAfterMs") else {
+                    walk(child.value, path: here)
+                    continue
+                }
+                let inner = Mirror(reflecting: child.value)
+                let age = inner.displayStyle == .optional ? inner.children.first?.value as? Double : child.value as? Double
+                guard let age else { continue }
+                found.append(here)
+                #expect(age > 0, "\(here) is \(age)")
+            }
+        }
+        walk(snapshot, path: "snapshot")
+        for section in ["structure", "probability", "risk", "macro", "account", "feeds", "gravity"] {
+            #expect(found.contains { $0.hasPrefix("snapshot.\(section)") }, "the fixture ages nothing under \(section)")
+        }
     }
 
     @Test("an unchanged snapshot is not handed out twice")

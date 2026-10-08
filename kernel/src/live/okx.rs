@@ -13,8 +13,19 @@ use super::Feed;
 
 pub const REST: &str = "https://www.okx.com";
 const PUBLIC_WS: &str = "wss://ws.okx.com:8443/ws/v5/public";
+const PUBLIC_WS_DEMO: &str = "wss://wspap.okx.com:8443/ws/v5/public";
+
+/// The public socket of an environment: the demo keeps its own books and
+/// marks.
+pub(crate) fn public_ws(demo: bool) -> &'static str {
+    if demo { PUBLIC_WS_DEMO } else { PUBLIC_WS }
+}
 const PRIVATE_WS: &str = "wss://ws.okx.com:8443/ws/v5/private";
 const PRIVATE_WS_DEMO: &str = "wss://wspap.okx.com:8443/ws/v5/private";
+/// Algo-order pushes live on the business socket: asked for on the private
+/// one, `orders-algo` is refused with 60018 (measured 2026-09-24).
+const BUSINESS_WS: &str = "wss://ws.okx.com:8443/ws/v5/business";
+const BUSINESS_WS_DEMO: &str = "wss://wspap.okx.com:8443/ws/v5/business";
 
 // MARK: - Shared JSON helpers
 
@@ -77,6 +88,47 @@ impl super::socket::Dialect for PublicDialect {
     }
     fn keepalive(&self) -> Keepalive {
         // OKX drops a connection silent for 30 s; the client must ping.
+        Keepalive::Text("ping", Duration::from_secs(15))
+    }
+    fn idle_timeout(&self) -> Duration {
+        Duration::from_secs(30)
+    }
+    fn is_chatter(&self, text: &str) -> bool {
+        text == "pong"
+    }
+}
+
+/// The marks of every instrument the account holds, on the public socket of
+/// the account's own environment: a demo account's positions are valued at
+/// the demo's marks, which are not the market's (an option measured at
+/// 0.052 there against 0.0205 on the real book, 2026-09).
+pub struct MarksDialect {
+    inst_ids: Vec<String>,
+    demo: bool,
+}
+
+impl MarksDialect {
+    pub fn new(inst_ids: Vec<String>, demo: bool) -> MarksDialect {
+        MarksDialect { inst_ids, demo }
+    }
+
+    fn args(&self) -> Value {
+        Value::Array(self.inst_ids.iter().map(|inst| json!({"channel": "mark-price", "instId": inst})).collect())
+    }
+}
+
+impl super::socket::Dialect for MarksDialect {
+    fn feed(&self) -> Feed {
+        Feed::OkxMarks
+    }
+    async fn plan(&self) -> Result<Plan, String> {
+        let frame = json!({"op": "subscribe", "args": self.args()}).to_string();
+        Ok(Plan { url: public_ws(self.demo).to_string(), steps: vec![Step { frame, await_ack: false }] })
+    }
+    fn ack(&self, _text: &str) -> Option<Result<(), String>> {
+        None
+    }
+    fn keepalive(&self) -> Keepalive {
         Keepalive::Text("ping", Duration::from_secs(15))
     }
     fn idle_timeout(&self) -> Duration {
@@ -215,19 +267,64 @@ pub(crate) fn parse_credentials(body: &str, profile: Option<&str>) -> Result<Cre
     })
 }
 
-/// The only channels the private socket may subscribe to. Both are read-only
-/// pushes; the socket never sends an order operation, and this list is the
-/// single place that would have to change for it to.
-const PRIVATE_CHANNELS: [&str; 2] = ["positions", "account"];
+/// The only channels each signed socket may subscribe to. Every one is a
+/// read-only push; neither socket ever sends an order operation, and these
+/// two lists are the single place that would have to change for it to.
+const PRIVATE_CHANNELS: [&str; 3] = ["positions", "account", "orders"];
+const BUSINESS_CHANNELS: [&str; 2] = ["orders-algo", "algo-advance"];
+
+/// Which of OKX's two signed sockets a dialect opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signed {
+    /// Positions, the account, and ordinary orders.
+    Private,
+    /// Algo orders: stops, targets, triggers, trailing, iceberg, TWAP.
+    Business,
+}
 
 pub struct PrivateDialect {
     credentials: Credentials,
     demo: bool,
+    socket: Signed,
 }
 
 impl PrivateDialect {
     pub fn new(credentials: Credentials, demo: bool) -> PrivateDialect {
-        PrivateDialect { credentials, demo }
+        PrivateDialect { credentials, demo, socket: Signed::Private }
+    }
+
+    /// The business socket, for the algo-order pushes.
+    pub fn business(credentials: Credentials, demo: bool) -> PrivateDialect {
+        PrivateDialect { credentials, demo, socket: Signed::Business }
+    }
+
+    fn args(&self) -> Vec<Value> {
+        match self.socket {
+            // A full snapshot every 2 s plus a push on every event, for
+            // positions and account: a missed event heals within two
+            // seconds, and equity — which carries unrealised P&L — keeps
+            // moving with price between events. Event-only pushes would leave
+            // it quietly stale. Orders push on events only: they are a signal
+            // to read the listing again, not the listing.
+            Signed::Private => PRIVATE_CHANNELS
+                .iter()
+                .map(|channel| match *channel {
+                    "positions" => json!({"channel": "positions", "instType": "ANY", "extraParams": "{\"updateInterval\":\"2000\"}"}),
+                    "account" => json!({"channel": "account", "extraParams": "{\"updateInterval\":\"2000\"}"}),
+                    other => json!({"channel": other, "instType": "ANY"}),
+                })
+                .collect(),
+            Signed::Business => BUSINESS_CHANNELS.iter().map(|channel| json!({"channel": channel, "instType": "ANY"})).collect(),
+        }
+    }
+
+    fn url(&self) -> &'static str {
+        match (self.socket, self.demo) {
+            (Signed::Private, false) => PRIVATE_WS,
+            (Signed::Private, true) => PRIVATE_WS_DEMO,
+            (Signed::Business, false) => BUSINESS_WS,
+            (Signed::Business, true) => BUSINESS_WS_DEMO,
+        }
     }
 }
 
@@ -239,7 +336,10 @@ pub(crate) fn login_signature(secret: &str, timestamp: &str) -> Result<String, S
 
 impl super::socket::Dialect for PrivateDialect {
     fn feed(&self) -> Feed {
-        Feed::OkxPrivate
+        match self.socket {
+            Signed::Private => Feed::OkxPrivate,
+            Signed::Business => Feed::OkxOrderEvents,
+        }
     }
     async fn plan(&self) -> Result<Plan, String> {
         let timestamp = (super::now_ms() / 1000).to_string();
@@ -249,21 +349,9 @@ impl super::socket::Dialect for PrivateDialect {
             "timestamp": timestamp, "sign": sign,
         }]})
         .to_string();
-        // A full snapshot every 2 s plus a push on every event, for both: a
-        // missed event heals within two seconds, and equity — which carries
-        // unrealised P&L — keeps moving with price between events. Event-only
-        // pushes would leave it quietly stale.
-        let args: Vec<Value> = PRIVATE_CHANNELS
-            .iter()
-            .map(|channel| match *channel {
-                "positions" => json!({"channel": "positions", "instType": "ANY", "extraParams": "{\"updateInterval\":\"2000\"}"}),
-                other => json!({"channel": other, "extraParams": "{\"updateInterval\":\"2000\"}"}),
-            })
-            .collect();
-        let subscribe = json!({"op": "subscribe", "args": args}).to_string();
-        let url = if self.demo { PRIVATE_WS_DEMO } else { PRIVATE_WS };
+        let subscribe = json!({"op": "subscribe", "args": self.args()}).to_string();
         Ok(Plan {
-            url: url.to_string(),
+            url: self.url().to_string(),
             steps: vec![Step { frame: login, await_ack: true }, Step { frame: subscribe, await_ack: false }],
         })
     }
@@ -303,6 +391,9 @@ pub struct PositionRow {
     pub average_price: Option<f64>,
     pub mark_price: Option<f64>,
     pub unrealised_pnl: Option<f64>,
+    /// The venue's own return on the position (`uplRatio`, a fraction):
+    /// floating profit over the margin the position opened with.
+    pub unrealised_ratio: Option<f64>,
     pub leverage: Option<f64>,
     pub liquidation_price: Option<f64>,
     pub notional_usd: Option<f64>,
@@ -313,6 +404,10 @@ pub struct PositionRow {
     pub funding_fee: Option<f64>,
     pub protective: Vec<Protective>,
     pub updated_ms: Option<i64>,
+    /// When the venue produced this reading (`pTime`, on its clock) — the
+    /// instant its `markPx` and `upl` are as of. Socket pushes carry it; a
+    /// REST read does not.
+    pub pushed_ms: Option<i64>,
     /// What the position settles in (`ccy`), and the venue's own rate from
     /// that into dollars (`usdPx`).
     pub settlement_currency: Option<String>,
@@ -362,6 +457,7 @@ fn position_row(row: &Value) -> Option<PositionRow> {
         average_price: num(row, "avgPx"),
         mark_price: num(row, "markPx"),
         unrealised_pnl: num(row, "upl"),
+        unrealised_ratio: num(row, "uplRatio"),
         leverage: num(row, "lever"),
         liquidation_price: num(row, "liqPx").filter(|p| *p > 0.0),
         notional_usd: num(row, "notionalUsd"),
@@ -371,6 +467,7 @@ fn position_row(row: &Value) -> Option<PositionRow> {
         funding_fee: num(row, "fundingFee"),
         protective,
         updated_ms: millis(row, "uTime").or_else(|| millis(row, "pTime")),
+        pushed_ms: millis(row, "pTime"),
         settlement_currency: text(row, "ccy").map(str::to_string),
         usd_rate: num(row, "usdPx"),
         margin_mode: text(row, "mgnMode").filter(|m| !m.is_empty()).map(str::to_string),
@@ -409,6 +506,63 @@ pub fn total_equity_in(value: &Value) -> Option<f64> {
     unified.or(valuation)
 }
 
+/// One currency of the trading account, as the venue values it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CurrencyEquity {
+    pub ccy: String,
+    /// Cash plus the margin and floating profit of everything settled in it
+    /// (`eq`).
+    pub equity: f64,
+    /// `equity` in dollars, as the venue values it (`eqUsd`).
+    pub equity_usd: Option<f64>,
+    /// The floating profit inside `equity` (`upl`), at the venue's mark when
+    /// this reading was made.
+    pub floating: f64,
+    /// What can be spent (`availBal`).
+    pub available: Option<f64>,
+}
+
+/// The trading account in one reading: its dollar total and every currency
+/// in it. The total and the lines come from the same push, so the floating
+/// profit inside the total is exactly the lines' `floating`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AccountRow {
+    /// `totalEq`, in dollars. None when the venue left it empty.
+    pub total_usd: Option<f64>,
+    pub currencies: Vec<CurrencyEquity>,
+}
+
+/// The trading account wherever a document carries it: the object holding
+/// `totalEq` — a socket push's data row, a REST read's, or the snapshot's
+/// `trading` section — with its `details`.
+pub fn account_in(value: &Value) -> Option<AccountRow> {
+    let mut found: Option<AccountRow> = None;
+    walk(value, &mut |object| {
+        if found.is_some() || object.get("totalEq").is_none() {
+            return;
+        }
+        let currencies = object
+            .get("details")
+            .and_then(Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| {
+                        Some(CurrencyEquity {
+                            ccy: text(row, "ccy")?.to_string(),
+                            equity: num(row, "eq")?,
+                            equity_usd: num(row, "eqUsd"),
+                            floating: num(row, "upl").unwrap_or(0.0),
+                            available: num(row, "availBal"),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        found = Some(AccountRow { total_usd: num(object, "totalEq").filter(|e| *e > 0.0), currencies });
+    });
+    found
+}
+
 /// One currency's holding.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Balance {
@@ -421,12 +575,21 @@ pub struct Balance {
 /// Every currency holding in a balance document, one per currency — the
 /// larger where a currency appears in both the trading and funding sections —
 /// sorted by currency. Zero holdings are left out.
+///
+/// A trading line's total is its equity (`eq`): cash plus the margin and
+/// floating profit of the positions settled in it, the figure the venue's
+/// `eqUsd` values and the one its app calls 权益. It used to be `cashBal`,
+/// which leaves isolated margin and floating profit out — so on the live
+/// account (2026-10-08) USDT read 2,871.34 against an `eqUsd` of 8,484.73,
+/// and the rate taken from the pair (`AccountSnapshot.usdRate`) came out at
+/// 2.955 dollars per USDT instead of 0.99924. A funding line has no `eq`;
+/// its `bal` is the whole of it.
 pub fn balances_in(value: &Value) -> Vec<Balance> {
     let mut best: std::collections::BTreeMap<String, Balance> = std::collections::BTreeMap::new();
     walk(value, &mut |object| {
         let Some(ccy) = text(object, "ccy") else { return };
         let available = num(object, "availBal").or_else(|| num(object, "availEq")).unwrap_or(0.0);
-        let total = num(object, "cashBal").or_else(|| num(object, "bal")).or_else(|| num(object, "eq")).unwrap_or(available);
+        let total = num(object, "eq").or_else(|| num(object, "bal")).or_else(|| num(object, "cashBal")).unwrap_or(available);
         if !(available > 0.0 || total > 0.0) {
             return;
         }
@@ -466,7 +629,12 @@ pub enum PrivateEvent {
     /// `last_page`); event pushes carry only what changed. `ms` is when the
     /// push arrived, on this machine's clock.
     Positions { rows: Vec<PositionRow>, snapshot: bool, last_page: bool, ms: i64 },
-    Account { equity: f64, ms: i64 },
+    /// An account push: the dollar total and the currencies it carries. A
+    /// snapshot carries every currency (paged like positions); an event push
+    /// carries the ones that changed.
+    Account { row: AccountRow, snapshot: bool, last_page: bool, ms: i64 },
+    /// An order pushed a change: the listing is to be read again.
+    OrdersChanged,
     Error(String),
 }
 
@@ -494,8 +662,14 @@ pub fn decode_private(frame: &str, received_ms: i64) -> Vec<PrivateEvent> {
                 ms,
             }]
         }
-        "account" => match total_equity_in(data) {
-            Some(equity) => vec![PrivateEvent::Account { equity, ms: received_ms }],
+        "orders" => vec![PrivateEvent::OrdersChanged],
+        "account" => match account_in(data) {
+            Some(row) => vec![PrivateEvent::Account {
+                row,
+                snapshot: text(&value, "eventType") != Some("event_update"),
+                last_page: value.get("lastPage").and_then(Value::as_bool).unwrap_or(true),
+                ms: received_ms,
+            }],
             None => Vec::new(),
         },
         _ => Vec::new(),
@@ -638,6 +812,27 @@ mod tests {
     }
 
     #[test]
+    fn a_trading_line_is_valued_whole_and_the_account_read_per_currency() {
+        // The live account's USDT line, 2026-10-08: cash 2,871 inside an
+        // equity of 8,491 — the rest is the isolated long's margin and its
+        // floating loss. The line's total is the equity, the figure its
+        // `eqUsd` values; the rate between them is the venue's USDT price.
+        let doc: Value = serde_json::from_str(r#"{"data":[{"totalEq":"8484.733987517242","details":[
+            {"ccy":"USDT","eq":"8491.264868898954","eqUsd":"8484.726594949901","cashBal":"2871.338915974109","availBal":"2871.338915974109","upl":"-479.05123159931134"}]}]}"#).unwrap();
+        let usdt = balances_in(&doc).into_iter().find(|b| b.ccy == "USDT").unwrap();
+        assert_eq!(usdt.total, 8491.264868898954);
+        assert_eq!(usdt.available, 2871.338915974109);
+        let rate = usdt.valuation_usd.unwrap() / usdt.total;
+        assert!((rate - 0.99923).abs() < 1e-5, "{rate}");
+        let account = account_in(&doc).unwrap();
+        assert_eq!(account.total_usd, Some(8484.733987517242));
+        assert_eq!(account.currencies[0].floating, -479.05123159931134);
+        // A funding line has no equity; its balance is the whole of it.
+        let funding: Value = serde_json::from_str(r#"{"funding":{"details":[{"ccy":"BTC","bal":"0.5","availBal":"0.5"}]}}"#).unwrap();
+        assert_eq!(balances_in(&funding)[0].total, 0.5);
+    }
+
+    #[test]
     fn a_position_says_which_margin_mode_holds_it() {
         // Shape of the live account's isolated long, 2026-09-24.
         let cli = r#"{"data":[
@@ -661,8 +856,17 @@ mod tests {
     }
 
     #[test]
-    fn the_private_socket_can_only_subscribe_read_only_channels() {
-        assert_eq!(PRIVATE_CHANNELS, ["positions", "account"]);
+    fn the_signed_sockets_can_only_subscribe_read_only_channels() {
+        assert_eq!(PRIVATE_CHANNELS, ["positions", "account", "orders"]);
+        assert_eq!(BUSINESS_CHANNELS, ["orders-algo", "algo-advance"]);
+        let credentials = parse_credentials("[profiles.a]\napi_key=\"k\"\nsecret_key=\"s\"\npassphrase=\"p\"\n", Some("a")).unwrap();
+        let business = PrivateDialect::business(credentials.clone(), true);
+        assert_eq!(business.url(), BUSINESS_WS_DEMO);
+        assert!(business.args().iter().all(|a| a["instType"] == "ANY"));
+        assert_eq!(PrivateDialect::new(credentials, false).url(), PRIVATE_WS);
+        // An order push is a signal, and only that.
+        let push = r#"{"arg":{"channel":"orders","instType":"ANY"},"data":[{"instId":"ETH-USDT-SWAP","ordId":"1","state":"canceled"}]}"#;
+        assert_eq!(decode_private(push, 1), vec![PrivateEvent::OrdersChanged]);
     }
 
     #[test]

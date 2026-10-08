@@ -181,17 +181,21 @@ public struct VenueConnectionReport: Sendable, Equatable {
     /// The profile the check ran under; nil means the CLI default.
     public let profile: String?
     public let checkedAt: Date
-    public let totalEquity: Double?
+    /// The account as the check read it, so its equity is shown in the unit
+    /// it is in (`AccountSnapshot.displayEquity`), never under a borrowed one.
+    public let snapshot: AccountSnapshot?
     public let balanceCount: Int
     /// Nil when the balance read succeeded but the configuration read did not.
     public let account: AccountConfigInfo?
 
+    public var totalEquity: Double? { snapshot?.totalEquity }
+
     public init(mode: TradingMode, profile: String?, checkedAt: Date,
-                totalEquity: Double?, balanceCount: Int, account: AccountConfigInfo?) {
+                snapshot: AccountSnapshot?, balanceCount: Int, account: AccountConfigInfo?) {
         self.mode = mode
         self.profile = profile
         self.checkedAt = checkedAt
-        self.totalEquity = totalEquity
+        self.snapshot = snapshot
         self.balanceCount = balanceCount
         self.account = account
     }
@@ -265,6 +269,32 @@ public struct AccountSnapshot: Sendable, Equatable {
 
     public func balance(of ccy: String) -> AccountBalance? {
         balances.first { $0.ccy == ccy }
+    }
+
+    /// The total stated in `currency`, at the venue's own rate into it from
+    /// this same reading. Nil when the venue gave no rate: a label borrowed
+    /// for a number in another unit is exactly the defect this exists to stop
+    /// (OKX's `totalEq` is dollars, and the panel used to call it USDT).
+    public func equity(in currency: String) -> Double? {
+        guard let total = totalEquity else { return nil }
+        if currency == equityCurrency { return total }
+        guard equityCurrency == Self.usdCode else { return nil }
+        return amount(usd: total, in: currency)
+    }
+
+    /// A dollar figure taken with this reading, stated in `currency` at the
+    /// reading's own rate (`usdRate`). Nil when the reading states no rate
+    /// for it — a reason to keep the dollars, labelled, not to guess.
+    public func amount(usd: Double, in currency: String) -> Double? {
+        usdRate(for: currency).map { usd / $0 }
+    }
+
+    /// The equity as a screen shows it: in `preferred` when the reading can
+    /// state it there, else in the unit the venue stated — always with the
+    /// label that belongs to the number.
+    public func displayEquity(in preferred: String) -> (amount: Double, currency: String)? {
+        if let amount = equity(in: preferred) { return (amount, preferred) }
+        return totalEquity.map { ($0, equityCurrency) }
     }
 
     /// The venue's own rate from `currency` into USD, taken from this very
@@ -388,6 +418,19 @@ public struct ExchangePosition: Sendable, Equatable, Identifiable {
     /// How the exchange margins it; nil when the venue does not say (Schwab)
     /// or said nothing recognisable.
     public let marginMode: MarginMode?
+    /// The venue's own return on the position (`uplRatio`, a fraction):
+    /// floating profit over the margin it opened with — the 收益率 its app
+    /// shows. Nil where the venue states none.
+    public let unrealisedRatio: Double?
+    /// When `markPrice` — and so every figure taken at it — is as of, on
+    /// this machine's clock. Nil when the reading did not say.
+    public let markAt: Date?
+    /// Valued at the mark streamed in the account's environment, rather
+    /// than the venue's last push of its own figures.
+    public let isValuedLive: Bool
+    /// Why the venue's pushed figures stand, when a fresher mark was there
+    /// to value at and could not be used.
+    public let valuationNote: String?
 
     public var id: String { instId + posSide.rawValue }
 
@@ -396,8 +439,14 @@ public struct ExchangePosition: Sendable, Equatable, Identifiable {
         markPrice: Double?, unrealisedPnL: Double, leverage: Double?, liquidationPrice: Double?,
         notionalUsd: Double? = nil, instType: String = "",
         margin: Double? = nil, maintenanceMargin: Double? = nil, marginRatio: Double? = nil,
-        settlementCurrency: String? = nil, usdRate: Double? = nil, marginMode: MarginMode? = nil
+        settlementCurrency: String? = nil, usdRate: Double? = nil, marginMode: MarginMode? = nil,
+        unrealisedRatio: Double? = nil, markAt: Date? = nil, isValuedLive: Bool = false,
+        valuationNote: String? = nil
     ) {
+        self.unrealisedRatio = unrealisedRatio
+        self.markAt = markAt
+        self.isValuedLive = isValuedLive
+        self.valuationNote = valuationNote
         self.marginMode = marginMode
         self.margin = margin
         self.maintenanceMargin = maintenanceMargin
@@ -414,6 +463,18 @@ public struct ExchangePosition: Sendable, Equatable, Identifiable {
         self.instType = instType
         self.settlementCurrency = settlementCurrency
         self.usdRate = usdRate
+    }
+
+    /// The same reading, stamped with when its mark is as of.
+    public func marked(at date: Date) -> ExchangePosition {
+        ExchangePosition(
+            instId: instId, posSide: posSide, quantity: quantity, averagePrice: averagePrice,
+            markPrice: markPrice, unrealisedPnL: unrealisedPnL, leverage: leverage,
+            liquidationPrice: liquidationPrice, notionalUsd: notionalUsd, instType: instType,
+            margin: margin, maintenanceMargin: maintenanceMargin, marginRatio: marginRatio,
+            settlementCurrency: settlementCurrency, usdRate: usdRate, marginMode: marginMode,
+            unrealisedRatio: unrealisedRatio, markAt: date, isValuedLive: isValuedLive,
+            valuationNote: valuationNote)
     }
 
     /// `unrealisedPnL` in dollars, or nil when the venue gave nothing to

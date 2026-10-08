@@ -543,7 +543,7 @@ private struct EnvironmentCard: View {
         switch status {
         case .connected(let report):
             VStack(alignment: .leading, spacing: 4) {
-                KeyValueRow(label: "账户权益", value: report.totalEquity.map { PriceFormatter.money($0) + " " + Venue.okx.quoteCurrency } ?? "未报告")
+                KeyValueRow(label: "账户权益", value: report.snapshot?.displayEquity(in: Venue.okx.quoteCurrency).map { PriceFormatter.money($0.amount) + " " + $0.currency } ?? "未报告")
                 KeyValueRow(label: "持有币种", value: "\(report.balanceCount) 种")
                 if let account = report.account {
                     KeyValueRow(label: "账户模式", value: account.accountLevelName, tint: account.supportsPerpetuals ? .primary : Theme.warning)

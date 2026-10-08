@@ -228,14 +228,19 @@ char *ms_settlement_currency(const char *venue,
 char *ms_okx_account_document(const char *kind, const char *json, char **error_out);
 
 /* The live data layer: every real-time market and account connection the
- * checkup screen reads, held in the kernel. Read-only — nothing it sends can
- * place, amend or cancel an order.
+ * app reads, held in the kernel. Read-only — nothing it sends can place,
+ * amend or cancel an order.
  *
  * Start it with a JSON config ({"instId","mode","okxProfile","okxConfigPath",
- * "schwabctlPath","followsHeldPosition","network","nowOverrideMs"}); ask for
- * the snapshot every frame. ms_live_snapshot returns NULL when nothing has
- * changed since `since_seq`, otherwise the snapshot JSON (caller frees) and
- * its sequence number in `seq_out`. */
+ * "schwabctlPath","followsHeldPosition","network","nowOverrideMs",
+ * "gridDivisor","analytics"}). The account part — private socket, held
+ * instruments' marks and terms, transfers, stops, clock — always runs; the
+ * checkup's market analytics run while "analytics" is true.
+ *
+ * ms_live_snapshot returns NULL when nothing has changed since `since_seq`,
+ * otherwise the whole checkup snapshot JSON (caller frees) and its sequence
+ * number in `seq_out`. ms_live_account does the same for the account
+ * document alone, whose sequence moves only when the account does. */
 typedef struct MSLive MSLive;
 MSLive *ms_live_start(const char *config_json, char **error_out);
 int32_t ms_live_configure(MSLive *handle, const char *config_json, char **error_out);
@@ -243,7 +248,14 @@ int32_t ms_live_configure(MSLive *handle, const char *config_json, char **error_
  * so does the CLI fallback for positions ("cli.positions", "cli.account"). */
 int32_t ms_live_ingest(MSLive *handle, const char *topic, const char *payload, char **error_out);
 char *ms_live_snapshot(const MSLive *handle, uint64_t since_seq, uint64_t *seq_out);
+char *ms_live_account(const MSLive *handle, uint64_t since_seq, uint64_t *seq_out);
 void ms_live_stop(MSLive *handle);
+/* How many of its own intervals a feed may miss before its age reads stale:
+ * the rule for the clocks the app runs itself, as for the kernel's feeds. */
+uint32_t ms_live_stale_after_intervals(void);
+/* How often the app reads the account through the CLI while the private
+ * socket is down, in milliseconds. */
+uint64_t ms_live_cli_fallback_ms(void);
 
 /* Trading: the one place an account is acted on. The kernel signs and sends
  * OKX REST requests itself, with the key from the okx CLI's config.toml, and

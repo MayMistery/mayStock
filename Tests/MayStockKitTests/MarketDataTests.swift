@@ -316,11 +316,11 @@ struct VenueMarketDataTests {
         }
     }
 
-    @Test func everyVenueDeclaresItsDataShape() {
+    @Test @MainActor func everyVenueDeclaresItsDataShape() {
         for venue in Venue.allCases {
             #expect(!venue.supportedBars.isEmpty)
             #expect(!venue.marketDataSourceName.isEmpty)
-            #expect(venue.changeBasis == (venue.tradesContinuously ? .rolling24h : .previousClose))
+            #expect(MarketHub(feeds: [], sources: []).changeBasis(for: venue) == (venue.tradesContinuously ? .sinceUtc8Midnight : .previousClose))
             for bar in venue.supportedBars {
                 #expect(BarInterval.allCases.contains(bar))
             }

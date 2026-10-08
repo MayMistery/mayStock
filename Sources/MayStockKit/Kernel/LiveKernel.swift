@@ -3,17 +3,31 @@ import CMayStockKernel
 
 /// Swift face of the kernel's live data layer.
 ///
-/// The kernel holds every real-time connection the checkup reads — OKX's
-/// public market socket and read-only account socket, Deribit's option
-/// surface, Binance's mark stream, Schwab's quote stream, and the REST reads
-/// with no stream — and republishes one snapshot, under a sequence number,
-/// whenever anything in it changes. This side only asks for that snapshot,
-/// once a frame, and gets nothing back when nothing moved.
+/// The kernel holds every real-time connection the app reads. The account
+/// part — OKX's read-only private socket, the marks of what the account
+/// holds, transfers, stops, the clock — runs for as long as the layer does,
+/// and is published on its own (`account(since:)`) for every screen. The
+/// checkup's market analytics — Deribit's option surface, Binance's mark
+/// stream, Schwab's quote stream, the option books and the REST reads with
+/// no stream — run while `Config.analytics` is on, and the whole snapshot
+/// (`snapshot(since:)`) carries them. Both come back nil when nothing moved.
+///
+/// One config, owned here: the app sets the account it reads, the checkup
+/// page switches its analytics on and off, and each changes only its own
+/// part (`update`).
 ///
 /// Thread-safe: the kernel serialises everything behind its own channel, and
 /// `stop` is guarded here so a late `snapshot` after it is a no-op, not a use
 /// of a freed handle.
 public final class LiveKernel: @unchecked Sendable {
+
+    /// How many of its own intervals a feed may miss before its age reads
+    /// stale — the kernel's rule for its feeds, and the rule for every clock
+    /// the app runs itself (the CLI fallback, a venue it polls).
+    public static let staleAfterIntervals = Double(ms_live_stale_after_intervals())
+    /// How often the account is read through the CLI while the private
+    /// socket is down: the interval the kernel ages those readings by.
+    public static let cliFallbackInterval = TimeInterval(ms_live_cli_fallback_ms()) / 1000
 
     /// What the live layer watches.
     public struct Config: Encodable, Sendable, Equatable {
@@ -33,12 +47,17 @@ public final class LiveKernel: @unchecked Sendable {
         /// into. The kernel declares which it offers
         /// (`Probability.gridChoices`); any other shows the automatic step.
         public var gridDivisor: Int
+        /// Whether the checkup's market analytics run. The account part runs
+        /// either way.
+        public var analytics: Bool
 
         public init(
             instId: String, followsHeldPosition: Bool, mode: TradingMode,
             okxProfile: String?, okxConfigPath: String?, schwabctlPath: String?,
-            network: Bool = true, nowOverrideMs: Int64? = nil, gridDivisor: Int = 1
+            network: Bool = true, nowOverrideMs: Int64? = nil, gridDivisor: Int = 1,
+            analytics: Bool = true
         ) {
+            self.analytics = analytics
             self.instId = instId
             self.followsHeldPosition = followsHeldPosition
             self.mode = mode == .demo ? "demo" : "live"
@@ -54,6 +73,15 @@ public final class LiveKernel: @unchecked Sendable {
     private let handle: OpaquePointer
     private let lock = NSLock()
     private var stopped = false
+    /// The config the layer is running under; read and written under `lock`.
+    private var running: Config
+
+    /// The config the layer is running under.
+    public var config: Config {
+        lock.lock()
+        defer { lock.unlock() }
+        return running
+    }
 
     public init(config: Config) throws {
         let json = try encodeJSON(config)
@@ -62,6 +90,7 @@ public final class LiveKernel: @unchecked Sendable {
             throw KernelError.kernel(KernelStrategy.take(&error) ?? "实时层启动失败（未给出原因）")
         }
         handle = started
+        running = config
     }
 
     deinit { stop() }
@@ -75,8 +104,38 @@ public final class LiveKernel: @unchecked Sendable {
     }
 
     public func configure(_ config: Config) throws {
-        let json = try encodeJSON(config)
-        try withLiveHandle { handle, error in ms_live_configure(handle, json, error) }
+        try update { $0 = config }
+    }
+
+    /// Change part of the config — what the caller owns — and keep the rest.
+    /// Read, changed and sent under one lock, so two owners changing their
+    /// own parts at once cannot undo each other. Nothing is sent when nothing
+    /// changed.
+    public func update(_ change: (inout Config) -> Void) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !stopped else { throw KernelError.kernel("实时层已停止") }
+        var next = running
+        change(&next)
+        guard next != running else { return }
+        let json = try encodeJSON(next)
+        var error: UnsafeMutablePointer<CChar>?
+        guard ms_live_configure(handle, json, &error) == 1 else {
+            throw KernelError.kernel(KernelStrategy.take(&error) ?? "实时层调用失败（未给出原因）")
+        }
+        running = next
+    }
+
+    /// The latest account document if it is newer than `since`; nil when
+    /// the account has not moved. Cheap enough to call every frame.
+    public func account(since: UInt64) -> (seq: UInt64, json: Data)? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !stopped else { return nil }
+        var seq: UInt64 = 0
+        guard let pointer = ms_live_account(handle, since, &seq) else { return nil }
+        defer { ms_string_free(pointer) }
+        return (seq, Data(bytes: pointer, count: strlen(pointer)))
     }
 
     /// Feed a recorded frame or a REST/CLI document down the live path.
