@@ -4,7 +4,7 @@ import Testing
 
 /// The checkup's job is to answer "how exposed am I" from whatever the account
 /// actually holds — now through the kernel's live layer, fed here offline with
-/// the same documents the CLI fallback hands it.
+/// the same documents the REST fallback hands it.
 ///
 /// The bug these tests exist for: the page was handed an instrument guessed
 /// from the watchlist — which holds spot pairs and equities, never perpetuals —
@@ -48,7 +48,7 @@ struct PositionCheckupTests {
         // caused the bug.
         let model = model(instId: "BTC-USDT")
         defer { model.stop() }
-        try model.ingest(topic: "cli.positions", payload: positions())
+        try model.ingest(topic: "rest.okx.positions", payload: positions())
         let snapshot = try #require(model.snapshot)
         #expect(snapshot.instrument.instId == "ETH-USDT-SWAP")
         #expect(snapshot.risk.positions.first?.contracts == -56.36)
@@ -58,20 +58,20 @@ struct PositionCheckupTests {
     func doesNotClaimFlatWhenHolding() throws {
         let model = model(instId: "TSLA")
         defer { model.stop() }
-        try model.ingest(topic: "cli.positions", payload: positions())
+        try model.ingest(topic: "rest.okx.positions", payload: positions())
         let risk = try #require(model.snapshot?.risk)
         // The failure this guards: "no position" on screen while a position is
         // open is worse than an empty page, because it is a confident lie.
         #expect(!risk.positions.isEmpty)
         #expect(risk.wasRead)
-        #expect(risk.source == "cli")
+        #expect(risk.source == "rest")
     }
 
     @Test("stays where it was told when it is not following positions")
     func respectsAnExplicitInstrument() throws {
         let model = model(instId: "ETH-USDT-SWAP", follows: false)
         defer { model.stop() }
-        try model.ingest(topic: "cli.positions", payload: positions(instId: "SOL-USDT-SWAP"))
+        try model.ingest(topic: "rest.okx.positions", payload: positions(instId: "SOL-USDT-SWAP"))
         let snapshot = try #require(model.snapshot)
         // A deep link naming an instrument is a request, not a guess.
         #expect(snapshot.instrument.instId == "ETH-USDT-SWAP")
@@ -83,7 +83,7 @@ struct PositionCheckupTests {
     func flatAccountKeepsItsInstrument() throws {
         let model = model()
         defer { model.stop() }
-        try model.ingest(topic: "cli.positions", payload: #"{"data":[]}"#)
+        try model.ingest(topic: "rest.okx.positions", payload: #"{"data":[]}"#)
         let risk = try #require(model.snapshot?.risk)
         #expect(risk.instId == "ETH-USDT-SWAP")
         #expect(risk.positions.isEmpty)
@@ -94,7 +94,7 @@ struct PositionCheckupTests {
     func carriesMarginFigures() throws {
         let model = model()
         defer { model.stop() }
-        try model.ingest(topic: "cli.positions", payload: positions())
+        try model.ingest(topic: "rest.okx.positions", payload: positions())
         let position = try #require(model.snapshot?.risk.positions.first)
         #expect(position.margin == 1_553.86)
         #expect(position.maintenanceMargin == 58.05)
@@ -105,8 +105,8 @@ struct PositionCheckupTests {
     func effectiveLeverageIgnoresTheContractSetting() throws {
         let model = model()
         defer { model.stop() }
-        try model.ingest(topic: "cli.positions", payload: positions())
-        try model.ingest(topic: "cli.account", payload: balance)
+        try model.ingest(topic: "rest.okx.positions", payload: positions())
+        try model.ingest(topic: "rest.okx.account", payload: balance)
         let risk = try #require(model.snapshot?.risk)
         // 14,489 / 7,130.97 ≈ 2.03 — a 50× contract says nothing about it.
         #expect(abs((risk.exposure?.effectiveLeverage ?? 0) - 2.03) < 0.01)
@@ -124,8 +124,8 @@ struct PositionCheckupTests {
         {"posId":"short","instId":"ETH-USDT-SWAP","instType":"SWAP","posSide":"short","pos":"83.32","avgPx":"2593.37","markPx":"2562.78","lever":"10","liqPx":"2840.06","notionalUsd":"21344.11","mgnMode":"isolated","margin":"2160.80"},
         {"posId":"long","instId":"ETH-USDT-SWAP","instType":"SWAP","posSide":"long","pos":"67.88","avgPx":"2617.5","markPx":"2562.78","lever":"10","liqPx":"2366.31","notionalUsd":"17388.84","mgnMode":"isolated","margin":"1776.59"}]}
         """
-        try model.ingest(topic: "cli.positions", payload: legs)
-        try model.ingest(topic: "cli.account", payload: balance)
+        try model.ingest(topic: "rest.okx.positions", payload: legs)
+        try model.ingest(topic: "rest.okx.account", payload: balance)
         let risk = try #require(model.snapshot?.risk)
         #expect(risk.positions.map(\.posSide) == ["long", "short"])
         #expect(risk.positions.map(\.liquidationPrice) == [2366.31, 2840.06])
@@ -141,7 +141,7 @@ struct PositionCheckupTests {
     func liquidationBuffer() throws {
         let model = model()
         defer { model.stop() }
-        try model.ingest(topic: "cli.positions", payload: positions())
+        try model.ingest(topic: "rest.okx.positions", payload: positions())
         let position = try #require(model.snapshot?.risk.positions.first)
         // 2886.06 / 2571.77 − 1 ≈ 12.22%
         #expect(abs((position.liquidationBufferPct ?? 0) - 12.22) < 0.05)
@@ -158,7 +158,7 @@ struct PositionCheckupTests {
         #expect(!risk.wasRead)
         #expect(risk.positions.isEmpty)
         #expect(risk.note != nil)
-        #expect(risk.fallbackNeeded, "no account socket: the app is asked to read through the CLI")
+        #expect(risk.fallbackNeeded, "no account socket: the app is asked to read over REST")
     }
 
     @Test("a page nobody can see keeps reading but redraws nothing, and catches up the moment it is shown")
@@ -166,7 +166,7 @@ struct PositionCheckupTests {
         let model = model()
         defer { model.stop() }
         model.isVisible = false
-        try model.ingest(topic: "cli.positions", payload: positions())
+        try model.ingest(topic: "rest.okx.positions", payload: positions())
         #expect(model.snapshot?.risk.positions.isEmpty == false, "the snapshot is still read while hidden")
         #expect(model.risk?.positions.isEmpty ?? true, "but nothing is published to the cards")
         model.isVisible = true
@@ -177,7 +177,7 @@ struct PositionCheckupTests {
     func switchingResetsStaleReadings() throws {
         let model = model()
         defer { model.stop() }
-        try model.ingest(topic: "cli.positions", payload: positions())
+        try model.ingest(topic: "rest.okx.positions", payload: positions())
         #expect(model.snapshot?.risk.positions.isEmpty == false)
 
         // Point it elsewhere: showing the old position's numbers under a new

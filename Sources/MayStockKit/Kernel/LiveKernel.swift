@@ -23,11 +23,11 @@ public final class LiveKernel: @unchecked Sendable {
 
     /// How many of its own intervals a feed may miss before its age reads
     /// stale — the kernel's rule for its feeds, and the rule for every clock
-    /// the app runs itself (the CLI fallback, a venue it polls).
+    /// the app runs itself (the REST fallback, a venue it polls).
     public static let staleAfterIntervals = Double(ms_live_stale_after_intervals())
-    /// How often the account is read through the CLI while the private
+    /// How often the account is read over REST while the private
     /// socket is down: the interval the kernel ages those readings by.
-    public static let cliFallbackInterval = TimeInterval(ms_live_cli_fallback_ms()) / 1000
+    public static let restFallbackInterval = TimeInterval(ms_live_rest_fallback_ms()) / 1000
 
     /// What the live layer watches.
     public struct Config: Encodable, Sendable, Equatable {

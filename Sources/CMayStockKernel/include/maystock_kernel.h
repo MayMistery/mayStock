@@ -245,7 +245,7 @@ typedef struct MSLive MSLive;
 MSLive *ms_live_start(const char *config_json, char **error_out);
 int32_t ms_live_configure(MSLive *handle, const char *config_json, char **error_out);
 /* Feed a recorded frame or REST body down the live path: tests use it, and
- * so does the CLI fallback for positions ("cli.positions", "cli.account"). */
+ * so does the REST fallback for positions ("rest.okx.positions", "rest.okx.account"). */
 int32_t ms_live_ingest(MSLive *handle, const char *topic, const char *payload, char **error_out);
 char *ms_live_snapshot(const MSLive *handle, uint64_t since_seq, uint64_t *seq_out);
 char *ms_live_account(const MSLive *handle, uint64_t since_seq, uint64_t *seq_out);
@@ -253,9 +253,9 @@ void ms_live_stop(MSLive *handle);
 /* How many of its own intervals a feed may miss before its age reads stale:
  * the rule for the clocks the app runs itself, as for the kernel's feeds. */
 uint32_t ms_live_stale_after_intervals(void);
-/* How often the app reads the account through the CLI while the private
+/* How often the app reads the account over REST while the private
  * socket is down, in milliseconds. */
-uint64_t ms_live_cli_fallback_ms(void);
+uint64_t ms_live_rest_fallback_ms(void);
 
 /* Trading: the one place an account is acted on. The kernel signs and sends
  * OKX REST requests itself, with the key from the okx CLI's config.toml, and

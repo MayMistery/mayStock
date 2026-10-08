@@ -26,13 +26,13 @@ public struct LiveAccount: Decodable, Sendable, Equatable {
     public let source: String
     public let note: String?
     /// The socket has been down long enough that the app should read the
-    /// account through the CLI and hand it in.
+    /// account over REST and hand it in.
     public let fallbackNeeded: Bool
     /// When positions were last read; nil until they have been.
     public let positionsMs: Int64?
     /// Past this age the list of positions is too old to be the account's
     /// reading and the app reads it over REST instead: the private socket's
-    /// grace before the CLI fallback starts, plus one fallback read.
+    /// grace before the REST fallback starts, plus one fallback read.
     public let positionsStaleAfterMs: Double
     public let equity: Equity?
     public let balances: [Balance]
@@ -288,7 +288,7 @@ public final class LiveAccountFeed {
     public static let pollInterval: TimeInterval = 0.25
     /// While the account socket is down, the CLI is read this often — the
     /// kernel's interval, the one it ages those readings by.
-    public static let fallbackInterval = LiveKernel.cliFallbackInterval
+    public static let fallbackInterval = LiveKernel.restFallbackInterval
 
     @ObservationIgnored private let kernel: LiveKernel
     @ObservationIgnored private let venue: () -> (any ExchangeVenue)?
@@ -354,11 +354,11 @@ public final class LiveAccountFeed {
 
     private func followFallback(needed: Bool) {
         if needed, fallback == nil {
-            Log.warn("account: 账户推送不可用，改由 okx CLI 每 \(Int(Self.fallbackInterval)) 秒读取一次")
+            Log.warn("account: 账户推送不可用，改由 REST（内核签名）每 \(Int(Self.fallbackInterval)) 秒读取一次")
             let interval = UInt64(Self.fallbackInterval * 1_000_000_000)
             fallback = Task { @MainActor [weak self] in
                 while !Task.isCancelled {
-                    await self?.readThroughCLI()
+                    await self?.readOverREST()
                     try? await Task.sleep(nanoseconds: interval)
                 }
             }
@@ -366,22 +366,22 @@ public final class LiveAccountFeed {
             task.cancel()
             fallback = nil
             fallbackError = nil
-            Log.warn("account: 账户推送恢复，停止 CLI 读取")
+            Log.warn("account: 账户推送恢复，停止 REST 读取")
         }
     }
 
-    private func readThroughCLI() async {
+    private func readOverREST() async {
         guard let venue = venue(), let mode = mode() else { return }
         do {
             let documents = try await venue.accountDocuments(mode: mode)
-            try kernel.ingest(topic: "cli.positions", payload: documents.positions)
-            try kernel.ingest(topic: "cli.account", payload: documents.balance)
+            try kernel.ingest(topic: "rest.okx.positions", payload: documents.positions)
+            try kernel.ingest(topic: "rest.okx.account", payload: documents.balance)
             fallbackError = nil
             pull()
         } catch {
             let message = (error as? TradeError)?.description ?? String(describing: error)
             fallbackError = message
-            Log.warn("account: CLI 读取账户失败：\(message)")
+            Log.warn("account: REST 读取账户失败：\(message)")
         }
     }
 }

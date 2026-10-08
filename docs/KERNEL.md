@@ -16,7 +16,7 @@
 ### 1.0 实时层的形状（2026-09-24）
 
 - **一个任务独占全部状态**。连接只转发收到的帧；解码、合并、所有派生数都在这个任务里按到达顺序算，没有锁，没有竞争。
-- **每次更新重新发布一份带序号的快照（JSON）**。页面可见时 Swift 每帧（16 ms）调 `ms_live_snapshot(since)`，没变化时拿到 NULL，只花一次锁；窗口被遮挡、最小化或切到别的 Space 超过半秒，降到每秒一次，照常记事件日志、跟随 CLI 兜底，但不重绘，重新可见时立刻发布最新一份。
+- **每次更新重新发布一份带序号的快照（JSON）**。页面可见时 Swift 每帧（16 ms）调 `ms_live_snapshot(since)`，没变化时拿到 NULL，只花一次锁；窗口被遮挡、最小化或切到别的 Space 超过半秒，降到每秒一次，照常记事件日志、跟随 REST 兜底，但不重绘，重新可见时立刻发布最新一份。
 - **每个数带交易所自己的时间戳**，界面按本机与交易所的时钟偏差（连测 6 次取往返最短）校正后显示毫秒级年龄。本机测得的时间（帧到达、轮询返回）在状态里是 `LocalMs` 类型，进快照只能经 `to_server` 换到交易所时钟——漏换是编译错误，不是随本机时钟漂移而错的年龄。
 - **每个源在 `Feed::cadence` 声明自己的节奏**：轮询器按它睡眠，年龄超过 3 个节奏变黄（`Feed::stale_after_ms`，随快照发给界面）。socket 帧和成功返回的轮询走同一个 `note_frame` 记新鲜度，所以「多久前」对每个源是同一个意思。
 - **风险按腿算，不按合约算**（2026-10-07）。同一合约可以同时持有多空两条腿（OKX 双向持仓模式），`risk.positions` 列出该合约上的每一条腿，各带自己的强平价、缓冲和强平概率。敞口按多、空分别累计（`gravity::Exposure`）：价格风险看净额；保证金、以及一条腿被强平后剩下的裸仓，看总额。条件单只归到它能平掉的那条腿，条件是同合约、同腿、方向为平仓方向（`WorkingOrder::closes`；「多卖空买」只在 `wire::Side::closing` 写一处）。不平任何腿的单（开仓或加仓触发）单独列在 `unattachedOrders`，不当作保护显示。
@@ -67,7 +67,7 @@ May 的决定：「交易相关都走内核」「内核直接签名下单」，�
 - **每条腿在自己的实时标记价上按平仓面板同一个公式重估**（`trade::terms::pnl`）：线性 `(mark − avg) × |pos| × ctVal × ctMult × 方向`。实测与交易所逐分对上：`maystock-e2e account` 在 REST 读数的标记价上复算实时文档的浮盈，Δ 0.0000（6–9 次对比）。收益率用交易所自己的分母，从推送里的 `upl / uplRatio` 还原。没有新标记价或规格未读到时沿用推送值，并写明原因。
 - **权益按币种重估**：`eq_now = (eq − upl)_推送 + Σ 各腿 upl_now`，再按推送里的 `eqUsd/eq` 折美元；没法重估的币种原样保留并点名（`unmarked`）。
 - **一份文档**：`ms_live_account(since)`，序号只在账户变了时前进；Swift 每 250 ms 取一次（`LiveAccountFeed`），`VenueBooks` 采纳后，每块屏幕和交易循环读的都是这一份（`AccountReading`）。各部分各带时间戳（权益、持仓、挂单、成交），一份新鲜的权益不替一份旧挂单作保。
-- **兜底分三层，每层都标出来**：私有 socket 断开超过 20 秒（`PRIVATE_GRACE_MS`）→ 文档置 `fallbackNeeded` → App 每 10 秒经 CLI 读一次交给内核（`Renewal::CliFallback`，App 的循环按 `ms_live_cli_fallback_ms` 睡），解析路径与推送完全相同；连这份也旧过 `positionsStaleAfterMs`（宽限 + 一次兜底读）→ App 按轮询节奏走 REST。界面写明当前是哪一层。
+- **兜底分三层，每层都标出来**：私有 socket 断开超过 20 秒（`PRIVATE_GRACE_MS`）→ 文档置 `fallbackNeeded` → App 每 10 秒经内核签名的 REST 读一次持仓与余额文档、交给内核（`rest.okx.positions` / `rest.okx.account`；`Renewal::RestFallback`，App 的循环按 `ms_live_rest_fallback_ms` 睡），解析路径与推送完全相同——这条兜底以前叫「CLI 兜底」，但早已不经过 okx CLI；连这份也旧过 `positionsStaleAfterMs`（宽限 + 一次兜底读）→ App 按轮询节奏另读一份 `AccountReading`。界面写明当前是哪一层。
 - **区间收益与手机同口径**：`(当前权益 − 起点权益)` 折成计价币，减去起点之后的本金划转（subType 11/12）；自动赚币算收益；不认识的类型按划转扣除并点名。已实现部分（账单）放在提示里。权益以计价币（USDT）显示，曲线每个点记下当时的 `quoteUsd`。
 - **嘉信**：一次 `schwabctl account` 同时给出权益与持股；有随行情变动的持仓时每 10 秒读一次，只有现金时每 60 秒（`AccountReading.pollInterval`），每次都是嘉信自己的估值，App 不在两次之间自己重估（那是第二份估值规则，盘前盘后怎么估值无法核实）。划转经 `schwabctl transfers`（9 种资金进出类型各一个请求），持有数量一变就重读，否则一分钟一次。
 
@@ -79,7 +79,7 @@ May 的决定：「交易相关都走内核」「内核直接签名下单」，�
 | OKX `funding-rate` | 30–90 s | 实测 58–72 s；推送自带的 `ts` 到达时可能已有 50 s |
 | OKX `open-interest` | 只在变化时推 | 实测中位 6 s、最长 16 s（原阈值 15 s 会误报） |
 | 5 分钟统计桶 | 300 s | 时间戳是桶的起点，正常年龄每轮都超过 10 分钟（原阈值 7 分钟会误报） |
-| CLI 兜底 | 10 s | App 自己的循环，间隔由内核给出 |
+| REST 兜底 | 10 s | App 自己的循环，间隔由内核给出 |
 
 App 自己跑的时钟（嘉信轮询、报价盘口）用 `ms_live_stale_after_intervals` 取同一个倍数。护栏两道：内核测试遍历 `Feed::ALL` 与 `Renewal::OWN_CLOCKS`，Swift 测试用反射遍历整份快照，凡是 `…StaleAfterMs` 都必须是正数——新加的字段当天就被覆盖。
 

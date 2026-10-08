@@ -564,7 +564,7 @@ private struct EnvironmentCard: View {
         case .checking:
             HStack(spacing: 6) {
                 ProgressView().controlSize(.small)
-                Text("正在通过 okx CLI 读取账户…").font(Theme.Text.secondary).foregroundStyle(.secondary)
+                Text("正在读取账户…").font(Theme.Text.secondary).foregroundStyle(.secondary)
             }
         case .unknown:
             Text("尚未验证。验证只读取余额与账户配置，不会下单。")

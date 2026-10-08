@@ -54,7 +54,7 @@ const GRID_ABOVE: i32 = 5;
 /// one; the page offers exactly these, read back from the snapshot.
 pub(crate) const GRID_DIVISORS: [u32; 4] = [1, 2, 5, 10];
 /// The private socket counts as down after this long out of service, and the
-/// app is asked to fall back to reading positions through the CLI.
+/// app is asked to fall back to reading positions over REST.
 const PRIVATE_GRACE_MS: i64 = 20_000;
 /// How far back transfers are read: the venue's bill listing reaches seven
 /// days, which covers the week the period figures measure from.
@@ -126,7 +126,8 @@ impl FeedHealth {
 #[derive(Debug, Clone, PartialEq)]
 enum RiskSource {
     Private,
-    Cli,
+    /// Read over REST, signed by the kernel, while the private socket is down.
+    Rest,
     None(String),
 }
 
@@ -177,11 +178,11 @@ pub struct State {
     okx_oi: Option<OpenInterest>,
     okx_trades: VecDeque<TradePrint>,
     trades_since_ms: Option<i64>,
-    // OKX private (or the CLI fallback)
+    // OKX private (or the REST fallback)
     positions: BTreeMap<String, PositionRow>,
     positions_local_ms: Option<LocalMs>,
     pending_pages: Vec<PositionRow>,
-    /// The trading account as last pushed (or read through the CLI).
+    /// The trading account as last pushed (or read over REST).
     account: AccountState,
     /// The mark of every held instrument, streamed in the account's own
     /// environment (`Feed::OkxMarks`). Every position is valued at these.
@@ -875,7 +876,7 @@ impl State {
         }
     }
 
-    // MARK: - Ingest (tests, and the CLI fallback for positions)
+    // MARK: - Ingest (tests, and the REST fallback for positions)
 
     pub(crate) fn ingest(&mut self, topic: &str, payload: &str, now: i64) -> Result<Vec<Effect>, String> {
         let frame = |feed: Feed| Update::Frame { feed, text: payload.to_string(), received_ms: now };
@@ -929,11 +930,11 @@ impl State {
                 self.apply_rest(RestUpdate::Orders(listing, now, Delivery::default()), now);
                 Vec::new()
             }
-            "cli.positions" => {
+            "rest.okx.positions" => {
                 let rows = okx::positions_in(&parsed()?);
-                self.apply_positions(rows, true, true, now, RiskSource::Cli, now)
+                self.apply_positions(rows, true, true, now, RiskSource::Rest, now)
             }
-            "cli.account" => match okx::account_in(&parsed()?) {
+            "rest.okx.account" => match okx::account_in(&parsed()?) {
                 Some(row) => self.apply_account(row, true, true, now),
                 None => Vec::new(),
             },
@@ -1418,7 +1419,7 @@ impl State {
         (equity, balances)
     }
 
-    /// Whether the app should read positions through the CLI: the private
+    /// Whether the app should read positions over REST: the private
     /// socket refused, is off, or has been down past its grace.
     fn fallback_needed(&self, now: i64) -> bool {
         match self.feeds.get(&Feed::OkxPrivate).map(|h| &h.state) {
@@ -1433,7 +1434,7 @@ impl State {
     fn push_renewal(&self) -> Option<Renewal> {
         match self.risk_source {
             RiskSource::Private => Some(Renewal::Frames(Feed::OkxPrivate)),
-            RiskSource::Cli => Some(Renewal::CliFallback),
+            RiskSource::Rest => Some(Renewal::RestFallback),
             RiskSource::None(_) => None,
         }
     }
@@ -1441,7 +1442,7 @@ impl State {
     fn source(&self) -> (&'static str, Option<String>) {
         match &self.risk_source {
             RiskSource::Private => ("okx.private", None),
-            RiskSource::Cli => ("cli", Some("私有推送不可用，经 okx CLI 读取".to_string())),
+            RiskSource::Rest => ("rest", Some("私有推送不可用，经 REST 读取（内核签名）".to_string())),
             RiskSource::None(why) => ("none", Some(why.clone())),
         }
     }
@@ -1460,7 +1461,7 @@ impl State {
             note,
             fallback_needed: self.fallback_needed(now),
             positions_ms: self.positions_ms(),
-            positions_stale_after_ms: PRIVATE_GRACE_MS + Renewal::CliFallback.interval().as_millis() as i64,
+            positions_stale_after_ms: PRIVATE_GRACE_MS + Renewal::RestFallback.interval().as_millis() as i64,
             equity,
             balances,
             positions: legs.iter().map(|(row, valued)| self.holding_view(row, valued)).collect(),
@@ -2076,14 +2077,14 @@ struct AccountView {
     /// `okx.private`, `cli`, or `none`.
     source: &'static str,
     note: Option<String>,
-    /// The private socket is down: the app should read through the CLI.
+    /// The private socket is down: the app should read over REST.
     fallback_needed: bool,
     /// When positions were last read, on the venue's clock. None means never
     /// read — which is not the same as holding nothing.
     positions_ms: Option<i64>,
     /// Past this age the list of positions is too old to be the account's
     /// reading, and the app reads the account over REST in its place: the
-    /// socket's grace before the CLI fallback starts, plus one fallback read.
+    /// socket's grace before the REST fallback starts, plus one fallback read.
     positions_stale_after_ms: i64,
     equity: Option<EquityView>,
     /// Each currency of the trading account, valued now.
@@ -2272,7 +2273,7 @@ struct RiskView {
     inst_id: String,
     positions_ms: Option<i64>,
     /// Past this age `positions_ms` reads stale: the private socket's, or the
-    /// CLI fallback's while that is the source. None while nothing is read.
+    /// REST fallback's while that is the source. None while nothing is read.
     positions_stale_after_ms: Option<i64>,
     /// Every instrument the account holds, each once.
     held: Vec<String>,
@@ -3023,8 +3024,8 @@ mod tests {
         let mut state = state();
         okx_index(&mut state, 2562.78, NOW - 800);
         surface(&mut state);
-        state.ingest("cli.positions", HEDGED, NOW).unwrap();
-        state.ingest("cli.account", r#"{"data":[{"totalEq":"7000"}]}"#, NOW).unwrap();
+        state.ingest("rest.okx.positions", HEDGED, NOW).unwrap();
+        state.ingest("rest.okx.account", r#"{"data":[{"totalEq":"7000"}]}"#, NOW).unwrap();
         state
     }
 
@@ -3085,7 +3086,7 @@ mod tests {
     fn a_one_way_account_attributes_by_side_alone() {
         let mut state = state();
         state
-            .ingest("cli.positions", r#"{"data":[{"instId":"ETH-USDT-SWAP","instType":"SWAP","posSide":"net","pos":"-12","markPx":"2562.78","liqPx":"2900","notionalUsd":"3075.34","mgnMode":"cross"}]}"#, NOW)
+            .ingest("rest.okx.positions", r#"{"data":[{"instId":"ETH-USDT-SWAP","instType":"SWAP","posSide":"net","pos":"-12","markPx":"2562.78","liqPx":"2900","notionalUsd":"3075.34","mgnMode":"cross"}]}"#, NOW)
             .unwrap();
         let stops = r#"{"code":"0","data":[
             {"algoId":"STOP","instId":"ETH-USDT-SWAP","ordType":"conditional","side":"buy","posSide":"net","sz":"12","slTriggerPx":"2700","slOrdPx":"-1","state":"live"},
@@ -3194,8 +3195,8 @@ mod tests {
 
     fn live_long() -> State {
         let mut state = state();
-        state.ingest("cli.positions", LIVE_LONG, NOW).unwrap();
-        state.ingest("cli.account", LIVE_BALANCE, NOW).unwrap();
+        state.ingest("rest.okx.positions", LIVE_LONG, NOW).unwrap();
+        state.ingest("rest.okx.account", LIVE_BALANCE, NOW).unwrap();
         state
     }
 
@@ -3261,7 +3262,7 @@ mod tests {
         assert_eq!(leg["remarked"], false);
         assert_eq!(leg["unrealisedPnl"].as_f64(), Some(-477.97638159930744));
         assert_eq!(leg["mark"]["source"], "position");
-        assert_eq!(leg["mark"]["staleAfterMs"], Renewal::CliFallback.stale_after_ms(), "read through the CLI, aged by its clock");
+        assert_eq!(leg["mark"]["staleAfterMs"], Renewal::RestFallback.stale_after_ms(), "read over REST, aged by its clock");
         assert!(leg["note"].is_null(), "the venue's own figure is the freshest; nothing to explain");
 
         // Terms not read: the venue's figure stands, and says why.
@@ -3327,13 +3328,13 @@ mod tests {
     #[test]
     fn what_is_held_changing_restarts_its_marks_and_reads_new_terms() {
         let mut state = state();
-        let effects = state.ingest("cli.positions", LIVE_LONG, NOW).unwrap();
+        let effects = state.ingest("rest.okx.positions", LIVE_LONG, NOW).unwrap();
         assert!(effects.contains(&Effect::HeldChanged));
         assert_eq!(state.held_instruments(), [("ETH-USDT-SWAP".to_string(), "SWAP".to_string())]);
         assert_eq!(state.terms_wanted().len(), 1);
         state.ingest("rest.okx.spec.ETH-USDT-SWAP", ETH_SWAP_SPEC, NOW).unwrap();
         assert!(state.terms_wanted().is_empty(), "read once");
-        let effects = state.ingest("cli.positions", LIVE_LONG, NOW + 2_000).unwrap();
+        let effects = state.ingest("rest.okx.positions", LIVE_LONG, NOW + 2_000).unwrap();
         assert!(!effects.contains(&Effect::HeldChanged), "the same holdings again restart nothing");
     }
 

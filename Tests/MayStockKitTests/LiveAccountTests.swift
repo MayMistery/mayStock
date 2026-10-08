@@ -93,12 +93,12 @@ struct LiveAccountTests {
         let first = try #require(feed.account)
         #expect(!first.wasRead, "nothing read is not flat")
 
-        try kernel.ingest(topic: "cli.positions", payload: """
+        try kernel.ingest(topic: "rest.okx.positions", payload: """
             {"data":[{"instId":"ETH-USDT-SWAP","instType":"SWAP","posId":"1","posSide":"long","pos":"10","avgPx":"2500",
             "markPx":"2510","upl":"10","uplRatio":"0.08","lever":"10","notionalUsd":"2509.0","mgnMode":"isolated","margin":"125",
             "ccy":"USDT","usdPx":"0.9996"}]}
             """)
-        try kernel.ingest(topic: "cli.account", payload: """
+        try kernel.ingest(topic: "rest.okx.account", payload: """
             {"data":[{"totalEq":"999.6","details":[{"ccy":"USDT","eq":"1000","eqUsd":"999.6","upl":"10","availBal":"875"}]}]}
             """)
         try kernel.ingest(topic: "rest.okx.spec.ETH-USDT-SWAP", payload: """
@@ -110,7 +110,7 @@ struct LiveAccountTests {
             """)
         #expect(feed.pull())
         let account = try #require(feed.account)
-        #expect(account.wasRead && account.source == "cli")
+        #expect(account.wasRead && account.source == "rest")
         let position = try #require(account.exchangePositions.first)
         // (2530 − 2500) × 10 contracts × 0.1 ETH.
         #expect(abs(position.unrealisedPnL - 30) < 1e-9)

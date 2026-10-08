@@ -1206,7 +1206,7 @@ pub unsafe extern "C" fn ms_live_configure(handle: *mut MSLive, config_json: *co
 }
 
 /// Feed a recorded frame or REST body down the live path (tests; and the
-/// CLI fallback for positions). Returns 1 on success, 0 on failure.
+/// REST fallback for positions). Returns 1 on success, 0 on failure.
 #[no_mangle]
 pub unsafe extern "C" fn ms_live_ingest(handle: *mut MSLive, topic: *const c_char, payload: *const c_char, error_out: *mut *mut c_char) -> i32 {
     guarded(error_out, 0, || {
@@ -1266,12 +1266,12 @@ pub extern "C" fn ms_live_stale_after_intervals() -> u32 {
     crate::live::STALE_AFTER
 }
 
-/// How often the app reads the account through the CLI while the private
+/// How often the app reads the account over REST while the private
 /// socket is down, in milliseconds — the interval the kernel ages those
-/// readings by (`Renewal::CliFallback`), so the loop and the ages agree.
+/// readings by (`Renewal::RestFallback`), so the loop and the ages agree.
 #[no_mangle]
-pub extern "C" fn ms_live_cli_fallback_ms() -> u64 {
-    crate::live::Renewal::CliFallback.interval().as_millis() as u64
+pub extern "C" fn ms_live_rest_fallback_ms() -> u64 {
+    crate::live::Renewal::RestFallback.interval().as_millis() as u64
 }
 
 /// Stop the live layer and release the handle. Null is a no-op.

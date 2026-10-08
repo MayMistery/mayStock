@@ -9,7 +9,7 @@ extension AppState {
 
     /// Past this, a venue's equity reads amber: the age its reading carries
     /// (`VenueBooks.equityStaleAfter`) — a few intervals of whatever renews
-    /// it, the marks' stream, the CLI fallback or the poll, by the one rule
+    /// it, the marks' stream, the REST fallback or the poll, by the one rule
     /// the kernel ages its own feeds by. Zero before there is a reading.
     func equityStaleAfter(for venue: Venue) -> TimeInterval {
         books(for: venue).equityStaleAfter ?? 0

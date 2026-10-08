@@ -219,7 +219,7 @@ final class VenueBooks {
         guard account.mode == (mode.isDemo ? "demo" : "live") else { return }
         liveAccount = account
         guard account.source != "none" else { return }
-        let source: AccountReading.Source = account.source == "cli" ? .fallback : .stream
+        let source: AccountReading.Source = account.source == "rest" ? .fallback : .stream
         if account.wasRead, let positionsMs = account.positionsMs {
             contractPositions = account.exchangePositions
             shareHoldings = []

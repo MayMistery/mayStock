@@ -104,12 +104,12 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
         public let source: String
         public let note: String?
         /// The account socket has been down long enough that the app should
-        /// read positions through the CLI and hand them in.
+        /// read positions over REST and hand them in.
         public let fallbackNeeded: Bool
         public let instId: String
         public let positionsMs: Int64?
         /// Past this age `positionsMs` reads stale: the private socket's, or
-        /// the CLI fallback's while that is the source.
+        /// the REST fallback's while that is the source.
         public let positionsStaleAfterMs: Double?
         /// Every instrument the account holds, each once.
         public let held: [String]

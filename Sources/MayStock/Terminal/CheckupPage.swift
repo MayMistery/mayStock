@@ -165,7 +165,7 @@ enum CheckupText {
     static func source(_ source: String) -> String {
         switch source {
         case "okx.private": return "账户推送"
-        case "cli": return "CLI 读取（推送不可用）"
+        case "rest": return "REST 读取（推送不可用）"
         default: return "未读到"
         }
     }

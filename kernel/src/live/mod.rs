@@ -309,17 +309,17 @@ pub enum Renewal {
     OkxOpenInterest,
     /// A five-minute statistics bucket, stamped with its start.
     Bucket,
-    /// The app's read of the account through the CLI while the private
-    /// socket is down (`ms_live_cli_fallback_ms`, which the app's loop
+    /// The app's read of the account over REST, signed by the kernel, while the private
+    /// socket is down (`ms_live_rest_fallback_ms`, which the app's loop
     /// sleeps by).
-    CliFallback,
+    RestFallback,
 }
 
 impl Renewal {
     /// Every renewal that is not a feed's frames, for anything that has to
     /// cover them all alongside `Feed::ALL`.
     pub const OWN_CLOCKS: [Renewal; 5] =
-        [Renewal::OkxMark, Renewal::OkxFunding, Renewal::OkxOpenInterest, Renewal::Bucket, Renewal::CliFallback];
+        [Renewal::OkxMark, Renewal::OkxFunding, Renewal::OkxOpenInterest, Renewal::Bucket, Renewal::RestFallback];
 
     pub fn interval(self) -> Duration {
         match self {
@@ -328,7 +328,7 @@ impl Renewal {
             Renewal::OkxFunding => Duration::from_secs(90),
             Renewal::OkxOpenInterest => Duration::from_secs(16),
             Renewal::Bucket => Duration::from_secs(300),
-            Renewal::CliFallback => Duration::from_secs(10),
+            Renewal::RestFallback => Duration::from_secs(10),
         }
     }
 
@@ -851,7 +851,7 @@ mod tests {
         assert_eq!(slot.snapshot.seq, 2);
         assert_eq!(slot.account.seq, first, "unchanged");
         drop(slot);
-        state.ingest("cli.account", r#"{"data":[{"totalEq":"7000"}]}"#, 1_790_164_800_200).unwrap();
+        state.ingest("rest.okx.account", r#"{"data":[{"totalEq":"7000"}]}"#, 1_790_164_800_200).unwrap();
         publish(&state, &config, &published, &mut seq);
         assert_eq!(published.lock().unwrap().account.seq, first + 1);
     }

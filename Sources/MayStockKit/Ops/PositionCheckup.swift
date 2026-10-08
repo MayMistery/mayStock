@@ -14,7 +14,7 @@ import Foundation
 /// borrows that layer: opening the page switches the market analytics on,
 /// closing it switches them off, and in between it asks for the snapshot
 /// once a frame and publishes it when it changed. The account's own duties —
-/// the engine log, the CLI fallback while the private socket is down — are
+/// the engine log, the REST fallback while the private socket is down — are
 /// the account feed's, so they keep running whether or not this page is open.
 ///
 /// Read-only by construction: nothing here, or in the live layer, places,
