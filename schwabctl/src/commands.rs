@@ -329,6 +329,31 @@ pub fn fills(from: &str, to: &str, symbol: Option<&str>) -> Result<Value, Error>
     api::parse_json(&client.get(&format!("{TRADER_BASE}/accounts/{hash}/transactions?{}", api::query(&pairs)))?)
 }
 
+/// The transaction types that move money or securities between the account
+/// and its owner — what a period's result leaves out. Dividends, interest,
+/// trades and fees are results and are not here. The one list of them.
+pub const MONEY_MOVEMENT_TYPES: [&str; 9] = [
+    "ACH_RECEIPT", "ACH_DISBURSEMENT", "CASH_RECEIPT", "CASH_DISBURSEMENT", "ELECTRONIC_FUND",
+    "WIRE_IN", "WIRE_OUT", "JOURNAL", "RECEIVE_AND_DELIVER",
+];
+
+/// Every money movement in a window, one listing per type — the endpoint
+/// takes a single `types` — merged into one array.
+pub fn transfers(from: &str, to: &str) -> Result<Value, Error> {
+    let mut client = Client::load()?;
+    let hash = client.account_hash()?;
+    let mut rows = Vec::new();
+    for kind in MONEY_MOVEMENT_TYPES {
+        let pairs = [("startDate", from), ("endDate", to), ("types", kind)];
+        match api::parse_json(&client.get(&format!("{TRADER_BASE}/accounts/{hash}/transactions?{}", api::query(&pairs)))?)? {
+            Value::Array(page) => rows.extend(page),
+            Value::Null => {}
+            other => return Err(Error::Transport(format!("{kind} 的交易记录不是数组：{other}"))),
+        }
+    }
+    Ok(Value::Array(rows))
+}
+
 pub fn quotes(symbols: &[String]) -> Result<Value, Error> {
     if symbols.is_empty() {
         return Err(Error::Usage("至少给一个代码：schwabctl quotes TSLA QQQ".into()));

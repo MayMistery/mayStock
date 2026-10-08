@@ -119,6 +119,14 @@ pub enum Command {
         #[arg(long)]
         symbol: Option<String>,
     },
+    /// Money moved into or out of the account in a window: deposits,
+    /// withdrawals, wires, journals, securities moved in or out. Read-only.
+    Transfers {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+    },
     /// Quotes for one or more symbols.
     Quotes {
         symbols: Vec<String>,
@@ -165,6 +173,7 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Error> {
         Command::Replace { id, body } => commands::replace(cli, id, body),
         Command::Cancel { id } => commands::cancel(cli, id),
         Command::Fills { from, to, symbol } => commands::fills(from, to, symbol.as_deref()),
+        Command::Transfers { from, to } => commands::transfers(from, to),
         Command::Quotes { symbols } => commands::quotes(symbols),
         Command::Candles { symbol, bar, days, extended } => commands::candles(symbol, bar, *days, *extended),
         Command::Hours { date } => commands::hours(date.as_deref()),
