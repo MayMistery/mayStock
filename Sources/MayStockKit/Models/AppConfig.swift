@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 
 // MARK: - Watchlist
 
@@ -293,118 +292,36 @@ public struct AppConfig: Codable, Sendable, Equatable {
     public static let `default` = AppConfig()
 }
 
-// MARK: - Persistence + v1 migration
+// MARK: - Transition rules
 
-/// A configuration file that exists and could not be read.
-public struct ConfigReadIssue: Error, Sendable, Equatable, CustomStringConvertible {
-    public let reason: String
-    /// Where the unreadable file was kept, when keeping it worked.
-    public let keptAt: URL?
-
-    public var description: String {
-        "配置文件读不出来（\(reason)）" + (keptAt.map { "，原文件已另存为 \($0.path)" } ?? "")
-    }
-}
-
-/// Loads/saves `AppConfig` as JSON. Migrates MayStock 1.x configs
-/// (a bare `[MonitorItem]` array) by keeping crypto items and dropping
-/// the removed CPU/MEM/NET monitors.
-public struct ConfigIO: Sendable {
-    public let fileURL: URL
-
-    public init(directory: URL) {
-        self.fileURL = directory.appendingPathComponent("config.json")
-    }
-
-    public static func defaultDirectory() -> URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config")
-        return base.appendingPathComponent("MayStock")
-    }
-
-    /// The configuration on disk, or the defaults when there is none.
-    public func load() -> AppConfig { read().config }
-
-    /// The configuration on disk, and — when a file exists but cannot be
-    /// read — why, and where it was kept.
+extension AppConfig {
+    /// Make `self` — the config just after a change — obey what every change
+    /// has to, whoever made it: a page in the app, the unattended review, or
+    /// a hand edit picked up from disk. Returns what had to be done, in words
+    /// for the log; empty when nothing did.
     ///
-    /// An unreadable file used to come back as the defaults in silence, and
-    /// the next save wrote the defaults over it: one field a newer build
-    /// added, or one hand-edited typo, and the watchlist, alerts and
-    /// strategy budgets were gone with nothing in the log. Now the file is
-    /// copied beside itself first (`config.json.unreadable-<digest>`, one copy
-    /// per distinct content), the reason is logged, and the caller is told —
-    /// the app says so on launch, and `review --apply` refuses to write.
-    public func read() -> (config: AppConfig, issue: ConfigReadIssue?) {
-        guard let data = try? Data(contentsOf: fileURL) else { return (.default, nil) }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        let reason: String
-        do {
-            var config = try decoder.decode(AppConfig.self, from: data)
-            if config.schemaVersion >= AppConfig.minimumSupportedSchemaVersion {
-                config.schemaVersion = AppConfig.currentSchemaVersion
-                // The menu bar is the app's only way in, so it never starts
-                // empty — but an empty watchlist is no reason to drop every
-                // other setting, which is what this used to do.
-                if config.watchlist.isEmpty {
-                    Log.warn("config: 自选为空，恢复默认自选，其余设置照旧")
-                    config.watchlist = AppConfig.default.watchlist
-                }
-                return (config, nil)
-            }
-            reason = "schemaVersion \(config.schemaVersion) 低于最低支持的 \(AppConfig.minimumSupportedSchemaVersion)"
-        } catch {
-            reason = String(describing: error)
+    /// These used to be written inline in the two pages that crossed the
+    /// boundary. The file has other writers, and the running app takes their
+    /// changes in as they land, so a rule kept on one door was a rule a hand
+    /// edit walked around.
+    public mutating func enforceTransitionRules(from previous: AppConfig) -> [String] {
+        var enforced: [String] = []
+        // Locking live trading must not leave the app on the live account.
+        if previous.trading.liveTradingUnlocked, !trading.liveTradingUnlocked, strategy.mode == .live {
+            strategy.mode = .demo
+            enforced.append("实盘已上锁，交易模式切回模拟盘")
         }
-        if let migrated = Self.migrateV1(data: data) { return (migrated, nil) }
-        let kept = keepUnreadable(data)
-        Log.warn("config: config.json 读不出来（\(reason)），"
-                 + (kept.map { "原文件另存为 \($0.lastPathComponent)，" } ?? "另存也失败，")
-                 + "这次用默认配置")
-        return (.default, ConfigReadIssue(reason: reason, keptAt: kept))
-    }
-
-    /// Copy an unreadable file beside itself, named by its content so the
-    /// same file read twice is kept once.
-    private func keepUnreadable(_ data: Data) -> URL? {
-        let digest = SHA256.hash(data: data).prefix(4).map { String(format: "%02x", $0) }.joined()
-        let copy = fileURL.deletingLastPathComponent()
-            .appendingPathComponent("\(fileURL.lastPathComponent).unreadable-\(digest)")
-        if FileManager.default.fileExists(atPath: copy.path) { return copy }
-        return (try? data.write(to: copy, options: .atomic)) != nil ? copy : nil
-    }
-
-    public func save(_ config: AppConfig) throws {
-        try FileManager.default.createDirectory(
-            at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        encoder.dateEncodingStrategy = .iso8601
-        try encoder.encode(config).write(to: fileURL, options: .atomic)
-    }
-
-    /// Best-effort v1 migration via loose JSON inspection (the old schema was
-    /// an array of enum-encoded `MonitorItem`s).
-    static func migrateV1(data: Data) -> AppConfig? {
-        guard let array = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else {
-            return nil
-        }
-        var items: [WatchItem] = []
-        for entry in array where (entry["type"] as? String) == "crypto" {
-            var instId = "BTC-USDT"
-            if let source = entry["source"] as? [String: Any],
-               let okx = source["okx"] as? [String: Any],
-               let v = okx["instId"] as? String, !v.isEmpty {
-                instId = v
-            }
-            if !items.contains(where: { $0.instId == instId }) {
-                items.append(WatchItem(instId: instId))
+        // Crossing between demo and live disarms every strategy: arming one
+        // was a decision about the other account. Positions are left alone —
+        // stopping means stop deciding, not liquidate.
+        if strategy.mode != previous.strategy.mode {
+            let armed = strategy.allocations.indices.filter { strategy.allocations[$0].running }
+            for index in armed { strategy.allocations[index].running = false }
+            if !armed.isEmpty {
+                enforced.append("交易模式 \(previous.strategy.mode.rawValue) → \(strategy.mode.rawValue)，停用 "
+                                + armed.map { strategy.allocations[$0].strategyId }.joined(separator: ", "))
             }
         }
-        guard !items.isEmpty else { return nil }
-        var config = AppConfig.default
-        config.watchlist = items
-        return config
+        return enforced
     }
 }

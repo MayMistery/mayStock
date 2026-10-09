@@ -37,7 +37,7 @@ struct ConfigReadTests {
         var saved = AppConfig.default
         saved.watchlist = []
         saved.alerts = [AlertRule(instId: "ETH-USDT-SWAP", condition: .priceAbove(3_000))]
-        try ConfigIO(directory: dir).save(saved)
+        try ConfigIO(directory: dir).update { $0 = saved }
 
         let (config, issue) = ConfigIO(directory: dir).read()
         #expect(issue == nil)

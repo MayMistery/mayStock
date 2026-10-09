@@ -3,16 +3,68 @@ import SwiftUI
 import Observation
 import MayStockKit
 
-/// Persisted configuration with debounced saves.
+/// The config the app runs on: config.json, plus what this process has
+/// changed and not yet written.
+///
+/// The app is not the file's only writer. `maystock-lab review --apply`
+/// halts strategies, cuts budgets and pulls the kill switch in it while the
+/// app runs, and it gets edited by hand. This store used to read the file
+/// once at launch and save its whole copy on every change, so its next save
+/// — an alert firing was enough — put back every value another writer had
+/// changed: a halted strategy armed again, with nothing logged. Now the file
+/// is the truth and the app follows it:
+///
+/// - a save is `ConfigIO.commit`, which lays this process's own edits over
+///   the file as it is at that moment, under the file's write lock, never
+///   over the copy read at launch;
+/// - the file is watched, and another writer's change is folded in as it
+///   lands and goes through `onChanged` like any edit made here, so a halt
+///   the review writes stops the strategy at the next tick, not at the next
+///   launch.
+///
+/// Every fold-in, conflict, enforced rule and failed write is logged with
+/// what changed.
 @Observable
 @MainActor
 final class ConfigStore {
-    var config: AppConfig
-    /// Set when a config file existed and could not be read: the app runs on
-    /// the defaults, the original is kept beside it, and launch says so.
+    private(set) var config: AppConfig
+    /// Set when a config file existed and could not be read at launch: the
+    /// app runs on the defaults, the original is kept beside it, and launch
+    /// says so.
     let readIssue: ConfigReadIssue?
-    private let io: ConfigIO
-    private var saveScheduled = false
+    @ObservationIgnored private let io: ConfigIO
+    /// The file as this process last read or wrote it: what the unsaved
+    /// edits in `config` are edits of, and what the file is compared with to
+    /// tell whether anyone else has written since.
+    @ObservationIgnored private var baseline: ConfigBaseline
+    @ObservationIgnored private var saveScheduled = false
+    /// Saves failed in a row, and the last reason logged: a failure that
+    /// persists is logged when it starts and when its reason changes, not
+    /// on every retry.
+    @ObservationIgnored private var failedSaves = 0
+    @ObservationIgnored private var loggedSaveFailure: String?
+    /// The same, for comparing the file with this process's copy.
+    @ObservationIgnored private var loggedFoldInFailure: String?
+    @ObservationIgnored private var watcher: FileWatcher?
+    /// Held while the file is followed, so a writer can tell its change will
+    /// be taken in (`ConfigIO.isFollowed`).
+    @ObservationIgnored private var following: ConfigFollowing?
+
+    /// After every change to `config`, whoever made it — a page here, the
+    /// review, a hand edit — with the config as it was before.
+    @ObservationIgnored var onChanged: ((AppConfig) -> Void)?
+
+    /// How long edits gather before they are written: a slider's drag is
+    /// one save, not forty.
+    nonisolated static let saveDelay: TimeInterval = 0.4
+    /// How long a save waits for another writer to let go of the file. Short,
+    /// because it waits on the main thread; the review holds the lock for a
+    /// few milliseconds, and a save that cannot get it is tried again.
+    nonisolated static let lockWait: TimeInterval = 0.25
+    /// A failed save is tried again after this, doubling each time it fails
+    /// again, up to `maxRetryDelay`.
+    nonisolated static let retryDelay: TimeInterval = 2
+    nonisolated static let maxRetryDelay: TimeInterval = 60
 
     init(directory: URL) {
         // The app owns this directory, so it is the one process allowed to
@@ -20,26 +72,170 @@ final class ConfigStore {
         // anywhere but stderr. Wired before the read, so a config that
         // cannot be read is logged where it can be found.
         Log.useFile(in: directory)
-        self.io = ConfigIO(directory: directory)
-        (config, readIssue) = io.read()
+        io = ConfigIO(directory: directory)
+        let (baseline, issue) = io.readBaseline()
+        self.baseline = baseline
+        config = baseline.config
+        readIssue = issue
     }
 
     /// Mutate + persist + let AppState react.
     func update(_ mutate: (inout AppConfig) -> Void) {
-        mutate(&config)
+        var next = config
+        mutate(&next)
+        change(to: next, notify: true)
         scheduleSave()
-        onChanged?()
     }
 
-    var onChanged: (() -> Void)?
+    /// Mutate + persist, without re-applying the config: for state the
+    /// runtime produced itself and already holds — an alert's fired and
+    /// disarmed state.
+    func record(_ mutate: (inout AppConfig) -> Void) {
+        var next = config
+        mutate(&next)
+        change(to: next, notify: false)
+        scheduleSave()
+    }
 
-    func scheduleSave() {
+    /// Follow the file from now on, and say so to its other writers. Looks
+    /// once straight away, so a write that landed between launch's read and
+    /// the watch is not missed.
+    func followFile() {
+        do {
+            following = try io.follow()
+        } catch {
+            Log.warn("config: 没能登记为 config.json 的跟随者（\(error)）；文件照样跟随，"
+                     + "但 review --apply 写入后会报告没有进程跟随")
+        }
+        watcher = FileWatcher(url: io.fileURL) { [weak self] in
+            MainActor.assumeIsolated { self?.foldInFile() }
+        }
+        foldInFile()
+    }
+
+    /// The one place `config` changes. The transition rules hold across
+    /// every change, whoever made it (`AppConfig.enforceTransitionRules`),
+    /// and what they had to do is logged — for a change that came in from
+    /// the file, the log is the only place it shows.
+    private func change(to next: AppConfig, notify: Bool) {
+        let before = config
+        var next = next
+        let enforced = next.enforceTransitionRules(from: before)
+        if !enforced.isEmpty { Log.warn("config: " + enforced.joined(separator: "；")) }
+        config = next
+        if notify { onChanged?(before) }
+    }
+
+    // MARK: Following the file
+
+    /// Take in whatever another writer has put in the file since this
+    /// process last read or wrote it.
+    private func foldInFile() {
+        let refresh: ConfigRefresh
+        do {
+            refresh = try io.refresh(config, over: baseline)
+        } catch {
+            let reason = String(describing: error)
+            if reason != loggedFoldInFailure {
+                loggedFoldInFailure = reason
+                Log.warn("config: 比对 config.json 失败（\(reason)），文件里的修改没有采纳；文件再变时重试，"
+                         + "同样的失败不再逐次记录")
+            }
+            return
+        }
+        if loggedFoldInFailure != nil {
+            Log.warn("config: config.json 比对恢复")
+            loggedFoldInFailure = nil
+        }
+        switch refresh {
+        case .unchanged:
+            return
+        case .changed(let merge, let current):
+            baseline = current
+            Self.log(merge, "config.json 在 App 之外被改过")
+            if merge.config != config { change(to: merge.config, notify: true) }
+            // This process's edits the file does not have yet, or what a
+            // transition rule just did to the change that came in.
+            if config != baseline.config { scheduleSave() }
+        case .removed(let current):
+            baseline = current
+            Log.warn("config: config.json 被删除了，继续用内存里的配置，并写回文件")
+            scheduleSave()
+        case .unreadable(let issue, let current):
+            baseline = current
+            Log.warn("config: config.json 被改成读不出来的内容（\(issue.reason)），不采纳，"
+                     + (issue.keptAt.map { "原文件另存为 \($0.lastPathComponent)，" } ?? "")
+                     + "继续用内存里的配置，并写回文件")
+            scheduleSave()
+        }
+    }
+
+    // MARK: Saving
+
+    private func scheduleSave(after delay: TimeInterval = ConfigStore.saveDelay) {
         guard !saveScheduled else { return }
         saveScheduled = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-            guard let self else { return }
-            self.saveScheduled = false
-            try? self.io.save(self.config)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.saveScheduled = false
+                self.save()
+            }
+        }
+    }
+
+    private func save() {
+        let commit: ConfigCommit
+        do {
+            commit = try io.commit(config, over: baseline, waitingUpTo: Self.lockWait)
+        } catch {
+            failedSaves += 1
+            let delay = min(Self.retryDelay * pow(2, Double(failedSaves - 1)), Self.maxRetryDelay)
+            let reason = String(describing: error)
+            if reason != loggedSaveFailure {
+                loggedSaveFailure = reason
+                Log.warn("config: 写入 config.json 失败（\(reason)），改动还在内存里，\(Int(delay)) 秒后重试；"
+                         + "同样的失败不再逐次记录")
+            }
+            scheduleSave(after: delay)
+            return
+        }
+        if failedSaves > 0 {
+            Log.warn("config: config.json 写入恢复，此前连续失败 \(failedSaves) 次")
+            failedSaves = 0
+            loggedSaveFailure = nil
+        }
+        baseline = commit.baseline
+        if let issue = commit.replacedUnreadable {
+            Log.warn("config: config.json 读不出来（\(issue.reason)），"
+                     + (issue.keptAt.map { "原文件另存为 \($0.lastPathComponent)，" } ?? "")
+                     + "已按内存里的配置重写")
+        }
+        if commit.recreated {
+            Log.warn("config: config.json 不在了，已按内存里的配置重建")
+        }
+        if let merge = commit.merge {
+            Self.log(merge, "保存时发现 config.json 在 App 之外被改过，已合并后写入")
+            if merge.config != config { change(to: merge.config, notify: true) }
+            if config != baseline.config { scheduleSave() }
+        }
+    }
+
+    /// What a merge did, for the engine log: what came in from the file,
+    /// where the two writers disagreed, and which of this process's edits
+    /// went on top.
+    private static func log(_ merge: ConfigMerge.Outcome, _ occasion: String) {
+        if !merge.adopted.isEmpty {
+            Log.warn("config: \(occasion)，采纳 \(merge.adopted.count) 处："
+                     + merge.adopted.map(\.description).joined(separator: "；"))
+        }
+        if !merge.conflicts.isEmpty {
+            Log.warn("config: 与文件冲突 \(merge.conflicts.count) 处，取文件里的值："
+                     + merge.conflicts.map(\.description).joined(separator: "；"))
+        }
+        if !merge.kept.isEmpty {
+            Log.warn("config: 本进程尚未写入的修改 \(merge.kept.count) 处，保留在文件之上："
+                     + merge.kept.map(\.description).joined(separator: "；"))
         }
     }
 }
@@ -203,6 +399,9 @@ final class AppState {
         if let issue = store.readIssue {
             notifications.post(title: "MayStock · 配置没读出来，这次用默认配置", body: issue.description, sound: true)
         }
+        // From here on the config is the file's, whoever writes it — before
+        // the trading loop starts, so its first tick is on what the file says.
+        store.followFile()
         Task {
             await detectTradeCLI()
             await detectSchwabCLI()
@@ -235,8 +434,9 @@ final class AppState {
     }
 
     private func wire() {
-        // Config edits flow into the runtime.
-        store.onChanged = { [weak self] in self?.applyConfig() }
+        // Config changes flow into the runtime — every change, whoever made
+        // it: a page here, the review, a hand edit picked up from the file.
+        store.onChanged = { [weak self] before in self?.configDidChange(from: before) }
 
         // Every tick feeds the alert engine.
         hub.onTick = { [weak self] session, ticker in
@@ -261,8 +461,7 @@ final class AppState {
         alerts.onRulesChanged = { [weak self] rules in
             guard let self else { return }
             if self.store.config.alerts != rules {
-                self.store.config.alerts = rules
-                self.store.scheduleSave()
+                self.store.record { $0.alerts = rules }
             }
         }
     }
@@ -291,6 +490,43 @@ final class AppState {
             alerts.setRules(store.config.alerts)
         }
         LaunchAtLogin.set(enabled: store.config.general.launchAtLogin)
+    }
+
+    /// Everything a config change sets off, keyed on the change rather than
+    /// on the page that made it: the file has other writers, and a mode
+    /// switched by a hand edit has to cross the same boundary as one
+    /// switched from the menu.
+    private func configDidChange(from before: AppConfig) {
+        applyConfig()
+        let after = store.config
+        if after.strategy.mode != before.strategy.mode {
+            accountDidChange(from: before)
+        } else if before.trading.liveTradingUnlocked, !after.trading.liveTradingUnlocked, !options.isSnapshot {
+            // Nothing decided while live trading was open may go out after
+            // it closed. See `StrategyRunner.restart`.
+            runners.forEach { $0.restart() }
+        }
+    }
+
+    /// The account the engines act on changed: demo ⇄ live. The transition
+    /// rules have already disarmed every strategy; positions are left alone,
+    /// because "stop trading" means stop deciding, not liquidate.
+    ///
+    /// The loop is restarted in the same main-actor turn that changed the
+    /// mode, so no tick can run in between — as clean a boundary as stopping
+    /// it before the change: nothing decided before the switch is executed
+    /// after it (see `StrategyRunner.restart`). A render pass never trades,
+    /// so it never starts a loop.
+    private func accountDidChange(from before: AppConfig) {
+        let mode = tradingMode
+        if !options.isSnapshot { runners.forEach { $0.restart() } }
+        let armed = before.strategy.allocations.filter(\.running).map(\.strategyId)
+        Log.warn("mode: switched to \(mode.rawValue); disarmed \(armed.isEmpty ? "nothing" : armed.joined(separator: ", "))")
+        for venue in Venue.allCases { books(for: venue).clearAccount() }
+        Task {
+            await refreshAccount()
+            for venue in Venue.allCases { await verifyConnection(mode, venue: venue) }
+        }
     }
 
     // MARK: The live layer
