@@ -241,6 +241,19 @@ impl InstrumentType {
     pub const ALL: [InstrumentType; 4] = [Self::Spot, Self::Swap, Self::Stock, Self::Option];
 }
 
+/// The finest step a leverage is held to. OKX keeps a leg's leverage to two
+/// decimals and truncates anything finer without saying so: `2.336` is
+/// accepted, echoed back as asked, and held at `2.33`; `2.005` is held at `2`
+/// (demo account, 2026-10-09). A leverage off this grid is one the exchange
+/// would hold at something else.
+pub const LEVERAGE_STEP: f64 = 0.01;
+
+/// Whether a leverage sits on the grid it can be held at.
+pub fn leverage_on_grid(leverage: f64) -> bool {
+    let steps = leverage / LEVERAGE_STEP;
+    leverage.is_finite() && (steps - steps.round()).abs() < 1e-6
+}
+
 // MARK: - Manifest
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -275,24 +288,32 @@ fn default_bar() -> String {
     "1H".to_string()
 }
 
+/// Every bar interval the kernel knows, with its length in seconds.
+///
+/// The one list: [`bar_seconds`] reads it, and a property that must hold at
+/// every interval walks it rather than naming the ones in use today.
+pub const BAR_INTERVALS: [(&str, f64); 12] = [
+    ("1m", 60.0),
+    ("3m", 180.0),
+    ("5m", 300.0),
+    ("15m", 900.0),
+    ("30m", 1_800.0),
+    ("1H", 3_600.0),
+    ("2H", 7_200.0),
+    ("4H", 14_400.0),
+    ("6H", 21_600.0),
+    ("12H", 43_200.0),
+    ("1D", 86_400.0),
+    ("1W", 604_800.0),
+];
+
 /// Seconds in one bar of the named interval. Unknown intervals fall back to an
 /// hour rather than zero, which would make funding bucketing divide by nothing.
 pub fn bar_seconds(bar: &str) -> f64 {
-    match bar {
-        "1m" => 60.0,
-        "3m" => 180.0,
-        "5m" => 300.0,
-        "15m" => 900.0,
-        "30m" => 1_800.0,
-        "1H" => 3_600.0,
-        "2H" => 7_200.0,
-        "4H" => 14_400.0,
-        "6H" => 21_600.0,
-        "12H" => 43_200.0,
-        "1D" => 86_400.0,
-        "1W" => 604_800.0,
-        _ => 3_600.0,
-    }
+    BAR_INTERVALS
+        .iter()
+        .find(|(name, _)| *name == bar)
+        .map_or(3_600.0, |(_, seconds)| *seconds)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -639,6 +660,14 @@ impl CompiledStrategy {
                 inst_type.max_leverage()
             )));
         }
+        // Nor is it rounded: the exchange would hold it at less than this
+        // without saying so, and margin it there.
+        if !leverage_on_grid(leverage) {
+            return Err(ExprError::Policy(format!(
+                "杠杆 {leverage}× 不在 {LEVERAGE_STEP} 的档位上：交易所按这个精度持有杠杆，会把它截短，\
+                 跑的就不是回测过的那个策略"
+            )));
+        }
 
         // What an option strategy can and cannot express. Each refusal is a
         // feature the option engine genuinely does not have, named at import
@@ -799,7 +828,16 @@ impl CompiledStrategy {
             .max()
             .unwrap_or(0);
         if manifest.sizing.mode == SizingMode::VolatilityTarget || manifest.market.inst_type.is_option() {
-            warmup = warmup.max(manifest.risk.vol_lookback_bars + 1);
+            // A rolling window like any other, under the same longest-window
+            // rule — which also keeps the bar added below inside `usize`.
+            let lookback = manifest.risk.vol_lookback_bars;
+            if lookback > crate::expr::MAX_PERIOD {
+                return Err(format!(
+                    "volLookbackBars({lookback}) 超过单个窗口的上限 {} 根",
+                    crate::expr::MAX_PERIOD
+                ));
+            }
+            warmup = warmup.max(lookback + 1);
         }
         let ceiling = crate::expr::MAX_BARS;
         if warmup + 2 > ceiling {
@@ -956,6 +994,28 @@ mod tests {
         assert!(swept.with_params(&HashMap::from([("n".to_string(), 1_000.0)])).is_some());
         assert!(swept.with_params(&HashMap::from([("n".to_string(), 90_000.0)])).is_none(),
                 "an EMA of 90 000 needs 270 000 bars to warm up");
+    }
+
+    /// The volatility lookback is a window under the same longest-window
+    /// rule as any function's period, up to the largest number a manifest
+    /// can write: one more bar on `usize::MAX` panicked compile in a debug
+    /// build and wrapped the warm-up to zero in release.
+    #[test]
+    fn a_volatility_lookback_past_the_longest_window_is_refused() {
+        let compile = |lookback: usize| {
+            let json = format!(
+                r#"{{"id":"v","market":{{"instId":"BTC-USDT-SWAP","instType":"SWAP","bar":"1H"}},
+                     "signals":{{"exposure":"1"}},"sizing":{{"mode":"volatilityTarget","value":40}},
+                     "risk":{{"leverage":1,"volLookbackBars":{lookback}}}}}"#
+            );
+            CompiledStrategy::compile(serde_json::from_str(&json).unwrap(), &[])
+        };
+        assert_eq!(compile(60).unwrap().warmup_bars, 61);
+        for lookback in [crate::expr::MAX_PERIOD + 1, usize::MAX] {
+            let error = compile(lookback).unwrap_err();
+            assert!(matches!(&error, ExprError::Policy(reason) if reason.contains("volLookbackBars")),
+                    "{lookback}: {error:?}");
+        }
     }
 
     #[test]
@@ -1148,6 +1208,24 @@ mod tests {
     }
 
     #[test]
+    fn a_leverage_the_exchange_cannot_hold_is_refused() {
+        let swap = |leverage: &str| {
+            let json = DONCHIAN
+                .replace(r#""instId": "BTC-USDT", "instType": "SPOT""#, r#""instId": "BTC-USDT-SWAP", "instType": "SWAP""#)
+                .replace(r#""leverage": 1"#, &format!(r#""leverage": {leverage}"#));
+            CompiledStrategy::compile(serde_json::from_str(&json).unwrap(), &[])
+        };
+        for held in ["1", "2.33", "2.5", "3", "12.25", "50"] {
+            assert!(swap(held).is_ok(), "{held}");
+        }
+        // Measured: 2.336 is held at 2.33, 2.005 at 2.
+        for truncated in ["2.336", "2.005", "3.333333"] {
+            let refused = swap(truncated).unwrap_err();
+            assert!(matches!(&refused, ExprError::Policy(reason) if reason.contains("档位")), "{truncated}: {refused:?}");
+        }
+    }
+
+    #[test]
     fn every_instrument_type_has_a_coherent_policy() {
         for inst_type in InstrumentType::ALL {
             let policy = inst_type.policy();
@@ -1180,6 +1258,11 @@ mod tests {
 
     #[test]
     fn bar_intervals_convert_to_seconds() {
+        // A name listed twice would answer with its first length only.
+        for (name, seconds) in BAR_INTERVALS {
+            assert_eq!(bar_seconds(name), seconds, "{name}");
+            assert!(seconds > 0.0, "{name}: the calendar divides by it");
+        }
         assert_eq!(bar_seconds("4H"), 14_400.0);
         assert_eq!(bar_seconds("1D"), 86_400.0);
         assert_eq!(bar_seconds("nonsense"), 3_600.0);

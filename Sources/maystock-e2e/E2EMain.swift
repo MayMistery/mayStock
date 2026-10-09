@@ -16,6 +16,10 @@ import MayStockKit
 ///                                      account's exchange precheck; places nothing
 ///   maystock-e2e option-demo           buy and sell one option on the DEMO account,
 ///                                      through the runner's own order path
+///   maystock-e2e leverage-demo         a perpetual strategy's leverage and margin mode on
+///                                      the DEMO account: the empty leg set to the manifest's,
+///                                      the entry isolated at it, a held leg never changed,
+///                                      someone else's never joined; restores the leg
 ///   maystock-e2e markets [sec] [sym…]  the watchlist's market data through the app's hub:
 ///                                      quotes, sources, phases, every bar's backfill, and
 ///                                      the US-equity fallback forced; read-only
@@ -35,6 +39,8 @@ struct E2EMain {
         switch command {
         case "option-demo":
             ok = await optionDemo(Array(args.dropFirst()))
+        case "leverage-demo":
+            ok = await leverageDemo(Array(args.dropFirst()))
         case "doctor":
             ok = await doctor(instId: args.count > 1 ? args[1] : "BTC-USDT")
         case "watch":
@@ -453,7 +459,7 @@ extension E2EMain {
         }
 
         let host = await MainActor.run {
-            DemoOptionHost(strategy: strategy, capital: capital, venue: venue)
+            DemoStrategyHost(strategy: strategy, capital: capital, venue: venue)
         }
         let runner = await MainActor.run { StrategyRunner(host: host) }
 
@@ -533,10 +539,10 @@ extension E2EMain {
     }
 }
 
-/// An in-memory host for the demo round trip: one armed option strategy,
-/// demo mode, live locked, nothing persisted.
+/// An in-memory host for a demo round trip: one armed strategy, demo mode,
+/// live locked, nothing persisted.
 @MainActor
-final class DemoOptionHost: StrategyRunnerHost {
+final class DemoStrategyHost: StrategyRunnerHost {
     var portfolio: StrategyPortfolioPrefs
     let liveTradingUnlocked = false
     var runnableStrategies: [CompiledStrategy]

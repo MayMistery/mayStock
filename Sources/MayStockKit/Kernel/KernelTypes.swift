@@ -67,7 +67,8 @@ public struct KernelAccountState: Encodable, Sendable {
     /// The venue's position tiers for the instrument, in base units, in the
     /// environment the runner trades — what `KernelBacktestConfig.positionTiers`
     /// is to a backtest. Nil when they could not be read: then no position
-    /// limit applies, and the venue refuses an order past its own.
+    /// limit applies here, and the runner's fit to the venue's own bound is
+    /// what stops the order.
     public var positionTiers: [KernelPositionTier]?
 
     public init(

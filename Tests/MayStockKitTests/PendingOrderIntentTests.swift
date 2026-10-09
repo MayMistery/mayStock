@@ -194,14 +194,14 @@ struct PendingOrderIntentTests {
         #expect(order.reduceOnly == false)
     }
 
-    @Test("a single-currency margin account isolates an option")
-    func optionTradeModeFollowsAccountLevel() {
-        // The URL must not get to pick its own margin treatment; the account
-        // level decides. May's live account is acctLv=2.
-        #expect(AccountTradingConfig(positionMode: nil, accountLevel: 1).optionTradeMode == "cash")
-        #expect(AccountTradingConfig(positionMode: nil, accountLevel: 2).optionTradeMode == "isolated")
-        #expect(AccountTradingConfig(positionMode: nil, accountLevel: 3).optionTradeMode == "cross")
-        #expect(AccountTradingConfig(positionMode: nil, accountLevel: nil).optionTradeMode == "cross")
+    @Test("the mode is the kernel's to decide, never the URL's: a URL that names one is refused")
+    func theURLCannotPickItsMarginMode() throws {
+        // The account level decides how a bought option is booked
+        // (`trade::margin`, May's live account is acctLv=2), so a proposal
+        // naming its own treatment is not a proposal this gate accepts.
+        #expect(throws: (any Error).self) {
+            try PendingOrderIntent.parse(url(optionQuery + "&tdMode=cross"))
+        }
     }
 
     // MARK: - Drift against the live book

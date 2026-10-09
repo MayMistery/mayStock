@@ -54,6 +54,9 @@ pub enum Read {
     AccountSnapshot,
     /// The account's position mode and level (`posMode`, `acctLv`).
     AccountConfig,
+    /// The leverage each leg of one contract is held at, in one margin mode.
+    #[serde(rename_all = "camelCase")]
+    Leverage { inst_id: String, margin_mode: String },
     /// The last three days' fills on one family, newest first.
     #[serde(rename_all = "camelCase")]
     Fills {
@@ -78,6 +81,18 @@ pub enum Read {
         /// The instrument's fee group (`groupId` in its specification).
         #[serde(default)]
         group_id: Option<String>,
+    },
+    /// The most an order on `inst_id` can open right now, by the exchange's
+    /// own reckoning of the account (`account/max-size`): the margin its check
+    /// will hold — at the buy price limit for a market buy — and the taker fee,
+    /// against what is free. In order units: contracts for a perpetual, the
+    /// base coin for spot. `trade_mode` is the order's own `tdMode` — the one
+    /// its leg was readied with, after its leverage was set — never a default.
+    #[serde(rename_all = "camelCase")]
+    MaxOrderSize {
+        inst_id: String,
+        family: Family,
+        trade_mode: String,
     },
 }
 
@@ -408,6 +423,56 @@ pub fn positions_target(family: Option<Family>) -> Result<Target, String> {
     }
 }
 
+/// The positions held on one instrument, every leg and margin mode.
+pub fn instrument_positions_target(inst_id: &str) -> Result<Target, String> {
+    Ok(Target::new(Route::Positions, format!("instId={}", instrument(inst_id)?)))
+}
+
+/// An instrument id as it may go into a query: OKX's own spelling, letters,
+/// digits and dashes, and nothing that could start another parameter.
+fn instrument(inst_id: &str) -> Result<&str, String> {
+    let id = inst_id.trim();
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err(format!("instId {inst_id:?} 不合法"));
+    }
+    Ok(id)
+}
+
+pub fn leverage_target(inst_id: &str, margin_mode: &str) -> Result<Target, String> {
+    if !matches!(margin_mode, "cross" | "isolated") {
+        return Err(format!("杠杆只按全仓或逐仓读，不认识 {margin_mode}"));
+    }
+    Ok(Target::new(Route::LeverageInfo, format!("instId={}&mgnMode={margin_mode}", instrument(inst_id)?)))
+}
+
+/// One leg's leverage as the exchange holds it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegLeverage {
+    pub inst_id: String,
+    pub margin_mode: String,
+    pub pos_side: PosSide,
+    pub leverage: f64,
+}
+
+/// The rows of a leverage read: both legs in long/short mode, the contract
+/// as `net` in net mode. A row without a leverage or a leg it names is an
+/// error, not a skipped line — the leg it stood for would read as unknown.
+pub fn parse_leverage(body: &str) -> Result<Vec<LegLeverage>, String> {
+    let value = envelope(body)?;
+    let rows = value.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
+    rows.iter()
+        .map(|row| {
+            let inst_id = text(row, "instId").ok_or("杠杆回复缺少 instId")?;
+            let margin_mode = text(row, "mgnMode").ok_or_else(|| format!("{inst_id} 的杠杆回复缺少 mgnMode"))?;
+            let pos_side = PosSide::from_venue(row.get("posSide").and_then(Value::as_str))
+                .ok_or_else(|| format!("{inst_id} 的杠杆回复里有不认识的 posSide"))?;
+            let leverage = num(row, "lever").filter(|l| *l > 0.0).ok_or_else(|| format!("{inst_id} 的杠杆回复缺少 lever"))?;
+            Ok(LegLeverage { inst_id, margin_mode, pos_side, leverage })
+        })
+        .collect()
+}
+
 pub fn balance_target(ccy: Option<&str>) -> Result<Target, String> {
     match ccy.map(str::trim).filter(|c| !c.is_empty()) {
         None => Ok(Target::bare(Route::Balance)),
@@ -577,6 +642,34 @@ pub fn order_status_target(inst_id: &str, client_id: &str) -> Result<Target, Str
     Ok(Target::new(Route::Order, format!("instId={inst_id}&clOrdId={client_id}")))
 }
 
+/// What one order on an instrument can open at most, each way, in order units.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaxOrderSize {
+    pub max_buy: f64,
+    pub max_sell: f64,
+}
+
+pub fn max_size_target(inst_id: &str, family: Family, trade_mode: &str) -> Result<Target, String> {
+    let inst_id = instrument(inst_id)?;
+    let mode = super::wire::trade_mode(family, Some(trade_mode))?;
+    Ok(Target::new(Route::MaxSize, format!("instId={inst_id}&tdMode={mode}")))
+}
+
+/// The row for `inst_id`; both bounds or neither — a missing one is not zero.
+pub fn parse_max_size(body: &str, inst_id: &str) -> Result<MaxOrderSize, String> {
+    let value = envelope(body)?;
+    let row = value
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|rows| rows.iter().find(|r| r.get("instId").and_then(Value::as_str) == Some(inst_id)))
+        .ok_or_else(|| format!("可开数量回复里没有 {inst_id}"))?;
+    match (num(row, "maxBuy"), num(row, "maxSell")) {
+        (Some(max_buy), Some(max_sell)) => Ok(MaxOrderSize { max_buy, max_sell }),
+        _ => Err(format!("可开数量回复缺少 maxBuy/maxSell：{}", head(&row.to_string()))),
+    }
+}
+
 /// Fee rates as fractions of notional, positive when charged and negative
 /// when rebated — the opposite of OKX's own sign.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -655,6 +748,26 @@ fn head(body: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Asked with the order's own margin mode, never a default; read back as
+    /// OKX answered it on the demo account (2026-10-09), and never as zero
+    /// when a bound is missing.
+    #[test]
+    fn the_most_an_order_can_open_is_read_with_the_orders_margin_mode() {
+        assert_eq!(max_size_target("ETH-USDT-SWAP", Family::Swap, "isolated").unwrap().path_and_query(),
+                   "/api/v5/account/max-size?instId=ETH-USDT-SWAP&tdMode=isolated");
+        assert_eq!(max_size_target("ETH-USDT", Family::Spot, "cross").unwrap().path_and_query(),
+                   "/api/v5/account/max-size?instId=ETH-USDT&tdMode=cross");
+        assert!(max_size_target("ETH USDT&x=1", Family::Swap, "isolated").is_err());
+        assert!(max_size_target("ETH-USDT-SWAP", Family::Swap, "margin").is_err());
+        assert!(max_size_target("ETH-USDT-SWAP", Family::Swap, "").is_err(), "a mode is stated, never defaulted");
+
+        let body = r#"{"code":"0","data":[{"ccy":"","instId":"ETH-USDT-SWAP","maxBuy":"774.85","maxSell":"782.61","tradeQuoteCcy":""}]}"#;
+        assert_eq!(parse_max_size(body, "ETH-USDT-SWAP").unwrap(), MaxOrderSize { max_buy: 774.85, max_sell: 782.61 });
+        assert!(parse_max_size(body, "BTC-USDT-SWAP").is_err(), "another instrument's row is not this one's");
+        assert!(parse_max_size(r#"{"code":"0","data":[{"instId":"ETH-USDT-SWAP","maxBuy":""}]}"#, "ETH-USDT-SWAP").is_err());
+        assert!(parse_max_size(r#"{"code":"51000","msg":"Parameter tdMode error"}"#, "ETH-USDT-SWAP").unwrap_err().contains("51000"));
+    }
+
     #[test]
     fn transfers_are_read_whole_or_not_at_all() {
         let body = r#"{"code":"0","data":[{"billId":"9","ts":"1790160000000","ccy":"USDT","balChg":"-250.5","type":"1","subType":"12"}]}"#;
@@ -717,6 +830,23 @@ mod tests {
         assert!(rows[0].reduce_only);
         assert_eq!((rows[1].size, rows[1].close_fraction, rows[1].trigger_price), (None, Some(1.0), Some(2600.0)));
         assert!(parse_page(r#"{"code":"51000","msg":"Parameter ordType error","data":[]}"#, Book::Algo).is_err());
+    }
+
+    #[test]
+    fn a_leverage_read_names_every_leg() {
+        assert_eq!(leverage_target("ETH-USDT-SWAP", "isolated").unwrap().path_and_query(),
+                   "/api/v5/account/leverage-info?instId=ETH-USDT-SWAP&mgnMode=isolated");
+        assert!(leverage_target("ETH-USDT-SWAP", "cash").is_err());
+        assert!(leverage_target("ETH-USDT-SWAP&mgnMode=cross", "isolated").is_err(), "nothing but an id reaches the query");
+        assert_eq!(instrument_positions_target("ETH-USDT-SWAP").unwrap().path_and_query(), "/api/v5/account/positions?instId=ETH-USDT-SWAP");
+        // Recorded from the demo account, 2026-10-09 (long/short mode).
+        let hedged = r#"{"code":"0","data":[{"ccy":"ETH-USDT-SWAP","instId":"ETH-USDT-SWAP","lever":"3","mgnMode":"isolated","posSide":"long"},{"ccy":"ETH-USDT-SWAP","instId":"ETH-USDT-SWAP","lever":"3","mgnMode":"isolated","posSide":"short"}],"msg":""}"#;
+        let legs = parse_leverage(hedged).unwrap();
+        assert_eq!(legs.iter().map(|l| (l.pos_side, l.leverage)).collect::<Vec<_>>(), vec![(PosSide::Long, 3.0), (PosSide::Short, 3.0)]);
+        let net = r#"{"code":"0","data":[{"instId":"BTC-USDT-SWAP","lever":"12.5","mgnMode":"isolated","posSide":"net"}]}"#;
+        assert_eq!(parse_leverage(net).unwrap()[0].pos_side, PosSide::Net);
+        assert!(parse_leverage(r#"{"code":"0","data":[{"instId":"X","mgnMode":"isolated","posSide":"long","lever":""}]}"#).is_err());
+        assert!(parse_leverage(r#"{"code":"59111","msg":"Leverage query isn't supported in portfolio margin account mode"}"#).unwrap_err().contains("59111"));
     }
 
     #[test]

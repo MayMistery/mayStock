@@ -66,10 +66,19 @@ public protocol ExchangeVenue: Sendable {
     // MARK: Account
 
     /// How the account is set up for derivatives: whether a perpetual order
-    /// must name its leg, and which margin mode an option order needs. Read
-    /// rather than assumed — an account switched to net mode rejects every
-    /// order that names a leg, with an error that says nothing about why.
+    /// must name its leg, and the account level the margin mode of a fully
+    /// paid holding follows. Read rather than assumed — an account switched
+    /// to net mode rejects every order that names a leg, with an error that
+    /// says nothing about why.
     func accountTradingConfig(mode: TradingMode) async throws -> AccountTradingConfig
+
+    /// Ready one leg for the order about to go out on it: the margin mode
+    /// the order states, and — before a strategy opens on a contract the
+    /// venue holds at a leverage of its own — that leverage, set where the
+    /// leg holds nothing. Throws `LegBlocked` when the order must not go out
+    /// now. Required of every venue: what an order is margined at is never a
+    /// default.
+    func prepareLeg(_ leg: LegPreparation, mode: TradingMode, liveUnlocked: Bool) async throws -> LegReadiness
 
     /// The alternative series a manifest declares — funding rates, open
     /// interest, long/short ratios — aligned to `candles`.
@@ -167,9 +176,10 @@ public protocol ExchangeVenue: Sendable {
         stopPrice: Double, mode: TradingMode, liveUnlocked: Bool
     ) async throws
 
-    /// Attach a standalone reduce-only stop to a position that has none.
+    /// Attach a standalone reduce-only stop to a position that has none,
+    /// stating the position's own margin mode (`prepareLeg`, `.reduce`).
     func placeProtectiveOrder(
-        instId: String, instType: InstrumentType, posSide: PositionSide?,
+        instId: String, instType: InstrumentType, posSide: PositionSide?, tradeMode: String?,
         size: Double, stopPrice: Double, mode: TradingMode, liveUnlocked: Bool
     ) async throws
 
@@ -187,6 +197,17 @@ public protocol ExchangeVenue: Sendable {
     /// The account's fee rates on one instrument; nil where the venue does
     /// not publish them.
     func feeRates(instId: String, instType: InstrumentType, groupId: String?, mode: TradingMode) async throws -> FeeRates?
+
+    /// The most an order that opens or adds to a position on `instId` can be
+    /// right now, by the venue's own reckoning of the account — margin held
+    /// where its check holds it, fees reserved — in the order's units, for an
+    /// order in `tradeMode` (the one its leg was readied with). Nil where the
+    /// venue cannot say. A venue refuses an order its account cannot back and
+    /// never shrinks one, so the runner fits an opening order to this before
+    /// it sends it (`StrategyRunner.fitToVenue`).
+    func maxOpeningSize(
+        instId: String, instType: InstrumentType, side: OrderSide, tradeMode: String?, mode: TradingMode
+    ) async throws -> Double?
 
     /// Open the trading connection ahead of the first order, when the venue
     /// keeps one. The default does nothing.
@@ -324,6 +345,12 @@ extension ExchangeVenue {
         nil
     }
 
+    public func maxOpeningSize(
+        instId: String, instType: InstrumentType, side: OrderSide, tradeMode: String?, mode: TradingMode
+    ) async throws -> Double? {
+        nil
+    }
+
     public func warmTrading() async {}
 
     public func workingOrders(
@@ -385,18 +412,6 @@ public struct AccountTradingConfig: Sendable, Equatable {
     /// wrong that way, a wrongly skipped check costs a position.
     public var borrowsMissingCoin: Bool {
         (accountLevel ?? 0) >= 3 && autoLoan == true
-    }
-
-    /// The `tdMode` an option order has to carry. Options are margined by the
-    /// account, not the order: a simple account buys them for cash, a
-    /// single-currency margin account isolates them, and the multi-currency
-    /// and portfolio modes cross-margin everything.
-    public var optionTradeMode: String {
-        switch accountLevel {
-        case .some(1): return "cash"
-        case .some(2): return "isolated"
-        default: return "cross"
-        }
     }
 }
 

@@ -254,12 +254,11 @@ struct TradeBridgeOptionTests {
         let config = TradeBridge.parseAccountTradingConfig(json: json)
         #expect(config?.positionMode == .longShort)
         #expect(config?.accountLevel == 3)
-        #expect(config?.optionTradeMode == "cross")
         #expect(config?.autoLoan == false)
         let net = TradeBridge.parseAccountTradingConfig(
             json: #"[{"acctLv":"1","posMode":"net_mode","autoLoan":"true"}]"#)
         #expect(net?.positionMode == .net)
-        #expect(net?.optionTradeMode == "cash")
+        #expect(net?.accountLevel == 1)
         #expect(net?.autoLoan == true, "the string spelling counts too")
         let silent = TradeBridge.parseAccountTradingConfig(json: #"[{"acctLv":"2"}]"#)
         #expect(silent?.autoLoan == nil, "not reported is not off")

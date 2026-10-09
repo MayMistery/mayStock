@@ -66,15 +66,12 @@ pub struct SweepRequest {
     /// linear in the candidates, so the sample is capped.
     #[serde(rename = "crossValidationSample", default = "default_sample")]
     pub cross_validation_sample: usize,
-    #[serde(default = "default_blocks")]
-    pub blocks: usize,
+    #[serde(default)]
+    pub blocks: crate::overfit::Blocks,
 }
 
 fn default_sample() -> usize {
     24
-}
-fn default_blocks() -> usize {
-    8
 }
 
 /// Evaluate every grid point and assess the winner.
@@ -327,7 +324,7 @@ mod tests {
             grid: grid(16),
             threads: 4,
             cross_validation_sample: 8,
-            blocks: 8,
+            blocks: Default::default(),
         };
         let outcome = sweep(&strategy(), &candles(900), &request);
         assert_eq!(outcome.candidates.len(), 16);
@@ -344,7 +341,7 @@ mod tests {
             grid: grid(16),
             threads,
             cross_validation_sample: 8,
-            blocks: 8,
+            blocks: Default::default(),
         };
         let one = sweep(&strategy(), &bars, &make(1));
         let many = sweep(&strategy(), &bars, &make(8));
@@ -419,7 +416,7 @@ mod tests {
             ],
             threads: 2,
             cross_validation_sample: 4,
-            blocks: 8,
+            blocks: Default::default(),
         };
         let outcome = sweep(&unbounded, &candles(600), &request);
         assert_eq!(outcome.candidates.len(), 1);
@@ -443,7 +440,7 @@ mod tests {
             grid: Vec::new(),
             threads: 0,
             cross_validation_sample: 8,
-            blocks: 8,
+            blocks: Default::default(),
         };
         let outcome = sweep(&strategy(), &candles(300), &request);
         assert!(outcome.candidates.is_empty());
@@ -472,7 +469,7 @@ mod bench {
                 grid: grid.clone(),
                 threads,
                 cross_validation_sample: 24,
-                blocks: 8,
+                blocks: Default::default(),
             };
             let started = std::time::Instant::now();
             let outcome = sweep(&strategy, &bars, &request);

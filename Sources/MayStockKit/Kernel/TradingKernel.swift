@@ -638,6 +638,13 @@ extension KernelMetrics {
 /// computed — a confirmed `maystock://order` link. The rule is the one every
 /// strategy order goes through (`guard::check_order`); nothing here restates it.
 public enum KernelGuard {
+    /// The part of an order that adds exposure, in coins: all of it from flat
+    /// or when adding, the overshoot past flat when it reverses, nothing when
+    /// it only reduces — the guard's own definition (`guard::opening_base`).
+    public static func openingBase(baseDelta: Double, heldBase: Double) -> Double {
+        ms_opening_base(baseDelta, heldBase)
+    }
+
     /// Nil when the order passes. A check that could not run is reported as a
     /// refusal, never as a pass.
     public static func checkOrder(

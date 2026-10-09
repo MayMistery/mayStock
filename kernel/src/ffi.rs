@@ -624,14 +624,11 @@ pub unsafe extern "C" fn ms_assess_overfit(
         periods_per_year: f64,
         #[serde(default)]
         candidates: Vec<Vec<f64>>,
-        #[serde(default = "default_blocks")]
-        blocks: usize,
+        #[serde(default)]
+        blocks: crate::overfit::Blocks,
     }
     fn default_periods() -> f64 {
         365.0
-    }
-    fn default_blocks() -> usize {
-        8
     }
     guarded(error_out, ptr::null_mut(), || {
         let text = borrow_str(request_json).ok_or("请求 JSON 为空")?;
@@ -860,6 +857,14 @@ pub unsafe extern "C" fn ms_option_select(
 /// (`{"reason", "byPolicy"}`): it does not. NULL with `error_out` set: the
 /// check itself failed, which the caller must not read as a pass. NULL
 /// `limits_json` means default limits.
+/// The part of an order that adds exposure, in coins — the guard's own
+/// definition (`guard::opening_base`): all of it from flat or when adding, the
+/// overshoot past flat when it reverses, nothing when it only reduces.
+#[no_mangle]
+pub extern "C" fn ms_opening_base(base_delta: f64, held_base: f64) -> f64 {
+    crate::guard::opening_base(base_delta, held_base)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn ms_check_order(
     base_delta: f64,
@@ -1502,6 +1507,37 @@ pub unsafe extern "C" fn ms_trade_read(request_json: *const c_char) -> *mut c_ch
         }
     }))
     .unwrap_or_else(|_| local(crate::trade::ReadReply::Failed { reason: "内核异常".into() }));
+    to_c_string(serde_json::to_string(&reply).unwrap_or_default())
+}
+
+/// Ready one leg for the order about to go out on it
+/// (`trade::PrepareRequest` as JSON): the `tdMode` it states, and for a
+/// strategy opening on a leveraged contract, the leg held at the manifest's
+/// leverage — set only where the leg is empty. Always returns a
+/// `trade::leg::LegReply` as JSON, with what it took. Caller frees.
+#[no_mangle]
+pub unsafe extern "C" fn ms_trade_prepare(request_json: *const c_char) -> *mut c_char {
+    let local = crate::trade::Prepared::local;
+    let refused = |reason: String| crate::trade::leg::LegReply::Refused { code: crate::trade::RefusalCode::Spec, reason };
+    let reply = catch_unwind(AssertUnwindSafe(|| {
+        let Some(text) = borrow_str(request_json) else {
+            return local(refused("请求不是 UTF-8".into()));
+        };
+        let request: crate::trade::PrepareRequest = match serde_json::from_str(text) {
+            Ok(request) => request,
+            Err(e) => return local(refused(format!("请求解析失败：{e}"))),
+        };
+        match crate::trade::shared() {
+            Ok(client) => client.prepare(&request),
+            Err(reason) => local(crate::trade::leg::LegReply::Blocked { code: crate::trade::leg::BlockCode::Unreadable, reason }),
+        }
+    }))
+    // A panic may have come after a leverage change left: whether the leg
+    // moved is unknown, so nothing opens on it.
+    .unwrap_or_else(|_| local(crate::trade::leg::LegReply::Blocked {
+        code: crate::trade::leg::BlockCode::LeverageUnsettled,
+        reason: "内核在核对杠杆途中出错，本轮不开仓".into(),
+    }));
     to_c_string(serde_json::to_string(&reply).unwrap_or_default())
 }
 

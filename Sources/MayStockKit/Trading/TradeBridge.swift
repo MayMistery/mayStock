@@ -67,9 +67,11 @@ public struct OrderRequest: Sendable, Equatable {
     public var takeProfitTriggerPrice: Double?
     /// Strategy attribution tag; see `OrderTag`.
     public var clOrdId: String?
-    /// OKX `tdMode`, which an option order must state: the account's margin
-    /// level decides it (`AccountTradingConfig.optionTradeMode`). Nil lets
-    /// the CLI default, which is right for spot and perpetuals.
+    /// OKX `tdMode`. Every OKX order states one and none is defaulted: the
+    /// kernel's margin rule decides it (`ExchangeVenue.prepareLeg`) — the
+    /// strategy's regime for an order that opens, the position's own for one
+    /// that acts on it — and refuses an OKX order sent without it. Nil only
+    /// on a venue that has no such field.
     public var tradeMode: String?
 
     public init(

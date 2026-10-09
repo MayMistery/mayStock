@@ -218,7 +218,8 @@ struct SettlementFundingTests {
             Issue.record("expected a funding step")
             return
         }
-        let order = SettlementFunding.spotOrder(for: step)
+        let order = SettlementFunding.spotOrder(for: step, tradeMode: "cross")
+        #expect(order.tradeMode == "cross", "the account's spot mode, stated")
         #expect(order.instId == "ETH-USDT")
         #expect(order.instType == .spot)
         #expect(order.side == .buy)

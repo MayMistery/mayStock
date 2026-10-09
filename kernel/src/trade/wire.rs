@@ -6,10 +6,16 @@
 //! approves is what the exchange receives. Every rule about which field goes
 //! where lives here and nowhere else:
 //!
-//! - `tdMode` is always stated. The CLI this replaced filled in `cross` for a
-//!   perpetual that named none, which on an isolated position is an order for
-//!   a different position; an order acting on a position states its mode, and
-//!   the defaults below are the CLI's own, kept for callers that open.
+//! - `tdMode` is always stated, and never defaulted here. The CLI this
+//!   replaced filled in `cross` for a perpetual that named none and `cash`
+//!   for spot: the first is an order for a different position when the one
+//!   held is isolated, and the second is refused outright on a
+//!   multi-currency account (`51000 Parameter tdMode error`, demo account,
+//!   2026-10-09). Which mode an order states is `margin`'s to decide — the
+//!   strategy's regime for an order that opens, the position's own for one
+//!   that acts on it — and an order that names none is refused.
+//! - A leg's leverage is set per contract and margin mode, and per leg only
+//!   where OKX keeps it per leg: isolated, in long/short mode.
 //! - `reduceOnly` only where OKX reads it: perpetuals in net mode (its own
 //!   words), options (deliberately — see `reduce_only_applies`), algo orders
 //!   on a derivative. Never on spot.
@@ -21,7 +27,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+use super::margin;
 use super::route::Route;
+use crate::strategy::InstrumentType;
 
 // MARK: - Vocabulary
 
@@ -45,6 +53,35 @@ impl Family {
     }
     pub fn is_derivative(self) -> bool {
         matches!(self, Family::Swap | Family::Option)
+    }
+
+    /// A family whose positions OKX holds at a leverage of their own, set
+    /// per contract and margin mode (`account/set-leverage`): a perpetual or
+    /// a delivery future. A coin is paid for, and an option's leverage is in
+    /// the contract.
+    pub fn has_leverage(self) -> bool {
+        matches!(self, Family::Swap)
+    }
+
+    /// The instrument type a strategy names this family by — where its
+    /// margin regime is declared.
+    pub fn instrument_type(self) -> InstrumentType {
+        match self {
+            Family::Spot => InstrumentType::Spot,
+            Family::Swap => InstrumentType::Swap,
+            Family::Option => InstrumentType::Option,
+            Family::Stock => InstrumentType::Stock,
+        }
+    }
+
+    /// The family a strategy's instrument type trades as.
+    pub fn of(inst_type: InstrumentType) -> Family {
+        match inst_type {
+            InstrumentType::Spot => Family::Spot,
+            InstrumentType::Swap => Family::Swap,
+            InstrumentType::Option => Family::Option,
+            InstrumentType::Stock => Family::Stock,
+        }
     }
 }
 
@@ -210,6 +247,19 @@ pub enum Action {
     /// The exchange's own check of an order, without placing it. OKX offers
     /// it on multi-currency and portfolio margin accounts only.
     Precheck { order: OrderSpec },
+    /// Hold one leg of a contract at `leverage`: the contract's, in one
+    /// margin mode, on the leg named where OKX keeps one per leg. On a leg
+    /// that holds an isolated position this moves margin in or out of it, so
+    /// the runner only ever sends it to an empty leg (`leg`).
+    #[serde(rename_all = "camelCase")]
+    SetLeverage {
+        inst_id: String,
+        family: Family,
+        margin_mode: String,
+        #[serde(default)]
+        pos_side: Option<PosSide>,
+        leverage: f64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -220,9 +270,21 @@ pub enum Endpoint {
     CancelAlgos,
     AmendAlgos,
     OrderPrecheck,
+    SetLeverage,
 }
 
 impl Endpoint {
+    /// Every endpoint an action can become.
+    pub const ALL: [Endpoint; 7] = [
+        Endpoint::PlaceOrder,
+        Endpoint::PlaceAlgo,
+        Endpoint::CancelOrder,
+        Endpoint::CancelAlgos,
+        Endpoint::AmendAlgos,
+        Endpoint::OrderPrecheck,
+        Endpoint::SetLeverage,
+    ];
+
     /// Where it goes, and at what rate — declared with every other route.
     pub fn route(self) -> Route {
         match self {
@@ -232,6 +294,7 @@ impl Endpoint {
             Endpoint::CancelAlgos => Route::CancelAlgos,
             Endpoint::AmendAlgos => Route::AmendAlgos,
             Endpoint::OrderPrecheck => Route::OrderPrecheck,
+            Endpoint::SetLeverage => Route::SetLeverage,
         }
     }
 
@@ -239,12 +302,13 @@ impl Endpoint {
         self.route().path()
     }
 
-    /// The field an accepted reply names the order by.
+    /// The field an accepted reply names the order by; none for a request
+    /// that names no order.
     pub fn id_field(self) -> Option<&'static str> {
         match self {
             Endpoint::PlaceOrder | Endpoint::CancelOrder => Some("ordId"),
             Endpoint::PlaceAlgo | Endpoint::CancelAlgos | Endpoint::AmendAlgos => Some("algoId"),
-            Endpoint::OrderPrecheck => None,
+            Endpoint::OrderPrecheck | Endpoint::SetLeverage => None,
         }
     }
 
@@ -291,6 +355,10 @@ pub fn build(action: &Action) -> Result<WireRequest, String> {
                        "newSlTriggerPx": price(*stop, "新止损价")?, "newSlOrdPx": "-1"}),
             )
         }
+        Action::SetLeverage { inst_id, family, margin_mode, pos_side, leverage } => (
+            Endpoint::SetLeverage,
+            Value::Object(leverage_body(inst_id, *family, margin_mode, *pos_side, *leverage)?),
+        ),
     };
     Ok(WireRequest { endpoint, method: "POST", path: endpoint.path(), body: body.to_string() })
 }
@@ -302,20 +370,67 @@ fn require_id(field: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The `tdMode` an order states: its own, or the default the CLI applied.
-fn trade_mode(family: Family, stated: Option<&str>) -> Result<String, String> {
-    if let Some(mode) = stated.filter(|m| !m.is_empty()) {
-        return match mode {
-            "cross" | "isolated" | "cash" => Ok(mode.to_string()),
-            other => Err(format!("不认识的 tdMode：{other}")),
-        };
+/// The `tdMode` an order states — its own, never a default: `margin`
+/// decides it, and an order that skipped it is refused here. The max-size
+/// read is checked by the same rule, so it asks about the margin the order
+/// will actually use.
+pub fn trade_mode(family: Family, stated: Option<&str>) -> Result<String, String> {
+    if family == Family::Stock {
+        return Err("OKX 不交易股票".into());
     }
+    let Some(mode) = stated.filter(|m| !m.is_empty()) else {
+        return Err(format!(
+            "{}单必须说明 tdMode：开仓按策略的保证金模式，作用于持仓的单按这笔仓位自己的模式，不能默认",
+            family_label(family)));
+    };
+    if !margin::modes(family).contains(&mode) {
+        return Err(format!("{}单不能用 tdMode {mode}", family_label(family)));
+    }
+    Ok(mode.to_string())
+}
+
+fn family_label(family: Family) -> &'static str {
     match family {
-        Family::Swap => Ok("cross".into()),
-        Family::Spot => Ok("cash".into()),
-        Family::Option => Err("期权单必须说明 tdMode：它由账户等级决定，不能默认".into()),
-        Family::Stock => Err("OKX 不交易股票".into()),
+        Family::Spot => "现货",
+        Family::Swap => "永续",
+        Family::Option => "期权",
+        Family::Stock => "股票",
     }
+}
+
+/// The body that holds one leg at a leverage. Cross leverage is the
+/// contract's, shared by both legs, so naming one there is a mistake; an
+/// isolated leg is named in long/short mode and is the whole contract in net
+/// mode.
+fn leverage_body(
+    inst_id: &str, family: Family, margin_mode: &str, pos_side: Option<PosSide>, leverage: f64,
+) -> Result<Map<String, Value>, String> {
+    require_id("instId", inst_id)?;
+    if !family.has_leverage() {
+        return Err(format!("{}没有按仓位设的杠杆", family_label(family)));
+    }
+    if !matches!(margin_mode, "cross" | "isolated") {
+        return Err(format!("杠杆只按全仓或逐仓设，不认识 {margin_mode}"));
+    }
+    if !crate::strategy::leverage_on_grid(leverage) {
+        return Err(format!(
+            "杠杆 {leverage} 不在 {} 的档位上：交易所会照单回执、却把它截短持有",
+            crate::strategy::LEVERAGE_STEP));
+    }
+    let mut body = Map::new();
+    body.insert("instId".into(), json!(inst_id));
+    body.insert("lever".into(), json!(amount(leverage, "杠杆")?));
+    body.insert("mgnMode".into(), json!(margin_mode));
+    match (margin_mode, pos_side) {
+        ("isolated", Some(leg @ (PosSide::Long | PosSide::Short))) => {
+            body.insert("posSide".into(), json!(leg.as_str()));
+        }
+        ("cross", Some(PosSide::Long | PosSide::Short)) => {
+            return Err("全仓杠杆按合约设、两条腿共用，不能只设一条腿".into());
+        }
+        _ => {}
+    }
+    Ok(body)
 }
 
 /// Where `reduceOnly` goes on a regular order.
@@ -510,7 +625,7 @@ mod tests {
             size: 187.75,
             size_in_quote: false,
             price: kind.is_priced().then_some(2653.2),
-            trade_mode: None,
+            trade_mode: margin::modes(family).first().map(|m| m.to_string()),
             pos_side: None,
             reduce_only: false,
             client_id: None,
@@ -535,23 +650,105 @@ mod tests {
         assert_eq!(number(0.01234567891234), "0.0123456789");
     }
 
+    const FAMILIES: [Family; 4] = [Family::Spot, Family::Swap, Family::Option, Family::Stock];
+
+    /// No family has a default: an order that names no mode is refused
+    /// before the network, on the order book and the algo book alike, and a
+    /// stated mode is sent exactly when the family may state it.
     #[test]
-    fn every_order_states_its_margin_mode() {
-        for (family, default) in [(Family::Swap, "cross"), (Family::Spot, "cash")] {
-            let b = body(&Action::Place { order: order(family, OrderKind::Limit) });
-            assert_eq!(b["tdMode"], default, "{family:?}: the CLI's own default, now stated");
+    fn every_order_states_its_margin_mode_and_none_is_defaulted() {
+        for family in FAMILIES {
+            let mut bare = order(family, OrderKind::Limit);
+            bare.trade_mode = None;
+            assert!(build(&Action::Place { order: bare.clone() }).is_err(), "{family:?}: no default");
+            assert!(build(&Action::Precheck { order: bare }).is_err(), "{family:?}: no default");
+            for mode in ["cash", "cross", "isolated", "margin"] {
+                let mut stated = order(family, OrderKind::Limit);
+                stated.trade_mode = Some(mode.into());
+                match build(&Action::Place { order: stated }) {
+                    Ok(wire) => {
+                        assert!(margin::modes(family).contains(&mode), "{family:?} {mode}");
+                        let sent: Value = serde_json::from_str(&wire.body).unwrap();
+                        assert_eq!(sent["tdMode"], mode, "{family:?}");
+                    }
+                    Err(_) => assert!(!margin::modes(family).contains(&mode), "{family:?} {mode}"),
+                }
+            }
+            if family.has_algo_book() {
+                let algo = AlgoSpec {
+                    inst_id: "ETH-USDT-SWAP".into(), inst_type: family, side: Side::Sell, pos_side: None,
+                    size: 1.0, trade_mode: None, reduce_only: family.is_derivative(), cancel_with_position: false,
+                    client_id: None, kind: AlgoKind::Protection { take_profit: None, stop_loss: Some(2500.0) },
+                };
+                assert!(build(&Action::PlaceAlgo { algo }).is_err(), "{family:?}: an algo order states its mode too");
+            }
         }
-        let mut isolated = order(Family::Swap, OrderKind::Market);
-        isolated.trade_mode = Some("isolated".into());
-        assert_eq!(body(&Action::Place { order: isolated })["tdMode"], "isolated");
-        // An option has no default: the account decides it.
-        assert!(build(&Action::Place { order: order(Family::Option, OrderKind::Limit) }).is_err());
-        let mut option = order(Family::Option, OrderKind::Limit);
-        option.trade_mode = Some("isolated".into());
-        assert_eq!(body(&Action::Place { order: option })["tdMode"], "isolated");
-        let mut bogus = order(Family::Swap, OrderKind::Limit);
-        bogus.trade_mode = Some("margin".into());
-        assert!(build(&Action::Place { order: bogus }).is_err());
+    }
+
+    /// The vocabulary is one: every instrument type a strategy can name is a
+    /// family the trading path knows, and back.
+    #[test]
+    fn every_instrument_type_is_a_family_and_back() {
+        for inst_type in InstrumentType::ALL {
+            assert_eq!(Family::of(inst_type).instrument_type(), inst_type);
+            // Spelled the same on both sides of the boundary.
+            assert_eq!(serde_json::to_value(Family::of(inst_type)).unwrap(), serde_json::to_value(inst_type).unwrap());
+        }
+        for family in FAMILIES {
+            assert_eq!(Family::of(family.instrument_type()), family);
+        }
+    }
+
+    /// OKX holds a leverage per position exactly where the backtest models
+    /// one: an isolated regime, margin `notional / leverage`. A family that
+    /// had one without the other would trade at a leverage nobody tested.
+    #[test]
+    fn leverage_is_held_where_the_regime_is_isolated() {
+        for inst_type in InstrumentType::ALL {
+            let family = Family::of(inst_type);
+            assert_eq!(
+                family.has_leverage(),
+                inst_type.margin_regime() == crate::strategy::MarginRegime::Isolated,
+                "{inst_type:?}");
+        }
+    }
+
+    #[test]
+    fn a_leg_is_named_only_where_okx_keeps_a_leverage_per_leg() {
+        let set = |family: Family, mode: &str, leg: Option<PosSide>| Action::SetLeverage {
+            inst_id: "ETH-USDT-SWAP".into(), family, margin_mode: mode.into(), pos_side: leg, leverage: 10.0,
+        };
+        for family in FAMILIES {
+            for mode in ["cross", "isolated", "cash"] {
+                for leg in [None, Some(PosSide::Net), Some(PosSide::Long), Some(PosSide::Short)] {
+                    let built = build(&set(family, mode, leg));
+                    let allowed = family.has_leverage()
+                        && matches!(mode, "cross" | "isolated")
+                        && !(mode == "cross" && matches!(leg, Some(PosSide::Long | PosSide::Short)));
+                    assert_eq!(built.is_ok(), allowed, "{family:?} {mode} {leg:?}: {built:?}");
+                    let Ok(wire) = built else { continue };
+                    assert_eq!(wire.path, "/api/v5/account/set-leverage");
+                    let sent: Value = serde_json::from_str(&wire.body).unwrap();
+                    assert_eq!(sent["lever"], "10");
+                    assert_eq!(sent["mgnMode"], mode);
+                    // Isolated in long/short mode is per leg; everything else
+                    // is the whole contract.
+                    let named = mode == "isolated" && matches!(leg, Some(PosSide::Long | PosSide::Short));
+                    assert_eq!(sent.get("posSide").is_some(), named, "{family:?} {mode} {leg:?}");
+                }
+            }
+        }
+        let fractional = Action::SetLeverage {
+            inst_id: "ETH-USDT-SWAP".into(), family: Family::Swap, margin_mode: "isolated".into(),
+            pos_side: Some(PosSide::Short), leverage: 2.5,
+        };
+        assert_eq!(body(&fractional)["lever"], "2.5");
+        // Off the grid OKX echoes the value and holds a truncated one.
+        for bad in [0.0, -3.0, f64::NAN, f64::INFINITY, 2.336, 2.005] {
+            let mut action = fractional.clone();
+            if let Action::SetLeverage { leverage, .. } = &mut action { *leverage = bad; }
+            assert!(build(&action).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -568,10 +765,6 @@ mod tests {
             let mut spec = order(family, OrderKind::Limit);
             spec.pos_side = leg;
             spec.reduce_only = true;
-            spec.trade_mode = Some("isolated".into());
-            if family == Family::Spot {
-                spec.trade_mode = None;
-            }
             let b = body(&Action::Place { order: spec });
             assert_eq!(b.get("reduceOnly").is_some(), sent, "{family:?} {leg:?}");
             if sent {
@@ -682,14 +875,33 @@ mod tests {
         assert!(build(&Action::Cancel { inst_id: "ETH-USDT-SWAP".into(), order_id: " ".into() }).is_err());
     }
 
+    /// `Endpoint::ALL` names every endpoint once: the match below stops
+    /// compiling when one is added, and an ordinal past the list fails.
     #[test]
-    fn every_endpoint_is_a_trade_endpoint() {
-        // The closed set: nothing here reads or moves funds.
-        for endpoint in [Endpoint::PlaceOrder, Endpoint::PlaceAlgo, Endpoint::CancelOrder,
-                         Endpoint::CancelAlgos, Endpoint::AmendAlgos, Endpoint::OrderPrecheck] {
-            assert!(endpoint.path().starts_with("/api/v5/trade/"), "{:?}", endpoint);
-            // Everything here acts on the account but the exchange's own check.
-            assert_eq!(endpoint.changes_state(), endpoint != Endpoint::OrderPrecheck, "{:?}", endpoint);
+    fn every_endpoint_is_listed_once() {
+        fn ordinal(endpoint: Endpoint) -> usize {
+            match endpoint {
+                Endpoint::PlaceOrder => 0,
+                Endpoint::PlaceAlgo => 1,
+                Endpoint::CancelOrder => 2,
+                Endpoint::CancelAlgos => 3,
+                Endpoint::AmendAlgos => 4,
+                Endpoint::OrderPrecheck => 5,
+                Endpoint::SetLeverage => 6,
+            }
+        }
+        let mut seen = [false; Endpoint::ALL.len()];
+        for endpoint in Endpoint::ALL {
+            assert!(!std::mem::replace(&mut seen[ordinal(endpoint)], true), "{endpoint:?} twice");
+        }
+        assert!(seen.iter().all(|s| *s));
+    }
+
+    #[test]
+    fn every_endpoint_acts_but_the_exchanges_own_check() {
+        for endpoint in Endpoint::ALL {
+            assert_eq!(endpoint.path(), endpoint.route().path());
+            assert_eq!(endpoint.changes_state(), endpoint != Endpoint::OrderPrecheck, "{endpoint:?}");
         }
     }
 

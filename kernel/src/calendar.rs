@@ -35,6 +35,8 @@ pub enum MarketCalendar {
 }
 
 impl MarketCalendar {
+    pub const ALL: [MarketCalendar; 2] = [Self::Continuous, Self::UsEquities];
+
     /// Trading sessions in a year. The annualisation constant for daily bars.
     pub fn sessions_per_year(self) -> f64 {
         match self {
@@ -109,8 +111,9 @@ impl MarketCalendar {
     ///
     /// This is "bars between": how many bars a position opened at `from_ms`
     /// has been held by the bar opening at `to_ms`, or how many a cooldown
-    /// has waited. `from_ms` is any instant — a fill time, a clock reading —
-    /// while `to_ms` is a bar's own open, which every caller has in hand.
+    /// has waited. `from_ms` is any instant — a fill time, a clock reading.
+    /// `to_ms` is a bar's own open, except when a window is sized: then it
+    /// is the clock, and the grids below take any instant.
     ///
     /// On a continuous market the grid is wherever the venue anchors it (OKX
     /// aligns daily bars to UTC+8, not to the epoch), so the count is taken
@@ -119,37 +122,48 @@ impl MarketCalendar {
     /// would call a position entered at 10:05 and judged at the 15:00 bar
     /// four bars old — 4.9 rounded down — when it has seen five opens, and
     /// every bar-counted rule would then sit one bar off the backtest.
+    ///
+    /// On the stock calendar the grid is the session's own — the open plus
+    /// whole bars, before the close — and stays put whatever `from_ms` is: a
+    /// fill five seconds into the 10:30 bar has seen the 11:30 open and every
+    /// one after it. Stepping [`Self::next_open`] from the fill instead
+    /// walked a grid shifted onto it (11:30:05, 12:30:05, …) and lost the
+    /// last bar, one short of the backtest on every fill not exactly on an
+    /// open. Daily bars carry whatever clock time the feed stamps them with,
+    /// so they are taken at `to_ms`'s clock time, one a session; weekly bars
+    /// are calendar time, counted back from `to_ms` as on a continuous market.
     pub fn opens_between(self, from_ms: i64, to_ms: i64, bar_seconds: f64) -> usize {
         if to_ms <= from_ms {
             return 0;
         }
+        let bar_ms = bar_millis(bar_seconds);
         match self {
-            Self::Continuous => {
-                let bar_ms = bar_millis(bar_seconds);
-                ((to_ms - from_ms + bar_ms - 1) / bar_ms) as usize
-            }
-            Self::UsEquities => {
-                let mut count = 0;
-                let mut t = self.next_open(from_ms, bar_seconds);
-                while t <= to_ms {
-                    count += 1;
-                    t = self.next_open(t, bar_seconds);
-                }
-                count
-            }
+            Self::Continuous => opens_back_from(from_ms, to_ms, bar_ms),
+            Self::UsEquities => us::opens_between(from_ms, to_ms, bar_ms, bar_seconds),
         }
     }
 
     /// Expected opens strictly between two observed bars — the bars that
     /// should be there and are not.
+    ///
+    /// Stepped from `a_ms` with [`Self::next_open`], so each observed bar is
+    /// judged against the one before it: a feed on a grid this calendar does
+    /// not describe — hourly bars on the clock hour rather than from 09:30 —
+    /// shows up as bars off the grid, not as a hole between every pair.
     pub fn opens_strictly_between(self, a_ms: i64, b_ms: i64, bar_seconds: f64) -> usize {
         if b_ms <= a_ms {
             return 0;
         }
         match self {
             Self::Continuous => {
-                let bar_ms = bar_millis(bar_seconds);
-                ((b_ms - a_ms) / bar_ms).saturating_sub(1) as usize
+                // Whole bars spanned, less the one opening at `b_ms` itself —
+                // none when the two are closer than one bar. Counted unsigned,
+                // where saturating stops at zero. In `i64` it stops at
+                // `i64::MIN`: the less-one came out −1 there, and `as usize`
+                // made that `usize::MAX`, a panic in a debug build and in
+                // release a gap count wrapped past zero.
+                let bar_ms = bar_millis(bar_seconds).unsigned_abs();
+                (b_ms.abs_diff(a_ms) / bar_ms).saturating_sub(1) as usize
             }
             Self::UsEquities => {
                 let mut count = 0;
@@ -208,6 +222,14 @@ impl MarketCalendar {
             }
         }
     }
+}
+
+/// Opens of a grid that runs through `to_ms` — `to_ms` itself, one bar
+/// earlier, and so on — that fall after `from_ms`, the earlier of the two.
+/// Unsigned from the start: the distance between them is the span, and a
+/// count taken from it has no sign to lose.
+fn opens_back_from(from_ms: i64, to_ms: i64, bar_ms: i64) -> usize {
+    to_ms.abs_diff(from_ms).div_ceil(bar_ms.unsigned_abs()) as usize
 }
 
 fn bar_millis(bar_seconds: f64) -> i64 {
@@ -324,6 +346,48 @@ mod us {
                 .map(|(open, _)| open)
                 .expect("the next session date is a trading day by construction"),
         }
+    }
+
+    /// Grid opens in `(from_ms, until_ms]`: intraday bars at the session
+    /// open plus whole bars, daily bars at `until_ms`'s clock time on each
+    /// trading day, weekly bars back from `until_ms` in calendar time.
+    /// Counted a day at a time, so a window of minute bars costs its days,
+    /// not its bars.
+    pub fn opens_between(from_ms: i64, until_ms: i64, bar_ms: i64, bar_seconds: f64) -> usize {
+        if bar_seconds >= WEEK_SECONDS {
+            return opens_back_from(from_ms, until_ms, bar_ms);
+        }
+        let stamp = local(until_ms).time();
+        let last = local(until_ms).date();
+        let mut date = local(from_ms).date();
+        let mut count = 0;
+        while date <= last {
+            count += if bar_seconds >= DAY_SECONDS {
+                let open = to_ms(date.and_time(stamp));
+                usize::from(is_trading_day(date) && open > from_ms && open <= until_ms)
+            } else {
+                session(date).map_or(0, |(open, close)| {
+                    session_opens(open, close, bar_ms, from_ms, until_ms)
+                })
+            };
+            date = date.succ_opt().expect("date within range");
+        }
+        count
+    }
+
+    /// How many of one session's opens — `open` plus whole bars, before
+    /// `close` — fall in `(from_ms, until_ms]`. The opens there are a run of
+    /// indices, `first` up to but not including `past_last`; both are taken
+    /// unsigned, so a window that misses the session counts none.
+    fn session_opens(open: i64, close: i64, bar_ms: i64, from_ms: i64, until_ms: i64) -> usize {
+        let latest = until_ms.min(close - 1);
+        if latest < open {
+            return 0;
+        }
+        let bar = bar_ms.unsigned_abs();
+        let past_last = latest.abs_diff(open) / bar + 1;
+        let first = if from_ms < open { 0 } else { from_ms.abs_diff(open) / bar + 1 };
+        past_last.saturating_sub(first) as usize
     }
 
     pub fn bar_close(ts_ms: i64, bar_ms: i64, bar_seconds: f64) -> i64 {
@@ -455,18 +519,26 @@ mod us {
     }
 
     /// Gregorian Easter Sunday (Meeus / Jones / Butcher).
-    fn easter(year: i32) -> NaiveDate {
-        let a = year % 19;
-        let b = year / 100;
-        let c = year % 100;
-        let d = b / 4;
-        let e = b % 4;
-        let f = (b + 8) / 25;
-        let g = (b - f + 1) / 3;
-        let h = (19 * a + b - d - g + 15) % 30;
+    ///
+    /// The method assumes every quotient rounds down and every remainder is
+    /// non-negative. Rust's `/` and `%` round toward zero, which agrees only
+    /// while the year is positive; before 1 BC the formula reached 29 to 31
+    /// February, and any stock-calendar question about such an instant
+    /// panicked. Floored throughout, it is a date between 22 March and
+    /// 25 April in every year a date can name, and unchanged in every
+    /// positive one.
+    pub fn easter(year: i32) -> NaiveDate {
+        let a = year.rem_euclid(19);
+        let b = year.div_euclid(100);
+        let c = year.rem_euclid(100);
+        let d = b.div_euclid(4);
+        let e = b.rem_euclid(4);
+        let f = (b + 8).div_euclid(25);
+        let g = (b - f + 1).div_euclid(3);
+        let h = (19 * a + b - d - g + 15).rem_euclid(30);
         let i = c / 4;
         let k = c % 4;
-        let l = (32 + 2 * e + 2 * i - h - k) % 7;
+        let l = (32 + 2 * e + 2 * i - h - k).rem_euclid(7);
         let m = (a + 11 * h + 22 * l) / 451;
         let month = (h + l - 7 * m + 114) / 31;
         let day = (h + l - 7 * m + 114) % 31 + 1;
@@ -555,6 +627,27 @@ mod tests {
         // And a closure no rule produces.
         assert!(!us::is_trading_day(date(2001, 9, 12)));
         assert!(us::is_trading_day(date(2001, 9, 17)));
+    }
+
+    /// Easter — and so Good Friday — is a real spring date in every year a
+    /// date can name. Before 1 BC the formula's truncating division gave
+    /// 29 to 31 February, and asking the stock calendar about any instant
+    /// then panicked, in release too.
+    #[test]
+    fn easter_is_a_spring_date_in_every_year() {
+        let earliest = (3, 22);
+        let latest = (4, 25);
+        for year in NaiveDate::MIN.year()..=NaiveDate::MAX.year() {
+            let easter = us::easter(year);
+            let day = (easter.month(), easter.day());
+            assert!(day >= earliest && day <= latest, "{year}: {easter}");
+            assert_eq!(easter.weekday(), Weekday::Sun, "{year}: {easter}");
+        }
+        // Spot checks against the published dates.
+        assert_eq!(us::easter(2024), date(2024, 3, 31));
+        assert_eq!(us::easter(2025), date(2025, 4, 20));
+        // The instant that panicked, in 3 BC, now has an answer.
+        let _ = MarketCalendar::UsEquities.is_open(-62_225_000_000_000);
     }
 
     // MARK: Time zone
@@ -686,6 +779,160 @@ mod tests {
         assert!(cal.on_grid(None, t0 + 1234, HOUR));
         assert!(cal.on_grid(Some(t0), t0 + 3_600_000, HOUR));
         assert!(!cal.on_grid(Some(t0), t0 + 5_400_000, HOUR));
+    }
+
+    /// Bars the calendar expects at `bar_seconds`, walked from a Friday open
+    /// across the weekend the clocks sprang forward on, and from the open of
+    /// the early-close day before Independence Day across the holiday.
+    fn expected_opens(calendar: MarketCalendar, bar_seconds: f64) -> Vec<i64> {
+        let mut opens = Vec::new();
+        for start in [ny(2024, 3, 8, 9, 30), ny(2024, 7, 3, 9, 30)] {
+            let mut t = start;
+            for _ in 0..400 {
+                opens.push(t);
+                t = calendar.next_open(t, bar_seconds);
+            }
+        }
+        opens
+    }
+
+    /// Two bars closer than one interval have no open between them, on every
+    /// calendar at every interval the kernel knows. Counted as "whole bars
+    /// spanned, less one" in `i64`, the continuous calendar made that −1 and
+    /// then `usize::MAX`: hourly bars judged at 4H panicked the gap detector
+    /// in a debug build and wrapped its count past zero in release.
+    #[test]
+    fn bars_closer_than_one_interval_have_nothing_between_them() {
+        for calendar in MarketCalendar::ALL {
+            for (interval, seconds) in crate::strategy::BAR_INTERVALS {
+                let bar_ms = bar_millis(seconds);
+                for a in expected_opens(calendar, seconds) {
+                    for closer in [1, bar_ms / 2, bar_ms - 1] {
+                        let b = a + closer;
+                        let case = format!("{calendar:?} {interval}: {a} and {closer} ms later");
+                        assert_eq!(calendar.opens_strictly_between(a, b, seconds), 0, "{case}");
+                        assert_eq!(calendar.opens_strictly_between(b, a, seconds), 0, "{case}, reversed");
+                        // At most the open at `b` itself: nothing fits before it.
+                        assert!(calendar.opens_between(a, b, seconds) <= 1, "{case}");
+                        assert_eq!(calendar.opens_between(b, a, seconds), 0, "{case}, reversed");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The grid `opens_between` counts on, built apart from it by stepping:
+    /// back from `to` on a continuous market and for weekly bars, trading
+    /// days at `to`'s clock time for daily stock bars, and the session grid
+    /// walked with `next_open` from a session open for intraday stock bars.
+    /// Ascending, from before `floor` to past `end`.
+    fn grid_through(calendar: MarketCalendar, seconds: f64, to: i64, floor: i64, end: i64) -> Vec<i64> {
+        let bar_ms = bar_millis(seconds);
+        if calendar == MarketCalendar::Continuous || seconds >= 7.0 * DAY {
+            let mut grid: Vec<i64> =
+                (0..).map(|k| to - k * bar_ms).take_while(|g| *g > floor - bar_ms).collect();
+            grid.reverse();
+            return grid;
+        }
+        let mut t = if seconds >= DAY {
+            let mut date = us::local(floor).date();
+            while !us::is_trading_day(date) {
+                date = date.succ_opt().unwrap();
+            }
+            us::to_ms(date.and_time(us::local(to).time()))
+        } else {
+            calendar.next_open(floor, seconds)
+        };
+        let mut grid = Vec::new();
+        while t <= end.max(to) {
+            grid.push(t);
+            t = calendar.next_open(t, seconds);
+        }
+        grid
+    }
+
+    /// Bars between an instant and a bar are the grid's opens after the one
+    /// and up to the other, on every calendar at every interval the kernel
+    /// knows — from any instant: on an open, a millisecond before one, five
+    /// seconds into a bar as a fill lands, half a bar in, before the open,
+    /// after the close, on a weekend or a holiday; and up to a bar's open or
+    /// to the clock, as a window is sized. The stock calendar used to step
+    /// `next_open` from the instant itself, which shifted the session grid
+    /// onto it and came out one bar short of the backtest for almost every
+    /// fill.
+    #[test]
+    fn opens_between_counts_the_grid_from_any_instant() {
+        // The weekend the clocks sprang forward on; the early close before
+        // Independence Day and the holiday; Thanksgiving and the early close
+        // after it.
+        for (y, m, d) in [(2024, 3, 7), (2024, 7, 3), (2024, 11, 27)] {
+            let floor = ny(y, m, d, 0, 0);
+            for calendar in MarketCalendar::ALL {
+                for (interval, seconds) in crate::strategy::BAR_INTERVALS {
+                    let bar_ms = bar_millis(seconds);
+                    let end = floor + (7 * DAY_MS).max(20 * bar_ms);
+                    let mut walk = vec![calendar.next_open(floor, seconds)];
+                    while let Some(&t) = walk.last().filter(|t| **t <= end) {
+                        walk.push(calendar.next_open(t, seconds));
+                    }
+                    // Every session's first and last bar, and a sample between.
+                    let stride = (walk.len() / 200).max(1);
+                    let mut froms = Vec::new();
+                    for (i, &g) in walk.iter().enumerate() {
+                        let edge = i == 0
+                            || i + 1 == walk.len()
+                            || g - walk[i - 1] != bar_ms
+                            || walk[i + 1] - g != bar_ms;
+                        if edge || i % stride == 0 {
+                            froms.extend([g - 1, g, g + 5_000, g + bar_ms / 2]);
+                        }
+                    }
+                    // Midnight, pre-market, a fill just after the open, midday,
+                    // the close, after hours, the last second — every day,
+                    // weekends and holidays included.
+                    let clock = [(0, 0, 0), (8, 0, 0), (9, 30, 5), (12, 17, 13),
+                                 (16, 0, 0), (17, 0, 0), (23, 59, 59)];
+                    let mut day = floor;
+                    while day <= end {
+                        let date = us::local(day).date();
+                        for (hour, minute, second) in clock {
+                            froms.push(us::to_ms(date.and_hms_opt(hour, minute, second).unwrap()));
+                        }
+                        day += DAY_MS;
+                    }
+                    // Bars' own opens, and the clock as a window is sized.
+                    let mut tos: Vec<i64> = (1..=6).map(|k| walk[(walk.len() - 1) * k / 6]).collect();
+                    tos.extend([floor + 2 * DAY_MS + 44_233_000, floor + 4 * DAY_MS + 43_200_000,
+                                end - 3_600_000]);
+
+                    for &to in &tos {
+                        let grid = grid_through(calendar, seconds, to, floor, end);
+                        let through = |t: i64| grid.partition_point(|g| *g <= t);
+                        for &from in &froms {
+                            let expected = through(to).saturating_sub(through(from));
+                            assert_eq!(
+                                calendar.opens_between(from, to, seconds), expected,
+                                "{calendar:?} {interval}: {} → {}", us::local(from), us::local(to)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A calendar added to the enum fails to compile here until it is placed;
+    /// the arm is the reminder that it belongs in `ALL` too, which every
+    /// property that must hold on each calendar walks.
+    #[test]
+    fn all_lists_every_calendar_once() {
+        let position = |calendar: MarketCalendar| match calendar {
+            MarketCalendar::Continuous => 0,
+            MarketCalendar::UsEquities => 1,
+        };
+        for (index, calendar) in MarketCalendar::ALL.iter().enumerate() {
+            assert_eq!(position(*calendar), index, "{calendar:?}");
+        }
     }
 
     // MARK: Staleness

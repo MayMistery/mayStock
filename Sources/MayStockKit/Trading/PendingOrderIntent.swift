@@ -429,9 +429,10 @@ public struct PendingOrderIntent: Sendable, Equatable, Codable {
     // MARK: - Handing it to the exchange
 
     /// The exchange request this intent stands for. `tradeMode` comes from the
-    /// account, not the URL — `AccountTradingConfig.optionTradeMode` decides
-    /// it, and letting a URL name it would let a proposal pick its own margin
-    /// treatment.
+    /// kernel's margin rule (`ExchangeVenue.prepareLeg`), never from the URL —
+    /// the account decides how a fully paid holding is booked, a position how
+    /// it is acted on, and letting a URL name it would let a proposal pick its
+    /// own margin treatment.
     ///
     /// `limitPrice` is passed in rather than read off the intent: a relative
     /// basis has no price until `resolveLimit` has run against the live book.

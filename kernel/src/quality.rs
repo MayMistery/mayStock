@@ -233,6 +233,34 @@ mod tests {
         assert!(as_crypto.gaps > 100);
     }
 
+    /// A series finer than the interval it is judged at holds every bar the
+    /// calendar expects and more besides, so it has no holes — on every
+    /// calendar at every interval the kernel knows. Each pair of bars
+    /// closer than one interval used to count −1 gaps, `usize::MAX` once
+    /// cast: a panic here in a debug build, and in release a total wrapped
+    /// past zero that refused the series as missing quintillions of bars.
+    #[test]
+    fn a_series_finer_than_its_interval_has_no_holes() {
+        // Friday 2024-03-08 09:30 New York, 14:30 UTC, through the weekend
+        // the clocks sprang forward on, to Tuesday evening.
+        let start = 1_709_908_200_000;
+        let end = start + 4 * 24 * HOUR_MS + 8 * HOUR_MS;
+        for calendar in MarketCalendar::ALL {
+            for (interval, seconds) in crate::strategy::BAR_INTERVALS {
+                // Half a bar, an hour at most: a step that divides the hour
+                // lands on every session open whatever the clocks did.
+                let step = (seconds as i64 * 500).min(HOUR_MS);
+                let candles: Vec<Candle> = (0..)
+                    .map(|k| bar(start + k * step))
+                    .take_while(|c| c.ts_ms < end)
+                    .collect();
+                let result = inspect(&candles, calendar, seconds, None);
+                assert_eq!(result.gaps, 0, "{calendar:?} {interval}");
+                assert!(result.usable, "{calendar:?} {interval}: {}", result.reason);
+            }
+        }
+    }
+
     #[test]
     fn a_missing_session_is_a_gap_on_a_stock_calendar_too() {
         let mut candles = stock_hours(10);

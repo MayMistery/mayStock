@@ -55,7 +55,11 @@ final class TicketVenue: ExchangeVenue, @unchecked Sendable {
     func sellableBalance(ccy: String, mode: TradingMode) async throws -> Double { coins[ccy] ?? 0 }
     func protectiveOrders(instId: String, instType: InstrumentType, mode: TradingMode) async throws -> [VenueProtectiveOrder] { [] }
     func amendProtectiveOrder(instId: String, instType: InstrumentType, algoId: String, stopPrice: Double, mode: TradingMode, liveUnlocked: Bool) async throws {}
-    func placeProtectiveOrder(instId: String, instType: InstrumentType, posSide: PositionSide?, size: Double, stopPrice: Double, mode: TradingMode, liveUnlocked: Bool) async throws {}
+    func placeProtectiveOrder(instId: String, instType: InstrumentType, posSide: PositionSide?, tradeMode: String?, size: Double, stopPrice: Double, mode: TradingMode, liveUnlocked: Bool) async throws {}
+    func prepareLeg(_ leg: LegPreparation, mode: TradingMode, liveUnlocked: Bool) async throws -> LegReadiness {
+        Issue.record("the ticket plans its mode in the kernel's close planner, never through prepareLeg")
+        return LegReadiness(tradeMode: nil)
+    }
 
     func closeBook(instId: String, instType: InstrumentType, mode: TradingMode) async throws -> any CloseBookFeed {
         let book = try KernelBook(instId: instId, instType: instType, mode: mode, network: false)
@@ -338,7 +342,11 @@ final class QuoteVenue: ExchangeVenue, @unchecked Sendable {
     }
     func protectiveOrders(instId: String, instType: InstrumentType, mode: TradingMode) async throws -> [VenueProtectiveOrder] { [] }
     func amendProtectiveOrder(instId: String, instType: InstrumentType, algoId: String, stopPrice: Double, mode: TradingMode, liveUnlocked: Bool) async throws {}
-    func placeProtectiveOrder(instId: String, instType: InstrumentType, posSide: PositionSide?, size: Double, stopPrice: Double, mode: TradingMode, liveUnlocked: Bool) async throws {}
+    func placeProtectiveOrder(instId: String, instType: InstrumentType, posSide: PositionSide?, tradeMode: String?, size: Double, stopPrice: Double, mode: TradingMode, liveUnlocked: Bool) async throws {}
+    func prepareLeg(_ leg: LegPreparation, mode: TradingMode, liveUnlocked: Bool) async throws -> LegReadiness {
+        Issue.record("the ticket plans its mode in the kernel's close planner, never through prepareLeg")
+        return LegReadiness(tradeMode: nil)
+    }
     func workingOrders(instId: String, instType: InstrumentType, mode: TradingMode) async throws -> OpenOrderListing {
         OpenOrderListing()
     }

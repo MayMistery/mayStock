@@ -843,12 +843,18 @@ public final class StrategyRunner {
     private func contractSize(for instId: String, host: StrategyRunnerHost) async -> Double? {
         let implied = host.venue.venue.instrumentType(of: instId).impliedContractSize
         if let implied { return implied }
-        if let cached = metaCache[instId] { return cached.contractValue }
+        return await instrumentMeta(for: instId, host: host)?.contractValue
+    }
+
+    /// An instrument's specification: cached, or read once from the venue.
+    /// Nil when the venue has none to give — never a made-up one.
+    private func instrumentMeta(for instId: String, host: StrategyRunnerHost) async -> InstrumentMeta? {
+        if let cached = metaCache[instId] { return cached }
         guard let meta = (try? await host.venue.instrumentMeta(instId: instId, mode: host.portfolio.mode)) ?? nil else {
             return nil
         }
         metaCache[instId] = meta
-        return meta.contractValue
+        return meta
     }
 
     /// Read total account equity and hand it to the host for the curve.
@@ -1463,6 +1469,7 @@ public final class StrategyRunner {
         protectionTripped = nil
         stopOuts = []
         pendingExternal = [:]
+        legBlocks = [:]
     }
     /// When protective exits fired, for the stop-loss guard.
     private var stopOuts: [Date] = []
@@ -1494,6 +1501,70 @@ public final class StrategyRunner {
 
     // MARK: Order submission
 
+    /// How far an opening order is left short of the venue's bound. The bound
+    /// is read at the buy price limit as it stands, and the order is judged at
+    /// the limit as it stands when it arrives, two round trips later. Measured
+    /// on the OKX demo account (2026-10-09, ETH and BTC perpetuals, a sample
+    /// every half second for 90 s): the buy limit rose at most 0.014% within
+    /// one second and 0.023% within five. A tenth of a percent covers that
+    /// with room; a faster market than that gets a refusal, and the next bar
+    /// decides again.
+    static let venueBoundHeadroom = 0.001
+
+    /// How much of an order that adds exposure the venue's account can back
+    /// right now, and the note that says so when that is less than the
+    /// strategy sized. The strategy's own size when it fits, or when the venue
+    /// cannot say; nil when not even the smallest order fits, and nothing is
+    /// sent.
+    ///
+    /// A venue refuses an order its account cannot back and never shrinks
+    /// one. Measured on the OKX demo account (2026-10-09): margin plus the
+    /// taker fee over what is free is refused with 51008, exact to the cent,
+    /// and a market buy's margin is held at the buy price limit, about 1%
+    /// above the mark — so with an allocation that is the whole available
+    /// balance a full-size buy was refused although its margin and fee fit at
+    /// the mark. Fitting to the venue's own bound (`maxOpeningSize`) covers
+    /// that and everything else the account's free balance answers for: hand
+    /// trades, other strategies, the account's real fee tier.
+    private func fitToVenue(
+        _ size: Double, side: OrderSide, crossing: Bool, tradeMode: String?, meta: InstrumentMeta?,
+        strategy: CompiledStrategy, host: StrategyRunnerHost
+    ) async -> (size: Double, note: String?)? {
+        let market = strategy.market
+        let unit = market.instType.isDerivative ? "张" : market.instId.components(separatedBy: "-").first ?? ""
+        // One order that closes a net-mode position and opens the other side:
+        // the venue's bound has not been measured against such an order, so
+        // it is not fitted to it.
+        if crossing {
+            Log.warn("runner: \(strategy.id) \(market.instId) 这张单先平后开（净持仓模式），不按交易所可开上限缩量，由交易所裁定")
+            return (size, nil)
+        }
+        let most: Double?
+        do {
+            most = try await host.venue.maxOpeningSize(
+                instId: market.instId, instType: market.instType, side: side, tradeMode: tradeMode,
+                mode: host.portfolio.mode)
+        } catch {
+            Log.warn("runner: \(strategy.id) \(market.instId) 读不到交易所可开上限（\(error)），按定仓 \(size) \(unit) 下单，由交易所裁定")
+            return (size, nil)
+        }
+        guard let most else { return (size, nil) }
+        let room = most * (1 - Self.venueBoundHeadroom)
+        guard size > room else { return (size, nil) }
+        let fitted = meta?.flooredToLot(room) ?? room.rounded(.down)
+        let smallest = meta.map { Swift.max($0.minSize, $0.lotSize) } ?? 0
+        guard fitted > 0, fitted >= smallest else {
+            Log.warn("runner: \(strategy.id) \(market.instId) 定仓 \(size) \(unit)，交易所当前最多可开 \(most) \(unit)，低于最小下单量，未开仓")
+            update(strategy.id) {
+                $0.message = "交易所当前最多可开 \(PriceFormatter.plain(most)) \(unit)，低于最小下单量，未开仓"
+            }
+            return nil
+        }
+        let note = "交易所当前最多可开 \(PriceFormatter.plain(most)) \(unit)，按上限下 \(PriceFormatter.plain(fitted))（定仓 \(PriceFormatter.plain(size))）"
+        Log.warn("runner: \(strategy.id) \(market.instId) \(note)")
+        return (fitted, note)
+    }
+
     private func submit(
         baseDelta: Double, strategy: CompiledStrategy, host: StrategyRunnerHost, reason: String,
         stopPrice: Double? = nil, takeProfitPrice: Double? = nil
@@ -1515,13 +1586,7 @@ public final class StrategyRunner {
             return
         }
 
-        let meta: InstrumentMeta?
-        if let cached = metaCache[market.instId] {
-            meta = cached
-        } else {
-            meta = (try? await host.venue.instrumentMeta(instId: market.instId, mode: host.portfolio.mode)) ?? nil
-            if let meta { metaCache[market.instId] = meta }
-        }
+        let meta = await instrumentMeta(for: market.instId, host: host)
 
         // Same rule as the ledger's: an unknown multiplier is not 1. Falling
         // back to the coin quantity here would send 13.8 *contracts* where 13.8
@@ -1557,9 +1622,12 @@ public final class StrategyRunner {
         // An order that shrinks a derivative position says so, and the
         // exchange then refuses to let it overshoot into the opposite side.
         let heldBase = host.ledger.position(for: strategy.id)?.baseQuantity ?? 0
+        // What the order adds, by the guard's own definition — nothing when it
+        // only moves the position towards flat, whatever the family.
+        let opens = KernelGuard.openingBase(baseDelta: baseDelta, heldBase: heldBase)
         let opposes = market.instType.isDerivative && abs(heldBase) > 1e-12
             && (baseDelta > 0) != (heldBase > 0)
-        let reduces = opposes && abs(baseDelta) <= abs(heldBase) + 1e-12
+        let reduces = opposes && opens == 0
 
         // A reversal is two trades, and on a hedge-mode account it has to be
         // sent as two orders.
@@ -1574,63 +1642,132 @@ public final class StrategyRunner {
         // same impossible shape, and the strategy ends up failed while still
         // holding the position its signal has turned against.
         //
-        // So the held leg is closed first, reduce-only, and what follows opens
-        // the new one — the same split `SchwabVenue.specs` already makes for
-        // equities. Net-mode accounts name no leg and may cross in one order,
-        // so they keep the single order they have always sent.
+        // So the held leg is closed first, reduce-only, in the held position's
+        // own margin mode, and what follows opens the new one on a leg readied
+        // for it — the same split `SchwabVenue.specs` already makes for
+        // equities. A net-mode account names no leg and may cross in one
+        // order, and keeps the single order it has always sent while the held
+        // position's mode is the opening's and the leg is ready; otherwise it
+        // is split the same way, so the close never waits on the opening.
+        let lot = meta?.lotSize ?? 0
+        let leverage = strategy.manifest.risk.leverage
+        func ready(_ intent: LegPreparation.Intent, on leg: PositionSide?) async throws -> LegReadiness {
+            try await readyLeg(
+                intent, instId: market.instId, instType: market.instType, leg: leg, lot: lot,
+                strategy: strategy, host: host)
+        }
         var openingDelta = baseDelta
-        if opposes, !reduces, let heldLeg = posSide, heldLeg != .net {
-            let closeSize = meta?.exchangeSize(forBaseQuantity: abs(heldBase))
-                ?? abs(heldBase) / contractSize
-            guard closeSize > 0 else {
-                update(strategy.id) { $0.message = "持仓量低于交易所最小下单量，无法先平后反手" }
+        // The mode the order states, once its leg is ready.
+        var readiness: LegReadiness?
+        if opposes, !reduces, let heldLeg = posSide {
+            let closing: LegReadiness
+            do {
+                closing = try await ready(.reduce, on: heldLeg)
+            } catch {
+                holdBack(error, opening: false, strategy: strategy)
                 return
             }
-            let close = OrderRequest(
-                instId: market.instId, instType: market.instType,
-                side: baseDelta > 0 ? .buy : .sell, kind: .market,
-                size: closeSize, sizeUnit: .base,
-                posSide: heldLeg, reduceOnly: true,
-                clOrdId: OrderTag.make(strategyId: strategy.id))
-            Log.warn("""
-                runner: 反手 \(strategy.id) \(market.instId) 先平 \(closeSize) 张\
-                （\(heldLeg.rawValue) 腿），再开 \(abs(heldBase + baseDelta)) 币
-                """)
-            switch await placeOrTrack(close, strategy: strategy, host: host, reason: reason) {
-            case .accepted:
-                break
-            case .cancelled:
-                return
-            case .unconfirmed:
-                // The close may or may not have landed. Opening the other leg
-                // now could leave both open at once, which is the one outcome
-                // worse than being late: the next tick re-decides from a
-                // position the exchange has by then confirmed.
-                update(strategy.id) { $0.message = "反手的平仓腿结果未确认，暂不开新仓，下轮重来" }
-                return
-            case .notDelivered(let why):
-                update(strategy.id) { $0.message = "反手的平仓腿没有送达（\(why)），下轮重来" }
-                return
-            case .rejected(let why):
-                update(strategy.id) {
-                    $0.status = .failed
-                    $0.message = "反手的平仓腿被拒绝：\(why)"
+            if heldLeg == .net {
+                do {
+                    let opening = try await ready(.open(leverage: leverage), on: .net)
+                    if opening.tradeMode == closing.tradeMode {
+                        readiness = opening
+                    } else {
+                        Log.warn("""
+                            runner: 反手 \(strategy.id) \(market.instId) 拆成两笔：持仓是\
+                            \(closing.marginText ?? "—")，新开仓要\(opening.marginText ?? "—")
+                            """)
+                    }
+                } catch {
+                    Log.warn("runner: 反手 \(strategy.id) \(market.instId) 拆成两笔，先平仓：开仓那一半\(error)")
                 }
-                return
             }
-            // What is left to do is the opening half — the target itself, now
-            // that the book is flat.
-            openingDelta = heldBase + baseDelta
-            posSide = await positionSide(forLeg: openingDelta, host: host)
+            if readiness == nil {
+                let closeSize = meta?.exchangeSize(forBaseQuantity: abs(heldBase))
+                    ?? abs(heldBase) / contractSize
+                guard closeSize > 0 else {
+                    update(strategy.id) { $0.message = "持仓量低于交易所最小下单量，无法先平后反手" }
+                    return
+                }
+                let close = OrderRequest(
+                    instId: market.instId, instType: market.instType,
+                    side: baseDelta > 0 ? .buy : .sell, kind: .market,
+                    size: closeSize, sizeUnit: .base,
+                    posSide: heldLeg, reduceOnly: true,
+                    clOrdId: OrderTag.make(strategyId: strategy.id),
+                    tradeMode: closing.tradeMode)
+                Log.warn("""
+                    runner: 反手 \(strategy.id) \(market.instId) 先平 \(closeSize) 张\
+                    （\(heldLeg.rawValue) 腿，\(closing.marginText ?? "—")），再开 \(abs(heldBase + baseDelta)) 币
+                    """)
+                switch await placeOrTrack(close, strategy: strategy, host: host, reason: reason) {
+                case .accepted:
+                    break
+                case .cancelled:
+                    return
+                case .unconfirmed:
+                    // The close may or may not have landed. Opening the other leg
+                    // now could leave both open at once, which is the one outcome
+                    // worse than being late: the next tick re-decides from a
+                    // position the exchange has by then confirmed.
+                    update(strategy.id) { $0.message = "反手的平仓腿结果未确认，暂不开新仓，下轮重来" }
+                    return
+                case .notDelivered(let why):
+                    update(strategy.id) { $0.message = "反手的平仓腿没有送达（\(why)），下轮重来" }
+                    return
+                case .rejected(let why):
+                    update(strategy.id) {
+                        $0.status = .failed
+                        $0.message = "反手的平仓腿被拒绝：\(why)"
+                    }
+                    return
+                }
+                // What is left to do is the opening half — the target itself, now
+                // that the book is flat.
+                openingDelta = heldBase + baseDelta
+                posSide = await positionSide(forLeg: openingDelta, host: host)
+            }
         }
 
-        let openingSize = openingDelta == baseDelta
+        var openingSize = openingDelta == baseDelta
             ? size
             : (meta?.exchangeSize(forBaseQuantity: abs(openingDelta))
                 ?? abs(openingDelta) / contractSize)
         guard openingSize > 0 else {
             update(strategy.id) { $0.message = "调整量低于交易所最小下单量，本次跳过" }
             return
+        }
+        // What adds exposure, by the guard's own definition: after a split
+        // reversal the order left is the opening leg, from flat; otherwise
+        // whatever the order adds. A close or a trim — a spot sale of what is
+        // held among them — adds nothing.
+        let adds = openingDelta != baseDelta || opens > 0
+
+        // A reduction states its position's own mode and is never held back
+        // by the leg; anything that adds goes out only on a leg holding
+        // nothing but the strategies' own contracts, at the manifest's
+        // leverage. First, so the venue's bound below is asked at the
+        // leverage and in the mode the order is margined at.
+        if readiness == nil {
+            do {
+                readiness = try await ready(adds ? .open(leverage: leverage) : .reduce, on: posSide)
+            } catch {
+                holdBack(error, opening: adds, strategy: strategy)
+                return
+            }
+        }
+        let tradeMode = readiness?.tradeMode
+
+        // What adds exposure is sent no larger than the account can back right
+        // now (`fitToVenue`); what does not goes whole.
+        var reason = reason
+        if adds {
+            let crossing = opposes && openingDelta == baseDelta
+            guard let fitted = await fitToVenue(
+                openingSize, side: openingDelta > 0 ? .buy : .sell, crossing: crossing, tradeMode: tradeMode,
+                meta: meta, strategy: strategy, host: host) else { return }
+            if let note = fitted.note { reason = "\(reason)；\(note)" }
+            openingSize = fitted.size
         }
 
         func request(withProtection: Bool) -> OrderRequest {
@@ -1645,7 +1782,8 @@ public final class StrategyRunner {
                 reduceOnly: reduces,
                 stopTriggerPrice: withProtection ? stopPrice : nil,
                 takeProfitTriggerPrice: withProtection ? takeProfitPrice : nil,
-                clOrdId: OrderTag.make(strategyId: strategy.id))
+                clOrdId: OrderTag.make(strategyId: strategy.id),
+                tradeMode: tradeMode)
         }
 
         let order = request(withProtection: true)
@@ -1655,9 +1793,11 @@ public final class StrategyRunner {
         // wire, and the number that made it wrong is never sent.
         Log.warn("""
             runner: 下单 \(strategy.id) \(market.instId) \
-            \(baseDelta > 0 ? "buy" : "sell") \(size) 张（面值 \(contractSize)，\
+            \(openingDelta > 0 ? "buy" : "sell") \(openingSize) 张（面值 \(contractSize)，\
             目标变动 \(baseDelta) 币，现持 \
-            \(host.ledger.position(for: strategy.id)?.quantity ?? 0) 张）理由：\(reason)
+            \(host.ledger.position(for: strategy.id)?.quantity ?? 0) 张，\
+            \(readiness?.marginText ?? "无保证金模式")\
+            \(readiness?.leverage.map { "，杠杆 \(PriceFormatter.plain($0))x" } ?? "")）理由：\(reason)
             """)
         let rejection: String
         switch await placeOrTrack(order, strategy: strategy, host: host, reason: reason) {
@@ -1787,7 +1927,10 @@ public final class StrategyRunner {
     /// only when the user changes them, and each read is an authenticated
     /// call.
     public static let accountConfigTTL: TimeInterval = 3_600
-    private var accountConfigCache: (config: AccountTradingConfig, at: Date)?
+    /// Per account: the demo and live accounts are set up apart — levels 3
+    /// and 2 today — and the level decides the margin mode of a coin or an
+    /// option order, so one account's reading is never the other's.
+    private var accountConfigCache: [TradingMode: (config: AccountTradingConfig, at: Date)] = [:]
 
     /// How long a read of an instrument's position tiers is reused. OKX
     /// changes them rarely, and a decision waits on the read.
@@ -1796,9 +1939,11 @@ public final class StrategyRunner {
 
     /// The instrument's position tiers in the environment the runner trades,
     /// cached. Nil where the venue states none, or when they have never been
-    /// readable — then the kernel sizes without the venue's limit and the
-    /// exchange refuses an order past it (51004); the log says the read
-    /// failed, so the refusal can be traced to it.
+    /// readable — then the kernel sizes without the venue's limit, and what
+    /// stops the order there is the fit to the exchange's own bound
+    /// (`fitToVenue`), which reads the same limit; where that read fails too,
+    /// the exchange refuses an order past it (51004). Each failed read is
+    /// logged.
     private func positionTiers(instId: String, host: StrategyRunnerHost) async -> [KernelPositionTier]? {
         let mode = host.portfolio.mode
         let key = "\(mode.rawValue)|\(instId)"
@@ -1817,20 +1962,104 @@ public final class StrategyRunner {
 
     /// The account's position mode and margin level, cached. Nil when it has
     /// never been readable, in which case callers fall back to the long/short
-    /// mode this app has always assumed — and the log says the read failed,
-    /// so a rejected order can be traced to it.
+    /// mode this app has always assumed and the kernel refuses to guess a
+    /// margin mode that hangs on the level — and the log says the read
+    /// failed, so a rejected order can be traced to it.
     private func accountTradingConfig(host: StrategyRunnerHost) async -> AccountTradingConfig? {
-        if let cached = accountConfigCache,
+        let mode = host.portfolio.mode
+        if let cached = accountConfigCache[mode],
            Date().timeIntervalSince(cached.at) < Self.accountConfigTTL {
             return cached.config
         }
         do {
-            let config = try await host.venue.accountTradingConfig(mode: host.portfolio.mode)
-            accountConfigCache = (config, Date())
+            let config = try await host.venue.accountTradingConfig(mode: mode)
+            accountConfigCache[mode] = (config, Date())
             return config
         } catch {
-            Log.warn("runner: 读不到账户配置（\(error)），仓位模式沿用上次读数或按 long/short 处理")
-            return accountConfigCache?.config
+            Log.warn("runner: 读不到\(mode.displayName)账户配置（\(error)），仓位模式沿用这个账户上次的读数或按 long/short 处理")
+            return accountConfigCache[mode]?.config
+        }
+    }
+
+    // MARK: Leg readiness
+
+    /// What the strategies' books hold on one leg of `instId`, in contracts,
+    /// signed: the side a long/short account names, or the whole net
+    /// position. Every strategy's, because on the exchange they are one
+    /// position — and what the leg holds beyond them is someone else's.
+    private func bookHolding(instId: String, leg: PositionSide?, host: StrategyRunnerHost) -> Double {
+        let quantities = host.ledger.positions.values
+            .filter { $0.instId == instId && $0.venue == host.venue.venue }
+            .map(\.quantity)
+        switch leg {
+        case .long: return quantities.filter { $0 > 0 }.reduce(0, +)
+        case .short: return quantities.filter { $0 < 0 }.reduce(0, +)
+        case .net, nil: return quantities.reduce(0, +)
+        }
+    }
+
+    /// Ready the leg an order is about to go out on (`ExchangeVenue.prepareLeg`):
+    /// the margin mode it states, and before an opening the manifest's
+    /// leverage held there. A leverage the venue changed, and anything that
+    /// was not the plain case, is logged.
+    private func readyLeg(
+        _ intent: LegPreparation.Intent, instId: String, instType: InstrumentType, leg: PositionSide?,
+        lot: Double, strategy: CompiledStrategy, host: StrategyRunnerHost
+    ) async throws -> LegReadiness {
+        let preparation = LegPreparation(
+            instId: instId, instType: instType, posSide: leg,
+            accountLevel: await accountTradingConfig(host: host)?.accountLevel,
+            held: bookHolding(instId: instId, leg: leg, host: host), lot: lot, intent: intent)
+        let readiness = try await host.venue.prepareLeg(
+            preparation, mode: host.portfolio.mode, liveUnlocked: host.liveTradingUnlocked)
+        if let from = readiness.changedFrom, let now = readiness.leverage {
+            let mode = readiness.tradeMode.flatMap { MarginMode(rawValue: $0)?.displayName } ?? ""
+            let side = leg == .long ? "多头" : leg == .short ? "空头" : ""
+            Log.warn("""
+                runner: \(strategy.id) 把 \(instId) \(mode)\(side)的杠杆从 \(PriceFormatter.plain(from))x \
+                设成清单的 \(PriceFormatter.plain(now))x（这条腿上没有仓位）
+                """)
+        }
+        if let note = readiness.note {
+            Log.warn("runner: \(strategy.id) \(instId)：\(note)")
+        }
+        let key = LegBlockKey(strategyId: strategy.id, opening: intent != .reduce)
+        if let held = legBlocks.removeValue(forKey: key) {
+            Log.warn("runner: \(strategy.id) \(instId) 不再受阻（之前\(held)）")
+        }
+        return readiness
+    }
+
+    /// The last reason each strategy's openings, and its reductions, were
+    /// held back at their leg — apart, so a reversal whose close is ready and
+    /// whose opening is not does not read as cleared and blocked again every
+    /// tick — so a reason that persists for ticks is logged once, not every
+    /// twenty seconds.
+    private var legBlocks: [LegBlockKey: String] = [:]
+
+    private struct LegBlockKey: Hashable {
+        let strategyId: String
+        let opening: Bool
+    }
+
+    /// An order held back at its leg. Said in the strategy's status and
+    /// logged when the reason is new. A block is decided again on the next
+    /// tick — nothing went out, so this bar's decision still stands, and a leg
+    /// freed mid-bar is traded on this bar, not the next. A refusal here
+    /// (live locked, no key) is final for the bar, as an exchange refusal is.
+    private func holdBack(_ error: Error, opening: Bool, strategy: CompiledStrategy) {
+        let reason = (error as? LegBlocked)?.reason ?? (error as? TradeError)?.description ?? String(describing: error)
+        let text = (opening ? "未开仓：" : "未能平仓：") + reason
+        let key = LegBlockKey(strategyId: strategy.id, opening: opening)
+        if legBlocks[key] != text {
+            Log.warn("runner: \(strategy.id) \(text)")
+            legBlocks[key] = text
+        }
+        let blocked = error is LegBlocked
+        if blocked { lastActedBar[strategy.id] = nil }
+        update(strategy.id) {
+            if !blocked { $0.status = .failed }
+            $0.message = text
         }
     }
 
@@ -1868,12 +2097,7 @@ public final class StrategyRunner {
             .first(where: { $0.instId == instId }) {
             return listed.meta
         }
-        if let cached = metaCache[instId] { return cached }
-        guard let meta = (try? await host.venue.instrumentMeta(instId: instId, mode: host.portfolio.mode)) ?? nil else {
-            return nil
-        }
-        metaCache[instId] = meta
-        return meta
+        return await instrumentMeta(for: instId, host: host)
     }
 
     /// Carry out the kernel's option plan.
@@ -2004,8 +2228,18 @@ public final class StrategyRunner {
             return
         }
         let config = await accountTradingConfig(host: host)
-        let tradeMode = (config ?? AccountTradingConfig(positionMode: nil, accountLevel: nil))
-            .optionTradeMode
+        // The account decides how a bought option is booked, and the contract
+        // must hold nothing the strategies did not buy.
+        let readiness: LegReadiness
+        do {
+            readiness = try await readyLeg(
+                .open(leverage: strategy.manifest.risk.leverage), instId: contract.instId, instType: .option,
+                leg: nil, lot: lot, strategy: strategy, host: host)
+        } catch {
+            holdBack(error, opening: true, strategy: strategy)
+            return
+        }
+        let tradeMode = readiness.tradeMode
         if let funding = await premiumFunding(
             contract: contract, contracts: contracts, limit: limit,
             strategy: strategy, config: config, host: host),
@@ -2026,7 +2260,7 @@ public final class StrategyRunner {
             \(contract.settleCurrency)（卖一 \(PriceFormatter.plain(ask))，\
             指数 \(PriceFormatter.plain(quote.indexPrice))，每张最多 \(PriceFormatter.money(perContract))，\
             预算 \(PriceFormatter.money(plan.premiumBudget))，权利金 \(PriceFormatter.money(bought.premium)) \
-            + 手续费 \(PriceFormatter.money(bought.fee))，tdMode \(tradeMode)）理由：\(reason)
+            + 手续费 \(PriceFormatter.money(bought.fee))，\(readiness.marginText ?? "无保证金模式")）理由：\(reason)
             """)
         switch await placeOrTrack(order, strategy: strategy, host: host, reason: reason) {
         case .rejected(let rejection):
@@ -2117,12 +2351,21 @@ public final class StrategyRunner {
             }
             return
         }
-        let tick = (await optionContractMeta(instId: position.instId, host: host))?.tickSize ?? 0.0001
+        let meta = await optionContractMeta(instId: position.instId, host: host)
+        let tick = meta?.tickSize ?? 0.0001
         let step = tick > 0 ? tick : 0.0001
         let limit = Swift.max(
             Self.snapToTick(bid * (1 - Self.optionPriceBuffer), tick: step, roundingUp: false), step)
-        let tradeMode = (await accountTradingConfig(host: host)
-            ?? AccountTradingConfig(positionMode: nil, accountLevel: nil)).optionTradeMode
+        // Sold in the mode the contract is held in.
+        let tradeMode: String?
+        do {
+            tradeMode = try await readyLeg(
+                .reduce, instId: position.instId, instType: .option, leg: nil,
+                lot: meta?.lotSize ?? 1, strategy: strategy, host: host).tradeMode
+        } catch {
+            holdBack(error, opening: false, strategy: strategy)
+            return
+        }
 
         let order = OrderRequest(
             instId: position.instId, instType: .option,
@@ -2267,11 +2510,17 @@ public final class StrategyRunner {
             // order's attachment was refused, or after a manual entry.
             let size = abs(position.quantity)
             guard size > 0 else { return }
+            let leg: PositionSide? = market.instType.usesPositionSide
+                ? await positionSide(forLeg: position.quantity, host: host) : nil
             do {
+                // In the mode of the position it protects: a stop in another
+                // mode guards a position that does not exist.
+                let mode = try await readyLeg(
+                    .reduce, instId: market.instId, instType: market.instType, leg: leg,
+                    lot: await instrumentMeta(for: market.instId, host: host)?.lotSize ?? 0,
+                    strategy: strategy, host: host).tradeMode
                 try await host.venue.placeProtectiveOrder(
-                    instId: market.instId, instType: market.instType,
-                    posSide: market.instType == .swap
-                        ? (direction == .long ? .long : .short) : nil,
+                    instId: market.instId, instType: market.instType, posSide: leg, tradeMode: mode,
                     size: size, stopPrice: level,
                     mode: host.portfolio.mode, liveUnlocked: host.liveTradingUnlocked)
                 localStops[strategy.id] = nil
