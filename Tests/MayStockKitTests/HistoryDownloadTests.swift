@@ -79,6 +79,16 @@ struct HistoryDownloadTests {
         #expect(ScriptedHTTP.paths(for: host).prefix(2) == ["/api/v5/market/candles", "/api/v5/market/candles"])
     }
 
+    /// A single read — a quote, not a download — is asked again too: one
+    /// cold connection that timed out used to fail the quote outright.
+    @Test func aSingleReadIsAskedAgainWhenItFailsInPassing() async throws {
+        let ticker = #"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","last":"100","bidPx":"99.9","askPx":"100.1","open24h":"99","high24h":"101","low24h":"98","vol24h":"10","ts":"1800000000000"}]}"#
+        let (client, host) = ScriptedHTTP.client([.init(status: 503, body: "{}"), .init(status: 200, body: ticker)])
+        let quote = try await client.ticker(instId: "BTC-USDT")
+        #expect(quote.last == 100)
+        #expect(ScriptedHTTP.paths(for: host) == ["/api/v5/market/ticker", "/api/v5/market/ticker"])
+    }
+
     /// A refusal of the request itself is the same next time: not retried.
     @Test func aRefusedRequestIsNotAskedAgain() async throws {
         let (client, host) = ScriptedHTTP.client([

@@ -4,8 +4,8 @@ import FoundationNetworking
 #endif
 
 /// Thin async client for OKX v5 public REST market data.
-/// Rate-limit aware: every paginated download shares one per-endpoint
-/// schedule (`OKXPublicPacer`) and retries the pages that fail in passing.
+/// Rate-limit aware: every read shares one per-endpoint schedule
+/// (`OKXPublicPacer`) and is asked again when it fails in passing.
 public struct OKXRESTClient: Sendable {
     public let baseURL: URL
     /// Read the demo environment's market data rather than the real market's.
@@ -57,7 +57,34 @@ public struct OKXRESTClient: Sendable {
         return request
     }
 
+    /// Every public read: paced with every other read in the process
+    /// (`OKXPublicPacer`), and asked again on a failure that passes — a rate
+    /// limit, a busy server, a dropped or timed-out connection — after 0.5,
+    /// 1, 2, 4 and 8 seconds. A read changes nothing, so asking again is
+    /// always safe; the kernel's signed reads follow the same rule. It used to
+    /// cover only long downloads, and a single cold connection that timed out
+    /// failed the quote it was fetching (measured: `maystock-e2e doctor`,
+    /// 2026-10-09, once in four runs). Every retry is logged, and the last
+    /// failure is what throws; a refusal of the request itself is not retried.
     private func get<Row: Decodable>(
+        _ type: Row.Type, path: String, query: [String: String]
+    ) async throws -> [Row] {
+        for (attempt, delay) in Self.retryDelays.enumerated() {
+            await OKXPublicPacer.shared.reserve(path)
+            do {
+                return try await getOnce(type, path: path, query: query)
+            } catch let error as OKXError where error.isTransient {
+                Log.warn("okx-rest: \(path) 第 \(attempt + 1) 次失败（\(error)），\(delay) 后重试")
+                try await Task.sleep(for: delay)
+            }
+        }
+        await OKXPublicPacer.shared.reserve(path)
+        return try await getOnce(type, path: path, query: query)
+    }
+
+    static let retryDelays: [Duration] = [.milliseconds(500), .seconds(1), .seconds(2), .seconds(4), .seconds(8)]
+
+    private func getOnce<Row: Decodable>(
         _ type: Row.Type, path: String, query: [String: String]
     ) async throws -> [Row] {
         let request = try request(path: path, query: query)
@@ -86,30 +113,6 @@ public struct OKXRESTClient: Sendable {
         }
         return envelope.data
     }
-
-    /// One page of a long download: paced with every other download in the
-    /// process (`OKXPublicPacer`), and asked again on a failure that passes —
-    /// a rate limit, a busy server, a dropped connection — after 0.5, 1, 2, 4
-    /// and 8 seconds. A download is hundreds of pages since the full sample
-    /// became the whole history, and one failed page used to fail the whole
-    /// backtest. Every retry is logged, and the last failure is what throws.
-    private func page<Row: Decodable>(
-        _ type: Row.Type, path: String, query: [String: String]
-    ) async throws -> [Row] {
-        for (attempt, delay) in Self.pageRetryDelays.enumerated() {
-            await OKXPublicPacer.shared.reserve(path)
-            do {
-                return try await get(type, path: path, query: query)
-            } catch let error as OKXError where error.isTransient {
-                Log.warn("okx-rest: \(path) 第 \(attempt + 1) 次失败（\(error)），\(delay) 后重试")
-                try await Task.sleep(for: delay)
-            }
-        }
-        await OKXPublicPacer.shared.reserve(path)
-        return try await get(type, path: path, query: query)
-    }
-
-    static let pageRetryDelays: [Duration] = [.milliseconds(500), .seconds(1), .seconds(2), .seconds(4), .seconds(8)]
 
     /// Envelope-aware GET for callers outside this file (alternative data).
     public func getRaw<Row: Decodable>(
@@ -162,7 +165,7 @@ public struct OKXRESTClient: Sendable {
         while collected.count < target {
             var query = ["instId": instId, "bar": bar.restBar, "limit": "100"]
             if let after { query["after"] = after }
-            let rows = try await self.page([String].self, path: "api/v5/market/candles", query: query)
+            let rows = try await self.get([String].self, path: "api/v5/market/candles", query: query)
             let page = rows.compactMap(OKXWireDecoder.candle(fromRow:))
             guard !page.isEmpty else { break }
             collected.append(contentsOf: page)
@@ -200,7 +203,7 @@ public struct OKXRESTClient: Sendable {
             var query = ["instId": instId, "bar": bar.restBar, "limit": usingHistory ? "100" : "300"]
             if let after { query["after"] = after }
 
-            let rows = try await self.page([String].self, path: path, query: query)
+            let rows = try await self.get([String].self, path: path, query: query)
             let page = rows.compactMap(OKXWireDecoder.candle(fromRow:))
             guard !page.isEmpty else {
                 if usingHistory { break }
@@ -241,7 +244,7 @@ public struct OKXRESTClient: Sendable {
         for _ in 0..<maxRequests {
             var query = ["instId": instId, "limit": "100"]
             if let after { query["after"] = after }
-            let rows = try await self.page(FundingRateRow.self,
+            let rows = try await self.get(FundingRateRow.self,
                                            path: "api/v5/public/funding-rate-history", query: query)
             guard !rows.isEmpty else { break }
             let page = rows.compactMap { row -> FundingRate? in

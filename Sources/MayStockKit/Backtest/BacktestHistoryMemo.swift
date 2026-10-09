@@ -56,9 +56,12 @@ actor BacktestHistoryMemo {
             return Array(try await entry.download.value.suffix(target))
         }
 
-        let download = Task { [weak self] in
+        // The memo is a process-wide singleton, so holding it for the length
+        // of one download keeps nothing alive that would otherwise go.
+        let memo = self
+        let download = Task {
             try await fetch { loaded in
-                Task { await self?.report(key, loaded: loaded) }
+                Task { await memo.report(key, loaded: loaded) }
             }
         }
         let entry = Entry(target: target, download: download, watchers: progress.map { [$0] } ?? [])
