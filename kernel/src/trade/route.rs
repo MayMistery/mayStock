@@ -40,6 +40,7 @@ pub enum Route {
     Fills,
     Bills,
     TradeFee,
+    MaxSize,
 }
 
 /// At most `requests` in any `window`.
@@ -77,6 +78,7 @@ impl Route {
             Route::Fills => "/api/v5/trade/fills",
             Route::Bills => "/api/v5/account/bills",
             Route::TradeFee => "/api/v5/account/trade-fee",
+            Route::MaxSize => "/api/v5/account/max-size",
         }
     }
 
@@ -97,7 +99,8 @@ impl Route {
             | Route::AccountConfig
             | Route::Fills
             | Route::Bills
-            | Route::TradeFee => false,
+            | Route::TradeFee
+            | Route::MaxSize => false,
         }
     }
 
@@ -108,7 +111,7 @@ impl Route {
             Route::PlaceOrder | Route::CancelOrder | Route::Order | Route::OrdersPending | Route::Fills => {
                 Limit::per_two_seconds(60)
             }
-            Route::PlaceAlgo | Route::CancelAlgos | Route::AmendAlgos | Route::AlgoOrdersPending => {
+            Route::PlaceAlgo | Route::CancelAlgos | Route::AmendAlgos | Route::AlgoOrdersPending | Route::MaxSize => {
                 Limit::per_two_seconds(20)
             }
             Route::Positions | Route::Balance | Route::Bills => Limit::per_two_seconds(10),

@@ -98,6 +98,21 @@ final class FakeVenue: ExchangeVenue, @unchecked Sendable {
         return OrderResult(ordId: "ord-\(placed.count)", clOrdId: order.clOrdId, raw: "{}")
     }
 
+    /// What `maxOpeningSize` answers — the venue's own bound on an opening
+    /// order, nil when it cannot say — or the error it throws instead; every
+    /// side it is asked for is recorded.
+    var maxOpening: Double?
+    var maxOpeningFailure: Error?
+    var maxOpeningAsked: [OrderSide] = []
+
+    func maxOpeningSize(
+        instId: String, instType: InstrumentType, side: OrderSide, mode: TradingMode
+    ) async throws -> Double? {
+        maxOpeningAsked.append(side)
+        if let maxOpeningFailure { throw maxOpeningFailure }
+        return maxOpening
+    }
+
     /// What the exchange says became of any order asked about; `.unknown`
     /// models a listing that has not caught up yet.
     var orderStatusResult: VenueOrderStatus = .unknown
@@ -2071,6 +2086,105 @@ struct LiveSizingFeeTests {
     }
 }
 
+// MARK: - Fitting an opening order to the venue
+
+/// A venue refuses an order its account cannot back and never shrinks one —
+/// OKX answers 51008, exact to the cent, and holds a market buy's margin at
+/// the buy price limit, about 1% over the mark (demo account, 2026-10-09). So
+/// an order that adds exposure is fitted to the venue's own bound before it is
+/// sent; one that closes or trims goes whole.
+@Suite("开仓按交易所可开上限缩量")
+@MainActor
+struct VenueBoundFitTests {
+    private static let price = 80_010.0
+
+    private func bars() -> [Candle] {
+        (0..<200).map { index in
+            let ts = (Date().timeIntervalSince1970 / 3_600).rounded(.down) * 3_600 - Double(200 - index) * 3_600
+            return Candle(ts: Date(timeIntervalSince1970: ts), open: 80_000, high: 80_080,
+                          low: 79_920, close: Self.price, volume: 5, confirmed: true)
+        }
+    }
+
+    /// A full-size long on a million of capital: 1 249 contracts at the
+    /// default 5 bps.
+    private func host(signals: String = #"{"longEntry":"close > 0"}"#) throws -> FakeHost {
+        let json = """
+        {"schema":1,"id":"fit","name":"fit",
+         "market":{"instId":"BTC-USDT-SWAP","instType":"SWAP","bar":"1H"},
+         "signals":\(signals),"sizing":{"mode":"equityPct","value":100}}
+        """
+        let host = FakeHost()
+        host.runnableStrategies = [try JSONDecoder().decode(StrategyManifest.self, from: Data(json.utf8)).compile()]
+        host.portfolio.capital[.okx] = 2_000_000
+        host.portfolio.setCapital(1_000_000, for: "fit", on: .okx)
+        host.portfolio.setRunning(true, for: "fit")
+        host.fake.equity = 2_000_000
+        host.fake.price = Self.price
+        host.fake.candlesResult = bars()
+        host.fake.positionsResult = .success([])
+        host.fake.accountConfig = AccountTradingConfig(positionMode: .longShort, accountLevel: 3)
+        return host
+    }
+
+    private let sized = (1_000_000 / 1.0005 / 80_010 / 0.01).rounded(.down)
+
+    @Test("超过交易所当前可开上限时按上限（留 0.1% 余量）取整下单，状态写明两个数")
+    func anOrderOverTheBoundIsFittedToIt() async throws {
+        let host = try host()
+        host.fake.maxOpening = 1_200
+        let runner = runner(for: host)
+        await runner.tick()
+        let order = try #require(host.fake.placed.first)
+        #expect(order.size == (1_200 * (1 - StrategyRunner.venueBoundHeadroom)).rounded(.down))
+        #expect(host.fake.maxOpeningAsked == [.buy])
+        let message = try #require(runner.state(for: "fit").message)
+        #expect(message.contains("交易所当前最多可开") && message.contains("按上限下"), "\(message)")
+    }
+
+    @Test("在上限之内、交易所说不了、读不到上限时都按定仓原样下单")
+    func anOrderWithinTheBoundOrWithoutOneGoesAsSized() async throws {
+        for setUp in [{ (fake: FakeVenue) in fake.maxOpening = 5_000 },
+                      { (fake: FakeVenue) in fake.maxOpening = nil },
+                      { (fake: FakeVenue) in fake.maxOpeningFailure = TradeError.readFailed("timeout") }] {
+            let host = try host()
+            setUp(host.fake)
+            let runner = runner(for: host)
+            await runner.tick()
+            #expect(host.fake.placed.first?.size == sized)
+            #expect(runner.state(for: "fit").message?.contains("交易所当前最多可开") != true)
+        }
+    }
+
+    @Test("连最小下单量都开不了时不下单，并说明")
+    func anOrderTheAccountCannotBackAtAllIsNotSent() async throws {
+        let host = try host()
+        host.fake.maxOpening = 0.5
+        let runner = runner(for: host)
+        await runner.tick()
+        #expect(host.fake.placed.isEmpty)
+        #expect(runner.state(for: "fit").message?.contains("低于最小下单量") == true)
+    }
+
+    @Test("平仓从不按可开上限缩量，也不去问")
+    func aCloseGoesWholeWithoutAsking() async throws {
+        let host = try host(signals: #"{"longEntry":"close < 0","longExit":"close > 0"}"#)
+        host.ledger.setContractSize(0.01, forInstId: "BTC-USDT-SWAP")
+        host.ledger.record(StrategyFill(
+            id: "entry-1", strategyId: "fit", instId: "BTC-USDT-SWAP", side: .buy,
+            price: 80_000, quantity: 10, feeQuote: 0.1, ts: Date(timeIntervalSince1970: 1_000),
+            clOrdId: OrderTag.make(strategyId: "fit"), mode: .demo))
+        host.fake.positionsResult = .success([ExchangePosition(
+            instId: "BTC-USDT-SWAP", posSide: .long, quantity: 10, averagePrice: 80_000,
+            markPrice: 80_010, unrealisedPnL: 0, leverage: 1, liquidationPrice: nil)])
+        host.fake.maxOpening = 0
+        await runner(for: host).tick()
+        let close = try #require(host.fake.placed.first)
+        #expect(close.side == .sell && close.size == 10)
+        #expect(host.fake.maxOpeningAsked.isEmpty)
+    }
+}
+
 // MARK: - Reversing a hedge-mode position
 
 /// A signal that flips while a position is open is *two* trades on an OKX
@@ -2139,6 +2253,14 @@ struct HedgeReversalTests {
 
         // 净持仓模式允许一笔穿过零点，所以它就是同一笔交易的另一种写法：
         // 两条腿加起来必须等于那一笔的量，否则拆分改变了交易本身。
+        // Only the opening leg is fitted to what the account can open; the
+        // close goes whole even when nothing more could be opened.
+        #expect(hedged.fake.maxOpeningAsked == [.sell])
+        let starved = try reversingHost(positionMode: .longShort)
+        starved.fake.maxOpening = 0
+        await runner(for: starved).tick()
+        #expect(starved.fake.placed.count == 1 && starved.fake.placed.first?.reduceOnly == true)
+
         let net = try reversingHost(positionMode: .net)
         await runner(for: net).tick()
         #expect(net.fake.placed.count == 1, "净模式不该被拆开")

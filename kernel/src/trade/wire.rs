@@ -303,7 +303,9 @@ fn require_id(field: &str, value: &str) -> Result<(), String> {
 }
 
 /// The `tdMode` an order states: its own, or the default the CLI applied.
-fn trade_mode(family: Family, stated: Option<&str>) -> Result<String, String> {
+/// The max-size read asks with the same one, so it measures the margin the
+/// order will actually use.
+pub fn trade_mode(family: Family, stated: Option<&str>) -> Result<String, String> {
     if let Some(mode) = stated.filter(|m| !m.is_empty()) {
         return match mode {
             "cross" | "isolated" | "cash" => Ok(mode.to_string()),

@@ -265,6 +265,18 @@ public struct TradeReceipt: Sendable, Equatable {
 
 /// The account's fee rates, as fractions of notional — positive when
 /// charged, negative when rebated.
+/// The most one order on an instrument can open right now, each way, in order
+/// units: contracts for a perpetual, the base coin for spot.
+public struct MaxOrderSize: Codable, Sendable, Equatable {
+    public let maxBuy: Double
+    public let maxSell: Double
+
+    public init(maxBuy: Double, maxSell: Double) {
+        self.maxBuy = maxBuy
+        self.maxSell = maxSell
+    }
+}
+
 public struct FeeRates: Codable, Sendable, Equatable {
     public let maker: Double
     public let taker: Double
@@ -646,5 +658,12 @@ public struct KernelTradeClient: Sendable {
     /// — without one — the family's standard rates.
     public func feeRates(family: InstrumentType, instId: String?, groupId: String?, mode: TradingMode) async throws -> FeeRates {
         try await read(["read": "feeRates", "family": family.rawValue, "instId": instId, "groupId": groupId], mode: mode)
+    }
+
+    /// The most an order on `instId` can open right now, as the exchange
+    /// reckons the account (`account/max-size`), asked with the order's own
+    /// margin mode — nil for the one an order defaults to.
+    public func maxOrderSize(family: InstrumentType, instId: String, tradeMode: String?, mode: TradingMode) async throws -> MaxOrderSize {
+        try await read(["read": "maxOrderSize", "family": family.rawValue, "instId": instId, "tradeMode": tradeMode], mode: mode)
     }
 }

@@ -183,6 +183,14 @@ public protocol ExchangeVenue: Sendable {
     /// not publish them.
     func feeRates(instId: String, instType: InstrumentType, groupId: String?, mode: TradingMode) async throws -> FeeRates?
 
+    /// The most an order that opens or adds to a position on `instId` can be
+    /// right now, by the venue's own reckoning of the account — margin held
+    /// where its check holds it, fees reserved — in the order's units. Nil
+    /// where the venue cannot say. A venue refuses an order its account cannot
+    /// back and never shrinks one, so the runner fits an opening order to this
+    /// before it sends it (`StrategyRunner.fitToVenue`).
+    func maxOpeningSize(instId: String, instType: InstrumentType, side: OrderSide, mode: TradingMode) async throws -> Double?
+
     /// Open the trading connection ahead of the first order, when the venue
     /// keeps one. The default does nothing.
     func warmTrading() async
@@ -312,6 +320,10 @@ extension ExchangeVenue {
     }
 
     public func feeRates(instId: String, instType: InstrumentType, groupId: String?, mode: TradingMode) async throws -> FeeRates? {
+        nil
+    }
+
+    public func maxOpeningSize(instId: String, instType: InstrumentType, side: OrderSide, mode: TradingMode) async throws -> Double? {
         nil
     }
 

@@ -106,6 +106,11 @@ char *ms_backtest_run(const MSStrategy *handle,
  * freeParameterCount. Caller frees. */
 char *ms_metrics_compute(const char *request_json, char **error_out);
 
+/* The part of an order that adds exposure, in coins: all of it from flat or
+ * when adding, the overshoot past flat when it reverses, 0 when it only
+ * reduces — the guard's own definition. */
+double ms_opening_base(double base_delta, double held_base);
+
 /* One order against the pre-trade limits, without a strategy handle (an order
  * no strategy computed — a confirmed maystock://order link). max_multiple is
  * the most of its equity the order's sizing could reach. NULL with error_out

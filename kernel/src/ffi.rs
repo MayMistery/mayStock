@@ -851,6 +851,14 @@ pub unsafe extern "C" fn ms_option_select(
 /// (`{"reason", "byPolicy"}`): it does not. NULL with `error_out` set: the
 /// check itself failed, which the caller must not read as a pass. NULL
 /// `limits_json` means default limits.
+/// The part of an order that adds exposure, in coins — the guard's own
+/// definition (`guard::opening_base`): all of it from flat or when adding, the
+/// overshoot past flat when it reverses, nothing when it only reduces.
+#[no_mangle]
+pub extern "C" fn ms_opening_base(base_delta: f64, held_base: f64) -> f64 {
+    crate::guard::opening_base(base_delta, held_base)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn ms_check_order(
     base_delta: f64,

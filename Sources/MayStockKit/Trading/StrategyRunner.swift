@@ -1490,6 +1490,69 @@ public final class StrategyRunner {
 
     // MARK: Order submission
 
+    /// How far an opening order is left short of the venue's bound. The bound
+    /// is read at the buy price limit as it stands, and the order is judged at
+    /// the limit as it stands when it arrives, two round trips later. Measured
+    /// on the OKX demo account (2026-10-09, ETH and BTC perpetuals, a sample
+    /// every half second for 90 s): the buy limit rose at most 0.014% within
+    /// one second and 0.023% within five. A tenth of a percent covers that
+    /// with room; a faster market than that gets a refusal, and the next bar
+    /// decides again.
+    static let venueBoundHeadroom = 0.001
+
+    /// How much of an order that adds exposure the venue's account can back
+    /// right now, and the note that says so when that is less than the
+    /// strategy sized. The strategy's own size when it fits, or when the venue
+    /// cannot say; nil when not even the smallest order fits, and nothing is
+    /// sent.
+    ///
+    /// A venue refuses an order its account cannot back and never shrinks
+    /// one. Measured on the OKX demo account (2026-10-09): margin plus the
+    /// taker fee over what is free is refused with 51008, exact to the cent,
+    /// and a market buy's margin is held at the buy price limit, about 1%
+    /// above the mark — so with an allocation that is the whole available
+    /// balance a full-size buy was refused although its margin and fee fit at
+    /// the mark. Fitting to the venue's own bound (`maxOpeningSize`) covers
+    /// that and everything else the account's free balance answers for: hand
+    /// trades, other strategies, the account's real fee tier.
+    private func fitToVenue(
+        _ size: Double, side: OrderSide, crossing: Bool, meta: InstrumentMeta?,
+        strategy: CompiledStrategy, host: StrategyRunnerHost
+    ) async -> (size: Double, note: String?)? {
+        let market = strategy.market
+        let unit = market.instType.isDerivative ? "张" : market.instId.components(separatedBy: "-").first ?? ""
+        // One order that closes a net-mode position and opens the other side:
+        // the venue's bound has not been measured against such an order, so
+        // it is not fitted to it.
+        if crossing {
+            Log.warn("runner: \(strategy.id) \(market.instId) 这张单先平后开（净持仓模式），不按交易所可开上限缩量，由交易所裁定")
+            return (size, nil)
+        }
+        let most: Double?
+        do {
+            most = try await host.venue.maxOpeningSize(
+                instId: market.instId, instType: market.instType, side: side, mode: host.portfolio.mode)
+        } catch {
+            Log.warn("runner: \(strategy.id) \(market.instId) 读不到交易所可开上限（\(error)），按定仓 \(size) \(unit) 下单，由交易所裁定")
+            return (size, nil)
+        }
+        guard let most else { return (size, nil) }
+        let room = most * (1 - Self.venueBoundHeadroom)
+        guard size > room else { return (size, nil) }
+        let fitted = meta?.flooredToLot(room) ?? room.rounded(.down)
+        let smallest = meta.map { Swift.max($0.minSize, $0.lotSize) } ?? 0
+        guard fitted > 0, fitted >= smallest else {
+            Log.warn("runner: \(strategy.id) \(market.instId) 定仓 \(size) \(unit)，交易所当前最多可开 \(most) \(unit)，低于最小下单量，未开仓")
+            update(strategy.id) {
+                $0.message = "交易所当前最多可开 \(PriceFormatter.plain(most)) \(unit)，低于最小下单量，未开仓"
+            }
+            return nil
+        }
+        let note = "交易所当前最多可开 \(PriceFormatter.plain(most)) \(unit)，按上限下 \(PriceFormatter.plain(fitted))（定仓 \(PriceFormatter.plain(size))）"
+        Log.warn("runner: \(strategy.id) \(market.instId) \(note)")
+        return (fitted, note)
+    }
+
     private func submit(
         baseDelta: Double, strategy: CompiledStrategy, host: StrategyRunnerHost, reason: String,
         stopPrice: Double? = nil, takeProfitPrice: Double? = nil
@@ -1553,9 +1616,12 @@ public final class StrategyRunner {
         // An order that shrinks a derivative position says so, and the
         // exchange then refuses to let it overshoot into the opposite side.
         let heldBase = host.ledger.position(for: strategy.id)?.baseQuantity ?? 0
+        // What the order adds, by the guard's own definition — nothing when it
+        // only moves the position towards flat, whatever the family.
+        let opens = KernelGuard.openingBase(baseDelta: baseDelta, heldBase: heldBase)
         let opposes = market.instType.isDerivative && abs(heldBase) > 1e-12
             && (baseDelta > 0) != (heldBase > 0)
-        let reduces = opposes && abs(baseDelta) <= abs(heldBase) + 1e-12
+        let reduces = opposes && opens == 0
 
         // A reversal is two trades, and on a hedge-mode account it has to be
         // sent as two orders.
@@ -1620,13 +1686,26 @@ public final class StrategyRunner {
             posSide = await positionSide(forLeg: openingDelta, host: host)
         }
 
-        let openingSize = openingDelta == baseDelta
+        var openingSize = openingDelta == baseDelta
             ? size
             : (meta?.exchangeSize(forBaseQuantity: abs(openingDelta))
                 ?? abs(openingDelta) / contractSize)
         guard openingSize > 0 else {
             update(strategy.id) { $0.message = "调整量低于交易所最小下单量，本次跳过" }
             return
+        }
+        // What adds exposure is sent no larger than the account can back right
+        // now (`fitToVenue`); a close or a trim — a spot sale of what is held
+        // among them — goes whole. After a split reversal the order left is
+        // the opening leg, from flat.
+        var reason = reason
+        if openingDelta != baseDelta || opens > 0 {
+            let crossing = opposes && openingDelta == baseDelta
+            guard let fitted = await fitToVenue(
+                openingSize, side: openingDelta > 0 ? .buy : .sell, crossing: crossing,
+                meta: meta, strategy: strategy, host: host) else { return }
+            if let note = fitted.note { reason = "\(reason)；\(note)" }
+            openingSize = fitted.size
         }
 
         func request(withProtection: Bool) -> OrderRequest {
@@ -1651,7 +1730,7 @@ public final class StrategyRunner {
         // wire, and the number that made it wrong is never sent.
         Log.warn("""
             runner: 下单 \(strategy.id) \(market.instId) \
-            \(baseDelta > 0 ? "buy" : "sell") \(size) 张（面值 \(contractSize)，\
+            \(openingDelta > 0 ? "buy" : "sell") \(openingSize) 张（面值 \(contractSize)，\
             目标变动 \(baseDelta) 币，现持 \
             \(host.ledger.position(for: strategy.id)?.quantity ?? 0) 张）理由：\(reason)
             """)

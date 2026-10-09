@@ -79,6 +79,19 @@ pub enum Read {
         #[serde(default)]
         group_id: Option<String>,
     },
+    /// The most an order on `inst_id` can open right now, by the exchange's
+    /// own reckoning of the account (`account/max-size`): the margin its check
+    /// will hold — at the buy price limit for a market buy — and the taker fee,
+    /// against what is free. In order units: contracts for a perpetual, the
+    /// base coin for spot. `trade_mode` is the order's own `tdMode`, defaulted
+    /// as an order defaults it.
+    #[serde(rename_all = "camelCase")]
+    MaxOrderSize {
+        inst_id: String,
+        family: Family,
+        #[serde(default)]
+        trade_mode: Option<String>,
+    },
 }
 
 /// The kinds of algo order OKX keeps, as its listing must be asked for them.
@@ -577,6 +590,36 @@ pub fn order_status_target(inst_id: &str, client_id: &str) -> Result<Target, Str
     Ok(Target::new(Route::Order, format!("instId={inst_id}&clOrdId={client_id}")))
 }
 
+/// What one order on an instrument can open at most, each way, in order units.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaxOrderSize {
+    pub max_buy: f64,
+    pub max_sell: f64,
+}
+
+pub fn max_size_target(inst_id: &str, family: Family, trade_mode: Option<&str>) -> Result<Target, String> {
+    if inst_id.is_empty() || !inst_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err(format!("instId {inst_id:?} 不合法"));
+    }
+    let mode = super::wire::trade_mode(family, trade_mode)?;
+    Ok(Target::new(Route::MaxSize, format!("instId={inst_id}&tdMode={mode}")))
+}
+
+/// The row for `inst_id`; both bounds or neither — a missing one is not zero.
+pub fn parse_max_size(body: &str, inst_id: &str) -> Result<MaxOrderSize, String> {
+    let value = envelope(body)?;
+    let row = value
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|rows| rows.iter().find(|r| r.get("instId").and_then(Value::as_str) == Some(inst_id)))
+        .ok_or_else(|| format!("可开数量回复里没有 {inst_id}"))?;
+    match (num(row, "maxBuy"), num(row, "maxSell")) {
+        (Some(max_buy), Some(max_sell)) => Ok(MaxOrderSize { max_buy, max_sell }),
+        _ => Err(format!("可开数量回复缺少 maxBuy/maxSell：{}", head(&row.to_string()))),
+    }
+}
+
 /// Fee rates as fractions of notional, positive when charged and negative
 /// when rebated — the opposite of OKX's own sign.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -654,6 +697,27 @@ fn head(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Asked with the order's own margin mode, defaulted as the order defaults
+    /// it; read back as OKX answered it on the demo account (2026-10-09), and
+    /// never as zero when a bound is missing.
+    #[test]
+    fn the_most_an_order_can_open_is_read_with_the_orders_margin_mode() {
+        assert_eq!(max_size_target("ETH-USDT-SWAP", Family::Swap, None).unwrap().path_and_query(),
+                   "/api/v5/account/max-size?instId=ETH-USDT-SWAP&tdMode=cross");
+        assert_eq!(max_size_target("ETH-USDT-SWAP", Family::Swap, Some("isolated")).unwrap().path_and_query(),
+                   "/api/v5/account/max-size?instId=ETH-USDT-SWAP&tdMode=isolated");
+        assert_eq!(max_size_target("ETH-USDT", Family::Spot, None).unwrap().path_and_query(),
+                   "/api/v5/account/max-size?instId=ETH-USDT&tdMode=cash");
+        assert!(max_size_target("ETH USDT&x=1", Family::Swap, None).is_err());
+        assert!(max_size_target("ETH-USDT-SWAP", Family::Swap, Some("margin")).is_err());
+
+        let body = r#"{"code":"0","data":[{"ccy":"","instId":"ETH-USDT-SWAP","maxBuy":"774.85","maxSell":"782.61","tradeQuoteCcy":""}]}"#;
+        assert_eq!(parse_max_size(body, "ETH-USDT-SWAP").unwrap(), MaxOrderSize { max_buy: 774.85, max_sell: 782.61 });
+        assert!(parse_max_size(body, "BTC-USDT-SWAP").is_err(), "another instrument's row is not this one's");
+        assert!(parse_max_size(r#"{"code":"0","data":[{"instId":"ETH-USDT-SWAP","maxBuy":""}]}"#, "ETH-USDT-SWAP").is_err());
+        assert!(parse_max_size(r#"{"code":"51000","msg":"Parameter tdMode error"}"#, "ETH-USDT-SWAP").unwrap_err().contains("51000"));
+    }
 
     #[test]
     fn transfers_are_read_whole_or_not_at_all() {

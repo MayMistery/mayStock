@@ -332,6 +332,10 @@ impl TradeClient {
                     let body = session.get(&reads::fee_target(*family, inst_id.as_deref())?).await?;
                     serde_json::to_value(reads::parse_fee_rates(&body, group_id.as_deref())?).map_err(|e| e.to_string())
                 }
+                Read::MaxOrderSize { inst_id, family, trade_mode } => {
+                    let body = session.get(&reads::max_size_target(inst_id, *family, trade_mode.as_deref())?).await?;
+                    serde_json::to_value(reads::parse_max_size(&body, inst_id)?).map_err(|e| e.to_string())
+                }
             }
         }
         .await;
