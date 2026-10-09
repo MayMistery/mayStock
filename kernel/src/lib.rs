@@ -44,6 +44,7 @@ pub mod resample;
 pub mod series;
 pub mod sizing;
 pub mod strategy;
+pub mod tiers;
 pub mod trade;
 pub mod us_options;
 

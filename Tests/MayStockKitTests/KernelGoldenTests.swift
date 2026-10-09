@@ -113,13 +113,15 @@ struct KernelGoldenTests {
     /// occur in the run. A fingerprint cannot move for a mechanism that never
     /// fires — the trailing-stop golden spent a year with every trade ending
     /// on its signal, pinning nothing about trailing stops.
+    @discardableResult
     private func check(
         _ name: String, _ manifestJSON: String, bars: [Candle],
-        capital: Double = 30_000, exercises: Set<TradeExitReason> = [], expect expected: Golden
-    ) throws {
+        capital: Double = 30_000, positionTiers: [KernelPositionTier]? = nil,
+        exercises: Set<TradeExitReason> = [], expect expected: Golden
+    ) throws -> KernelBacktestResult {
         let strategy = try KernelStrategy(manifestJSON: manifestJSON)
         let result = try strategy.backtest(
-            candles: bars, config: KernelBacktestConfig(initialCapital: capital))
+            candles: bars, config: KernelBacktestConfig(initialCapital: capital, positionTiers: positionTiers))
         let actual = Golden(result)
         if ProcessInfo.processInfo.environment["MAYSTOCK_PRINT_GOLDENS"] != nil {
             let exits = Dictionary(grouping: result.trades, by: \.exitReason.rawValue)
@@ -129,6 +131,7 @@ struct KernelGoldenTests {
         let reached = Set(result.trades.map(\.exitReason))
         #expect(exercises.isSubset(of: reached), "\(name) never reached \(exercises.subtracting(reached))")
         #expect(actual == expected, "\(name): got \(actual)")
+        return result
     }
 
     /// Frozen at the point the Swift engine was deleted, when the two agreed;
@@ -180,6 +183,24 @@ struct KernelGoldenTests {
         "continuousExposure": Golden(
             trades: 19, finalEquity: 30040.23065, totalReturnPct: 0.134102,
             maxDrawdownPct: 5.089221, winRate: 26.315789, feesPaid: 419.574133),
+        // 2026-10-09: new. Every other golden ends before a liquidation, so the
+        // level that triggers one was pinned by none. At 50× on 0.5% and 5 bps
+        // OKX liquidates a long 1.46% and a short 1.44% against the entry, and
+        // the 1.7% stop sits past both: it never fills — 16 liquidations, 16
+        // reversals. The rule this replaced (1.99%) filled it first: 12 stops,
+        // 2 liquidations, and a final equity of 1 158 785.03 (+3 762.6%).
+        "liquidationAtLeverage": Golden(
+            trades: 33, finalEquity: 630129.559897, totalReturnPct: 2000.431866,
+            maxDrawdownPct: 79.067225, winRate: 42.424242, feesPaid: 76812.007221),
+        // 2026-10-09: new. The same run on OKX's BTC-USDT isolated tiers: each
+        // position owes its tier's maintenance — 0.4% up to 10 BTC, where the
+        // single default says 0.5% — and none holds more than the 200 BTC that
+        // 50× allows, which the compounding reaches. The same 16 liquidations
+        // and 16 reversals; 696 724.61 where one rate and no limit gave
+        // 630 129.56.
+        "liquidationAtLeverageTiered": Golden(
+            trades: 33, finalEquity: 696724.610716, totalReturnPct: 2222.415369,
+            maxDrawdownPct: 79.067225, winRate: 42.424242, feesPaid: 74382.981131),
     ]
 
     @Test func movingAverageCrossover() throws {
@@ -255,6 +276,53 @@ struct KernelGoldenTests {
             bars: Self.candles(1_500, seed: 17),
             exercises: [.stopLoss],
             expect: Self.GOLDENS["shortsAndLeverage"]!)
+    }
+    @Test func liquidationAtLeverage() throws {
+        try check("liquidationAtLeverage",
+            Self.manifest(
+                instType: "SWAP",
+                signals: """
+                {"longEntry": "ema(close, fast) crosses_above ema(close, slow)",
+                 "longExit": "ema(close, fast) crosses_below ema(close, slow)",
+                 "shortEntry": "ema(close, fast) crosses_below ema(close, slow)",
+                 "shortExit": "ema(close, fast) crosses_above ema(close, slow)"}
+                """,
+                sizing: #"{"mode":"equityPct","value":20}"#,
+                risk: #"{"leverage":50,"stopLossPct":1.7}"#,
+                costs: #"{"feeBps":5,"slippageBps":5}"#),
+            bars: Self.candles(1_500, seed: 19),
+            exercises: [.liquidation],
+            expect: Self.GOLDENS["liquidationAtLeverage"]!)
+    }
+    /// OKX's isolated tiers for BTC-USDT perpetuals, the first four, read
+    /// 2026-10-09 and converted from contracts of 0.01 BTC.
+    static let btcTiers = [
+        KernelPositionTier(maxBase: 10, maintenanceMarginRate: 0.004, maxLeverage: 100),
+        KernelPositionTier(maxBase: 50, maintenanceMarginRate: 0.005, maxLeverage: 66.66),
+        KernelPositionTier(maxBase: 200, maintenanceMarginRate: 0.0075, maxLeverage: 50),
+        KernelPositionTier(maxBase: 400, maintenanceMarginRate: 0.0125, maxLeverage: 40),
+    ]
+    @Test func liquidationAtLeverageTiered() throws {
+        let result = try check("liquidationAtLeverageTiered",
+            Self.manifest(
+                instType: "SWAP",
+                signals: """
+                {"longEntry": "ema(close, fast) crosses_above ema(close, slow)",
+                 "longExit": "ema(close, fast) crosses_below ema(close, slow)",
+                 "shortEntry": "ema(close, fast) crosses_below ema(close, slow)",
+                 "shortExit": "ema(close, fast) crosses_above ema(close, slow)"}
+                """,
+                sizing: #"{"mode":"equityPct","value":20}"#,
+                risk: #"{"leverage":50,"stopLossPct":1.7}"#,
+                costs: #"{"feeBps":5,"slippageBps":5}"#),
+            bars: Self.candles(1_500, seed: 19),
+            positionTiers: Self.btcTiers,
+            exercises: [.liquidation],
+            expect: Self.GOLDENS["liquidationAtLeverageTiered"]!)
+        // The limit is what the fixture exists to reach, as `exercises` is.
+        #expect(result.positionLimit == 200)
+        #expect(result.positionLimited > 0, "the compounding never reached the 200 BTC limit")
+        #expect(!result.positionTiersUnmodelled)
     }
     @Test func continuousExposure() throws {
         try check("continuousExposure",

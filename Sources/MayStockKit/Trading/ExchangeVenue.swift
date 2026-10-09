@@ -37,6 +37,11 @@ public protocol ExchangeVenue: Sendable {
     func lastPrice(instId: String, mode: TradingMode) async throws -> Double
     /// Nil when the exchange does not publish metadata for the instrument.
     func instrumentMeta(instId: String, mode: TradingMode) async throws -> InstrumentMeta?
+    /// The instrument's position tiers in base units, in the environment the
+    /// order will go to: the maintenance a position owes and how large it may
+    /// grow at a leverage (`KernelPositionTier`). Nil where the venue states
+    /// none for the instrument, and then no position limit applies.
+    func positionTiers(instId: String, mode: TradingMode) async throws -> [KernelPositionTier]?
 
     /// The price the ledger marks `instId` at, in the quote currency it books
     /// in. For spot and perpetuals that is the last trade. For an option it is
@@ -260,6 +265,10 @@ extension ExchangeVenue {
     public func fundingPayments(
         instId: String?, mode: TradingMode
     ) async throws -> [FundingPayment] { [] }
+
+    /// A venue that tiers nothing — shares on Regulation T, which has its own
+    /// rule in the kernel.
+    public func positionTiers(instId: String, mode: TradingMode) async throws -> [KernelPositionTier]? { nil }
 
     public func accountDocuments(mode: TradingMode) async throws -> (positions: String, balance: String) {
         throw ExchangeVenueError.unsupported(venue.displayName, "账户文档")

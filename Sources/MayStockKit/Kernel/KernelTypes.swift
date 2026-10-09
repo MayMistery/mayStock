@@ -64,6 +64,12 @@ public struct KernelAccountState: Encodable, Sendable {
     /// its margin and its fee together fit in `equity`. Nil leaves the
     /// instrument's documented default.
     public var fees: FeeModel?
+    /// The venue's position tiers for the instrument, in base units, in the
+    /// environment the runner trades — what `KernelBacktestConfig.positionTiers`
+    /// is to a backtest. Nil when they could not be read: then no position
+    /// limit applies here, and the runner's fit to the venue's own bound is
+    /// what stops the order.
+    public var positionTiers: [KernelPositionTier]?
 
     public init(
         equity: Double = 0, heldBase: Double = 0,
@@ -71,7 +77,8 @@ public struct KernelAccountState: Encodable, Sendable {
         barsSinceExit: Int? = nil, haltedToday: Bool = false,
         entryPrice: Double = 0, now: Date? = nil,
         limits: KernelOrderLimits = KernelOrderLimits(),
-        fees: FeeModel? = nil
+        fees: FeeModel? = nil,
+        positionTiers: [KernelPositionTier]? = nil
     ) {
         self.equity = equity
         self.heldBase = heldBase
@@ -83,6 +90,7 @@ public struct KernelAccountState: Encodable, Sendable {
         self.now = now
         self.limits = limits
         self.fees = fees
+        self.positionTiers = positionTiers
     }
 }
 
@@ -308,9 +316,16 @@ public struct KernelDecision: Decodable, Sendable, Equatable {
 
 public struct KernelBacktestConfig: Encodable, Sendable {
     public var initialCapital: Double
-    /// Nil takes the instrument's documented default: OKX's tier-one rate on a
-    /// perpetual, FINRA's 25% minimum on a margined stock.
+    /// A share of the position's current value. Nil takes the instrument's
+    /// documented default: one rate for every perpetual, and on a margined
+    /// stock none — FINRA's minimum, which the kernel's Reg T rule applies
+    /// beneath any rate given, is the requirement. Not together with
+    /// `positionTiers`, which carry a rate per tier.
     public var maintenanceMarginRate: Double?
+    /// The venue's position tiers for the instrument, in base units
+    /// (`OKXRESTClient.positionTiers`): a position owes its tier's
+    /// maintenance and may hold no more than its leverage allows.
+    public var positionTiers: [KernelPositionTier]?
     public var fundingRates: [KernelFundingRate]
     /// The fee schedule's model, used only when the manifest states no costs.
     public var fees: FeeModel?
@@ -322,6 +337,7 @@ public struct KernelBacktestConfig: Encodable, Sendable {
     public init(
         initialCapital: Double = 10_000,
         maintenanceMarginRate: Double? = nil,
+        positionTiers: [KernelPositionTier]? = nil,
         fundingRates: [KernelFundingRate] = [],
         fees: FeeModel? = nil,
         slippageBps: Double? = nil,
@@ -330,11 +346,27 @@ public struct KernelBacktestConfig: Encodable, Sendable {
     ) {
         self.initialCapital = initialCapital
         self.maintenanceMarginRate = maintenanceMarginRate
+        self.positionTiers = positionTiers
         self.fundingRates = fundingRates
         self.fees = fees
         self.slippageBps = slippageBps
         self.externalSeries = externalSeries
         self.scriptTargets = scriptTargets
+    }
+}
+
+/// One rung of a venue's position tiers, in base units (`kernel/src/tiers.rs`):
+/// positions up to `maxBase` owe `maintenanceMarginRate` of their whole value
+/// and may be levered up to `maxLeverage`.
+public struct KernelPositionTier: Codable, Sendable, Equatable {
+    public let maxBase: Double
+    public let maintenanceMarginRate: Double
+    public let maxLeverage: Double
+
+    public init(maxBase: Double, maintenanceMarginRate: Double, maxLeverage: Double) {
+        self.maxBase = maxBase
+        self.maintenanceMarginRate = maintenanceMarginRate
+        self.maxLeverage = maxLeverage
     }
 }
 
@@ -447,6 +479,13 @@ public struct KernelBacktestResult: Decodable, Sendable {
     /// and the first one's reason.
     public let guardRefusals: Int
     public let guardRefusal: String?
+    /// True when an isolated position ran without the venue's position tiers:
+    /// one maintenance rate at every size, and no position limit.
+    public let positionTiersUnmodelled: Bool
+    /// The most the venue let a position hold at the run's leverage, in base
+    /// units, where its tiers were given; and how many orders it cut short.
+    public let positionLimit: Double?
+    public let positionLimited: Int
     /// What the candle series itself was like. Nil only for a result written
     /// by a kernel that predates the field.
     public let dataQuality: KernelDataQuality?

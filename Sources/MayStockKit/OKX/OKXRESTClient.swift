@@ -292,6 +292,7 @@ public struct OKXRESTClient: Sendable {
         let ctVal: String?
         let ctMult: String?
         let uly: String?
+        let instFamily: String?
         let optType: String?
         let stk: String?
         let expTime: String?
@@ -329,6 +330,10 @@ public struct OKXRESTClient: Sendable {
     /// Instrument metadata (tick size → price decimals). Also serves as
     /// validation when the user adds a new instrument.
     public func instrumentMeta(instId: String) async throws -> InstrumentMeta? {
+        try await instrumentRow(instId: instId)?.meta
+    }
+
+    private func instrumentRow(instId: String) async throws -> InstrumentRow? {
         let instType = Venue.okx.instrumentType(of: instId)
         var query = ["instType": instType.rawValue, "instId": instId]
         // The instruments endpoint refuses an option lookup without its
@@ -337,7 +342,41 @@ public struct OKXRESTClient: Sendable {
             query["uly"] = underlying
         }
         let rows = try await get(InstrumentRow.self, path: "api/v5/public/instruments", query: query)
-        return rows.first?.meta
+        return rows.first
+    }
+
+    private struct PositionTierRow: Decodable {
+        let tier: String
+        let maxSz: String
+        let mmr: String
+        let maxLever: String
+    }
+
+    /// A perpetual's isolated-margin position tiers, smallest first, in base
+    /// units — the kernel's — for `BacktestConfig.positionTiers` and the live
+    /// decision. OKX states each tier's limit in contracts: measured on the
+    /// demo account 2026-10-09, `max-size` at 50× stopped at exactly the first
+    /// tier's `maxSz` on DOGE (1 500 contracts of 1 000 DOGE), TRX (300), XRP
+    /// and SOL (2 500). So the limit is converted by the contract's value, and
+    /// a contract whose value cannot be read is an error, never a guess.
+    public func positionTiers(instId: String) async throws -> [KernelPositionTier] {
+        guard let row = try await instrumentRow(instId: instId),
+              let family = row.instFamily ?? row.uly, !family.isEmpty,
+              let contract = row.meta.contractValue, contract > 0 else {
+            throw OKXError.decoding("\(instId) 的合约面值或合约族读不到，档位表无法换算")
+        }
+        let rows = try await get(
+            PositionTierRow.self, path: "api/v5/public/position-tiers",
+            query: ["instType": "SWAP", "tdMode": "isolated", "instFamily": family])
+        let tiers = try rows.map { row -> (Int, KernelPositionTier) in
+            guard let tier = Int(row.tier), let size = Double(row.maxSz), let rate = Double(row.mmr),
+                  let lever = Double(row.maxLever) else {
+                throw OKXError.decoding("\(instId) 的档位行无法解析：\(row)")
+            }
+            return (tier, KernelPositionTier(maxBase: size * contract, maintenanceMarginRate: rate, maxLeverage: lever))
+        }
+        guard !tiers.isEmpty else { throw OKXError.decoding("\(instId) 没有档位表") }
+        return tiers.sorted { $0.0 < $1.0 }.map(\.1)
     }
 
     // MARK: Options

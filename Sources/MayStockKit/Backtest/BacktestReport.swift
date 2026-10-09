@@ -222,6 +222,7 @@ public struct RobustnessAssessment: Sendable, Equatable {
         if primary.fundingUnmodelled {
             notes.append("未取到资金费率历史，永续的持仓成本被低估。")
         }
+        notes.append(contentsOf: primary.positionTierNotes)
         if primary.guardRefusals > 0 {
             notes.append("风控拒绝了 \(primary.guardRefusals) 次开仓，实盘同样会拒——这是定仓问题，不是行情："
                          + (primary.guardRefusal ?? "原因未给出"))
@@ -291,5 +292,25 @@ public struct StrategyBacktestReport: Sendable, Identifiable {
 
     public var availableWindows: [BacktestWindow] {
         BacktestWindow.allCases.filter { results[$0] != nil }
+    }
+}
+
+extension BacktestResult {
+    /// What the venue's position tiers did to this run, in words: that it ran
+    /// without them, or how often their limit cut a position the capital would
+    /// have carried. Empty when there is nothing to say. The report and the
+    /// lab both print these.
+    public var positionTierNotes: [String] {
+        var notes: [String] = []
+        if positionTiersUnmodelled {
+            notes.append("没有按交易所的仓位档位回测：维持保证金率全程是一个数，仓位也不受档位的杠杆上限约束——"
+                         + "仓位一大，强平和定仓都偏乐观。")
+        }
+        if positionLimited > 0, let limit = positionLimit {
+            let base = market.venue.currencies(of: market.instId).base
+            notes.append("\(positionLimited) 次开仓或加仓被交易所档位截短：这个杠杆下单个仓位最多 "
+                         + "\(PriceFormatter.plain(limit)) \(base)，资金本可以撑更大的仓位。")
+        }
+        return notes
     }
 }

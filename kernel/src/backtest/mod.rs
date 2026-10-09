@@ -10,12 +10,16 @@
 //!   position (`protective_exit`);
 //! - every close is a fill (`ExitFill`): a market order pays slippage and the
 //!   fee schedule, and an isolated-margin liquidation takes the position's
-//!   margin — exactly, never more (`liquidation_fill`).
+//!   margin — exactly, never more;
+//! - a position lent against is liquidated where its lender's rule puts it,
+//!   worked out from the position as it stands on each bar — its size, its
+//!   basis, the funding it has settled (`liquidation::Lender`).
 //!
 //! Look-ahead bias is structurally impossible here: the evaluation window ends
 //! where the execution window begins.
 
 pub mod continuous;
+pub(crate) mod liquidation;
 pub mod metrics;
 pub mod options;
 
@@ -30,7 +34,8 @@ use crate::expr::eval::Evaluator;
 use crate::expr::{ExprError, ExprResult};
 use crate::fees::{FeeComponent, OrderSide};
 use crate::series;
-use crate::strategy::{bar_seconds, CompiledStrategy, Costs, MarginRegime};
+use crate::strategy::{bar_seconds, CompiledStrategy, Costs};
+use liquidation::{Holding, Lender};
 
 pub use metrics::Metrics;
 
@@ -48,10 +53,19 @@ pub struct FundingRate {
 pub struct BacktestConfig {
     #[serde(rename = "initialCapital", default = "default_capital")]
     pub initial_capital: f64,
-    /// Maintenance margin rate for the liquidation check. `None` takes the
-    /// instrument's documented default (`InstrumentType::default_maintenance_margin_rate`).
+    /// Maintenance margin rate for the liquidation check, as a share of the
+    /// position's current value. `None` takes the instrument's documented
+    /// default (`InstrumentType::default_maintenance_margin_rate`); under
+    /// Regulation T, FINRA's minimum applies beneath either
+    /// (`liquidation::finra_maintenance`).
     #[serde(rename = "maintenanceMarginRate", default)]
     pub maintenance_margin_rate: Option<f64>,
+    /// The venue's position tiers for the instrument, in base units: each
+    /// position owes its tier's maintenance rate and may grow no further than
+    /// its leverage allows (`tiers::PositionTiers`). Isolated margin only, and
+    /// not together with `maintenance_margin_rate`.
+    #[serde(rename = "positionTiers", default)]
+    pub position_tiers: Option<Vec<crate::tiers::PositionTier>>,
     /// Real funding history; empty means funding is not modelled (flagged in
     /// the report rather than silently assumed to be zero).
     #[serde(rename = "fundingRates", default)]
@@ -81,6 +95,7 @@ impl Default for BacktestConfig {
         Self {
             initial_capital: 10_000.0,
             maintenance_margin_rate: None,
+            position_tiers: None,
             funding_rates: Vec::new(),
             fees: None,
             slippage_bps: None,
@@ -201,6 +216,18 @@ pub struct BacktestResult {
     /// Why the first refusal was refused.
     #[serde(rename = "guardRefusal")]
     pub guard_refusal: Option<String>,
+    /// True when an isolated position ran without the venue's position tiers:
+    /// one maintenance rate at every size, and no position limit
+    /// (`liquidation::tiers_unmodelled`).
+    #[serde(rename = "positionTiersUnmodelled")]
+    pub position_tiers_unmodelled: bool,
+    /// The most the venue let a position hold at the run's leverage, in base
+    /// units, where its tiers were given.
+    #[serde(rename = "positionLimit")]
+    pub position_limit: Option<f64>,
+    /// Orders that limit cut short: the capital would have carried more.
+    #[serde(rename = "positionLimited")]
+    pub position_limited: usize,
     /// What the candle series itself was like.
     ///
     /// A backtest run over history with holes in it is not wrong so much as
@@ -227,12 +254,23 @@ struct OpenPosition {
     stop_price: Option<f64>,
     target_price: Option<f64>,
     trail_anchor: Option<f64>,
-    liquidation_price: Option<f64>,
 }
 
 impl OpenPosition {
     fn notional(&self) -> f64 {
         self.quantity * self.entry_price
+    }
+
+    /// The position as its lender sees it, with the run's realised `capital`
+    /// behind it.
+    fn holding(&self, capital: f64) -> Holding {
+        Holding {
+            direction: self.direction,
+            quantity: self.quantity,
+            basis: self.entry_price,
+            funding: self.funding,
+            capital,
+        }
     }
 }
 
@@ -240,33 +278,6 @@ impl OpenPosition {
 struct PendingExit {
     price: f64,
     reason: ExitReason,
-}
-
-/// Fractional adverse move that gets a position closed out by its lender.
-///
-/// Shared with the continuous engine so "when does this get liquidated" has
-/// one definition rather than two that must be kept in step. The arithmetic
-/// differs by margin regime because the collateral does:
-///
-/// - isolated margin backs the position with `notional / leverage` and closes
-///   it when the loss has eaten that down to the maintenance rate;
-/// - Regulation T lends against the shares and calls the loan when equity
-///   falls below the maintenance share of the position's *current* value,
-///   so at 2× and 25% the buffer is a third, not the 37.5% the isolated
-///   formula would give.
-pub(crate) fn liquidation_buffer(regime: MarginRegime, maintenance_margin_rate: f64, leverage: f64) -> f64 {
-    match regime {
-        // Fully paid: only a price of zero takes it away.
-        MarginRegime::None => 1.0,
-        MarginRegime::Isolated => (1.0 - maintenance_margin_rate) / leverage,
-        MarginRegime::RegT => {
-            if leverage <= 1.0 {
-                1.0
-            } else {
-                1.0 - (1.0 - 1.0 / leverage) / (1.0 - maintenance_margin_rate)
-            }
-        }
-    }
 }
 
 /// Costs the simulation charges: the manifest's own, else the caller's fee
@@ -277,14 +288,6 @@ fn resolve_costs(strategy: &CompiledStrategy, config: &BacktestConfig) -> ExprRe
     strategy
         .costs(config.fees.as_deref(), config.slippage_bps)
         .map_err(ExprError::Policy)
-}
-
-/// Maintenance margin the simulation liquidates against.
-fn resolve_maintenance(strategy: &CompiledStrategy, config: &BacktestConfig) -> f64 {
-    config
-        .maintenance_margin_rate
-        .or_else(|| strategy.manifest.market.inst_type.default_maintenance_margin_rate())
-        .unwrap_or(0.0)
 }
 
 fn unrealised(position: Option<&OpenPosition>, price: f64) -> f64 {
@@ -316,7 +319,8 @@ fn closing_side(direction: Direction) -> OrderSide {
 
 /// One closing fill: the price the position left at and the fee the venue
 /// charged for it. Every close in the binary and continuous engines is built
-/// by `market` or `liquidation_fill`, so how a close fills has one answer.
+/// by `market` or `Lender::liquidation_fill`, so how a close fills has one
+/// answer.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ExitFill {
     pub price: f64,
@@ -334,59 +338,6 @@ impl ExitFill {
     pub(crate) fn market(costs: &Costs, direction: Direction, quantity: f64, reference: f64, slippage: f64) -> Self {
         let price = fill_price(reference, direction, true, slippage);
         Self { price, fee: costs.fee(closing_side(direction), quantity, quantity * price) }
-    }
-}
-
-/// How a liquidation fills, by margin regime.
-///
-/// **Isolated margin** backs a position with `notional / leverage`, and a
-/// liquidation takes all of it — never more. The exchange closes at the
-/// bankruptcy price: where the move, the funding settled against the margin
-/// and an ordinary closing fee together use the margin up exactly; whatever
-/// the market did past that, a gap included, is the insurance fund's. This is
-/// OKX's own booking of a liquidated isolated 5× BTC short (positions-history,
-/// 2025-05): price P&L −614.60 at the close price, funding +14.12, and a fee of
-/// 1.81 on the close at the same ≈0.05% the opening fill paid — so the close
-/// realised −602.29, the margin (0.0324 BTC × 92 945.9 / 5) to the cent, and
-/// the trade −603.79 with its opening fee. The level that *triggers* a
-/// liquidation (`liquidation_buffer`) only decides when; this decides what.
-///
-/// **Regulation T** has no such floor: the broker sells into the market, and a
-/// gap past the call is the customer's debt — an ordinary market close at the
-/// trigger, slippage and all. A fully paid position is never liquidated
-/// (its buffer is the whole price).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn liquidation_fill(
-    regime: MarginRegime,
-    direction: Direction,
-    quantity: f64,
-    basis: f64,
-    leverage: f64,
-    funding: f64,
-    trigger: f64,
-    slippage: f64,
-    costs: &Costs,
-) -> ExitFill {
-    match regime {
-        MarginRegime::Isolated => {
-            let margin = quantity * basis / leverage;
-            let side = closing_side(direction);
-            // The fee depends on the price and the price on the fee, but the
-            // fee moves only by its rate times the price change: a few rounds
-            // settle it far below a cent. The books balance exactly whatever
-            // the round count — the price is always solved from the fee.
-            let mut fill = ExitFill { price: trigger, fee: 0.0 };
-            for _ in 0..4 {
-                let fee = costs.fee(side, quantity, quantity * fill.price);
-                // gross − fee − funding = −margin
-                let gross = fee + funding - margin;
-                fill = ExitFill { price: basis + gross / (direction.sign() * quantity), fee };
-            }
-            fill
-        }
-        MarginRegime::RegT | MarginRegime::None => {
-            ExitFill::market(costs, direction, quantity, trigger, slippage)
-        }
     }
 }
 
@@ -409,7 +360,7 @@ pub fn run(
 
     let manifest = &strategy.manifest;
     let costs = resolve_costs(strategy, config)?;
-    let maintenance = resolve_maintenance(strategy, config);
+    let lender = Lender::for_run(strategy, config, &costs)?;
     let calendar: MarketCalendar = manifest.market.calendar();
     let slippage = costs.slippage_bps / 10_000.0;
     let leverage = strategy.leverage();
@@ -418,6 +369,7 @@ pub fn run(
     // drawdown brake is a live risk control, not a rule of the strategy.
     let limits = crate::guard::OrderLimits::default();
     let mut refusals = GuardRefusals::default();
+    let mut limited = 0usize;
 
     if candles.len() <= 1 {
         return Ok(empty_result(strategy, &candles, config));
@@ -524,7 +476,6 @@ pub fn run(
                         });
                         open_position(
                             strategy,
-                            maintenance,
                             &mut position,
                             direction,
                             fill,
@@ -532,8 +483,10 @@ pub fn run(
                             index,
                             &mut equity,
                             leverage,
+                            lender.position_limit(),
                             &limits,
                             &mut refusals,
+                            &mut limited,
                             &costs,
                             atr,
                         );
@@ -542,22 +495,16 @@ pub fn run(
             }
         }
 
-        // --- 2. Protective exits, checked against this bar's range.
+        // --- 2. Protective exits, checked against this bar's range. The
+        //        liquidation level is the position's as it stands now: the
+        //        funding settled since it opened is out of its margin.
         if let Some(existing) = position {
-            if let Some(exit) = protective_exit(strategy, &existing, &candle, leverage) {
+            let held = existing.holding(equity);
+            let liquidation = lender.liquidation_level(&held);
+            if let Some(exit) = protective_exit(strategy, &existing, &candle, liquidation) {
                 let fill = if exit.reason == ExitReason::Liquidation {
                     liquidations += 1;
-                    liquidation_fill(
-                        manifest.market.inst_type.margin_regime(),
-                        existing.direction,
-                        existing.quantity,
-                        existing.entry_price,
-                        leverage,
-                        existing.funding,
-                        exit.price,
-                        slippage,
-                        &costs,
-                    )
+                    lender.liquidation_fill(&held, exit.price, slippage)
                 } else {
                     ExitFill::market(&costs, existing.direction, existing.quantity, exit.price, slippage)
                 };
@@ -716,6 +663,9 @@ pub fn run(
             && config.funding_rates.is_empty(),
         guard_refusals: refusals.count,
         guard_refusal: refusals.first,
+        position_tiers_unmodelled: liquidation::tiers_unmodelled(strategy, config),
+        position_limit: lender.position_limit(),
+        position_limited: limited,
         metrics,
     })
 }
@@ -740,7 +690,6 @@ impl GuardRefusals {
 #[allow(clippy::too_many_arguments)]
 fn open_position(
     strategy: &CompiledStrategy,
-    maintenance_margin_rate: f64,
     position: &mut Option<OpenPosition>,
     direction: Direction,
     price: f64,
@@ -748,8 +697,10 @@ fn open_position(
     index: usize,
     equity: &mut f64,
     leverage: f64,
+    position_limit: Option<f64>,
     limits: &crate::guard::OrderLimits,
     refusals: &mut GuardRefusals,
+    limited: &mut usize,
     costs: &Costs,
     atr: Option<f64>,
 ) {
@@ -760,13 +711,20 @@ fn open_position(
     let stop_distance = crate::sizing::stop_distance(strategy, price, atr);
 
     // Sized from flat — a reversal has already closed and paid for the close —
-    // so that the margin and this fill's fee together fit in the equity left.
+    // so that the margin and this fill's fee together fit in the equity left,
+    // and the position under the venue's limit.
     let footing = crate::sizing::Footing {
         costs, capital: *equity, price, leverage, regime: manifest.market.inst_type.margin_regime(),
-        held_base: 0.0, held_basis: 0.0,
+        held_base: 0.0, held_basis: 0.0, max_base: position_limit,
     };
     let Some(base) = crate::sizing::target_base(strategy, &footing, stop_distance, direction)
     else { return };
+    if crate::sizing::wanted_base(strategy, &footing, stop_distance, direction)
+        .and_then(|wanted| footing.limited_by_venue(wanted))
+        .is_some()
+    {
+        *limited += 1;
+    }
 
     // The same pre-trade limits the live runner applies. Only a sizing bug
     // ever reaches them, and this is where such a bug should surface: a
@@ -802,7 +760,6 @@ fn open_position(
         stop_price: None,
         target_price: None,
         trail_anchor: Some(price),
-        liquidation_price: None,
     };
 
     if let Some(distance) = stop_distance {
@@ -817,15 +774,6 @@ fn open_position(
             price * (1.0 + take_profit / 100.0)
         } else {
             price * (1.0 - take_profit / 100.0)
-        });
-    }
-    if leverage > 1.0 {
-        let buffer = liquidation_buffer(
-            manifest.market.inst_type.margin_regime(), maintenance_margin_rate, leverage);
-        new.liquidation_price = Some(if direction == Direction::Long {
-            price * (1.0 - buffer)
-        } else {
-            price * (1.0 + buffer)
         });
     }
     *position = Some(new);
@@ -873,6 +821,7 @@ fn close_position(
 }
 
 /// Which protective level this bar fills, and the price it fills against.
+/// `liquidation` is the position's liquidation level, where it has one.
 ///
 /// What the bar makes certain is used; only what it leaves unknowable is
 /// assumed against the position.
@@ -895,7 +844,7 @@ fn protective_exit(
     strategy: &CompiledStrategy,
     position: &OpenPosition,
     candle: &Candle,
-    leverage: f64,
+    liquidation: Option<f64>,
 ) -> Option<PendingExit> {
     let sign = position.direction.sign();
     // Whether `price` is at or past `level` against the position (below a
@@ -907,7 +856,6 @@ fn protective_exit(
     } else {
         ExitReason::StopLoss
     };
-    let liquidation = if leverage > 1.0 { position.liquidation_price } else { None };
     let adverse = [(liquidation, ExitReason::Liquidation), (position.stop_price, stop_reason)];
 
     // 1. Opened past a level: liquidation first, then the stop, then the target.
@@ -999,6 +947,9 @@ fn empty_result(
             && config.funding_rates.is_empty(),
         guard_refusals: 0,
         guard_refusal: None,
+        position_tiers_unmodelled: liquidation::tiers_unmodelled(strategy, config),
+        position_limit: None,
+        position_limited: 0,
         metrics: Metrics::compute(
             &[],
             &[],
@@ -1013,7 +964,7 @@ fn empty_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::strategy::Manifest;
+    use crate::strategy::{InstrumentType, MarginRegime, Manifest};
 
     fn compile(json: &str) -> CompiledStrategy {
         let manifest: Manifest = serde_json::from_str(json).unwrap();
@@ -1120,8 +1071,9 @@ mod tests {
         }
     }
 
-    /// Always in on `direction`'s side at `leverage`, full size.
-    fn always_in(family: crate::strategy::InstrumentType, direction: Direction, leverage: f64) -> CompiledStrategy {
+    /// Always in on `direction`'s side at `leverage`, `pct` of the equity,
+    /// with `risk` added to the risk block.
+    fn always_in_with(family: InstrumentType, direction: Direction, leverage: f64, pct: f64, risk: &str) -> CompiledStrategy {
         let signals = match direction {
             Direction::Long => r#""longEntry":"close > 0","longExit":"close < 0""#,
             Direction::Short => r#""shortEntry":"close > 0","shortExit":"close < 0""#,
@@ -1129,53 +1081,76 @@ mod tests {
         let family = serde_json::to_value(family).unwrap();
         compile(&format!(
             r#"{{"id":"f","name":"f","market":{{"instId":"X","instType":{family},"bar":"1H"}},
-                 "signals":{{{signals}}},"sizing":{{"mode":"equityPct","value":100}},
-                 "risk":{{"leverage":{leverage}}}}}"#
+                 "signals":{{{signals}}},"sizing":{{"mode":"equityPct","value":{pct}}},
+                 "risk":{{"leverage":{leverage}{risk}}}}}"#
         ))
     }
 
+    /// Always in on `direction`'s side at `leverage`, full size.
+    fn always_in(family: InstrumentType, direction: Direction, leverage: f64) -> CompiledStrategy {
+        always_in_with(family, direction, leverage, 100.0, "")
+    }
+
+    /// The position `strategy` opens on quiet bars at 100, as its lender sees
+    /// it — read off the engine's own entry, its opening fee paid — and the
+    /// lender of the run.
+    fn entered<'a>(strategy: &CompiledStrategy, config: &BacktestConfig, costs: &'a Costs) -> (Holding, Lender<'a>) {
+        let quiet = run(strategy, &flat_then(6, (100.0, 100.0, 100.0, 100.0), 3), config).unwrap();
+        let entry = quiet.trades.first().expect("the strategy entered");
+        let side = if entry.direction == Direction::Long { OrderSide::Buy } else { OrderSide::Sell };
+        let held = Holding {
+            direction: entry.direction,
+            quantity: entry.quantity,
+            basis: entry.entry_price,
+            funding: 0.0,
+            capital: quiet.initial_capital - costs.fee(side, entry.quantity, entry.notional),
+        };
+        (held, Lender::for_run(strategy, config, costs).unwrap())
+    }
+
+    fn sides(family: InstrumentType) -> Vec<Direction> {
+        if family.allows_short() { vec![Direction::Long, Direction::Short] } else { vec![Direction::Long] }
+    }
+
     /// Walks every family the binary engine trades (a bought option has its
-    /// own engine and its own walk), at every whole leverage it allows, long
-    /// and — where it can be — short, at full size. What the entry commits, its
-    /// margin and its fee, never exceeds the equity behind it; so the worst
-    /// exit the family's margin defines leaves the run at or above zero: an
-    /// isolated liquidation takes exactly the margin, a fully paid position at
-    /// most its price, a Reg T call met inside its bar what the move took. A
-    /// full-size isolated liquidation used to end the run at minus the
-    /// opening fee.
+    /// own engine and its own walk), at every whole leverage it allows — 1×
+    /// included — long and, where it can be, short, at full size. What the
+    /// entry commits, its margin and its fee, never exceeds the equity behind
+    /// it; so the worst bar its lender defines leaves the run at or above
+    /// zero: an isolated liquidation takes exactly the margin, a Reg T call met
+    /// inside its bar what the move took, and a position with no level — paid
+    /// for, or a long covered all the way down — at most its price. A
+    /// full-size isolated liquidation used to end the run at minus the opening
+    /// fee, and a 1× short — which had no level — rode a gap past +100%.
     #[test]
     fn a_full_size_entry_never_commits_more_than_the_equity_behind_it() {
-        use crate::strategy::{InstrumentType, MarginRegime};
         let (fee, slippage) = (5.0, 3.0);
+        let config = costs(fee, slippage);
         let mut walked = 0;
         for family in InstrumentType::ALL.into_iter().filter(|f| !f.is_option()) {
-            let maintenance = family.default_maintenance_margin_rate().unwrap_or(0.0);
             let mut leverage = 1.0;
             while leverage <= family.max_leverage() {
-                let sides = if family.allows_short() { vec![Direction::Long, Direction::Short] } else { vec![Direction::Long] };
-                for direction in sides {
+                for direction in sides(family) {
+                    let strategy = always_in(family, direction, leverage);
+                    let run_costs = resolve_costs(&strategy, &config).unwrap();
+                    let (held, lender) = entered(&strategy, &config, &run_costs);
+                    let level = lender.liquidation_level(&held);
                     let sign = direction.sign();
-                    // The position fills at 100 through the slippage; the bar
-                    // after five quiet ones is the worst its margin allows.
-                    let fill = 100.0 * (1.0 + sign * slippage / 10_000.0);
-                    let lends = leverage > 1.0 && family.margin_regime() != MarginRegime::None;
-                    let level = fill * (1.0 - sign * liquidation_buffer(family.margin_regime(), maintenance, leverage));
-                    let worst = match (lends, family.margin_regime()) {
+                    let worst = match (level, family.margin_regime()) {
                         // Opened far past the liquidation level.
-                        (true, MarginRegime::Isolated) => {
+                        (Some(level), MarginRegime::Isolated) => {
                             let gap = level * (1.0 - sign * 0.5);
                             (gap, gap, gap, gap)
                         }
                         // The call met inside the bar: the broker sells there.
-                        (true, _) => (100.0, level.max(100.0), level.min(100.0), level),
-                        // Nothing lent: all but the whole price, either way.
-                        (false, _) => {
+                        (Some(level), _) => (100.0, level.max(100.0), level.min(100.0), level),
+                        // No level: all but the whole price, either way.
+                        (None, _) => {
                             let moved = 100.0 * (1.0 - sign * 0.99);
                             (moved, moved, moved, moved)
                         }
                     };
-                    let result = run(&always_in(family, direction, leverage), &flat_then(6, worst, 3),
-                                     &costs(fee, slippage)).unwrap();
+                    let result = run(&strategy, &flat_then(6, worst, 3), &config).unwrap();
                     let label = format!("{family:?} {leverage}x {direction:?}");
                     let entry = result.trades.first().unwrap_or_else(|| panic!("{label}: never entered"));
                     let committed = entry.notional / leverage + entry.notional * fee / 10_000.0;
@@ -1183,11 +1158,19 @@ mod tests {
                     assert!(result.final_equity >= -1e-9 * result.initial_capital,
                             "{label}: ends at {} after {:?}", result.final_equity,
                             result.trades.iter().map(|t| t.exit_reason).collect::<Vec<_>>());
-                    if lends && family.margin_regime() == MarginRegime::Isolated {
-                        assert_eq!(result.liquidations, 1, "{label}");
-                        assert!(result.final_equity.abs() < 1e-9 * result.initial_capital,
-                                "{label}: a full-size liquidation takes everything committed and no more — {}",
-                                result.final_equity);
+                    match level {
+                        Some(_) => {
+                            assert_eq!(result.liquidations, 1, "{label}");
+                            if family.margin_regime() == MarginRegime::Isolated {
+                                assert!(result.final_equity.abs() < 1e-9 * result.initial_capital,
+                                        "{label}: a full-size liquidation takes everything committed and no more — {}",
+                                        result.final_equity);
+                            }
+                        }
+                        // Only a short is lent the thing it sold: it always
+                        // has a level where anything is lent.
+                        None => assert!(direction == Direction::Long || family.margin_regime() == MarginRegime::None,
+                                        "{label}: lent against with no level"),
                     }
                     walked += 1;
                 }
@@ -1197,12 +1180,321 @@ mod tests {
         assert!(walked > 100, "walked {walked}");
     }
 
+    /// A stop placed past the venue's liquidation level is never reached: the
+    /// exchange closes the position first and takes its margin. Walked over
+    /// every family on isolated margin, at every whole leverage, on both sides
+    /// wherever there is a level, with the stop a tenth of a percent past it,
+    /// through a bar that falls through both and one that opens just past the
+    /// stop. The rule this replaced put the level beyond the stop: the first
+    /// bar filled the stop, and the second — at 50×, past the bankruptcy price
+    /// — lost more than the margin and left a full-size run below zero.
+    #[test]
+    fn a_stop_past_the_liquidation_level_never_fills() {
+        let config = costs(5.0, 3.0);
+        let mut walked = 0;
+        for family in InstrumentType::ALL.into_iter().filter(|f| f.margin_regime() == MarginRegime::Isolated) {
+            let mut leverage = 1.0;
+            while leverage <= family.max_leverage() {
+                for direction in sides(family) {
+                    let plain = always_in(family, direction, leverage);
+                    let run_costs = resolve_costs(&plain, &config).unwrap();
+                    let (held, lender) = entered(&plain, &config, &run_costs);
+                    let Some(level) = lender.liquidation_level(&held) else {
+                        assert_eq!(direction, Direction::Long, "{family:?} {leverage}x: a short has a level");
+                        continue;
+                    };
+                    let sign = direction.sign();
+                    let past = (sign * (held.basis - level) / held.basis + 0.001) * 100.0;
+                    let stopped = always_in_with(family, direction, leverage, 100.0, &format!(r#","stopLossPct":{past}"#));
+                    let stop = held.basis * (1.0 - sign * past / 100.0);
+                    let far = level * (1.0 - sign * 0.5);
+                    let just_past = stop * (1.0 - sign * 0.000_5);
+                    for (shape, bar) in [
+                        ("through", (100.0, far.max(100.0), far.min(100.0), far)),
+                        ("gapped", (just_past, just_past, just_past, just_past)),
+                    ] {
+                        let result = run(&stopped, &flat_then(6, bar, 3), &config).unwrap();
+                        let label = format!("{family:?} {leverage}x {direction:?} stop {past:.4}% {shape}");
+                        // What follows on the dust a liquidation leaves is no matter.
+                        let reasons: Vec<ExitReason> = result.trades.iter().map(|t| t.exit_reason).collect();
+                        assert_eq!(reasons.first(), Some(&ExitReason::Liquidation), "{label}: {reasons:?}");
+                        assert!(!reasons.contains(&ExitReason::StopLoss), "{label}: {reasons:?}");
+                        assert!(result.final_equity.abs() < 1e-9 * result.initial_capital,
+                                "{label}: ends at {}", result.final_equity);
+                        walked += 1;
+                    }
+                }
+                leverage += 1.0;
+            }
+        }
+        assert!(walked > 150, "walked {walked}");
+    }
+
+    /// Funding is settled out of an isolated margin, so a position that has
+    /// paid it is liquidated nearer its entry — where the margin left meets
+    /// the requirement — and still loses exactly the margin. Walked over every
+    /// isolated family, leverage and side: half the margin paid in funding over
+    /// ten quiet bars, then a steady slide. The liquidation comes on the first
+    /// bar to reach the level of the position as funded, and before the bar
+    /// that reaches the level it opened with — where the rule this replaced,
+    /// which fixed the level at the entry, liquidated it.
+    #[test]
+    fn funding_paid_out_of_an_isolated_margin_brings_its_liquidation_nearer() {
+        let mut walked = 0;
+        for family in InstrumentType::ALL.into_iter().filter(|f| f.margin_regime() == MarginRegime::Isolated) {
+            let mut leverage = 1.0;
+            while leverage <= family.max_leverage() {
+                for direction in sides(family) {
+                    let sign = direction.sign();
+                    let strategy = always_in(family, direction, leverage);
+                    // Longs pay a positive rate, shorts a negative one.
+                    let mut config = costs(5.0, 3.0);
+                    config.funding_rates = (2..12)
+                        .map(|hour| FundingRate { ts_ms: hour * 3_600_000, rate: sign * 0.05 / leverage })
+                        .collect();
+                    let run_costs = resolve_costs(&strategy, &config).unwrap();
+                    let (unfunded, lender) = entered(&strategy, &costs(5.0, 3.0), &run_costs);
+                    // A tenth of the margin a bar, compounding.
+                    let step = 1.0 - sign * 0.1 / leverage;
+                    let mut bars: Vec<Candle> = (0..14).map(|i| bar(i, 100.0, 100.0, 100.0, 100.0)).collect();
+                    for k in 1..=40 {
+                        let (open, close) = (100.0 * step.powi(k - 1), 100.0 * step.powi(k));
+                        bars.push(bar(13 + k as i64, open, open.max(close), open.min(close), close));
+                    }
+                    let result = run(&strategy, &bars, &config).unwrap();
+                    let label = format!("{family:?} {leverage}x {direction:?}");
+                    let liquidated = first(&result, ExitReason::Liquidation);
+                    // Ten settlements at the close of 100: half the margin.
+                    assert!((liquidated.funding - 0.5 * unfunded.quantity * 100.0 / leverage).abs()
+                                < 1e-9 * unfunded.quantity * 100.0, "{label}: paid {}", liquidated.funding);
+                    // Exactly the margin, its opening fee on top.
+                    let margin = liquidated.notional / leverage;
+                    let entry_fee = liquidated.notional * 0.0005;
+                    assert!((liquidated.net_pnl + margin + entry_fee).abs() < 1e-6 * margin, "{label}: {}", liquidated.net_pnl);
+                    // On the first bar to reach the funded level.
+                    let funded = lender.liquidation_level(&Holding { funding: liquidated.funding, ..unfunded })
+                        .unwrap_or_else(|| panic!("{label}: no funded level"));
+                    let reaches = |level: f64| bars.iter().position(|c| sign * (level - if sign > 0.0 { c.low } else { c.high }) >= 0.0);
+                    let at = bars.iter().position(|c| c.ts_ms == liquidated.exit_ts).unwrap();
+                    assert_eq!(Some(at), reaches(funded), "{label}: liquidated on bar {at}, the funded level {funded}");
+                    if let Some(opened) = lender.liquidation_level(&unfunded) {
+                        assert!(reaches(opened).is_none_or(|later| later > at), "{label}: {opened} vs {funded}");
+                    }
+                    walked += 1;
+                }
+                leverage += 1.0;
+            }
+        }
+        assert!(walked > 90, "walked {walked}");
+    }
+
+    /// A broker lends against the account, so a Reg T call comes where the
+    /// account's equity — what the run realised, plus the position's P&L —
+    /// falls to FINRA's minimum of the position's value: 25% of a long's, 30%
+    /// of a short's above $16.67. Walked over every family on Reg T, every
+    /// whole leverage, both sides, at full and half size, through a bar that
+    /// moves 99% against a long and 300% against a short: every call fills at
+    /// the market where the account holds exactly that minimum, and a long
+    /// whose level the bar never reaches — at half size and 2× it borrows
+    /// only its opening fee — is not called. The rule this replaced levered
+    /// the position alone: it called that long a third down, a 2× short at
+    /// +33% where FINRA's minimum is met at +15%, and a 1× short never.
+    #[test]
+    fn a_reg_t_call_comes_where_the_account_holds_finras_minimum() {
+        let slippage = 10.0 / 10_000.0;
+        let config = costs(5.0, 10.0);
+        let mut called = 0;
+        for family in InstrumentType::ALL.into_iter().filter(|f| f.margin_regime() == MarginRegime::RegT) {
+            let mut leverage = 1.0;
+            while leverage <= family.max_leverage() {
+                for direction in sides(family) {
+                    for pct in [100.0, 50.0] {
+                        let sign = direction.sign();
+                        let strategy = always_in_with(family, direction, leverage, pct, "");
+                        let run_costs = resolve_costs(&strategy, &config).unwrap();
+                        let (held, lender) = entered(&strategy, &config, &run_costs);
+                        let extreme = 100.0 * (1.0 - sign * if sign > 0.0 { 0.99 } else { 3.0 });
+                        let result = run(&strategy, &flat_then(6, (100.0, extreme.max(100.0), extreme.min(100.0), extreme), 3),
+                                         &config).unwrap();
+                        let label = format!("{family:?} {leverage}x {direction:?} {pct}%");
+                        match result.trades.iter().find(|t| t.exit_reason == ExitReason::Liquidation) {
+                            Some(call) => {
+                                // A market order at the level, slippage against it.
+                                let level = call.exit_price / (1.0 - sign * slippage);
+                                let equity = held.capital + sign * (level - held.basis) * held.quantity;
+                                let minimum = if direction == Direction::Long { 0.25 } else { 0.30 };
+                                assert!((equity / (held.quantity * level) - minimum).abs() < 1e-9,
+                                        "{label}: called at {level} holding {}", equity / (held.quantity * level));
+                                called += 1;
+                            }
+                            None => {
+                                assert_eq!(direction, Direction::Long, "{label}: a short was never called");
+                                assert!(lender.liquidation_level(&held).is_none_or(|level| level < extreme * 0.5),
+                                        "{label}: not called at {:?}", lender.liquidation_level(&held));
+                                if leverage == 2.0 && pct == 50.0 {
+                                    let borrowed = held.quantity * held.basis - held.capital;
+                                    assert!(borrowed < 1e-3 * held.capital, "{label}: borrows {borrowed}");
+                                }
+                            }
+                        }
+                    }
+                }
+                leverage += 1.0;
+            }
+        }
+        assert!(called >= 5, "called {called}");
+    }
+
+    /// Both engines ask the same lender, and given the same position they
+    /// liquidate it on the same bar at the same price — with funding settled
+    /// first, since both settle a bar's funding after checking its range.
+    /// Walked over every family that lends, every whole leverage, both sides.
+    #[test]
+    fn both_engines_liquidate_the_same_position_on_the_same_bar_at_the_same_price() {
+        let mut walked = 0;
+        for family in InstrumentType::ALL.into_iter().filter(|f| f.margin_regime() != MarginRegime::None && !f.is_option()) {
+            let mut leverage = 1.0;
+            while leverage <= family.max_leverage() {
+                for direction in sides(family) {
+                    let sign = direction.sign();
+                    let binary = always_in(family, direction, leverage);
+                    let continuous = compile(&format!(
+                        r#"{{"id":"c","name":"c","market":{{"instId":"X","instType":{},"bar":"1H"}},
+                             "signals":{{"exposure":"{}"}},"sizing":{{"mode":"equityPct","value":100}},
+                             "risk":{{"leverage":{leverage},"rebalanceThreshold":0.5}}}}"#,
+                        serde_json::to_value(family).unwrap(), sign));
+                    // No slippage, so both size against the same price.
+                    let mut config = costs(5.0, 0.0);
+                    config.funding_rates = (2..5)
+                        .map(|hour| FundingRate { ts_ms: hour * 3_600_000, rate: sign * 0.02 / leverage })
+                        .collect();
+                    let run_costs = resolve_costs(&binary, &config).unwrap();
+                    let (held, lender) = entered(&binary, &costs(5.0, 0.0), &run_costs);
+                    let Some(level) = lender.liquidation_level(&held) else { continue };
+                    let far = level * (1.0 - sign * 0.3);
+                    let bars = flat_then(6, (100.0, far.max(100.0), far.min(100.0), far), 3);
+                    let label = format!("{family:?} {leverage}x {direction:?}");
+                    let liquidated = |strategy: &CompiledStrategy| {
+                        let result = run(strategy, &bars, &config).unwrap();
+                        result.trades.iter().find(|t| t.exit_reason == ExitReason::Liquidation).cloned().unwrap_or_else(|| {
+                            panic!("{label}: no liquidation in {:?}", result.trades.iter().map(|t| t.exit_reason).collect::<Vec<_>>())
+                        })
+                    };
+                    let (one, other) = (liquidated(&binary), liquidated(&continuous));
+                    // Each enters at 100 when its warm-up allows; both hold
+                    // through the same settlements and leave on the same bar.
+                    assert_eq!((one.entry_price, one.exit_ts), (other.entry_price, other.exit_ts), "{label}");
+                    assert!((one.exit_price - other.exit_price).abs() < 1e-9 * one.exit_price,
+                            "{label}: {} vs {}", one.exit_price, other.exit_price);
+                    assert!((one.funding / one.quantity - other.funding / other.quantity).abs() < 1e-9, "{label}");
+                    walked += 1;
+                }
+                leverage += 1.0;
+            }
+        }
+        assert!(walked > 100, "walked {walked}");
+    }
+
+    /// A tier table for the walks at 100 with 10 000: whatever the leverage,
+    /// the limit it allows is below what a full-size position would hold
+    /// (100 × leverage base units).
+    fn tight_tiers() -> Vec<crate::tiers::PositionTier> {
+        [(10.0, 0.005, 50.0), (20.0, 0.0075, 40.0), (30.0, 0.01, 20.0), (40.0, 0.02, 10.0), (50.0, 0.05, 5.0)]
+            .into_iter()
+            .map(|(max_base, maintenance_margin_rate, max_leverage)| crate::tiers::PositionTier {
+                max_base, maintenance_margin_rate, max_leverage,
+            })
+            .collect()
+    }
+
+    /// A run on the venue's tiers holds no position past what its leverage
+    /// allows. Walked over every whole leverage a perpetual allows, long and
+    /// short, through both engines, under a table whose limit is always below
+    /// full size: every position stops at the limit, the run reports the limit
+    /// and counts the orders it cut, and says it ran on the tiers. A run
+    /// without them says so — for exactly the families held on isolated
+    /// margin.
+    #[test]
+    fn a_run_on_the_venues_tiers_holds_no_position_past_its_leverages_limit() {
+        let table = crate::tiers::PositionTiers::new(tight_tiers()).unwrap();
+        let mut walked = 0;
+        let mut leverage = 1.0;
+        while leverage <= InstrumentType::Swap.max_leverage() {
+            let limit = table.max_base(leverage).unwrap();
+            for direction in [Direction::Long, Direction::Short] {
+                let continuous = compile(&format!(
+                    r#"{{"id":"c","name":"c","market":{{"instId":"X","instType":"SWAP","bar":"1H"}},
+                         "signals":{{"exposure":"{}"}},"sizing":{{"mode":"equityPct","value":100}},
+                         "risk":{{"leverage":{leverage},"rebalanceThreshold":0.001}}}}"#, direction.sign()));
+                // A threshold below the smallest limit's exposure (10 of 50×
+                // 10 000 at 100 is 0.002), so the capped order still goes.
+                for (engine, strategy) in [("binary", always_in(InstrumentType::Swap, direction, leverage)), ("continuous", continuous)] {
+                    let config = BacktestConfig { position_tiers: Some(tight_tiers()), ..costs(5.0, 3.0) };
+                    let result = run(&strategy, &flat(24), &config).unwrap();
+                    let label = format!("{engine} {leverage}x {direction:?}");
+                    assert_eq!(result.position_limit, Some(limit), "{label}");
+                    assert!(!result.position_tiers_unmodelled, "{label}");
+                    assert!(!result.trades.is_empty(), "{label}: traded nothing");
+                    assert!(result.trades.iter().all(|t| t.quantity <= limit * (1.0 + 1e-12)),
+                            "{label}: past {limit}: {:?}", result.trades.iter().map(|t| t.quantity).collect::<Vec<_>>());
+                    assert!(result.trades.iter().any(|t| (t.quantity - limit).abs() <= 1e-9 * limit), "{label}: never at the limit");
+                    assert!(result.position_limited >= 1, "{label}: cut, and not counted");
+                    walked += 1;
+                }
+            }
+            leverage += 1.0;
+        }
+        assert!(walked >= 200, "walked {walked}");
+        for family in InstrumentType::ALL {
+            let leverage = 1.0;
+            let strategy = if family.is_option() {
+                compile(r#"{"id":"o","name":"o","market":{"instId":"BTC-USDT","instType":"OPTION","bar":"1H"},
+                            "signals":{"longEntry":"close > 0"},"sizing":{"mode":"equityPct","value":10},
+                            "risk":{"leverage":1}}"#)
+            } else {
+                always_in_with(family, Direction::Long, leverage, 50.0, "")
+            };
+            let result = run(&strategy, &flat(24), &costs(5.0, 3.0)).unwrap();
+            assert_eq!(result.position_tiers_unmodelled, family.margin_regime() == MarginRegime::Isolated, "{family:?}");
+            assert_eq!((result.position_limit, result.position_limited), (None, 0), "{family:?}");
+        }
+    }
+
+    /// Tiers the venue would not have are refused rather than simulated: a
+    /// leverage no tier allows (the venue will not set it), tiers and a rate
+    /// both, tiers for a regime that has none, and a table that is not one.
+    #[test]
+    fn tiers_the_venue_would_not_have_are_refused() {
+        let with = |tiers: Vec<crate::tiers::PositionTier>, rate: Option<f64>| BacktestConfig {
+            position_tiers: Some(tiers), maintenance_margin_rate: rate, ..costs(5.0, 3.0)
+        };
+        let refused = |strategy: &CompiledStrategy, config: &BacktestConfig| match run(strategy, &flat(24), config) {
+            Err(ExprError::Policy(why)) => why,
+            other => panic!("not refused: {:?}", other.map(|r| r.trades.len())),
+        };
+        let mut low = tight_tiers();
+        low.iter_mut().for_each(|tier| tier.max_leverage = tier.max_leverage.min(20.0));
+        assert!(refused(&always_in(InstrumentType::Swap, Direction::Long, 25.0), &with(low, None)).contains("25"));
+        assert!(refused(&always_in(InstrumentType::Swap, Direction::Long, 5.0), &with(tight_tiers(), Some(0.01))).contains("只能给一个"));
+        for family in InstrumentType::ALL.into_iter().filter(|f| f.margin_regime() != MarginRegime::Isolated && !f.is_option()) {
+            assert!(refused(&always_in(family, Direction::Long, 1.0), &with(tight_tiers(), None)).contains("逐仓"), "{family:?}");
+        }
+        let mut unsorted = tight_tiers();
+        unsorted.swap(0, 1);
+        assert!(refused(&always_in(InstrumentType::Swap, Direction::Long, 5.0), &with(unsorted, None)).contains("档位表无效"));
+        let mut continuous = BacktestConfig { maintenance_margin_rate: Some(1.5), ..costs(5.0, 3.0) };
+        assert!(refused(&always_in(InstrumentType::Swap, Direction::Long, 5.0), &continuous).contains("维持保证金率"));
+        continuous.maintenance_margin_rate = Some(f64::NAN);
+        assert!(refused(&always_in(InstrumentType::Swap, Direction::Long, 5.0), &continuous).contains("维持保证金率"));
+    }
+
     /// Regulation T has no floor under the loss: the broker sells into the
     /// market, so a gap past the call fills at the open, slippage and all.
+    /// Full size: at half size and 2× the account borrows nothing to call.
     #[test]
     fn a_reg_t_call_is_a_market_close_at_the_open_it_gapped_to() {
         let result = run(
-            &always_long("STOCK", 2.0, 50.0, ""),
+            &always_long("STOCK", 2.0, 100.0, ""),
             &flat_then(6, (50.0, 50.0, 45.0, 48.0), 3),
             &costs(0.0, 10.0),
         ).unwrap();

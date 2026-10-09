@@ -88,6 +88,7 @@ char *ms_strategy_decide(const MSStrategy *handle,
                          int64_t now_ms,        /* 0 = skip the staleness check */
                          const char *limits_json, /* NULL = default limits */
                          const char *fees_json,   /* fee components for a manifest without costs; NULL = the instrument's default */
+                         const char *tiers_json,  /* the venue's position tiers in base units; NULL = not known, no position limit */
                          char **error_out);
 
 /* --- backtest -------------------------------------------------------- */

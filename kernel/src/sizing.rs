@@ -33,8 +33,9 @@ use crate::strategy::{CompiledStrategy, Costs, MarginRegime, SizingMode};
 
 /// What an order is sized against: the capital behind it, marked at the
 /// price the order fills at; the leverage and the regime the position is
-/// margined under; what a fill costs; and the position it trades from —
-/// signed, in base units, with its average entry price (0 when flat).
+/// margined under; what a fill costs; the position it trades from — signed,
+/// in base units, with its average entry price (0 when flat); and the most
+/// the venue lets a position hold at that leverage.
 #[derive(Debug, Clone, Copy)]
 pub struct Footing<'a> {
     pub costs: &'a Costs,
@@ -46,6 +47,11 @@ pub struct Footing<'a> {
     pub regime: MarginRegime,
     pub held_base: f64,
     pub held_basis: f64,
+    /// The venue's position limit at `leverage`, in base units
+    /// (`tiers::PositionTiers::max_base`); `None` where it states none. OKX
+    /// refuses an order past it (51004) rather than shrinking it, so sizing
+    /// stops there, as it stops where the capital runs out.
+    pub max_base: Option<f64>,
 }
 
 impl Footing<'_> {
@@ -93,10 +99,11 @@ impl Footing<'_> {
     }
 
     /// The position to hold after an order that asks for `wanted_base`: that,
-    /// when the capital can commit to it, and otherwise the largest on the same
-    /// side that it can. Never less than is already held on that side — the
-    /// rule limits what an order adds — and flat when even the close of a
-    /// reversal leaves nothing for the other side.
+    /// when the capital can commit to it and the venue allows it, and
+    /// otherwise the largest on the same side that both do. Never less than is
+    /// already held on that side — the rules limit what an order adds — and
+    /// flat when even the close of a reversal leaves nothing for the other
+    /// side.
     pub fn affordable(&self, wanted_base: f64) -> f64 {
         let held = self.held_base;
         let same_side = held == 0.0 || (wanted_base > 0.0) == (held > 0.0);
@@ -112,8 +119,23 @@ impl Footing<'_> {
         // over the leverage per unit, so where it alone uses the capital up is
         // as far as the search need go.
         let room = (self.capital - self.margin(sign * keeps)).max(0.0);
-        let bound = wanted_base.abs().min(keeps + room * self.leverage.max(1.0) / self.price);
+        let bound = wanted_base.abs()
+            .min(keeps + room * self.leverage.max(1.0) / self.price)
+            .min(self.max_base.unwrap_or(f64::INFINITY));
         sign * largest_within(self.capital, keeps, bound.max(keeps), |size| self.committed(sign * size))
+    }
+
+    /// The venue's position limit, when it is what stops `wanted_base`: the
+    /// capital alone would carry more than the limit allows. A run counts
+    /// these and the live decision says so, since a position cut short by the
+    /// venue is one the strategy did not ask for.
+    pub fn limited_by_venue(&self, wanted_base: f64) -> Option<f64> {
+        let limit = self.max_base?;
+        if wanted_base.abs() <= limit {
+            return None;
+        }
+        let uncapped = Footing { max_base: None, ..*self }.affordable(wanted_base);
+        (uncapped.abs() > limit * (1.0 + 1e-12)).then_some(limit)
     }
 
     /// A scaled position: `exposure` of the capital at the leverage, signed,
@@ -265,6 +287,23 @@ pub fn target_base(
     stop_distance: Option<f64>,
     direction: Direction,
 ) -> Option<f64> {
+    let wanted = wanted_base(strategy, footing, stop_distance, direction)?;
+    // The ceilings no manifest can argue with: what the order leaves
+    // committed — margin and fee — fits in the capital, and the position fits
+    // under the venue's limit.
+    let target = footing.affordable(wanted);
+    (target != 0.0 && target.signum() == direction.sign()).then_some(target)
+}
+
+/// What a binary strategy's sizing asks for on `direction`'s side, signed, in
+/// base units — before the capital or the venue has had a say. `None` where
+/// `target_base` stands aside for want of a stop distance or of capital.
+pub fn wanted_base(
+    strategy: &CompiledStrategy,
+    footing: &Footing,
+    stop_distance: Option<f64>,
+    direction: Direction,
+) -> Option<f64> {
     let (equity, price, leverage) = (footing.capital, footing.price, footing.leverage);
     if !(equity > 0.0) || !(price > 0.0) {
         return None;
@@ -286,10 +325,7 @@ pub fn target_base(
         // commits its budget. The continuous path sizes off the exposure.
         SizingMode::VolatilityTarget => equity * leverage,
     };
-    // The one ceiling no manifest can argue with: what the order leaves
-    // committed — margin and fee — fits in the capital.
-    let target = footing.affordable(notional / price * direction.sign());
-    (target != 0.0 && target.signum() == direction.sign()).then_some(target)
+    Some(notional / price * direction.sign())
 }
 
 #[cfg(test)]
@@ -349,7 +385,10 @@ mod tests {
     }
 
     fn footing(costs: &Costs, capital: f64, price: f64, leverage: f64) -> Footing<'_> {
-        Footing { costs, capital, price, leverage, regime: MarginRegime::Isolated, held_base: 0.0, held_basis: 0.0 }
+        Footing {
+            costs, capital, price, leverage, regime: MarginRegime::Isolated, held_base: 0.0, held_basis: 0.0,
+            max_base: None,
+        }
     }
 
     /// Notional of a long entry sized from flat.
@@ -471,6 +510,49 @@ mod tests {
             }
         }
         assert!(checked > 1_000, "the walk covered {checked} entries");
+    }
+
+    /// The venue's position limit is a ceiling like the capital, and nothing
+    /// more. Walked over every family, every whole leverage, the sizing modes
+    /// that ask for the whole capital and both sides: under a limit at half of
+    /// what the capital carries, an entry stops exactly at it and says the
+    /// venue stopped it; under one past that, the limit plays no part. What is
+    /// already held past a limit is kept — it limits what an order adds.
+    #[test]
+    fn the_venues_position_limit_is_a_ceiling_and_nothing_more() {
+        let costs = Costs::flat(5.0, 0.0);
+        let (capital, price) = (10_000.0, 37.5);
+        let mut checked = 0;
+        for family in InstrumentType::ALL.into_iter().filter(|f| !f.is_option()) {
+            let mut leverage = 1.0;
+            while leverage <= family.max_leverage() {
+                for sizing in [r#"{"mode":"equityPct","value":100}"#, r#"{"mode":"fixedQuote","value":1e9}"#] {
+                    let s = strategy(sizing, "{}");
+                    let at = Footing { regime: family.margin_regime(), ..footing(&costs, capital, price, leverage) };
+                    let sides = if family.allows_short() { vec![Direction::Long, Direction::Short] } else { vec![Direction::Long] };
+                    for direction in sides {
+                        let label = format!("{family:?} {leverage}x {sizing} {direction:?}");
+                        let free = target_base(&s, &at, None, direction).unwrap();
+                        let wanted = wanted_base(&s, &at, None, direction).unwrap();
+                        let limit = free.abs() * 0.5;
+                        let tight = Footing { max_base: Some(limit), ..at };
+                        let base = target_base(&s, &tight, None, direction).unwrap();
+                        assert!((base.abs() - limit).abs() <= 1e-12 * limit && base.signum() == direction.sign(), "{label}: {base}");
+                        assert_eq!(tight.limited_by_venue(wanted), Some(limit), "{label}");
+                        let loose = Footing { max_base: Some(free.abs() * 2.0), ..at };
+                        assert_eq!(target_base(&s, &loose, None, direction), Some(free), "{label}");
+                        assert_eq!(loose.limited_by_venue(wanted), None, "{label}");
+                        checked += 1;
+                    }
+                }
+                leverage += 1.0;
+            }
+        }
+        assert!(checked > 200, "checked {checked}");
+        let held = Footing { held_base: 50.0, held_basis: 100.0, max_base: Some(20.0), ..footing(&costs, 1e6, 100.0, 10.0) };
+        assert_eq!(held.affordable(80.0), 50.0, "kept, not cut to the limit");
+        assert_eq!(held.affordable(30.0), 30.0, "a trim goes whole");
+        assert_eq!(held.affordable(-80.0), -20.0, "a reversal opens the other side up to the limit");
     }
 
     /// A flat fee has an exact ceiling: margin and fee are both proportional

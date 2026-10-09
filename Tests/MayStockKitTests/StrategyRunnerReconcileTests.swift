@@ -78,6 +78,15 @@ final class FakeVenue: ExchangeVenue, @unchecked Sendable {
     /// before the network is up is the realistic case.
     var metaFailure: Error?
 
+    /// The position tiers every instrument answers with, or the error the
+    /// read throws.
+    var tiers: [KernelPositionTier]?
+    var tiersFailure: Error?
+    func positionTiers(instId: String, mode: TradingMode) async throws -> [KernelPositionTier]? {
+        if let tiersFailure { throw tiersFailure }
+        return tiers
+    }
+
     /// One BTC-USDT-SWAP contract is 0.01 BTC, as OKX reports it. The runner
     /// re-reads this every tick, so a fixture that omitted it would silently
     /// have the ledger price contracts as coins.
@@ -2117,6 +2126,48 @@ struct LiveSizingFeeTests {
         #expect(order.size == (1_000_000 / 1.0025 / 80_010 / 0.01).rounded(.down))
         #expect(order.size != (1_000_000 / 1.0005 / 80_010 / 0.01).rounded(.down),
                 "the instrument's default fee would have sized it")
+    }
+
+    /// The venue's position tiers reach the plan: a full-size entry the capital
+    /// would carry to some twelve coins stops at the five the venue allows at
+    /// 1× — 500 contracts of 0.01 BTC. A read that fails leaves the order to
+    /// the capital alone, as before the tiers were read at all.
+    @Test("满仓开仓停在交易所档位允许的持仓上限")
+    func aFullSizeEntryStopsAtTheVenuesLimit() async throws {
+        for (tiers, failure) in [([KernelPositionTier(maxBase: 5, maintenanceMarginRate: 0.004, maxLeverage: 100)], nil),
+                                 (nil, OKXError.http(status: 503) as Error?)] {
+            let json = """
+            {"schema":1,"id":"full","name":"full",
+             "market":{"instId":"BTC-USDT-SWAP","instType":"SWAP","bar":"1H"},
+             "signals":{"longEntry":"close > 0"},
+             "sizing":{"mode":"equityPct","value":100}}
+            """
+            let host = FakeHost()
+            host.runnableStrategies = [try JSONDecoder().decode(StrategyManifest.self, from: Data(json.utf8)).compile()]
+            host.portfolio.capital[.okx] = 2_000_000
+            host.portfolio.setCapital(1_000_000, for: "full", on: .okx)
+            host.portfolio.setRunning(true, for: "full")
+            host.fake.equity = 2_000_000
+            host.fake.price = 80_010
+            host.fake.tiers = tiers
+            host.fake.tiersFailure = failure
+            host.fake.candlesResult = (0..<200).map { index in
+                let ts = (Date().timeIntervalSince1970 / 3_600).rounded(.down) * 3_600
+                    - Double(200 - index) * 3_600
+                return Candle(ts: Date(timeIntervalSince1970: ts), open: 80_000, high: 80_080,
+                              low: 79_920, close: 80_010, volume: 5, confirmed: true)
+            }
+            host.fake.positionsResult = .success([])
+            host.fake.accountConfig = AccountTradingConfig(positionMode: .longShort, accountLevel: 3)
+            await runner(for: host).tick()
+
+            let order = try #require(host.fake.placed.first)
+            if tiers != nil {
+                #expect(order.size == 500, "five coins in contracts of 0.01")
+            } else {
+                #expect(order.size > 1_000, "the capital alone: \(order.size)")
+            }
+        }
     }
 }
 
