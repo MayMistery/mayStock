@@ -615,14 +615,11 @@ pub unsafe extern "C" fn ms_assess_overfit(
         periods_per_year: f64,
         #[serde(default)]
         candidates: Vec<Vec<f64>>,
-        #[serde(default = "default_blocks")]
-        blocks: usize,
+        #[serde(default)]
+        blocks: crate::overfit::Blocks,
     }
     fn default_periods() -> f64 {
         365.0
-    }
-    fn default_blocks() -> usize {
-        8
     }
     guarded(error_out, ptr::null_mut(), || {
         let text = borrow_str(request_json).ok_or("请求 JSON 为空")?;

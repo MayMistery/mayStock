@@ -124,6 +124,46 @@ pub struct OverfitProbability {
     pub candidates: usize,
 }
 
+/// How many contiguous blocks CSCV cuts the series into.
+///
+/// Every half of the blocks is one split, so the work is C(blocks, blocks/2)
+/// splits: 70 at the default of 8, 12 870 at 16 — the most allowed, and the
+/// size the method's authors use. Even, so the halves are equal, and at least
+/// 4, so each half holds two. A count outside that is refused where the
+/// request is read, rather than assessed as if the data were short: past 31
+/// the mask of chosen blocks no longer fits its integer, a panic in a debug
+/// build and in release a silent "cannot assess"; at 30 the splits number in
+/// the hundreds of millions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "usize")]
+pub struct Blocks(usize);
+
+impl Blocks {
+    pub const MAX: usize = 16;
+
+    pub fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl Default for Blocks {
+    fn default() -> Self {
+        Self(8)
+    }
+}
+
+impl TryFrom<usize> for Blocks {
+    type Error = String;
+
+    fn try_from(blocks: usize) -> Result<Self, String> {
+        if (4..=Self::MAX).contains(&blocks) && blocks % 2 == 0 {
+            Ok(Self(blocks))
+        } else {
+            Err(format!("blocks 须为 4 到 {} 之间的偶数，收到 {blocks}", Self::MAX))
+        }
+    }
+}
+
 /// Combinatorially symmetric cross-validation.
 ///
 /// `returns_by_candidate[i]` is one candidate's per-period return series; every
@@ -137,10 +177,11 @@ pub struct OverfitProbability {
 /// are, and would flatter every candidate equally.
 pub fn probability_of_backtest_overfitting(
     returns_by_candidate: &[Vec<f64>],
-    blocks: usize,
+    blocks: Blocks,
 ) -> Option<OverfitProbability> {
+    let blocks = blocks.get();
     let candidates = returns_by_candidate.len();
-    if candidates < 2 || blocks < 4 || blocks % 2 != 0 {
+    if candidates < 2 {
         return None;
     }
     let length = returns_by_candidate[0].len();
@@ -366,7 +407,7 @@ mod tests {
         // luck, so its out-of-sample rank is a toss-up. Anything much below
         // 0.5 here would mean the method is finding signal in noise.
         let candidates: Vec<Vec<f64>> = (0..6).map(|seed| returns(400, 0.0, seed + 1)).collect();
-        let result = probability_of_backtest_overfitting(&candidates, 6).unwrap();
+        let result = probability_of_backtest_overfitting(&candidates, six()).unwrap();
         assert!(result.pbo > 0.25, "pbo {}", result.pbo);
     }
 
@@ -377,7 +418,7 @@ mod tests {
         // information as perfectly reliable.
         let series = returns(400, 0.0005, 7);
         let candidates = vec![series.clone(), series.clone(), series.clone(), series];
-        let result = probability_of_backtest_overfitting(&candidates, 6).unwrap();
+        let result = probability_of_backtest_overfitting(&candidates, six()).unwrap();
         assert!(result.pbo >= 0.99, "a tie is not a win: pbo {}", result.pbo);
     }
 
@@ -389,7 +430,7 @@ mod tests {
         for seed in 2..6 {
             candidates.push(returns(600, -0.0005, seed));
         }
-        let result = probability_of_backtest_overfitting(&candidates, 6).unwrap();
+        let result = probability_of_backtest_overfitting(&candidates, six()).unwrap();
         assert!(result.pbo < 0.2, "pbo {}", result.pbo);
     }
 
@@ -399,11 +440,31 @@ mod tests {
         // different lengths cannot be ranked against each other at all.
         let a = returns(400, 0.0, 1);
         let b = returns(300, 0.0, 2);
-        assert!(probability_of_backtest_overfitting(&[a, b], 6).is_none());
-        // And an odd number of blocks cannot be split in half.
-        let c = returns(400, 0.0, 3);
-        let d = returns(400, 0.0, 4);
-        assert!(probability_of_backtest_overfitting(&[c, d], 5).is_none());
+        assert!(probability_of_backtest_overfitting(&[a, b], six()).is_none());
+    }
+
+    fn six() -> Blocks {
+        Blocks::try_from(6).unwrap()
+    }
+
+    /// The blocks a request may ask for are exactly the even counts from 4 to
+    /// 16, refused where the request is read; every one of them is assessed
+    /// in full. 32 used to overflow the split mask — a debug panic, a silent
+    /// "cannot assess" in release — and 30 walked a billion masks.
+    #[test]
+    fn blocks_are_an_even_count_from_four_to_sixteen() {
+        let series: Vec<Vec<f64>> = (0..2).map(|seed| returns(64, 0.0, seed + 1)).collect();
+        for count in 0..=usize::BITS as usize * 2 {
+            let parsed = serde_json::from_str::<Blocks>(&count.to_string());
+            let allowed = (4..=Blocks::MAX).contains(&count) && count % 2 == 0;
+            assert_eq!(parsed.is_ok(), allowed, "{count}: {parsed:?}");
+            if let Ok(blocks) = parsed {
+                let result = probability_of_backtest_overfitting(&series, blocks).unwrap();
+                let half = (1..=count / 2).fold(1, |n, k| n * (count / 2 + k) / k);
+                assert_eq!(result.splits, half, "{count}");
+            }
+        }
+        assert!(serde_json::from_str::<Blocks>("-1").is_err());
     }
 
     #[test]

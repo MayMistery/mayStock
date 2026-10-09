@@ -1015,6 +1015,24 @@ debug 检查溢出所以 panic；App 链接的 release 不检查，按 2^64 回�
 零点、盘前、开盘后 5 秒、午间、收盘、盘后、最后一秒（周末假日都算），`to` 取网格点和
 任意时刻。旧步进上第一个反例：1m、09:30:05 → 14:55，数出 324，网格 325。
 
+## 3.27 同一形状的另外三处：落在类型边缘的输入（2026-10-09）
+
+§3.25 之后按同一形状——输入到达整数运算、取到类型边缘时 debug panic、release 给错答案——
+对公开接口做了 debug 构建的模糊测试（序列、回测、对账、隐含分布、平仓、解析器），
+找到三处，都已实测：
+
+- **复活节公式在公元前 panic。** Meeus / Jones / Butcher 假定商向下取整、余数非负；Rust 的
+  `/` `%` 向零取整，只在正年份一致。公元前 3 年起算出 2 月 29–31 日，`expect` 在 release 也
+  panic，任何问到那种时刻的美股日历查询都会崩。改成 `div_euclid` / `rem_euclid`，正年份
+  结果不变；测试走遍 chrono 能表示的每一年，都在 3 月 22 日到 4 月 25 日之间且是周日。
+- **CSCV 的 `blocks` 到 32 溢出。** 切分掩码是 `1u32 << blocks`：32 时 debug panic、release 静默
+  「无法评估」；30 时要走十亿个掩码。现在是一个类型 `overfit::Blocks`（4 到 16 的偶数，默认 8，
+  C(16, 8) = 12 870 种切分），读请求时就拒绝并说明原因；默认值原来在 `optimize.rs` 和 `ffi.rs`
+  各写一份，现在只有这一处。App 一直传 8，不受影响。
+- **`volLookbackBars` 加一溢出。** 预热是回看加一根，`usize::MAX` 在 debug panic、release 回绕成
+  0。回看是一个滚动窗口，套用已有的单窗口上限 `MAX_PERIOD`，在 `warmup_for`（`compile` 与
+  `with_params` 共用）里拒绝。
+
 ## 4.1 迁移已完成，Swift 侧没有第二份实现
 
 已删除：`Indicators.swift`、`StrategyExpression.swift`、`StrategyEvaluator.swift`、

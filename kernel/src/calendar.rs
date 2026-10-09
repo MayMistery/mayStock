@@ -519,18 +519,26 @@ mod us {
     }
 
     /// Gregorian Easter Sunday (Meeus / Jones / Butcher).
-    fn easter(year: i32) -> NaiveDate {
-        let a = year % 19;
-        let b = year / 100;
-        let c = year % 100;
-        let d = b / 4;
-        let e = b % 4;
-        let f = (b + 8) / 25;
-        let g = (b - f + 1) / 3;
-        let h = (19 * a + b - d - g + 15) % 30;
+    ///
+    /// The method assumes every quotient rounds down and every remainder is
+    /// non-negative. Rust's `/` and `%` round toward zero, which agrees only
+    /// while the year is positive; before 1 BC the formula reached 29 to 31
+    /// February, and any stock-calendar question about such an instant
+    /// panicked. Floored throughout, it is a date between 22 March and
+    /// 25 April in every year a date can name, and unchanged in every
+    /// positive one.
+    pub fn easter(year: i32) -> NaiveDate {
+        let a = year.rem_euclid(19);
+        let b = year.div_euclid(100);
+        let c = year.rem_euclid(100);
+        let d = b.div_euclid(4);
+        let e = b.rem_euclid(4);
+        let f = (b + 8).div_euclid(25);
+        let g = (b - f + 1).div_euclid(3);
+        let h = (19 * a + b - d - g + 15).rem_euclid(30);
         let i = c / 4;
         let k = c % 4;
-        let l = (32 + 2 * e + 2 * i - h - k) % 7;
+        let l = (32 + 2 * e + 2 * i - h - k).rem_euclid(7);
         let m = (a + 11 * h + 22 * l) / 451;
         let month = (h + l - 7 * m + 114) / 31;
         let day = (h + l - 7 * m + 114) % 31 + 1;
@@ -619,6 +627,27 @@ mod tests {
         // And a closure no rule produces.
         assert!(!us::is_trading_day(date(2001, 9, 12)));
         assert!(us::is_trading_day(date(2001, 9, 17)));
+    }
+
+    /// Easter — and so Good Friday — is a real spring date in every year a
+    /// date can name. Before 1 BC the formula's truncating division gave
+    /// 29 to 31 February, and asking the stock calendar about any instant
+    /// then panicked, in release too.
+    #[test]
+    fn easter_is_a_spring_date_in_every_year() {
+        let earliest = (3, 22);
+        let latest = (4, 25);
+        for year in NaiveDate::MIN.year()..=NaiveDate::MAX.year() {
+            let easter = us::easter(year);
+            let day = (easter.month(), easter.day());
+            assert!(day >= earliest && day <= latest, "{year}: {easter}");
+            assert_eq!(easter.weekday(), Weekday::Sun, "{year}: {easter}");
+        }
+        // Spot checks against the published dates.
+        assert_eq!(us::easter(2024), date(2024, 3, 31));
+        assert_eq!(us::easter(2025), date(2025, 4, 20));
+        // The instant that panicked, in 3 BC, now has an answer.
+        let _ = MarketCalendar::UsEquities.is_open(-62_225_000_000_000);
     }
 
     // MARK: Time zone

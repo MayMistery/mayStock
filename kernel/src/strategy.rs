@@ -817,7 +817,16 @@ impl CompiledStrategy {
             .max()
             .unwrap_or(0);
         if manifest.sizing.mode == SizingMode::VolatilityTarget || manifest.market.inst_type.is_option() {
-            warmup = warmup.max(manifest.risk.vol_lookback_bars + 1);
+            // A rolling window like any other, under the same longest-window
+            // rule — which also keeps the bar added below inside `usize`.
+            let lookback = manifest.risk.vol_lookback_bars;
+            if lookback > crate::expr::MAX_PERIOD {
+                return Err(format!(
+                    "volLookbackBars({lookback}) 超过单个窗口的上限 {} 根",
+                    crate::expr::MAX_PERIOD
+                ));
+            }
+            warmup = warmup.max(lookback + 1);
         }
         let ceiling = crate::expr::MAX_BARS;
         if warmup + 2 > ceiling {
@@ -974,6 +983,28 @@ mod tests {
         assert!(swept.with_params(&HashMap::from([("n".to_string(), 1_000.0)])).is_some());
         assert!(swept.with_params(&HashMap::from([("n".to_string(), 90_000.0)])).is_none(),
                 "an EMA of 90 000 needs 270 000 bars to warm up");
+    }
+
+    /// The volatility lookback is a window under the same longest-window
+    /// rule as any function's period, up to the largest number a manifest
+    /// can write: one more bar on `usize::MAX` panicked compile in a debug
+    /// build and wrapped the warm-up to zero in release.
+    #[test]
+    fn a_volatility_lookback_past_the_longest_window_is_refused() {
+        let compile = |lookback: usize| {
+            let json = format!(
+                r#"{{"id":"v","market":{{"instId":"BTC-USDT-SWAP","instType":"SWAP","bar":"1H"}},
+                     "signals":{{"exposure":"1"}},"sizing":{{"mode":"volatilityTarget","value":40}},
+                     "risk":{{"leverage":1,"volLookbackBars":{lookback}}}}}"#
+            );
+            CompiledStrategy::compile(serde_json::from_str(&json).unwrap(), &[])
+        };
+        assert_eq!(compile(60).unwrap().warmup_bars, 61);
+        for lookback in [crate::expr::MAX_PERIOD + 1, usize::MAX] {
+            let error = compile(lookback).unwrap_err();
+            assert!(matches!(&error, ExprError::Policy(reason) if reason.contains("volLookbackBars")),
+                    "{lookback}: {error:?}");
+        }
     }
 
     #[test]
