@@ -278,8 +278,9 @@ uint64_t ms_live_rest_fallback_ms(void);
  * OKX REST requests itself, with the key from the okx CLI's config.toml, and
  * can send nothing but the closed set of actions in trade::wire::Action
  * (place, place an algo order, cancel, cancel an algo order, move a stop,
- * precheck). A live action with the lock closed is refused before a key is
- * read.
+ * precheck, hold a leg at a leverage). A live action with the lock closed is
+ * refused before a key is read. Every order states its tdMode; none is
+ * defaulted.
  *
  * Every request waits for room under OKX's published limit for its route
  * (trade::route), and one the exchange certainly did not act on — no
@@ -295,9 +296,21 @@ uint64_t ms_live_rest_fallback_ms(void);
  * took in words. ms_trade_read does the
  * trading path's signed reads (trade::reads::Read): working orders, one
  * order's status, protective orders, fee rates, positions, balances, the
- * account snapshot and configuration, fills, funding. ms_trade_describe gives
- * the exact request an action becomes. */
+ * account snapshot and configuration, fills, funding, a leg's leverage.
+ * ms_trade_describe gives the exact request an action becomes.
+ *
+ * ms_trade_prepare readies one leg (a contract, a margin mode, a side) for
+ * the order about to go out on it (trade::PrepareRequest): the tdMode the
+ * order states, from the strategy's margin regime when it opens and the
+ * position's own when it reduces; and before a strategy opens on a
+ * leveraged contract, a leg holding nothing but the strategy's own
+ * contracts, at the manifest's leverage — set when the leg is empty, never
+ * under a held position. Returns {"outcome":"ready","tradeMode",
+ * "leverage","changedFrom","note"}, "blocked" with a "code" and "reason",
+ * or "refused"; with what it took, as above. A strategy's reduction is
+ * blocked only when no mode can be stated for it at all. */
 char *ms_trade_send(const char *request_json);
+char *ms_trade_prepare(const char *request_json);
 char *ms_trade_read(const char *request_json);
 char *ms_trade_describe(const char *action_json, char **error_out);
 int64_t ms_trade_warm(char **error_out);

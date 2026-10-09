@@ -90,6 +90,12 @@ public struct OKXVenue: ExchangeVenue {
         try await trade.accountTradingConfig(mode: mode)
     }
 
+    /// The kernel readies the leg (`trade::leg`): the mode from its margin
+    /// rule, the leverage held where the family has one.
+    public func prepareLeg(_ leg: LegPreparation, mode: TradingMode, liveUnlocked: Bool) async throws -> LegReadiness {
+        try await trade.prepare(leg, mode: mode, liveUnlocked: liveUnlocked)
+    }
+
     public func alternativeSeries(
         specs: [String: AlternativeSeriesSpec], market: StrategyMarket,
         candles: [Candle], days: Int
@@ -170,16 +176,15 @@ public struct OKXVenue: ExchangeVenue {
             .amendStop(instId: instId, algoId: algoId, stop: stopPrice), mode: mode, liveUnlocked: liveUnlocked)
     }
 
-    /// A standalone reduce-only stop, filled at market. No `tdMode`: the
-    /// runner only protects positions it opened, and it opens them without
-    /// one, so the default is the mode they are held in.
+    /// A standalone reduce-only stop, filled at market, in the mode of the
+    /// position it protects.
     public func placeProtectiveOrder(
-        instId: String, instType: InstrumentType, posSide: PositionSide?,
+        instId: String, instType: InstrumentType, posSide: PositionSide?, tradeMode: String?,
         size: Double, stopPrice: Double, mode: TradingMode, liveUnlocked: Bool
     ) async throws {
         let algo = TradeAlgoSpec(
             instId: instId, instType: instType, side: posSide == .short ? .buy : .sell, posSide: posSide,
-            size: size, tradeMode: nil, reduceOnly: true, cancelWithPosition: false,
+            size: size, tradeMode: tradeMode, reduceOnly: true, cancelWithPosition: false,
             kind: .protection(takeProfit: nil, stopLoss: stopPrice))
         _ = try await trade.send(.placeAlgo(algo), mode: mode, liveUnlocked: liveUnlocked)
     }

@@ -46,6 +46,8 @@ final class FakeVenue: ExchangeVenue, @unchecked Sendable {
     var optionQuotes: [String: OptionQuote] = [:]
     var indexPrices: [String: Double] = [:]
     var accountConfig: AccountTradingConfig?
+    /// One account's own configuration, where it differs from `accountConfig`.
+    var accountConfigs: [TradingMode: AccountTradingConfig] = [:]
 
     func valuationPrice(instId: String, mode: TradingMode) async throws -> Double {
         if let price = valuationPrices[instId] { return price }
@@ -67,8 +69,10 @@ final class FakeVenue: ExchangeVenue, @unchecked Sendable {
         return index
     }
     func accountTradingConfig(mode: TradingMode) async throws -> AccountTradingConfig {
-        guard let accountConfig else { throw ExchangeVenueError.unsupported(venueName, "账户配置") }
-        return accountConfig
+        guard let config = accountConfigs[mode] ?? accountConfig else {
+            throw ExchangeVenueError.unsupported(venueName, "账户配置")
+        }
+        return config
     }
     /// Set to model an exchange we cannot reach — a laptop waking from sleep
     /// before the network is up is the realistic case.
@@ -134,11 +138,29 @@ final class FakeVenue: ExchangeVenue, @unchecked Sendable {
         wedged = nil
     }
 
+    // MARK: Legs
+
+    /// Every leg the runner readied, in order.
+    var preparedLegs: [LegPreparation] = []
+    /// The mode each family's legs are readied with, unless `legAnswer`
+    /// says otherwise — what the kernel's rule would give this account.
+    var legModes: [InstrumentType: String] = [.swap: "isolated", .spot: "cash", .option: "cross"]
+    /// A test's own answer for a leg; nil falls back to `legModes`.
+    var legAnswer: ((LegPreparation) -> Result<LegReadiness, Error>)?
+
+    func prepareLeg(_ leg: LegPreparation, mode: TradingMode, liveUnlocked: Bool) async throws -> LegReadiness {
+        preparedLegs.append(leg)
+        if let legAnswer { return try legAnswer(leg).get() }
+        var leverage: Double?
+        if case .open(let wanted?) = leg.intent, leg.instType == .swap { leverage = wanted }
+        return LegReadiness(tradeMode: legModes[leg.instType], leverage: leverage)
+    }
+
     // MARK: Protective orders
 
     var protectiveResult: [VenueProtectiveOrder] = []
     var amended: [(algoId: String, stopPrice: Double)] = []
-    var placedProtective: [(size: Double, stopPrice: Double)] = []
+    var placedProtective: [(size: Double, stopPrice: Double, tradeMode: String?)] = []
 
     func protectiveOrders(
         instId: String, instType: InstrumentType, mode: TradingMode
@@ -152,10 +174,10 @@ final class FakeVenue: ExchangeVenue, @unchecked Sendable {
     }
 
     func placeProtectiveOrder(
-        instId: String, instType: InstrumentType, posSide: PositionSide?,
+        instId: String, instType: InstrumentType, posSide: PositionSide?, tradeMode: String?,
         size: Double, stopPrice: Double, mode: TradingMode, liveUnlocked: Bool
     ) async throws {
-        placedProtective.append((size, stopPrice))
+        placedProtective.append((size, stopPrice, tradeMode))
     }
 }
 
@@ -1642,7 +1664,11 @@ struct OptionRunnerTests {
         #expect(order.instType == .option)
         #expect(order.side == .buy)
         #expect(order.kind == .ioc)
-        #expect(order.tradeMode == "cross", "acctLv 3 cross-margins options")
+        #expect(order.tradeMode == host.fake.legModes[.option], "the mode the venue readied the contract with")
+        let leg = try #require(host.fake.preparedLegs.first)
+        #expect(leg.instId == Self.call && leg.instType == .option && leg.posSide == nil)
+        #expect(leg.accountLevel == 3, "the account level the kernel's rule decides an option's mode by")
+        #expect(leg.intent == .open(leverage: 1) && leg.held == 0, "nothing on the contract is the strategies'")
         #expect(order.posSide == nil)
         #expect(!order.reduceOnly)
         #expect(order.stopTriggerPrice == nil, "levels live on the premium, watched locally")
@@ -1722,6 +1748,9 @@ struct OptionRunnerTests {
         #expect(exit.side == .sell)
         #expect(exit.kind == .ioc)
         #expect(exit.reduceOnly)
+        // Sold in the mode the contract is held in, as the venue reports it.
+        #expect(host.fake.preparedLegs.last?.intent == .reduce)
+        #expect(host.fake.preparedLegs.last?.held == 59)
         #expect(exit.size == 59)
         // The limit is the bid less the buffer, rounded down to the tick.
         #expect(abs((exit.limitPrice ?? 0) - 0.0196) < 1e-9)
@@ -2095,5 +2124,200 @@ struct HedgeReversalTests {
         #expect(single.posSide == .net)
         #expect(abs(single.size - (close.size + open.size)) < 1e-9,
                 "拆成两腿不能改变成交总量")
+        #expect(single.tradeMode == "isolated", "one mode, the held position's and the opening's alike")
+    }
+
+    @Test("每笔单用各自那条腿核对出的保证金模式；净模式下模式不一致或开仓被拦就先平后开")
+    func eachLegStatesItsOwnMode() async throws {
+        // The held long is cross (opened before modes were stated), the new
+        // short opens isolated.
+        let byIntent: (LegPreparation) -> Result<LegReadiness, Error> = { leg in
+            .success(LegReadiness(tradeMode: leg.intent == .reduce ? "cross" : "isolated"))
+        }
+        let hedged = try reversingHost(positionMode: .longShort)
+        hedged.fake.legAnswer = byIntent
+        await runner(for: hedged).tick()
+        #expect(hedged.fake.placed.map(\.tradeMode) == ["cross", "isolated"])
+        #expect(hedged.fake.preparedLegs.map(\.posSide) == [.long, .short])
+        #expect(hedged.fake.preparedLegs.map(\.intent) == [.reduce, .open(leverage: 1)])
+        #expect(hedged.fake.preparedLegs.first?.held == 10, "what the books hold on the leg being closed")
+
+        // Net mode: one order cannot be both cross and isolated.
+        let net = try reversingHost(positionMode: .net)
+        net.fake.legAnswer = byIntent
+        await runner(for: net).tick()
+        #expect(net.fake.placed.count == 2, "split, so the close never waits on the opening")
+        #expect(net.fake.placed.first?.reduceOnly == true && net.fake.placed.first?.tradeMode == "cross")
+        #expect(net.fake.placed.last?.tradeMode == "isolated")
+
+        // Net mode, the opening held back: the close still goes, alone.
+        let blocked = try reversingHost(positionMode: .net)
+        blocked.fake.legAnswer = { leg in
+            leg.intent == .reduce
+                ? .success(LegReadiness(tradeMode: "isolated"))
+                : .failure(LegBlocked(code: "heldAtOtherLeverage", reason: "持仓中杠杆是 10x，清单要 1x"))
+        }
+        let runner = runner(for: blocked)
+        await runner.tick()
+        #expect(blocked.fake.placed.count == 1)
+        #expect(blocked.fake.placed.first?.reduceOnly == true)
+        #expect(runner.state(for: "alpha").message?.contains("未开仓：持仓中杠杆是 10x") == true)
+    }
+}
+
+/// Before a strategy opens on a perpetual its leg is readied
+/// (`ExchangeVenue.prepareLeg`): the order goes out in the mode the venue
+/// readied it with — isolated, as the backtest liquidates — and only on a leg
+/// at the manifest's leverage holding nothing but the strategies' own
+/// contracts. A reduction is never held back.
+@MainActor
+struct LegReadinessRunnerTests {
+    private func candles(_ count: Int) -> [Candle] {
+        (0..<count).map { index in
+            let ts = (Date().timeIntervalSince1970 / 3_600).rounded(.down) * 3_600
+                - Double(count - index) * 3_600
+            return Candle(ts: Date(timeIntervalSince1970: ts), open: 80_000, high: 80_080,
+                          low: 79_920, close: 80_010, volume: 5, confirmed: true)
+        }
+    }
+
+    private func strategy(instId: String, instType: InstrumentType, signals: String, risk: String) throws -> CompiledStrategy {
+        let json = """
+        {"schema":1,"id":"alpha","name":"alpha",
+         "market":{"instId":"\(instId)","instType":"\(instType.rawValue)","bar":"1H"},
+         "signals":\(signals),
+         "sizing":{"mode":"equityPct","value":10},
+         "risk":\(risk)}
+        """
+        return try JSONDecoder().decode(StrategyManifest.self, from: Data(json.utf8)).compile()
+    }
+
+    private func host(
+        instId: String = "BTC-USDT-SWAP", instType: InstrumentType = .swap,
+        signals: String = #"{"longEntry":"close > 0"}"#, risk: String = #"{"leverage":3}"#
+    ) throws -> FakeHost {
+        let host = FakeHost()
+        host.runnableStrategies = [try strategy(instId: instId, instType: instType, signals: signals, risk: risk)]
+        host.portfolio.capital[.okx] = 20_000
+        host.portfolio.setCapital(10_000, for: "alpha", on: .okx)
+        host.portfolio.setRunning(true, for: "alpha")
+        host.fake.equity = 20_000
+        host.fake.price = 80_000
+        host.fake.candlesResult = candles(200)
+        host.fake.accountConfig = AccountTradingConfig(positionMode: .longShort, accountLevel: 3)
+        return host
+    }
+
+    private static let instIdUnderTest = "BTC-USDT-SWAP"
+
+    @Test("开仓前按清单杠杆核对这条腿，订单写明核对出的保证金模式")
+    func anOpeningGoesOutOnAReadiedLeg() async throws {
+        let host = try host()
+        await runner(for: host).tick()
+        let order = try #require(host.fake.placed.first)
+        #expect(order.tradeMode == "isolated")
+        #expect(order.posSide == .long && !order.reduceOnly)
+        let leg = try #require(host.fake.preparedLegs.first)
+        #expect(leg.instId == Self.instIdUnderTest && leg.instType == .swap && leg.posSide == .long)
+        #expect(leg.intent == .open(leverage: 3), "the manifest's leverage, for the kernel to hold the leg at")
+        #expect(leg.held == 0 && leg.accountLevel == 3 && leg.lot == 1)
+    }
+
+    @Test("这条腿被拦下时不下单、写明原因，同一根 K 线的下一轮再核对")
+    func aBlockedLegHoldsTheOpeningAndRetriesOnTheSameBar() async throws {
+        let host = try host()
+        host.fake.legAnswer = { _ in
+            .failure(LegBlocked(code: "foreignPosition", reason: "BTC-USDT-SWAP 逐仓多头上有 2 张不是策略开的仓位"))
+        }
+        let runner = runner(for: host)
+        await runner.tick()
+        #expect(host.fake.placed.isEmpty, "nothing joins someone else's position")
+        let state = runner.state(for: "alpha")
+        #expect(state.message == "未开仓：BTC-USDT-SWAP 逐仓多头上有 2 张不是策略开的仓位")
+        #expect(state.status != .failed, "a held-back opening is not a failed strategy")
+
+        await runner.tick()
+        #expect(host.fake.preparedLegs.count == 2, "asked again on the same bar")
+        #expect(host.fake.placed.isEmpty)
+
+        host.fake.legAnswer = nil
+        await runner.tick()
+        #expect(host.fake.placed.count == 1, "a leg freed mid-bar is traded on this bar")
+        #expect(host.fake.placed.first?.tradeMode == "isolated")
+    }
+
+    @Test("本地拦下（实盘未解锁、key 不对）是本根 K 线的终局，和交易所拒单一样")
+    func aRefusalAtTheLegIsFinalForTheBar() async throws {
+        let host = try host()
+        host.fake.legAnswer = { _ in .failure(TradeError.liveTradingLocked) }
+        let runner = runner(for: host)
+        await runner.tick()
+        #expect(runner.state(for: "alpha").status == .failed)
+        await runner.tick()
+        #expect(host.fake.preparedLegs.count == 1, "not asked again until the next bar")
+    }
+
+    @Test("减仓按仓位自己的保证金模式发出，开仓被拦也不影响平仓")
+    func aReductionIsNeverHeldBack() async throws {
+        let host = try host(signals: #"{"longEntry":"close > 1e12","longExit":"close > 0"}"#)
+        seedLongPosition(host, strategyId: "alpha", contracts: 10)
+        host.fake.positionsResult = .success([exchangePosition(contracts: 10)])
+        host.fake.legAnswer = { leg in
+            leg.intent == .reduce
+                ? .success(LegReadiness(tradeMode: "cross", note: "10 张在全仓里"))
+                : .failure(LegBlocked(code: "heldAtOtherLeverage", reason: "持仓中，杠杆不对"))
+        }
+        await runner(for: host).tick()
+        let close = try #require(host.fake.placed.first)
+        #expect(close.reduceOnly && close.side == .sell && close.size == 10)
+        #expect(close.tradeMode == "cross", "the position's own mode")
+        let leg = try #require(host.fake.preparedLegs.first)
+        #expect(leg.intent == .reduce && leg.held == 10 && leg.posSide == .long)
+    }
+
+    @Test("补挂的止损用它保护的那笔仓位的保证金模式")
+    func aStandaloneStopStatesItsPositionsMode() async throws {
+        let host = try host(risk: #"{"leverage":3,"trailingStopPct":5}"#)
+        seedLongPosition(host, strategyId: "alpha", contracts: 10)
+        host.fake.positionsResult = .success([exchangePosition(contracts: 10)])
+        host.fake.legAnswer = { leg in .success(LegReadiness(tradeMode: leg.intent == .reduce ? "cross" : "isolated")) }
+        await runner(for: host).tick()
+        let stop = try #require(host.fake.placedProtective.first, "a held position with nothing armed gets a stop")
+        #expect(stop.tradeMode == "cross")
+        #expect(host.fake.preparedLegs.last?.intent == .reduce)
+    }
+
+    @Test("模拟盘和实盘的账户配置分开缓存：切到实盘后按实盘自己的账户等级核对")
+    func eachAccountIsReadAsItself() async throws {
+        let host = try host()
+        host.fake.accountConfigs[.live] = AccountTradingConfig(positionMode: .longShort, accountLevel: 2)
+        // Held back, so the bar is decided again on the next tick.
+        host.fake.legAnswer = { _ in .failure(LegBlocked(code: "unreadable", reason: "读不到这条腿")) }
+        let runner = runner(for: host)
+        await runner.tick()
+        #expect(host.fake.preparedLegs.last?.accountLevel == 3)
+        host.portfolio.mode = .live
+        host.liveTradingUnlocked = true
+        await runner.tick()
+        #expect(host.fake.preparedLegs.last?.accountLevel == 2,
+                "the live account's own level — the demo's, an hour old, would margin a coin as spot margin")
+    }
+
+    /// Walks every instrument type the runner sends through `submit` on
+    /// OKX: whatever the type, the order states exactly the mode its leg was
+    /// readied with — a sentinel only the venue could have given.
+    @Test("走遍 OKX 由 submit 下单的每个品种：订单写的就是 venue 核对出的模式")
+    func everyTypeStatesTheModeItsLegWasReadiedWith() async throws {
+        for instType in InstrumentType.allCases where Venue.okx.trades(instType) && instType != .option {
+            let instId = instType.tradesInContracts ? "BTC-USDT-\(instType.rawValue)" : "BTC-USDT"
+            let host = try host(instId: instId, instType: instType, risk: "{}")
+            host.fake.legModes[instType] = "mode-\(instType.rawValue)"
+            await runner(for: host).tick()
+            let order = try #require(host.fake.placed.first, "\(instType)")
+            #expect(order.tradeMode == "mode-\(instType.rawValue)", "\(instType)")
+            let leg = try #require(host.fake.preparedLegs.first, "\(instType)")
+            #expect(leg.instType == instType && leg.intent == .open(leverage: 1), "\(instType)")
+            #expect(leg.posSide == (instType.usesPositionSide ? .long : nil), "\(instType)")
+        }
     }
 }

@@ -54,6 +54,9 @@ pub enum Read {
     AccountSnapshot,
     /// The account's position mode and level (`posMode`, `acctLv`).
     AccountConfig,
+    /// The leverage each leg of one contract is held at, in one margin mode.
+    #[serde(rename_all = "camelCase")]
+    Leverage { inst_id: String, margin_mode: String },
     /// The last three days' fills on one family, newest first.
     #[serde(rename_all = "camelCase")]
     Fills {
@@ -408,6 +411,56 @@ pub fn positions_target(family: Option<Family>) -> Result<Target, String> {
     }
 }
 
+/// The positions held on one instrument, every leg and margin mode.
+pub fn instrument_positions_target(inst_id: &str) -> Result<Target, String> {
+    Ok(Target::new(Route::Positions, format!("instId={}", instrument(inst_id)?)))
+}
+
+/// An instrument id as it may go into a query: OKX's own spelling, letters,
+/// digits and dashes, and nothing that could start another parameter.
+fn instrument(inst_id: &str) -> Result<&str, String> {
+    let id = inst_id.trim();
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err(format!("instId {inst_id:?} 不合法"));
+    }
+    Ok(id)
+}
+
+pub fn leverage_target(inst_id: &str, margin_mode: &str) -> Result<Target, String> {
+    if !matches!(margin_mode, "cross" | "isolated") {
+        return Err(format!("杠杆只按全仓或逐仓读，不认识 {margin_mode}"));
+    }
+    Ok(Target::new(Route::LeverageInfo, format!("instId={}&mgnMode={margin_mode}", instrument(inst_id)?)))
+}
+
+/// One leg's leverage as the exchange holds it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegLeverage {
+    pub inst_id: String,
+    pub margin_mode: String,
+    pub pos_side: PosSide,
+    pub leverage: f64,
+}
+
+/// The rows of a leverage read: both legs in long/short mode, the contract
+/// as `net` in net mode. A row without a leverage or a leg it names is an
+/// error, not a skipped line — the leg it stood for would read as unknown.
+pub fn parse_leverage(body: &str) -> Result<Vec<LegLeverage>, String> {
+    let value = envelope(body)?;
+    let rows = value.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
+    rows.iter()
+        .map(|row| {
+            let inst_id = text(row, "instId").ok_or("杠杆回复缺少 instId")?;
+            let margin_mode = text(row, "mgnMode").ok_or_else(|| format!("{inst_id} 的杠杆回复缺少 mgnMode"))?;
+            let pos_side = PosSide::from_venue(row.get("posSide").and_then(Value::as_str))
+                .ok_or_else(|| format!("{inst_id} 的杠杆回复里有不认识的 posSide"))?;
+            let leverage = num(row, "lever").filter(|l| *l > 0.0).ok_or_else(|| format!("{inst_id} 的杠杆回复缺少 lever"))?;
+            Ok(LegLeverage { inst_id, margin_mode, pos_side, leverage })
+        })
+        .collect()
+}
+
 pub fn balance_target(ccy: Option<&str>) -> Result<Target, String> {
     match ccy.map(str::trim).filter(|c| !c.is_empty()) {
         None => Ok(Target::bare(Route::Balance)),
@@ -717,6 +770,23 @@ mod tests {
         assert!(rows[0].reduce_only);
         assert_eq!((rows[1].size, rows[1].close_fraction, rows[1].trigger_price), (None, Some(1.0), Some(2600.0)));
         assert!(parse_page(r#"{"code":"51000","msg":"Parameter ordType error","data":[]}"#, Book::Algo).is_err());
+    }
+
+    #[test]
+    fn a_leverage_read_names_every_leg() {
+        assert_eq!(leverage_target("ETH-USDT-SWAP", "isolated").unwrap().path_and_query(),
+                   "/api/v5/account/leverage-info?instId=ETH-USDT-SWAP&mgnMode=isolated");
+        assert!(leverage_target("ETH-USDT-SWAP", "cash").is_err());
+        assert!(leverage_target("ETH-USDT-SWAP&mgnMode=cross", "isolated").is_err(), "nothing but an id reaches the query");
+        assert_eq!(instrument_positions_target("ETH-USDT-SWAP").unwrap().path_and_query(), "/api/v5/account/positions?instId=ETH-USDT-SWAP");
+        // Recorded from the demo account, 2026-10-09 (long/short mode).
+        let hedged = r#"{"code":"0","data":[{"ccy":"ETH-USDT-SWAP","instId":"ETH-USDT-SWAP","lever":"3","mgnMode":"isolated","posSide":"long"},{"ccy":"ETH-USDT-SWAP","instId":"ETH-USDT-SWAP","lever":"3","mgnMode":"isolated","posSide":"short"}],"msg":""}"#;
+        let legs = parse_leverage(hedged).unwrap();
+        assert_eq!(legs.iter().map(|l| (l.pos_side, l.leverage)).collect::<Vec<_>>(), vec![(PosSide::Long, 3.0), (PosSide::Short, 3.0)]);
+        let net = r#"{"code":"0","data":[{"instId":"BTC-USDT-SWAP","lever":"12.5","mgnMode":"isolated","posSide":"net"}]}"#;
+        assert_eq!(parse_leverage(net).unwrap()[0].pos_side, PosSide::Net);
+        assert!(parse_leverage(r#"{"code":"0","data":[{"instId":"X","mgnMode":"isolated","posSide":"long","lever":""}]}"#).is_err());
+        assert!(parse_leverage(r#"{"code":"59111","msg":"Leverage query isn't supported in portfolio margin account mode"}"#).unwrap_err().contains("59111"));
     }
 
     #[test]

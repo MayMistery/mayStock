@@ -16,6 +16,10 @@
 //! seconds per account. The app polling the same account at the same moment
 //! as the close-doctor took four of them over the limit — `50011 Too Many
 //! Requests`.
+//!
+//! The two leverage routes were checked 2026-10-09 against OKX's own
+//! documentation — twenty per two seconds per user ID, each — and ccxt's
+//! table (cost 1).
 
 use std::time::Duration;
 
@@ -28,6 +32,8 @@ pub enum Route {
     CancelAlgos,
     AmendAlgos,
     OrderPrecheck,
+    /// The leverage one leg of a contract is held at.
+    SetLeverage,
     // Reading it.
     OrdersPending,
     AlgoOrdersPending,
@@ -40,6 +46,7 @@ pub enum Route {
     Fills,
     Bills,
     TradeFee,
+    LeverageInfo,
 }
 
 /// At most `requests` in any `window`.
@@ -59,6 +66,29 @@ impl Limit {
 }
 
 impl Route {
+    /// Every route, for the checks that must hold of each one.
+    pub const ALL: [Route; 19] = [
+        Route::PlaceOrder,
+        Route::PlaceAlgo,
+        Route::CancelOrder,
+        Route::CancelAlgos,
+        Route::AmendAlgos,
+        Route::OrderPrecheck,
+        Route::SetLeverage,
+        Route::OrdersPending,
+        Route::AlgoOrdersPending,
+        Route::Order,
+        Route::Positions,
+        Route::Balance,
+        Route::AssetBalances,
+        Route::AssetValuation,
+        Route::AccountConfig,
+        Route::Fills,
+        Route::Bills,
+        Route::TradeFee,
+        Route::LeverageInfo,
+    ];
+
     pub fn path(self) -> &'static str {
         match self {
             Route::PlaceOrder | Route::Order => "/api/v5/trade/order",
@@ -67,6 +97,7 @@ impl Route {
             Route::CancelAlgos => "/api/v5/trade/cancel-algos",
             Route::AmendAlgos => "/api/v5/trade/amend-algos",
             Route::OrderPrecheck => "/api/v5/trade/order-precheck",
+            Route::SetLeverage => "/api/v5/account/set-leverage",
             Route::OrdersPending => "/api/v5/trade/orders-pending",
             Route::AlgoOrdersPending => "/api/v5/trade/orders-algo-pending",
             Route::Positions => "/api/v5/account/positions",
@@ -77,6 +108,7 @@ impl Route {
             Route::Fills => "/api/v5/trade/fills",
             Route::Bills => "/api/v5/account/bills",
             Route::TradeFee => "/api/v5/account/trade-fee",
+            Route::LeverageInfo => "/api/v5/account/leverage-info",
         }
     }
 
@@ -85,7 +117,12 @@ impl Route {
     /// than simply failed. A precheck and every read change nothing.
     pub fn acts(self) -> bool {
         match self {
-            Route::PlaceOrder | Route::PlaceAlgo | Route::CancelOrder | Route::CancelAlgos | Route::AmendAlgos => true,
+            Route::PlaceOrder
+            | Route::PlaceAlgo
+            | Route::CancelOrder
+            | Route::CancelAlgos
+            | Route::AmendAlgos
+            | Route::SetLeverage => true,
             Route::OrderPrecheck
             | Route::OrdersPending
             | Route::AlgoOrdersPending
@@ -97,7 +134,8 @@ impl Route {
             | Route::AccountConfig
             | Route::Fills
             | Route::Bills
-            | Route::TradeFee => false,
+            | Route::TradeFee
+            | Route::LeverageInfo => false,
         }
     }
 
@@ -108,9 +146,12 @@ impl Route {
             Route::PlaceOrder | Route::CancelOrder | Route::Order | Route::OrdersPending | Route::Fills => {
                 Limit::per_two_seconds(60)
             }
-            Route::PlaceAlgo | Route::CancelAlgos | Route::AmendAlgos | Route::AlgoOrdersPending => {
-                Limit::per_two_seconds(20)
-            }
+            Route::PlaceAlgo
+            | Route::CancelAlgos
+            | Route::AmendAlgos
+            | Route::AlgoOrdersPending
+            | Route::SetLeverage
+            | Route::LeverageInfo => Limit::per_two_seconds(20),
             Route::Positions | Route::Balance | Route::Bills => Limit::per_two_seconds(10),
             Route::OrderPrecheck | Route::AccountConfig | Route::TradeFee => Limit::per_two_seconds(5),
             Route::AssetBalances => Limit::per_second(6),
@@ -155,6 +196,59 @@ impl Target {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Route::ALL` names every route once: the match below stops compiling
+    /// when a route is added, and an ordinal past the list fails.
+    #[test]
+    fn every_route_is_listed_once() {
+        fn ordinal(route: Route) -> usize {
+            match route {
+                Route::PlaceOrder => 0,
+                Route::PlaceAlgo => 1,
+                Route::CancelOrder => 2,
+                Route::CancelAlgos => 3,
+                Route::AmendAlgos => 4,
+                Route::OrderPrecheck => 5,
+                Route::SetLeverage => 6,
+                Route::OrdersPending => 7,
+                Route::AlgoOrdersPending => 8,
+                Route::Order => 9,
+                Route::Positions => 10,
+                Route::Balance => 11,
+                Route::AssetBalances => 12,
+                Route::AssetValuation => 13,
+                Route::AccountConfig => 14,
+                Route::Fills => 15,
+                Route::Bills => 16,
+                Route::TradeFee => 17,
+                Route::LeverageInfo => 18,
+            }
+        }
+        let mut seen = [false; Route::ALL.len()];
+        for route in Route::ALL {
+            assert!(!std::mem::replace(&mut seen[ordinal(route)], true), "{route:?} twice");
+        }
+        assert!(seen.iter().all(|s| *s));
+    }
+
+    /// Whatever acts on the account is an order or an account setting.
+    /// Nothing under the funding account's paths — where transfers and
+    /// withdrawals live — acts, so no route here can move money out.
+    #[test]
+    fn nothing_here_can_move_funds() {
+        for route in Route::ALL {
+            let path = route.path();
+            assert!(path.starts_with("/api/v5/"), "{route:?}");
+            if route.acts() {
+                assert!(path.starts_with("/api/v5/trade/") || path.starts_with("/api/v5/account/set-"), "{route:?} {path}");
+            }
+            if path.starts_with("/api/v5/asset/") {
+                assert!(!route.acts(), "{route:?}");
+            }
+            let limit = route.limit();
+            assert!(limit.requests > 0 && limit.window > Duration::ZERO, "{route:?}");
+        }
+    }
 
     #[test]
     fn a_target_is_its_route_and_query() {

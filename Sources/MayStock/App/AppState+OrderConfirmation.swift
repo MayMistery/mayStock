@@ -234,10 +234,43 @@ extension AppState {
             return
         }
 
+        // What the order is margined at. Never a default: a reduction states
+        // its position's own mode, an opening the account's and the
+        // strategy's rule — and when that cannot be known, nothing goes out.
+        let readiness: LegReadiness
+        switch context.leg {
+        case .success(let ready):
+            readiness = ready
+        case .failure(let error):
+            let reason = (error as? LegBlocked)?.reason ?? (error as? TradeError)?.description ?? String(describing: error)
+            finish("保证金模式定不下来：\(reason)")
+            _ = await presentAlert(
+                title: "无法确定保证金模式",
+                message: """
+                    \(reason)，已拒绝。
+
+                    \(Self.describe(intent, limit: limit))
+                    """,
+                style: .critical, buttons: ["好"])
+            return
+        case nil:
+            finish("没有核对这条腿")
+            return
+        }
+
         // Can the account pay for it, and if not, what one spot order fixes it.
         let funding = Self.fundingOutcome(intent: intent, limit: limit, context: context)
+        if case .needed = funding, case .failure(let error)? = context.spotLeg {
+            let reason = (error as? LegBlocked)?.reason ?? (error as? TradeError)?.description ?? String(describing: error)
+            finish("换币的现货单保证金模式定不下来：\(reason)")
+            _ = await presentAlert(
+                title: "无法确定保证金模式",
+                message: "要先买入结算币，但那笔现货单的 tdMode 定不下来（\(reason)），已拒绝。",
+                style: .critical, buttons: ["好"])
+            return
+        }
 
-        var message = Self.describe(intent, limit: limit)
+        var message = Self.describe(intent, limit: limit) + Self.describeMargin(readiness)
         if let capWarning = capWarning(intent, limit: limit, context: context) {
             message = capWarning + "\n\n" + message
         }
@@ -314,8 +347,9 @@ extension AppState {
                 约 \(PriceFormatter.money(step.estimatedCostQuote))）
                 """)
             do {
+                let spotMode = (try? context.spotLeg?.get())?.tradeMode
                 let result = try await orderVenue(for: step.instId).place(
-                    SettlementFunding.spotOrder(for: step),
+                    SettlementFunding.spotOrder(for: step, tradeMode: spotMode),
                     mode: intent.mode, liveUnlocked: liveTradingUnlocked)
                 Log.warn("order-intent: 第 1 步成交 nonce=\(intent.nonce) ordId=\(result.ordId)")
             } catch {
@@ -360,14 +394,9 @@ extension AppState {
             }
         }
 
-        // Step 2: the order this was all for.
-        //
-        // `tdMode` comes from the account, never from the URL — the account's
-        // margin level decides how an option is margined.
-        let tradeMode = intent.instType == .option
-            ? (context.accountConfig
-                ?? AccountTradingConfig(positionMode: nil, accountLevel: nil)).optionTradeMode
-            : nil
+        // Step 2: the order this was all for, in the mode the leg was readied
+        // with — never one a URL named.
+        let tradeMode = readiness.tradeMode
         let order = intent.toOrderRequest(limitPrice: limit, tradeMode: tradeMode)
 
         Log.warn("""
@@ -375,7 +404,7 @@ extension AppState {
             \(intent.mode.badge) \(order.side.rawValue) \(order.instId) \
             \(PriceFormatter.plain(order.size)) 张 \
             @\(limit.map { PriceFormatter.plain($0) } ?? "市价") \
-            tdMode=\(tradeMode ?? "默认") \
+            tdMode=\(tradeMode ?? "无")\(readiness.leverage.map { " 杠杆=\(PriceFormatter.plain($0))x" } ?? "") \
             盘口 bid=\(Self.describePrice(context.bid)) ask=\(Self.describePrice(context.ask))
             """)
 
@@ -453,6 +482,15 @@ extension AppState {
         var spotTakerBps: Double = SettlementFunding.defaultSpotTakerBps
         var feeModel: FeeModel?
         var failure: String?
+        /// The contract's lot, for telling a position from rounding.
+        var lotSize: Double = 0
+        /// The leg readied for this order (`ExchangeVenue.prepareLeg`): the
+        /// margin mode it states — the position's own for a reduction, the
+        /// strategy's rule for an opening — and the leverage the leg is held
+        /// at, shown and never changed here.
+        var leg: Result<LegReadiness, Error>?
+        /// The mode a coin-buying step states, from the account level.
+        var spotLeg: Result<LegReadiness, Error>?
     }
 
     private func gatherContext(for intent: PendingOrderIntent) async -> Context {
@@ -478,6 +516,7 @@ extension AppState {
             if let meta = try? await orderVenue(for: intent.instId).instrumentMeta(instId: intent.instId, mode: intent.mode) {
                 if meta.tickSize > 0 { context.tickSize = meta.tickSize }
                 context.contractValue = meta.contractValue
+                context.lotSize = meta.lotSize
             }
             let underlying = Self.underlying(of: intent.instId)
             if let chain = try? await orderVenue(for: intent.instId).optionChain(underlying: underlying, mode: intent.mode),
@@ -485,6 +524,7 @@ extension AppState {
                 context.contractValue = contract.contractValue
                 context.settleCurrency = contract.settleCurrency
                 if contract.tickSize > 0 { context.tickSize = contract.tickSize }
+                if contract.lotSize > 0 { context.lotSize = contract.lotSize }
             }
         } else {
             do {
@@ -501,8 +541,16 @@ extension AppState {
                 if meta.tickSize > 0 { context.tickSize = meta.tickSize }
                 // How much underlying a contract is: what a swap's notional is counted in.
                 context.contractValue = meta.contractValue
+                context.lotSize = meta.lotSize
             }
         }
+
+        // The person's own order: it joins whatever the leg holds, at the
+        // leverage the leg is held at, which is shown and left as it is.
+        context.leg = await readyLeg(LegPreparation(
+            instId: intent.instId, instType: intent.instType, posSide: intent.posSide,
+            accountLevel: context.accountConfig?.accountLevel, held: nil, lot: context.lotSize,
+            intent: intent.reduceOnly ? .reduce : .open(leverage: nil)), mode: intent.mode)
 
         // What a spot leg would need, if one turns out to be required.
         if let coin = context.settleCurrency,
@@ -512,6 +560,9 @@ extension AppState {
                 context.spotLotSize = meta.lotSize
                 context.spotMinSize = meta.minSize
             }
+            context.spotLeg = await readyLeg(LegPreparation(
+                instId: spot, instType: .spot, posSide: nil, accountLevel: context.accountConfig?.accountLevel,
+                held: nil, lot: context.spotLotSize, intent: .open(leverage: nil)), mode: intent.mode)
             // The account's own schedule beats the default: the fee is taken
             // out of the coin that arrives, so getting it wrong strands the
             // purchase a few lots short of what the option leg needs.
@@ -521,6 +572,17 @@ extension AppState {
         }
         context.feeModel = store.config.strategy.feeSchedules.okx.feeModel(for: .option)
         return context
+    }
+
+    private func readyLeg(_ leg: LegPreparation, mode: TradingMode) async -> Result<LegReadiness, Error> {
+        do {
+            let readiness = try await orderVenue(for: leg.instId).prepareLeg(leg, mode: mode, liveUnlocked: liveTradingUnlocked)
+            if let note = readiness.note { Log.warn("order-intent: \(leg.instId)：\(note)") }
+            return .success(readiness)
+        } catch {
+            Log.warn("order-intent: \(leg.instId) 的保证金模式定不下来：\(error)")
+            return .failure(error)
+        }
     }
 
     /// The per-order cap every strategy order is refused at, checked here by
@@ -651,6 +713,18 @@ extension AppState {
             lines.append("到期：\(note)")
         }
         return lines.joined(separator: "\n")
+    }
+
+    /// The margin the order goes out with: the mode it states and, on a
+    /// contract held at a leverage of its own, the leverage the leg is at —
+    /// what OKX holds margin at, which this dialog shows and never changes.
+    private static func describeMargin(_ readiness: LegReadiness) -> String {
+        guard let margin = readiness.marginText else { return "" }
+        var text = "\n保证金：\(margin)"
+        if let leverage = readiness.leverage {
+            text += "\n这条腿当前杠杆：\(PriceFormatter.plain(leverage))x（交易所按它占用保证金；这里不改）"
+        }
+        return text
     }
 
     /// The spot leg, spelled out so the amount can be checked rather than

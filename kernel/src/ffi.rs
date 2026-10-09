@@ -1437,6 +1437,37 @@ pub unsafe extern "C" fn ms_trade_read(request_json: *const c_char) -> *mut c_ch
     to_c_string(serde_json::to_string(&reply).unwrap_or_default())
 }
 
+/// Ready one leg for the order about to go out on it
+/// (`trade::PrepareRequest` as JSON): the `tdMode` it states, and for a
+/// strategy opening on a leveraged contract, the leg held at the manifest's
+/// leverage — set only where the leg is empty. Always returns a
+/// `trade::leg::LegReply` as JSON, with what it took. Caller frees.
+#[no_mangle]
+pub unsafe extern "C" fn ms_trade_prepare(request_json: *const c_char) -> *mut c_char {
+    let local = crate::trade::Prepared::local;
+    let refused = |reason: String| crate::trade::leg::LegReply::Refused { code: crate::trade::RefusalCode::Spec, reason };
+    let reply = catch_unwind(AssertUnwindSafe(|| {
+        let Some(text) = borrow_str(request_json) else {
+            return local(refused("请求不是 UTF-8".into()));
+        };
+        let request: crate::trade::PrepareRequest = match serde_json::from_str(text) {
+            Ok(request) => request,
+            Err(e) => return local(refused(format!("请求解析失败：{e}"))),
+        };
+        match crate::trade::shared() {
+            Ok(client) => client.prepare(&request),
+            Err(reason) => local(crate::trade::leg::LegReply::Blocked { code: crate::trade::leg::BlockCode::Unreadable, reason }),
+        }
+    }))
+    // A panic may have come after a leverage change left: whether the leg
+    // moved is unknown, so nothing opens on it.
+    .unwrap_or_else(|_| local(crate::trade::leg::LegReply::Blocked {
+        code: crate::trade::leg::BlockCode::LeverageUnsettled,
+        reason: "内核在核对杠杆途中出错，本轮不开仓".into(),
+    }));
+    to_c_string(serde_json::to_string(&reply).unwrap_or_default())
+}
+
 /// The request an action becomes (`{endpoint, method, path, body}`), for
 /// showing before it is sent. Caller frees.
 #[no_mangle]

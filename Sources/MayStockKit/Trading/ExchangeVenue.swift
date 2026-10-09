@@ -61,10 +61,19 @@ public protocol ExchangeVenue: Sendable {
     // MARK: Account
 
     /// How the account is set up for derivatives: whether a perpetual order
-    /// must name its leg, and which margin mode an option order needs. Read
-    /// rather than assumed — an account switched to net mode rejects every
-    /// order that names a leg, with an error that says nothing about why.
+    /// must name its leg, and the account level the margin mode of a fully
+    /// paid holding follows. Read rather than assumed — an account switched
+    /// to net mode rejects every order that names a leg, with an error that
+    /// says nothing about why.
     func accountTradingConfig(mode: TradingMode) async throws -> AccountTradingConfig
+
+    /// Ready one leg for the order about to go out on it: the margin mode
+    /// the order states, and — before a strategy opens on a contract the
+    /// venue holds at a leverage of its own — that leverage, set where the
+    /// leg holds nothing. Throws `LegBlocked` when the order must not go out
+    /// now. Required of every venue: what an order is margined at is never a
+    /// default.
+    func prepareLeg(_ leg: LegPreparation, mode: TradingMode, liveUnlocked: Bool) async throws -> LegReadiness
 
     /// The alternative series a manifest declares — funding rates, open
     /// interest, long/short ratios — aligned to `candles`.
@@ -162,9 +171,10 @@ public protocol ExchangeVenue: Sendable {
         stopPrice: Double, mode: TradingMode, liveUnlocked: Bool
     ) async throws
 
-    /// Attach a standalone reduce-only stop to a position that has none.
+    /// Attach a standalone reduce-only stop to a position that has none,
+    /// stating the position's own margin mode (`prepareLeg`, `.reduce`).
     func placeProtectiveOrder(
-        instId: String, instType: InstrumentType, posSide: PositionSide?,
+        instId: String, instType: InstrumentType, posSide: PositionSide?, tradeMode: String?,
         size: Double, stopPrice: Double, mode: TradingMode, liveUnlocked: Bool
     ) async throws
 
@@ -376,18 +386,6 @@ public struct AccountTradingConfig: Sendable, Equatable {
     /// wrong that way, a wrongly skipped check costs a position.
     public var borrowsMissingCoin: Bool {
         (accountLevel ?? 0) >= 3 && autoLoan == true
-    }
-
-    /// The `tdMode` an option order has to carry. Options are margined by the
-    /// account, not the order: a simple account buys them for cash, a
-    /// single-currency margin account isolates them, and the multi-currency
-    /// and portfolio modes cross-margin everything.
-    public var optionTradeMode: String {
-        switch accountLevel {
-        case .some(1): return "cash"
-        case .some(2): return "isolated"
-        default: return "cross"
-        }
     }
 }
 

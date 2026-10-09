@@ -21,7 +21,8 @@ struct KernelTradingTests {
             instId: "ETH-USDT-SWAP", instType: .swap, side: .sell, kind: .limit, size: 187.75, price: 2700.01,
             tradeMode: "isolated", posSide: .long, reduceOnly: true, clientId: "ms1",
             stopTrigger: 2500, takeProfitTrigger: 2900)),
-        .place(TradeOrderSpec(instId: "BTC-USDT", instType: .spot, side: .buy, kind: .market, size: 20, sizeInQuote: true)),
+        .place(TradeOrderSpec(instId: "BTC-USDT", instType: .spot, side: .buy, kind: .market, size: 20, sizeInQuote: true,
+                              tradeMode: "cash")),
         .placeAlgo(TradeAlgoSpec(
             instId: "ETH-USDT-SWAP", instType: .swap, side: .sell, posSide: .long, size: 10, tradeMode: "cross",
             reduceOnly: true, cancelWithPosition: false, clientId: "ms2", kind: .chase(maxChaseRatio: 0.002))),
@@ -36,6 +37,8 @@ struct KernelTradingTests {
         .amendStop(instId: "ETH-USDT-SWAP", algoId: "9", stop: 2610.5),
         .precheck(TradeOrderSpec(instId: "BTC-USDT-SWAP", instType: .swap, side: .buy, kind: .market, size: 0.01,
                                  tradeMode: "cross", posSide: .short)),
+        .setLeverage(instId: "ETH-USDT-SWAP", instType: .swap, marginMode: "isolated", posSide: .long, leverage: 10),
+        .setLeverage(instId: "BTC-USDT-SWAP", instType: .swap, marginMode: "cross", posSide: nil, leverage: 2.5),
     ]
 
     @Test("every action round-trips through Swift and is read by the kernel")
@@ -45,25 +48,34 @@ struct KernelTradingTests {
             #expect(try JSONDecoder().decode(TradeAction.self, from: data) == action, "\(action)")
             let wire = try KernelTradeClient.describe(action)
             #expect(wire.method == "POST")
-            #expect(wire.path.hasPrefix("/api/v5/trade/"), "the closed set: \(wire.path)")
+            // The closed set: orders, and the one account setting an order
+            // is margined by — never a route that moves funds.
+            #expect(wire.path.hasPrefix("/api/v5/trade/") || wire.path == "/api/v5/account/set-leverage",
+                    "the closed set: \(wire.path)")
         }
+        let leverage = try Self.body(Self.everyAction.first { if case .setLeverage = $0 { true } else { false } }!)
+        #expect(leverage["lever"] as? String == "10" && leverage["posSide"] as? String == "long")
+        #expect(leverage["mgnMode"] as? String == "isolated")
     }
 
     @Test("the runner's orders become the bodies the exchange has always read")
     func runnerOrders() throws {
-        // A spot market buy sized in the quote currency.
+        // A spot market buy sized in the quote currency, in the account's
+        // spot mode.
         let buy = try Self.body(.place(TradeOrderSpec(OrderRequest(
-            instId: "BTC-USDT", side: .buy, kind: .market, size: 20, clOrdId: "msbuy"))))
+            instId: "BTC-USDT", side: .buy, kind: .market, size: 20, clOrdId: "msbuy", tradeMode: "cross"))))
         #expect(buy["tgtCcy"] as? String == "quote_ccy")
-        #expect(buy["tdMode"] as? String == "cash")
+        #expect(buy["tdMode"] as? String == "cross")
         #expect(buy["px"] == nil)
         #expect(buy["clOrdId"] as? String == "msbuy")
 
-        // A perpetual entry on a long/short account, protection attached.
+        // A perpetual entry on a long/short account, protection attached, in
+        // the isolated margin the backtest liquidates by.
         let entry = try Self.body(.place(TradeOrderSpec(OrderRequest(
             instId: "ETH-USDT-SWAP", instType: .swap, side: .buy, kind: .market, size: 3, sizeUnit: .base,
-            posSide: .long, stopTriggerPrice: 2500, takeProfitTriggerPrice: 2900, clOrdId: "msent"))))
-        #expect(entry["tdMode"] as? String == "cross", "the default the runner has always opened with")
+            posSide: .long, stopTriggerPrice: 2500, takeProfitTriggerPrice: 2900, clOrdId: "msent",
+            tradeMode: "isolated"))))
+        #expect(entry["tdMode"] as? String == "isolated")
         #expect(entry["posSide"] as? String == "long")
         #expect(entry["tgtCcy"] == nil, "a size unit means nothing off spot market orders")
         let attached = try #require((entry["attachAlgoOrds"] as? [[String: Any]])?.first)
@@ -74,7 +86,7 @@ struct KernelTradingTests {
         for (leg, sent) in [(PositionSide.net, true), (.long, false), (.short, false)] {
             let close = try Self.body(.place(TradeOrderSpec(OrderRequest(
                 instId: "ETH-USDT-SWAP", instType: .swap, side: .sell, kind: .market, size: 3, sizeUnit: .base,
-                posSide: leg, reduceOnly: true))))
+                posSide: leg, reduceOnly: true, tradeMode: "isolated"))))
             #expect((close["reduceOnly"] as? String == "true") == sent, "\(leg)")
         }
 
@@ -91,16 +103,23 @@ struct KernelTradingTests {
         // A size goes out as it is, never rounded up past the lot.
         let exact = try Self.body(.place(TradeOrderSpec(OrderRequest(
             instId: "ETH-USDT", instType: .spot, side: .sell, kind: .limit, size: 0.01234567, sizeUnit: .base,
-            limitPrice: 2700))))
+            limitPrice: 2700, tradeMode: "cash"))))
         #expect(exact["sz"] as? String == "0.01234567")
     }
 
     @Test("an order the kernel cannot send as written is refused before the network")
     func malformedOrdersAreRefused() {
-        // A priced kind without a price, an option without a margin mode.
+        // A priced kind without a price, an order of any family without a
+        // margin mode — none is defaulted.
         #expect(throws: KernelError.self) {
             try KernelTradeClient.describe(.place(TradeOrderSpec(
-                instId: "ETH-USDT-SWAP", instType: .swap, side: .sell, kind: .limit, size: 1)))
+                instId: "ETH-USDT-SWAP", instType: .swap, side: .sell, kind: .limit, size: 1, tradeMode: "isolated")))
+        }
+        for instType in InstrumentType.allCases {
+            #expect(throws: KernelError.self, "\(instType): no default mode") {
+                try KernelTradeClient.describe(.place(TradeOrderSpec(
+                    instId: "X-USDT", instType: instType, side: .buy, kind: .market, size: 1)))
+            }
         }
         #expect(throws: KernelError.self) {
             try KernelTradeClient.describe(.place(TradeOrderSpec(
@@ -235,6 +254,49 @@ struct KernelTradingTests {
         let rebuilt = try JSONDecoder().decode(BookDocument.self, from: after)
         #expect(rebuilt.stats?.resyncs == 1)
         #expect(rebuilt.asks.isEmpty && rebuilt.bids.isEmpty, "a lost book is shown gone, not as it was")
+    }
+
+    @Test("a fully paid holding's mode is the account's, through the kernel, with no network for a coin")
+    func aCoinsModeFollowsTheAccountLevel() async throws {
+        let client = KernelTradeClient(configPath: try Self.config(), demoProfile: "paper", liveProfile: "real")
+        func ready(_ level: Int?, _ intent: LegPreparation.Intent) async throws -> LegReadiness {
+            try await client.prepare(LegPreparation(
+                instId: "BTC-USDT", instType: .spot, posSide: nil, accountLevel: level, held: nil, lot: 0,
+                intent: intent), mode: .demo, liveUnlocked: false)
+        }
+        for intent in [LegPreparation.Intent.open(leverage: 1), .reduce] {
+            #expect(try await ready(2, intent).tradeMode == "cash", "the live account's level, cash measured 2026-09-18")
+            #expect(try await ready(3, intent).tradeMode == "cross", "cash refused at level 3, 2026-10-09")
+            await #expect(throws: LegBlocked.self, "an unknown level is not guessed") {
+                _ = try await ready(nil, intent)
+            }
+        }
+        // A share is not OKX's.
+        await #expect(throws: TradeError.self) {
+            _ = try await client.prepare(LegPreparation(
+                instId: "MU", instType: .stock, posSide: nil, accountLevel: 2, held: nil, lot: 1,
+                intent: .open(leverage: 1)), mode: .demo, liveUnlocked: false)
+        }
+    }
+
+    @Test("every answer the kernel gives a leg is read as what it is; one it never gave blocks")
+    func legRepliesAreReadAsWhatTheySay() throws {
+        let ready = try KernelTradeClient.readiness(from: #"{"outcome":"ready","tradeMode":"isolated","leverage":10,"changedFrom":3,"note":null,"retries":0}"#)
+        #expect(ready == LegReadiness(tradeMode: "isolated", leverage: 10, changedFrom: 3))
+        #expect(ready.marginText == "逐仓（tdMode=isolated）")
+        do {
+            _ = try KernelTradeClient.readiness(from: #"{"outcome":"blocked","code":"foreignPosition","reason":"ETH-USDT-SWAP 逐仓多头上有 186.97 张不是策略开的仓位"}"#)
+            Issue.record("a block must throw")
+        } catch let blocked as LegBlocked {
+            #expect(blocked.code == "foreignPosition" && blocked.reason.contains("186.97"))
+        }
+        #expect(throws: TradeError.self) {
+            _ = try KernelTradeClient.readiness(from: #"{"outcome":"refused","code":"liveLocked","reason":"实盘交易未解锁"}"#)
+        }
+        // Nothing opens on a leg whose state is unknown.
+        for text in [#"{"outcome":"somethingNew"}"#, "not json"] {
+            #expect(throws: LegBlocked.self, "\(text)") { _ = try KernelTradeClient.readiness(from: text) }
+        }
     }
 
     @Test("a position's margin mode is read from the exchange's own document")

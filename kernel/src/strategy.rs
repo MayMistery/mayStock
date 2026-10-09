@@ -230,6 +230,19 @@ impl InstrumentType {
     pub const ALL: [InstrumentType; 4] = [Self::Spot, Self::Swap, Self::Stock, Self::Option];
 }
 
+/// The finest step a leverage is held to. OKX keeps a leg's leverage to two
+/// decimals and truncates anything finer without saying so: `2.336` is
+/// accepted, echoed back as asked, and held at `2.33`; `2.005` is held at `2`
+/// (demo account, 2026-10-09). A leverage off this grid is one the exchange
+/// would hold at something else.
+pub const LEVERAGE_STEP: f64 = 0.01;
+
+/// Whether a leverage sits on the grid it can be held at.
+pub fn leverage_on_grid(leverage: f64) -> bool {
+    let steps = leverage / LEVERAGE_STEP;
+    leverage.is_finite() && (steps - steps.round()).abs() < 1e-6
+}
+
 // MARK: - Manifest
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -626,6 +639,14 @@ impl CompiledStrategy {
             return Err(ExprError::Policy(format!(
                 "杠杆 {leverage}× 超出 {inst_type:?} 允许的范围（1~{}）",
                 inst_type.max_leverage()
+            )));
+        }
+        // Nor is it rounded: the exchange would hold it at less than this
+        // without saying so, and margin it there.
+        if !leverage_on_grid(leverage) {
+            return Err(ExprError::Policy(format!(
+                "杠杆 {leverage}× 不在 {LEVERAGE_STEP} 的档位上：交易所按这个精度持有杠杆，会把它截短，\
+                 跑的就不是回测过的那个策略"
             )));
         }
 
@@ -1134,6 +1155,24 @@ mod tests {
             .replace(r#""leverage": 1"#, r#""leverage": 3"#);
         let manifest: Manifest = serde_json::from_str(&json).unwrap();
         assert!(CompiledStrategy::compile(manifest, &[]).is_err());
+    }
+
+    #[test]
+    fn a_leverage_the_exchange_cannot_hold_is_refused() {
+        let swap = |leverage: &str| {
+            let json = DONCHIAN
+                .replace(r#""instId": "BTC-USDT", "instType": "SPOT""#, r#""instId": "BTC-USDT-SWAP", "instType": "SWAP""#)
+                .replace(r#""leverage": 1"#, &format!(r#""leverage": {leverage}"#));
+            CompiledStrategy::compile(serde_json::from_str(&json).unwrap(), &[])
+        };
+        for held in ["1", "2.33", "2.5", "3", "12.25", "50"] {
+            assert!(swap(held).is_ok(), "{held}");
+        }
+        // Measured: 2.336 is held at 2.33, 2.005 at 2.
+        for truncated in ["2.336", "2.005", "3.333333"] {
+            let refused = swap(truncated).unwrap_err();
+            assert!(matches!(&refused, ExprError::Policy(reason) if reason.contains("档位")), "{truncated}: {refused:?}");
+        }
     }
 
     #[test]

@@ -177,8 +177,13 @@ public enum TradeAction: Codable, Sendable, Equatable {
     case amendStop(instId: String, algoId: String, stop: Double)
     /// The exchange's own check of an order, without placing it.
     case precheck(TradeOrderSpec)
+    /// Hold one leg of a contract at a leverage. The runner never sends this
+    /// itself: `prepareLeg` does, and only to an empty leg.
+    case setLeverage(instId: String, instType: InstrumentType, marginMode: String, posSide: PositionSide?, leverage: Double)
 
-    private enum CodingKeys: String, CodingKey { case action, order, algo, instId, orderId, algoId, stop }
+    private enum CodingKeys: String, CodingKey {
+        case action, order, algo, instId, orderId, algoId, stop, family, marginMode, posSide, leverage
+    }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -194,6 +199,13 @@ public enum TradeAction: Codable, Sendable, Equatable {
                 instId: try c.decode(String.self, forKey: .instId), algoId: try c.decode(String.self, forKey: .algoId),
                 stop: try c.decode(Double.self, forKey: .stop))
         case "precheck": self = .precheck(try c.decode(TradeOrderSpec.self, forKey: .order))
+        case "setLeverage":
+            self = .setLeverage(
+                instId: try c.decode(String.self, forKey: .instId),
+                instType: try c.decode(InstrumentType.self, forKey: .family),
+                marginMode: try c.decode(String.self, forKey: .marginMode),
+                posSide: try c.decodeIfPresent(PositionSide.self, forKey: .posSide),
+                leverage: try c.decode(Double.self, forKey: .leverage))
         case let other:
             throw DecodingError.dataCorruptedError(forKey: .action, in: c, debugDescription: "未知的交易动作 \(other)")
         }
@@ -224,6 +236,13 @@ public enum TradeAction: Codable, Sendable, Equatable {
         case .precheck(let order):
             try c.encode("precheck", forKey: .action)
             try c.encode(order, forKey: .order)
+        case .setLeverage(let instId, let instType, let marginMode, let posSide, let leverage):
+            try c.encode("setLeverage", forKey: .action)
+            try c.encode(instId, forKey: .instId)
+            try c.encode(instType, forKey: .family)
+            try c.encode(marginMode, forKey: .marginMode)
+            try c.encodeIfPresent(posSide, forKey: .posSide)
+            try c.encode(leverage, forKey: .leverage)
         }
     }
 
@@ -233,8 +252,103 @@ public enum TradeAction: Codable, Sendable, Equatable {
         case .place(let order), .precheck(let order): return order.instId
         case .placeAlgo(let algo): return algo.instId
         case .cancel(let instId, _), .cancelAlgo(let instId, _), .amendStop(let instId, _, _): return instId
+        case .setLeverage(let instId, _, _, _, _): return instId
         }
     }
+}
+
+// MARK: - Readying a leg
+
+/// The order about to go out on one leg — a contract, a margin mode, a side —
+/// as the kernel readies it (`trade::leg`): the margin mode the order states,
+/// and before a strategy opens on a contract held at a leverage of its own,
+/// that leverage.
+public struct LegPreparation: Sendable, Equatable {
+    public enum Intent: Sendable, Equatable {
+        /// About to open or add. `leverage` is what the leg must be held at —
+        /// the manifest's; the kernel holds it only where the family has a
+        /// leverage of its own. Nil reads the leg's leverage without holding
+        /// it to anything — a person's order.
+        case open(leverage: Double?)
+        /// About to reduce or close.
+        case reduce
+    }
+
+    public var instId: String
+    public var instType: InstrumentType
+    /// The side in long/short mode; `.net` or nil in net mode and for a
+    /// family without legs.
+    public var posSide: PositionSide?
+    /// OKX's `acctLv`, as last read.
+    public var accountLevel: Int?
+    /// Contracts the strategies' books hold on this leg, signed — long
+    /// positive, short negative. Nil for a person's order: what the leg holds
+    /// is then theirs to act on.
+    public var held: Double?
+    /// The instrument's lot: a difference under half of one is rounding.
+    public var lot: Double
+    public var intent: Intent
+
+    public init(
+        instId: String, instType: InstrumentType, posSide: PositionSide?, accountLevel: Int?,
+        held: Double?, lot: Double, intent: Intent
+    ) {
+        self.instId = instId
+        self.instType = instType
+        self.posSide = posSide
+        self.accountLevel = accountLevel
+        self.held = held
+        self.lot = lot
+        self.intent = intent
+    }
+}
+
+/// A leg ready for its order.
+public struct LegReadiness: Sendable, Equatable {
+    /// The `tdMode` the order states. Nil only on a venue that has none.
+    public let tradeMode: String?
+    /// The leg's leverage as the exchange holds it now; nil where the family
+    /// has none.
+    public let leverage: Double?
+    /// What it was before this call set it to the manifest's.
+    public let changedFrom: Double?
+    /// Anything that was not the plain case, in words for the log.
+    public let note: String?
+
+    public init(tradeMode: String?, leverage: Double? = nil, changedFrom: Double? = nil, note: String? = nil) {
+        self.tradeMode = tradeMode
+        self.leverage = leverage
+        self.changedFrom = changedFrom
+        self.note = note
+    }
+
+    /// The margin mode for a person: `逐仓（tdMode=isolated）`.
+    public var marginText: String? {
+        guard let tradeMode else { return nil }
+        return "\(MarginMode(rawValue: tradeMode)?.displayName ?? tradeMode)（tdMode=\(tradeMode)）"
+    }
+}
+
+/// An order that must not go out now, and why — in the kernel's words. The
+/// code says what kind of reason (`trade::leg::BlockCode`).
+public struct LegBlocked: Error, CustomStringConvertible, Sendable, Equatable {
+    public let code: String
+    public let reason: String
+
+    public init(code: String, reason: String) {
+        self.code = code
+        self.reason = reason
+    }
+
+    public var description: String { reason }
+}
+
+/// One leg's leverage as the exchange holds it (`trade::reads::LegLeverage`).
+public struct LegLeverage: Decodable, Sendable, Equatable {
+    public let instId: String
+    public let marginMode: String
+    public let posSide: PositionSide
+    public let leverage: Double
 }
 
 /// One request exactly as it is signed and sent.
@@ -399,6 +513,78 @@ public struct KernelTradeClient: Sendable {
             throw TradeError.refused(reply.reason ?? "未给出原因")
         default:
             throw TradeError.unconfirmed("内核回复了不认识的结果 \(reply.outcome)：\(text.prefix(200))")
+        }
+    }
+
+    // MARK: Readying a leg
+
+    private struct LegReply: Decodable {
+        let outcome: String
+        let tradeMode: String?
+        let leverage: Double?
+        let changedFrom: Double?
+        let note: String?
+        let code: String?
+        let reason: String?
+    }
+
+    /// Ready one leg for the order about to go out on it. Returns the margin
+    /// mode the order states and the leg's leverage, or throws: `LegBlocked`
+    /// (not now, and why), `.liveTradingLocked` or `.refused` (stopped here).
+    /// A reply this side cannot read is a block — nothing opens on a leg
+    /// whose state is unknown.
+    public func prepare(_ leg: LegPreparation, mode: TradingMode, liveUnlocked: Bool) async throws -> LegReadiness {
+        struct Query: Encodable {
+            let instId: String
+            let family: InstrumentType
+            let posSide: PositionSide?
+            let accountLevel: Int?
+            let held: Double?
+            let lot: Double
+            let intent: String
+            let leverage: Double?
+        }
+        let query: Query
+        switch leg.intent {
+        case .open(let leverage):
+            query = Query(instId: leg.instId, family: leg.instType, posSide: leg.posSide, accountLevel: leg.accountLevel,
+                          held: leg.held, lot: leg.lot, intent: "open", leverage: leverage)
+        case .reduce:
+            query = Query(instId: leg.instId, family: leg.instType, posSide: leg.posSide, accountLevel: leg.accountLevel,
+                          held: leg.held, lot: leg.lot, intent: "reduce", leverage: nil)
+        }
+        let request: String
+        do {
+            request = try Self.merged(access(mode, liveUnlocked: liveUnlocked), query)
+        } catch {
+            throw TradeError.refused("请求无法编码：\(error)")
+        }
+        let text = await Self.offload {
+            guard let pointer = ms_trade_prepare(request) else { return "" }
+            defer { ms_string_free(pointer) }
+            return String(cString: pointer)
+        }
+        Self.noteDelivery(text, "\(leg.instId) 核对杠杆与保证金模式")
+        return try Self.readiness(from: text)
+    }
+
+    /// The kernel's reply to a leg readied, read.
+    static func readiness(from text: String) throws -> LegReadiness {
+        guard let reply = try? JSONDecoder().decode(LegReply.self, from: Data(text.utf8)) else {
+            throw LegBlocked(code: "unreadable", reason: "内核回复无法解析：\(text.prefix(200))")
+        }
+        switch reply.outcome {
+        case "ready":
+            return LegReadiness(
+                tradeMode: reply.tradeMode, leverage: reply.leverage, changedFrom: reply.changedFrom, note: reply.note)
+        case "blocked":
+            throw LegBlocked(code: reply.code ?? "unknown", reason: reply.reason ?? "未给出原因")
+        case "refused" where reply.code == "liveLocked":
+            throw TradeError.liveTradingLocked
+        case "refused":
+            throw TradeError.refused(reply.reason ?? "未给出原因")
+        default:
+            throw LegBlocked(code: "unknown", reason: "内核回复了不认识的结果 \(reply.outcome)：\(text.prefix(200))")
         }
     }
 
@@ -640,6 +826,11 @@ public struct KernelTradeClient: Sendable {
         async let positions = document(["read": "positions"], mode: mode)
         async let balance = document(["read": "balance"], mode: mode)
         return try await (positions, balance)
+    }
+
+    /// The leverage each leg of one contract is held at, in one margin mode.
+    public func leverage(instId: String, marginMode: String, mode: TradingMode) async throws -> [LegLeverage] {
+        try await read(["read": "leverage", "instId": instId, "marginMode": marginMode], mode: mode)
     }
 
     /// The account's fee rates: on one instrument, from its own fee group, or

@@ -16,6 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::margin::{self, MarginError};
 use super::reads::{FeeRates, WorkingOrder};
 use super::terms::{self, Terms};
 use super::wire::{self, Action, AlgoKind, AlgoSpec, Family, OrderKind, OrderSpec, PosSide, Side, WireRequest};
@@ -627,7 +628,7 @@ pub enum CloseError {
     SizeAboveHolding { size: f64, held: f64, unit: String },
     SizeBelowMinimum { minimum: f64, unit: String },
     PartialNeedsLot,
-    UnknownMarginMode,
+    Margin(MarginError),
     BadBook(String),
     NoLevel { source: String, available: usize },
     NoPrice(String),
@@ -655,7 +656,7 @@ impl std::fmt::Display for CloseError {
             }
             CloseError::SizeBelowMinimum { minimum, unit } => write!(f, "低于交易所最小下单量 {} {unit}", wire::number(*minimum)),
             CloseError::PartialNeedsLot => write!(f, "读不到合约规格（最小变动单位），只能整笔平掉"),
-            CloseError::UnknownMarginMode => write!(f, "读不到这笔仓位是逐仓还是全仓，平仓单必须和仓位同一种保证金模式，不能猜"),
+            CloseError::Margin(why) => write!(f, "{why}"),
             CloseError::BadBook(why) => write!(f, "盘口数据不可用：{why}"),
             CloseError::NoLevel { source, available } => write!(f, "{source}不存在：盘口这一侧只有 {available} 档"),
             CloseError::NoPrice(why) => write!(f, "{why}"),
@@ -678,14 +679,6 @@ impl std::fmt::Display for CloseError {
                 f, "止损价 {price} 在强平价 {liquidation} {}，仓位会先被强平，这张止损永远等不到触发", if *is_long { "之下" } else { "之上" }),
             CloseError::Wire(why) => write!(f, "{why}"),
         }
-    }
-}
-
-fn margin_name(mode: &str) -> &'static str {
-    match mode {
-        "cross" => "全仓",
-        "isolated" => "逐仓",
-        _ => "现金",
     }
 }
 
@@ -715,16 +708,15 @@ pub fn plan(input: &PlanInput, book: &BookView) -> Result<ClosePlan, CloseError>
     let market = Market::read(book)?;
     let (size, remainder) = close_size(&ticket.size, holding, market.terms.as_ref())?;
 
-    // An order acting on a position states that position's margin mode: a
-    // default of `cross` on an isolated position is an order for a position
-    // that does not exist.
-    let trade_mode = match (holding.family, holding.margin_mode.as_deref()) {
-        (Family::Swap, Some(mode @ ("cross" | "isolated"))) => Some(mode.to_string()),
-        // An option bought outright on a simple account is held for cash.
-        (Family::Option, Some(mode @ ("cross" | "isolated" | "cash"))) => Some(mode.to_string()),
-        (Family::Swap | Family::Option, _) => return Err(CloseError::UnknownMarginMode),
-        (Family::Spot, _) => Some("cash".to_string()),
-        (Family::Stock, _) => None,
+    // An order acting on a position states that position's margin mode
+    // (`margin::position_mode`); a coin is sold as the account books spot.
+    // A share is Schwab's, which has no such field.
+    let trade_mode = match (input.venue, holding.family) {
+        (Venue::Schwab, _) | (_, Family::Stock) => None,
+        (Venue::Okx, family) => Some(
+            margin::position_mode(family, holding.margin_mode.as_deref(), input.account.as_ref().and_then(|a| a.level))
+                .map_err(CloseError::Margin)?,
+        ),
     };
     let side = holding.closing_side();
     let pos_side = if holding.family == Family::Swap { holding.pos_side } else { None };
@@ -945,8 +937,8 @@ pub fn plan(input: &PlanInput, book: &BookView) -> Result<ClosePlan, CloseError>
     }
     let mut account_line = Vec::new();
     match (holding.family, &trade_mode) {
-        (Family::Swap | Family::Option, Some(mode)) => account_line.push(format!("{}（tdMode={mode}）", margin_name(mode))),
-        (Family::Spot, _) => account_line.push("现货（tdMode=cash）".to_string()),
+        (Family::Swap | Family::Option, Some(mode)) => account_line.push(format!("{}（tdMode={mode}）", margin::mode_name(mode))),
+        (Family::Spot, Some(mode)) => account_line.push(format!("现货（tdMode={mode}）")),
         _ => {}
     }
     if let Some(leg) = pos_side {
@@ -1518,7 +1510,15 @@ mod tests {
         let spot = book(&[("2682.45", "10")], &[("2682.44", "8")], spec("SPOT"));
         let plan = plan(&input(coin.clone(), limit(PriceSource::Counterparty { level: 1 }, OrderKind::Limit, SizeRequest::All)), &spot).unwrap();
         assert_eq!(body(&plan)["sz"], "0.040813");
-        assert_eq!(body(&plan)["tdMode"], "cash");
+        assert_eq!(body(&plan)["tdMode"], "cash", "a coin is sold as the account books spot: level 2, cash");
+        assert!(plan.review.lines.iter().any(|l| l.contains("现货（tdMode=cash）")));
+        // At level 3 OKX refuses cash on spot (51000, 2026-10-09): cross.
+        let mut multi = input(coin.clone(), limit(PriceSource::Counterparty { level: 1 }, OrderKind::Limit, SizeRequest::All));
+        multi.account = Some(Account { level: Some(3) });
+        assert_eq!(body(&super::plan(&multi, &spot).unwrap())["tdMode"], "cross");
+        // The level unknown: no guess.
+        multi.account = None;
+        assert_eq!(super::plan(&multi, &spot).unwrap_err(), CloseError::Margin(MarginError::AccountLevelUnknown(Family::Spot)));
         assert!(body(&plan).get("reduceOnly").is_none(), "never on spot");
         assert!((plan.remainder - 0.0000005).abs() < 1e-12);
         assert!(plan.review.lines.iter().any(|l| l.contains("余下 0.0000005 ETH 不足一个最小单位")));
@@ -1542,10 +1542,10 @@ mod tests {
         assert_eq!(b["clOrdId"], "msmanual");
         let mut cash = long_swap(10.0);
         cash.margin_mode = Some("cash".into());
-        assert_eq!(super::plan(&input(cash, limit(PriceSource::Counterparty { level: 1 }, OrderKind::Limit, SizeRequest::All)), &eth_book()).unwrap_err(), CloseError::UnknownMarginMode, "a perpetual is never held for cash");
+        assert_eq!(super::plan(&input(cash, limit(PriceSource::Counterparty { level: 1 }, OrderKind::Limit, SizeRequest::All)), &eth_book()).unwrap_err(), CloseError::Margin(MarginError::PositionModeUnknown), "a perpetual is never held for cash");
         let mut unknown = long_swap(10.0);
         unknown.margin_mode = None;
-        assert_eq!(super::plan(&input(unknown, limit(PriceSource::Counterparty { level: 1 }, OrderKind::Limit, SizeRequest::All)), &eth_book()).unwrap_err(), CloseError::UnknownMarginMode);
+        assert_eq!(super::plan(&input(unknown, limit(PriceSource::Counterparty { level: 1 }, OrderKind::Limit, SizeRequest::All)), &eth_book()).unwrap_err(), CloseError::Margin(MarginError::PositionModeUnknown));
     }
 
     #[test]

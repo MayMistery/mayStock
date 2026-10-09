@@ -141,7 +141,9 @@ public struct SettlementFunding: Sendable, Equatable {
     /// amount of coin acquired is the amount that was planned. Sizing it in
     /// quote units instead would spend a known number of USDT and acquire an
     /// unknown amount of ETH, which is the wrong unknown for this job.
-    public static func spotOrder(for step: Step, clOrdId: String? = nil) -> OrderRequest {
+    /// `tradeMode` is the account's for spot (`ExchangeVenue.prepareLeg`): a
+    /// multi-currency account refuses `cash`.
+    public static func spotOrder(for step: Step, tradeMode: String?, clOrdId: String? = nil) -> OrderRequest {
         OrderRequest(
             instId: step.instId,
             instType: .spot,
@@ -149,6 +151,7 @@ public struct SettlementFunding: Sendable, Equatable {
             kind: .market,
             size: step.buyAmount,
             sizeUnit: .base,
-            clOrdId: clOrdId)
+            clOrdId: clOrdId,
+            tradeMode: tradeMode)
     }
 }

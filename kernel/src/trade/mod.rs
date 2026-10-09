@@ -2,8 +2,12 @@
 //!
 //! The kernel's other network code (`live`) only reads. This module is the one
 //! place that acts on an account, and it can only do what `wire::Action`
-//! names — place, place an algo order, cancel, move a stop, precheck. There is
-//! no path argument anywhere.
+//! names — place, place an algo order, cancel, move a stop, precheck, hold a
+//! leg at a leverage. There is no path argument anywhere.
+//!
+//! How an order is margined is decided here too, never by a default: the
+//! `tdMode` every order states (`margin`), and the leverage a strategy's leg
+//! is held at before it opens (`leg`).
 //!
 //! What it guarantees, each tested against a local stand-in for OKX:
 //!
@@ -23,6 +27,8 @@
 //!   between orders, so an order pays one round trip, not a TLS handshake.
 
 pub mod close;
+pub mod leg;
+pub mod margin;
 pub mod terms;
 pub mod reads;
 pub mod route;
@@ -73,6 +79,30 @@ pub struct ReadRequest {
     pub access: Access,
     #[serde(flatten)]
     pub read: Read,
+}
+
+/// One leg readied for the order about to go out on it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PrepareRequest {
+    #[serde(flatten)]
+    pub access: Access,
+    #[serde(flatten)]
+    pub query: leg::LegQuery,
+}
+
+/// What readying the leg found, and what it took.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Prepared {
+    #[serde(flatten)]
+    pub reply: leg::LegReply,
+    #[serde(flatten)]
+    pub delivery: Delivery,
+}
+
+impl Prepared {
+    pub fn local(reply: leg::LegReply) -> Prepared {
+        Prepared { reply, delivery: Delivery::default() }
+    }
 }
 
 /// What a read found.
@@ -256,6 +286,21 @@ impl TradeClient {
         Sent { outcome, delivery: log.delivery() }
     }
 
+    /// Ready one leg for an order (`leg`): the mode it states, and for a
+    /// strategy opening on a leveraged contract, the leg held at the
+    /// manifest's leverage. Only a query that may set a leverage needs the
+    /// live unlock; the rest only read.
+    pub fn prepare(&self, request: &PrepareRequest) -> Prepared {
+        let credentials = match credentials(&request.access, request.query.may_act()) {
+            Ok(credentials) => credentials,
+            Err((code, reason)) => return Prepared::local(leg::LegReply::Refused { code, reason }),
+        };
+        let log = DeliveryLog::default();
+        let session = self.session(&credentials, &log);
+        let reply = self.runtime.block_on(leg::prepare(&session, &request.query));
+        Prepared { reply, delivery: log.delivery() }
+    }
+
     /// A signed read, blocking the caller.
     pub fn read(&self, request: &ReadRequest) -> Answered {
         self.runtime.block_on(self.answer(request))
@@ -308,6 +353,10 @@ impl TradeClient {
                     reads::account_snapshot(section(trading), section(funding), section(valuation))
                 }
                 Read::AccountConfig => reads::document(&session.get(&reads::account_config_target()).await?),
+                Read::Leverage { inst_id, margin_mode } => {
+                    let body = session.get(&reads::leverage_target(inst_id, margin_mode)?).await?;
+                    serde_json::to_value(reads::parse_leverage(&body)?).map_err(|e| e.to_string())
+                }
                 Read::Fills { family, inst_id } => {
                     reads::document(&session.get(&reads::fills_target(*family, inst_id.as_deref())?).await?)
                 }
@@ -1208,6 +1257,231 @@ mod tests {
         assert!(held.delivery.note.as_deref().is_some_and(|n| n.contains("1 个请求") && n.contains("排队")), "{held:?}");
         let json = serde_json::to_value(&held).unwrap();
         assert!(json["pacedMs"].as_u64().unwrap() >= 1_000 && json["pacedRequests"] == 1);
+    }
+
+    // MARK: Readying a leg
+
+    const POSITIONS_NONE: &str = r#"{"code":"0","msg":"","data":[]}"#;
+
+    fn positions(rows: &[(&str, &str, &str)]) -> String {
+        let rows: Vec<String> = rows.iter().map(|(leg, mode, pos)| format!(
+            r#"{{"instId":"ETH-USDT-SWAP","instType":"SWAP","posSide":"{leg}","mgnMode":"{mode}","pos":"{pos}","lever":"3"}}"#)).collect();
+        format!(r#"{{"code":"0","msg":"","data":[{}]}}"#, rows.join(","))
+    }
+
+    fn leverage_rows(long: &str, short: &str) -> String {
+        format!(r#"{{"code":"0","msg":"","data":[{{"instId":"ETH-USDT-SWAP","mgnMode":"isolated","posSide":"long","lever":"{long}"}},{{"instId":"ETH-USDT-SWAP","mgnMode":"isolated","posSide":"short","lever":"{short}"}}]}}"#)
+    }
+
+    fn leg_query(held: Option<f64>, intent: leg::Intent) -> leg::LegQuery {
+        leg::LegQuery {
+            inst_id: "ETH-USDT-SWAP".into(), family: Family::Swap, pos_side: Some(PosSide::Long),
+            account_level: Some(3), held, lot: 0.01, intent,
+        }
+    }
+
+    fn prepare_request(mode: &str, unlocked: bool, profile: &str, query: leg::LegQuery) -> PrepareRequest {
+        PrepareRequest { access: access(mode, unlocked, profile), query }
+    }
+
+    /// An exchange whose positions and isolated leverage are as given; a
+    /// leverage change it accepts is what it reads back from then on.
+    fn exchange(positions: String, long: &'static str, set_answer: &'static str) -> Behaviour {
+        let set = Arc::new(Mutex::new(None::<String>));
+        Behaviour::Route(Arc::new(move |line: &str| {
+            if line.starts_with("POST /api/v5/account/set-leverage") {
+                if set_answer.contains(r#""code":"0""#) {
+                    *set.lock().unwrap() = Some("10".into());
+                }
+                (200, set_answer.to_string())
+            } else if line.contains("/api/v5/account/leverage-info") {
+                let held = set.lock().unwrap().clone().unwrap_or_else(|| long.to_string());
+                (200, leverage_rows(&held, "3"))
+            } else if line.contains("/api/v5/account/positions") {
+                (200, positions.clone())
+            } else {
+                (404, "{}".into())
+            }
+        }))
+    }
+
+    const SET_OK: &str = r#"{"code":"0","msg":"","data":[{"lever":"10","mgnMode":"isolated","instId":"ETH-USDT-SWAP","posSide":"long"}]}"#;
+
+    #[test]
+    fn an_empty_leg_is_set_to_the_manifests_leverage_and_read_back() {
+        let helper = tokio::runtime::Runtime::new().unwrap();
+        let (base, seen) = server(&helper, exchange(POSITIONS_NONE.into(), "3", SET_OK));
+        let client = TradeClient::with(base, Duration::from_secs(2)).unwrap();
+        let prepared = client.prepare(&prepare_request("demo", false, "paper",
+            leg_query(Some(0.0), leg::Intent::Open { leverage: Some(10.0) })));
+        assert_eq!(prepared.reply, leg::LegReply::Ready {
+            trade_mode: "isolated".into(), leverage: Some(10.0), changed_from: Some(3.0), note: None,
+        }, "{prepared:?}");
+        let seen = seen.lock().unwrap();
+        let set: Vec<&Seen> = seen.iter().filter(|r| r.head.starts_with("POST /api/v5/account/set-leverage")).collect();
+        assert_eq!(set.len(), 1);
+        let body: Value = serde_json::from_str(&set[0].body).unwrap();
+        assert_eq!(body, json!({"instId": "ETH-USDT-SWAP", "lever": "10", "mgnMode": "isolated", "posSide": "long"}));
+        assert_eq!(header(&set[0].head, "x-simulated-trading"), Some("1"));
+        // Read before, and read back after: an accepted change is checked.
+        assert_eq!(seen.iter().filter(|r| r.head.contains("leverage-info")).count(), 2);
+        let json = serde_json::to_value(&prepared).unwrap();
+        assert_eq!(json["outcome"], "ready");
+        assert_eq!(json["tradeMode"], "isolated");
+        assert_eq!(json["changedFrom"], 3.0);
+    }
+
+    #[test]
+    fn a_leg_already_at_the_leverage_is_left_alone() {
+        let helper = tokio::runtime::Runtime::new().unwrap();
+        let (base, seen) = server(&helper, exchange(POSITIONS_NONE.into(), "10", SET_OK));
+        let client = TradeClient::with(base, Duration::from_secs(2)).unwrap();
+        let prepared = client.prepare(&prepare_request("demo", false, "paper",
+            leg_query(Some(0.0), leg::Intent::Open { leverage: Some(10.0) })));
+        assert!(matches!(prepared.reply, leg::LegReply::Ready { changed_from: None, leverage: Some(_), .. }), "{prepared:?}");
+        assert!(seen.lock().unwrap().iter().all(|r| r.head.starts_with("GET ")), "nothing set");
+    }
+
+    #[test]
+    fn a_held_or_foreign_leg_is_refused_and_never_changed() {
+        let cases = [
+            // May's own position on the leg, nothing in the books.
+            (positions(&[("long", "isolated", "186.97")]), Some(0.0), leg::BlockCode::ForeignPosition),
+            // The strategy's own position, at another leverage.
+            (positions(&[("long", "isolated", "5")]), Some(5.0), leg::BlockCode::HeldAtOtherLeverage),
+            // The books hold more than the leg: an exit not booked yet.
+            (POSITIONS_NONE.to_string(), Some(5.0), leg::BlockCode::BookAhead),
+        ];
+        for (held_there, books, expected) in cases {
+            let helper = tokio::runtime::Runtime::new().unwrap();
+            let (base, seen) = server(&helper, exchange(held_there, "3", SET_OK));
+            let client = TradeClient::with(base, Duration::from_secs(2)).unwrap();
+            let prepared = client.prepare(&prepare_request("demo", false, "paper",
+                leg_query(books, leg::Intent::Open { leverage: Some(10.0) })));
+            let leg::LegReply::Blocked { code, .. } = &prepared.reply else { panic!("{prepared:?}") };
+            assert_eq!(*code, expected);
+            assert!(seen.lock().unwrap().iter().all(|r| !r.head.starts_with("POST")), "{expected:?}: no change sent");
+        }
+    }
+
+    #[test]
+    fn a_change_the_exchange_refuses_or_does_not_hold_blocks_the_opening() {
+        let refused = r#"{"code":"59101","msg":"You have pending orders with isolated positions. Please cancel all the pending orders and adjust the leverage.","data":[]}"#;
+        let helper = tokio::runtime::Runtime::new().unwrap();
+        let (base, _) = server(&helper, exchange(POSITIONS_NONE.into(), "3", refused));
+        let client = TradeClient::with(base, Duration::from_secs(2)).unwrap();
+        let prepared = client.prepare(&prepare_request("demo", false, "paper",
+            leg_query(Some(0.0), leg::Intent::Open { leverage: Some(10.0) })));
+        let leg::LegReply::Blocked { code, reason } = &prepared.reply else { panic!("{prepared:?}") };
+        assert_eq!(*code, leg::BlockCode::LeverageRefused);
+        assert!(reason.contains("59101") && reason.contains("3x") && reason.contains("10x"), "{reason}");
+
+        // Accepted, but the leg reads back another leverage: not held.
+        let helper = tokio::runtime::Runtime::new().unwrap();
+        let (base, _) = server(&helper, Behaviour::Route(Arc::new(|line: &str| {
+            if line.starts_with("POST") { (200, SET_OK.to_string()) }
+            else if line.contains("leverage-info") { (200, leverage_rows("3", "3")) }
+            else { (200, POSITIONS_NONE.to_string()) }
+        })));
+        let client = TradeClient::with(base, Duration::from_secs(2)).unwrap();
+        let prepared = client.prepare(&prepare_request("demo", false, "paper",
+            leg_query(Some(0.0), leg::Intent::Open { leverage: Some(10.0) })));
+        assert!(matches!(&prepared.reply, leg::LegReply::Blocked { code: leg::BlockCode::LeverageNotHeld, .. }), "{prepared:?}");
+
+        // No verdict at all: unknown, so not opened, and read again next time.
+        let helper = tokio::runtime::Runtime::new().unwrap();
+        let (base, _) = server(&helper, Behaviour::Route(Arc::new(|line: &str| {
+            if line.starts_with("POST") { (200, r#"{"code":"50004","msg":"API endpoint request timeout","data":[]}"#.to_string()) }
+            else if line.contains("leverage-info") { (200, leverage_rows("3", "3")) }
+            else { (200, POSITIONS_NONE.to_string()) }
+        })));
+        let client = TradeClient::with(base, Duration::from_secs(2)).unwrap();
+        let prepared = client.prepare(&prepare_request("demo", false, "paper",
+            leg_query(Some(0.0), leg::Intent::Open { leverage: Some(10.0) })));
+        assert!(matches!(&prepared.reply, leg::LegReply::Blocked { code: leg::BlockCode::LeverageUnsettled, .. }), "{prepared:?}");
+    }
+
+    #[test]
+    fn only_a_change_needs_the_live_unlock() {
+        let helper = tokio::runtime::Runtime::new().unwrap();
+        let (base, seen) = server(&helper, exchange(POSITIONS_NONE.into(), "10", SET_OK));
+        let client = TradeClient::with(base, Duration::from_secs(2)).unwrap();
+        let locked = client.prepare(&prepare_request("live", false, "real",
+            leg_query(Some(0.0), leg::Intent::Open { leverage: Some(10.0) })));
+        assert!(matches!(locked.reply, leg::LegReply::Refused { code: RefusalCode::LiveLocked, .. }), "{locked:?}");
+        assert!(seen.lock().unwrap().is_empty(), "refused before the network");
+        // Reading the leg, or the mode of a reduction, changes nothing.
+        let read = client.prepare(&prepare_request("live", false, "real", leg_query(None, leg::Intent::Open { leverage: None })));
+        assert!(matches!(read.reply, leg::LegReply::Ready { leverage: Some(_), .. }), "{read:?}");
+        let reduce = client.prepare(&prepare_request("live", false, "real", leg_query(Some(0.0), leg::Intent::Reduce)));
+        assert!(matches!(reduce.reply, leg::LegReply::Ready { .. }), "{reduce:?}");
+        assert!(seen.lock().unwrap().iter().all(|r| r.head.starts_with("GET ") && header(&r.head, "OK-ACCESS-KEY") == Some("k-live")));
+    }
+
+    #[test]
+    fn a_reduction_goes_out_in_its_positions_own_mode_even_unread() {
+        // The demo's own leftover: a short opened before the mode was stated,
+        // held cross.
+        let helper = tokio::runtime::Runtime::new().unwrap();
+        let (base, _) = server(&helper, exchange(positions(&[("short", "cross", "0.01")]), "3", SET_OK));
+        let client = TradeClient::with(base, Duration::from_secs(2)).unwrap();
+        let mut query = leg_query(Some(-0.01), leg::Intent::Reduce);
+        query.pos_side = Some(PosSide::Short);
+        let prepared = client.prepare(&prepare_request("demo", false, "paper", query.clone()));
+        let leg::LegReply::Ready { trade_mode, note, .. } = &prepared.reply else { panic!("{prepared:?}") };
+        assert_eq!(trade_mode, "cross");
+        assert!(note.as_deref().is_some_and(|n| n.contains("全仓")), "{prepared:?}");
+        // The positions cannot be read: the strategy's own mode, said so —
+        // never a refusal to close.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let client = TradeClient::with(format!("http://127.0.0.1:{port}"), Duration::from_secs(2)).unwrap();
+        let prepared = client.prepare(&prepare_request("demo", false, "paper", query));
+        let leg::LegReply::Ready { trade_mode, note, .. } = &prepared.reply else { panic!("{prepared:?}") };
+        assert_eq!(trade_mode, "isolated");
+        assert!(note.as_deref().is_some_and(|n| n.contains("读不到")), "{prepared:?}");
+        assert!(prepared.delivery.retries > 0, "and the retries are reported: {prepared:?}");
+    }
+
+    #[test]
+    fn a_coin_needs_no_network_to_know_its_mode() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let client = TradeClient::with(format!("http://127.0.0.1:{port}"), Duration::from_secs(2)).unwrap();
+        for (level, mode) in [(Some(2), "cash"), (Some(3), "cross")] {
+            for intent in [leg::Intent::Open { leverage: None }, leg::Intent::Reduce] {
+                let query = leg::LegQuery {
+                    inst_id: "BTC-USDT".into(), family: Family::Spot, pos_side: None, account_level: level,
+                    held: Some(0.0), lot: 0.00000001, intent: intent.clone(),
+                };
+                let prepared = client.prepare(&prepare_request("demo", false, "paper", query));
+                assert!(matches!(&prepared.reply, leg::LegReply::Ready { trade_mode, .. } if trade_mode == mode), "{level:?} {intent:?}: {prepared:?}");
+                assert_eq!(prepared.delivery.retries, 0, "no request made");
+            }
+        }
+    }
+
+    #[test]
+    fn requests_to_ready_a_leg_parse_from_the_json_swift_sends() {
+        let text = r#"{"mode":"demo","configPath":"/x","profile":"paper","instId":"ETH-USDT-SWAP","family":"SWAP","posSide":"short","accountLevel":2,"held":-3.5,"lot":0.01,"intent":"open","leverage":1}"#;
+        let request: PrepareRequest = serde_json::from_str(text).unwrap();
+        assert_eq!(request.query.intent, leg::Intent::Open { leverage: Some(1.0) });
+        assert_eq!(request.query.held, Some(-3.5));
+        assert_eq!(request.query.pos_side, Some(PosSide::Short));
+        assert!(request.query.may_act());
+    }
+
+    #[test]
+    fn a_legs_leverage_is_read_on_its_own() {
+        let helper = tokio::runtime::Runtime::new().unwrap();
+        let (base, seen) = server(&helper, exchange(POSITIONS_NONE.into(), "3", SET_OK));
+        let client = TradeClient::with(base, Duration::from_secs(2)).unwrap();
+        let answered = client.read(&ReadRequest {
+            access: access("demo", false, "paper"),
+            read: Read::Leverage { inst_id: "ETH-USDT-SWAP".into(), margin_mode: "isolated".into() },
+        });
+        let ReadReply::Ok { data } = answered.reply else { panic!("{answered:?}") };
+        assert_eq!(data[0]["posSide"], "long");
+        assert_eq!(data[0]["leverage"], 3.0);
+        assert!(seen.lock().unwrap()[0].head.starts_with("GET /api/v5/account/leverage-info?instId=ETH-USDT-SWAP&mgnMode=isolated"));
     }
 
     #[test]

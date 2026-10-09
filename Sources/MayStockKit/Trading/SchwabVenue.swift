@@ -131,6 +131,16 @@ public struct SchwabVenue: ExchangeVenue {
 
     // MARK: Trading
 
+    /// Shares carry no margin mode and no leverage of their own: Schwab
+    /// lends under Regulation T, on the account, and a manifest's leverage is
+    /// the cap its sizing stays inside (`InstrumentType.stock`'s regime). So
+    /// there is nothing to set and no mode to state; anything but a share is
+    /// not this venue's.
+    public func prepareLeg(_ leg: LegPreparation, mode: TradingMode, liveUnlocked: Bool) async throws -> LegReadiness {
+        guard leg.instType == .stock else { throw TradeError.unsupportedInstrument(leg.instType) }
+        return LegReadiness(tradeMode: nil)
+    }
+
     public func place(_ order: OrderRequest, mode: TradingMode, liveUnlocked: Bool) async throws -> OrderResult {
         guard order.instType == .stock else { throw TradeError.unsupportedInstrument(order.instType) }
         switch mode {
@@ -390,8 +400,9 @@ public struct SchwabVenue: ExchangeVenue {
         }
     }
 
+    /// Shares have no margin mode to state: `tradeMode` is the OKX field.
     public func placeProtectiveOrder(
-        instId: String, instType: InstrumentType, posSide: PositionSide?,
+        instId: String, instType: InstrumentType, posSide: PositionSide?, tradeMode: String?,
         size: Double, stopPrice: Double, mode: TradingMode, liveUnlocked: Bool
     ) async throws {
         switch mode {
@@ -444,13 +455,13 @@ public struct SchwabVenue: ExchangeVenue {
             // Schwab returns a stop's id in a header this channel does not
             // surface; the ticket re-reads the working orders to show it.
             try await placeProtectiveOrder(
-                instId: algo.instId, instType: algo.instType, posSide: nil,
+                instId: algo.instId, instType: algo.instType, posSide: nil, tradeMode: nil,
                 size: algo.size, stopPrice: stop, mode: mode, liveUnlocked: liveUnlocked)
             return ""
         case .cancel(_, let id), .cancelAlgo(_, let id):
             try await cancel(id: id, mode: mode, liveUnlocked: liveUnlocked)
             return id
-        case .amendStop, .precheck:
+        case .amendStop, .precheck, .setLeverage:
             throw TradeError.refused("嘉信通道没有这个操作")
         }
     }
