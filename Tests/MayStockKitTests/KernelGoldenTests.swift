@@ -115,7 +115,7 @@ struct KernelGoldenTests {
     /// on its signal, pinning nothing about trailing stops.
     private func check(
         _ name: String, _ manifestJSON: String, bars: [Candle],
-        capital: Double = 30_000, exercises: Set<KernelExitReason> = [], expect expected: Golden
+        capital: Double = 30_000, exercises: Set<TradeExitReason> = [], expect expected: Golden
     ) throws {
         let strategy = try KernelStrategy(manifestJSON: manifestJSON)
         let result = try strategy.backtest(

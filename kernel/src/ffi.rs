@@ -965,6 +965,22 @@ pub unsafe extern "C" fn ms_instrument_policy(
     })
 }
 
+// MARK: - Exit reasons
+
+/// Every reason a backtest trade can end with, in the kernel's spelling, as a
+/// JSON array (`backtest::ExitReason::ALL`). The app keeps its own enum for
+/// the labels; its test holds that enum to exactly this list, so a reason
+/// added on one side can neither fail to decode nor read as another on the
+/// other. Caller frees.
+#[no_mangle]
+pub unsafe extern "C" fn ms_exit_reasons(error_out: *mut *mut c_char) -> *mut c_char {
+    guarded(error_out, ptr::null_mut(), || {
+        serde_json::to_string(&backtest::ExitReason::ALL)
+            .map(to_c_string)
+            .map_err(|e| e.to_string())
+    })
+}
+
 // MARK: - Fills
 
 /// Every key each fill record carries, strongest first: a JSON array of

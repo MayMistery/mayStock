@@ -38,6 +38,14 @@ public enum TradingKernel {
             return decoded.map { $0 ?? .nan }
         }
     }
+
+    /// The reasons the kernel can end a backtest trade with, in its own
+    /// spelling. `TradeExitReason` names exactly these — its test holds it to
+    /// this list rather than to one written out a second time.
+    public static func exitReasons() throws -> [String] {
+        let json = try callReturningString { error in ms_exit_reasons(error) }
+        return try JSONDecoder().decode([String].self, from: Data(json.utf8))
+    }
 }
 
 // MARK: - Errors

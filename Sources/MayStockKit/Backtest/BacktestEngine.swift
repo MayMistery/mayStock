@@ -129,12 +129,31 @@ public enum TradeDirection: String, Sendable, Equatable, Codable {
     }
 }
 
-public enum TradeExitReason: String, Sendable, Equatable, Codable {
-    case signal, stopLoss, takeProfit, trailingStop, liquidation, dailyLossHalt, endOfData
+/// Why a backtest trade ended: the kernel's reasons (`ExitReason` in
+/// `kernel/src/backtest/mod.rs`), decoded straight from its result. A reason
+/// the kernel adds and this does not name fails the decode, loudly, rather
+/// than reading as some other reason; the test holds the two lists equal.
+public enum TradeExitReason: String, Sendable, Equatable, Codable, CaseIterable {
+    case signal
+    /// The opposite entry fired while holding: the first leg of a reversal.
+    case reversal
+    case stopLoss, takeProfit, trailingStop, liquidation, dailyLossHalt, endOfData
     /// An option contract reached settlement and paid its intrinsic value.
     case expiry
 
-    public var displayName: String { KernelExitReason(rawValue: rawValue)?.displayName ?? rawValue }
+    public var displayName: String {
+        switch self {
+        case .signal: return "信号平仓"
+        case .reversal: return "反手"
+        case .stopLoss: return "止损"
+        case .takeProfit: return "止盈"
+        case .trailingStop: return "移动止损"
+        case .liquidation: return "强平"
+        case .dailyLossHalt: return "日内熔断"
+        case .endOfData: return "回测结束"
+        case .expiry: return "到期结算"
+        }
+    }
 }
 
 public struct BacktestTrade: Sendable, Equatable, Identifiable {
@@ -337,6 +356,6 @@ extension BacktestTrade {
             quantity: t.quantity, notional: t.notional,
             grossPnL: t.grossPnL, fees: t.fees, funding: t.funding,
             netPnL: t.netPnL, returnPct: t.returnPct, bars: t.bars,
-            exitReason: TradeExitReason(rawValue: t.exitReason.rawValue) ?? .signal)
+            exitReason: t.exitReason)
     }
 }

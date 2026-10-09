@@ -201,9 +201,12 @@ pub struct LiveDecision {
     pub warming_up: bool,
     /// Set when a computed order was refused before it could be sent.
     ///
-    /// The plan is still reported in full — the caller needs to show what the
-    /// strategy wanted, not just that it was stopped — but `should_trade` is
-    /// false and this says why.
+    /// Refused whole, the plan is still reported in full — the caller needs to
+    /// show what the strategy wanted, not just that it was stopped — but
+    /// `should_trade` is false and this says why. A reversal refused only in
+    /// its opening half still closes (`guard::admit`): the decision is then
+    /// the flat position it leaves, and this says why the other side was not
+    /// opened.
     pub denied: Option<crate::guard::OrderDenied>,
     /// Set when the candle series is not fit to trade on. Distinct from
     /// warming up: there is enough data, it is just not trustworthy.
@@ -309,6 +312,16 @@ impl Default for AccountState {
             limits: crate::guard::OrderLimits::default(),
             entry_price: 0.0,
         }
+    }
+}
+
+/// The status line for a refused order: the guard's reason, and — when only
+/// a reversal's opening half was refused — that the close still goes.
+fn refused_reason(refusal: &crate::guard::OrderDenied, closing_only: bool) -> String {
+    if closing_only {
+        format!("{}；反手只平仓、不开新仓", refusal.reason)
+    } else {
+        refusal.reason.clone()
     }
 }
 
@@ -534,19 +547,21 @@ pub fn decide_live(
         // same threshold the backtester honours.
         let threshold = strategy.manifest.risk.rebalance_threshold.max(0.0);
         let drift = (effective - current_exposure).abs();
-        let delta = target_base - account.held_base;
-        let denied = crate::guard::check_order(
-            delta, account.held_base, price, account.equity, strategy.max_notional_multiple(), &account.limits);
+        let wanted = target_base - account.held_base;
+        let admission = crate::guard::admit(
+            wanted, account.held_base, price, account.equity, strategy.max_notional_multiple(), &account.limits);
+        let closing_only = admission.denied.is_some() && admission.base_delta != 0.0;
+        let (effective, target_base) = if closing_only { (0.0, 0.0) } else { (effective, target_base) };
 
         return Ok(LiveDecision {
             target: if effective > 1e-9 { 1 } else if effective < -1e-9 { -1 } else { 0 },
             target_exposure: effective,
             target_base_quantity: target_base,
-            base_delta: delta,
-            should_trade: drift >= threshold && denied.is_none(),
+            base_delta: if closing_only { admission.base_delta } else { wanted },
+            should_trade: drift >= threshold && admission.base_delta.abs() > 1e-12,
             halt_daily_loss: false,
-            reason: if let Some(refusal) = &denied {
-                refusal.reason.clone()
+            reason: if let Some(refusal) = &admission.denied {
+                refused_reason(refusal, closing_only)
             } else if drift >= threshold {
                 format!("敞口 {current_exposure:.3} → {effective:.3}")
             } else {
@@ -560,7 +575,7 @@ pub fn decide_live(
             stop_price: None,
             take_profit_price: None,
             trailing_stop_price: None,
-            denied,
+            denied: admission.denied,
             data_quality: None,
             option_plan: None,
         });
@@ -679,20 +694,27 @@ pub fn decide_live(
         }
     }
 
-    let delta = target_base - account.held_base;
-    let denied = crate::guard::check_order(
-        delta, account.held_base, price, account.equity, strategy.max_notional_multiple(), &account.limits);
+    let wanted = target_base - account.held_base;
+    let admission = crate::guard::admit(
+        wanted, account.held_base, price, account.equity, strategy.max_notional_multiple(), &account.limits);
+    // A reversal refused only in its opening half still closes; the decision
+    // is then the flat position that leaves, with nothing attached to it.
+    let closing_only = admission.denied.is_some() && admission.base_delta != 0.0;
+    let (target, target_base) = if closing_only { (None, 0.0) } else { (target, target_base) };
+    if closing_only {
+        (stop_price, take_profit_price) = (None, None);
+    }
     Ok(LiveDecision {
-        denied: denied.clone(),
+        denied: admission.denied.clone(),
         data_quality: None,
         target: Direction::to_i32(target),
         target_exposure: f64::NAN,
         target_base_quantity: target_base,
-        base_delta: delta,
-        should_trade: delta.abs() > 1e-12 && denied.is_none(),
+        base_delta: if closing_only { admission.base_delta } else { wanted },
+        should_trade: admission.base_delta.abs() > 1e-12,
         halt_daily_loss: false,
-        reason: match (&denied, target) {
-            (Some(refusal), _) => refusal.reason.clone(),
+        reason: match (&admission.denied, target) {
+            (Some(refusal), _) => refused_reason(refusal, closing_only),
             (None, Some(d)) => format!("信号{}", if d == Direction::Long { "做多" } else { "做空" }),
             (None, None) => "信号平仓".to_string(),
         },
@@ -971,6 +993,76 @@ mod tests {
             desired_direction(9, Some(Direction::Long), 0, 0, None, None, None, None, None, Some(&targets)),
             Some(Direction::Long)
         );
+    }
+
+    // MARK: Reversals and the guard
+
+    /// Held long at full size on a perpetual; every bar's signal says short.
+    fn reversing(leverage: f64, exposure: bool) -> CompiledStrategy {
+        let signals = if exposure {
+            r#"{"exposure":"-1"}"#
+        } else {
+            r#"{"longEntry":"close < 0","shortEntry":"close > 0"}"#
+        };
+        let json = format!(
+            r#"{{"id":"rv","market":{{"instId":"BTC-USDT-SWAP","instType":"SWAP","bar":"1H"}},
+                 "signals":{signals},"sizing":{{"mode":"equityPct","value":100}},
+                 "risk":{{"leverage":{leverage},"rebalanceThreshold":0.01}}}}"#
+        );
+        CompiledStrategy::compile(serde_json::from_str(&json).unwrap(), &[]).unwrap()
+    }
+
+    fn decide_reversal(strategy: &CompiledStrategy, leverage: f64, limits: crate::guard::OrderLimits) -> LiveDecision {
+        let candles: Vec<Candle> = (0..30).map(|i| bar(i * 3_600_000, 100.0, 100.5, 99.5, 100.0)).collect();
+        let held = 10_000.0 * leverage / 100.0;
+        decide_live(
+            strategy, &candles, Some(Direction::Long), 5, &std::collections::HashMap::new(),
+            AccountState { equity: 10_000.0, held_base: held, entry_price: 100.0, limits, ..AccountState::default() },
+        )
+        .unwrap()
+    }
+
+    /// A full-size reversal is one full-size position closed and one opened:
+    /// sent whole, at any leverage, binary or continuous. The guard used to
+    /// judge the whole order — twice the position — as an entry, and refused
+    /// every one of them, close included.
+    #[test]
+    fn a_full_size_reversal_is_sent_whole() {
+        for exposure in [false, true] {
+            for leverage in [1.0, 10.0, crate::strategy::InstrumentType::Swap.max_leverage()] {
+                let decision = decide_reversal(&reversing(leverage, exposure), leverage, Default::default());
+                let held = 10_000.0 * leverage / 100.0;
+                assert!(decision.should_trade && decision.denied.is_none(),
+                        "{leverage}x exposure={exposure}: {}", decision.reason);
+                assert!((decision.base_delta + 2.0 * held).abs() < 1e-6 * held, "{}", decision.base_delta);
+                assert_eq!(decision.target, -1);
+            }
+        }
+    }
+
+    /// When the book may only reduce, or the new side is over the per-order
+    /// cap, a reversal still closes — the decision is the flat position, and
+    /// the status line says the other side was not opened. A halt sends
+    /// nothing.
+    #[test]
+    fn a_reversal_the_book_cannot_open_still_closes() {
+        use crate::guard::{OrderLimits, TradingState};
+        for exposure in [false, true] {
+            let strategy = reversing(3.0, exposure);
+            for limits in [
+                OrderLimits { max_order_notional: None, state: TradingState::Reducing },
+                OrderLimits { max_order_notional: Some(1_000.0), state: TradingState::Active },
+            ] {
+                let decision = decide_reversal(&strategy, 3.0, limits);
+                assert!(decision.should_trade, "{limits:?}: {}", decision.reason);
+                assert!((decision.base_delta + 300.0).abs() < 1e-9, "closes the 300 held: {}", decision.base_delta);
+                assert_eq!((decision.target, decision.target_base_quantity), (0, 0.0));
+                assert!(decision.denied.is_some() && decision.reason.contains("反手只平仓"), "{}", decision.reason);
+                assert!(decision.stop_price.is_none() && decision.take_profit_price.is_none());
+            }
+            let halted = OrderLimits { max_order_notional: None, state: TradingState::Halted };
+            assert!(!decide_reversal(&strategy, 3.0, halted).should_trade);
+        }
     }
 
     // MARK: Trailing stop

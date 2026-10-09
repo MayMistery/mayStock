@@ -319,30 +319,11 @@ public struct KernelTrade: Decodable, Sendable, Equatable {
     public let netPnL: Double
     public let returnPct: Double
     public let bars: Int
-    public let exitReason: KernelExitReason
+    public let exitReason: TradeExitReason
 
     public var isWin: Bool { netPnL > 0 }
     public var entryTime: Date { Date(timeIntervalSince1970: Double(entryTs) / 1000) }
     public var exitTime: Date { Date(timeIntervalSince1970: Double(exitTs) / 1000) }
-}
-
-public enum KernelExitReason: String, Decodable, Sendable, Equatable {
-    case signal, stopLoss, takeProfit, trailingStop, liquidation, dailyLossHalt, endOfData
-    /// An option contract reached settlement and paid its intrinsic value.
-    case expiry
-
-    public var displayName: String {
-        switch self {
-        case .signal: return "信号平仓"
-        case .stopLoss: return "止损"
-        case .takeProfit: return "止盈"
-        case .trailingStop: return "移动止损"
-        case .liquidation: return "强平"
-        case .dailyLossHalt: return "日内熔断"
-        case .endOfData: return "回测结束"
-        case .expiry: return "到期结算"
-        }
-    }
 }
 
 public struct KernelEquityPoint: Decodable, Sendable, Equatable {

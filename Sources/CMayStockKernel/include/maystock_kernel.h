@@ -150,6 +150,10 @@ int32_t ms_calendar_is_open(const char *market_json, int64_t ts_ms, char **error
  * frees; NULL with error_out set on an unknown type. */
 char *ms_instrument_policy(const char *inst_type, char **error_out);
 
+/* Every reason a backtest trade can end with, in the kernel's spelling, as a
+ * JSON array. The app's own enum is tested against it. Caller frees. */
+char *ms_exit_reasons(char **error_out);
+
 /* Run a whole parameter sweep inside the kernel: every grid point evaluated in
  * parallel, only metrics returned, plus the deflated-Sharpe and overfitting
  * assessment of the winner. Request JSON carries config, grid, threads,

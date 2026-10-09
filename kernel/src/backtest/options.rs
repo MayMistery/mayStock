@@ -165,24 +165,28 @@ pub fn run(
 
         // --- 2. Orders decided at the previous close fill at this open.
         if let Some(target) = pending_target.take() {
-            let cooldown_reference = last_exit_index;
+            // A reversal swaps the contract whatever the cooldown, as on the
+            // binary path and live: the cooldown gates an entry from flat.
+            let mut reversing = false;
             if let Some(open) = position.as_ref() {
                 if Some(open.kind.direction()) != target {
+                    reversing = target.is_some();
                     let exit = premium(open, candle.open, candle.ts_ms, sigma_prev) * (1.0 - slippage);
                     let fee = options::option_fee(
                         &costs.fees, OrderSide::Sell, candle.open, exit, open.units,
                         spec.fee_cap_pct_of_premium);
                     close_position(
                         &mut position, exit, fee, candle.ts_ms, index,
-                        ExitReason::Signal, &mut cash, &mut trades,
+                        if reversing { ExitReason::Reversal } else { ExitReason::Signal },
+                        &mut cash, &mut trades,
                     );
                     last_exit_index = Some(index);
                 }
             }
             if position.is_none() && halted_day.is_none() {
                 if let Some(direction) = target {
-                    let since_exit = cooldown_reference.map(|exit| index - exit);
-                    if can_enter(since_exit, manifest.risk.cooldown_bars) {
+                    let since_exit = last_exit_index.map(|exit| index - exit);
+                    if reversing || can_enter(since_exit, manifest.risk.cooldown_bars) {
                         open_position(
                             strategy, &spec, &mut position, direction, candle.open,
                             candle.ts_ms, index, sigma_prev, slippage, &costs.fees,
@@ -548,6 +552,37 @@ mod tests {
         for trade in &result.trades {
             let entry_index = bars.iter().position(|c| c.ts_ms == trade.entry_ts).unwrap();
             assert!(entry_index > strategy.warmup_bars);
+        }
+    }
+
+    /// The option path keeps the reversal rule too: the second swap falls
+    /// inside the first one's cooldown and still buys the other contract.
+    #[test]
+    fn a_chained_reversal_inside_the_cooldown_still_swaps_the_contract() {
+        let config = BacktestConfig::default();
+        // A rally long enough to prime the volatility window, then a slide
+        // and a rally of a few bars each: two reversals well inside 200 bars.
+        let mut bars = drifting(120, 0.003);
+        for per_bar in [-0.003, 0.003] {
+            let tail = drifting(12, per_bar);
+            let scale = bars.last().unwrap().close / tail[0].open;
+            let resume = bars.last().unwrap().ts_ms;
+            bars.extend(tail.iter().enumerate().map(|(i, c)| Candle {
+                ts_ms: resume + (i as i64 + 1) * 3_600_000,
+                open: c.open * scale, high: c.high * scale, low: c.low * scale,
+                close: c.close * scale, volume: 1.0, confirmed: 1,
+            }));
+        }
+        let strategy = strategy(
+            r#"{"longEntry":"close > ref(close, 3)","shortEntry":"close < ref(close, 3)"}"#,
+            r#","cooldownBars":200"#, r#"{"minDaysToExpiry": 14}"#);
+        let result = run(&strategy, &bars, &config).unwrap();
+        let reversals: Vec<&Trade> =
+            result.trades.iter().filter(|t| t.exit_reason == ExitReason::Reversal).collect();
+        assert!(reversals.len() >= 2, "{:?}", result.trades.iter().map(|t| t.exit_reason).collect::<Vec<_>>());
+        for closed in reversals {
+            assert!(result.trades.iter().any(|t| t.entry_ts == closed.exit_ts && t.direction != closed.direction),
+                    "the swap at {} sold one contract and bought nothing", closed.exit_ts);
         }
     }
 

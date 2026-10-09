@@ -80,6 +80,9 @@ pub fn run(
     let mut trades: Vec<Trade> = Vec::new();
     let mut equity_curve: Vec<EquityPoint> = Vec::with_capacity(candles.len());
     let mut pending_target_quantity: Option<f64> = None;
+    // Whether the pending order is the daily-loss breaker standing the
+    // position down, so its close says so rather than "signal".
+    let mut pending_halt = false;
 
     let funding_by_bar = bucket_funding(&candles, &manifest.market.bar, &config.funding_rates);
     let first_tradable = strategy.warmup_bars.min(candles.len() - 1);
@@ -108,6 +111,7 @@ pub fn run(
         }
 
         // --- 1. Execute the adjustment decided at the previous close.
+        let halting = std::mem::take(&mut pending_halt);
         if let Some(target) = pending_target_quantity.take() {
             let delta = target - quantity;
             if delta.abs() > 1e-12 {
@@ -198,7 +202,13 @@ pub fn run(
                             0.0
                         },
                         bars: index - entry_index,
-                        exit_reason: ExitReason::Signal,
+                        exit_reason: if halting {
+                            ExitReason::DailyLossHalt
+                        } else if flipped {
+                            ExitReason::Reversal
+                        } else {
+                            ExitReason::Signal
+                        },
                     });
                     // Only the closed share's costs are consumed; the rest
                     // stays with the position that is still open.
@@ -283,6 +293,7 @@ pub fn run(
                 accrued_funding = 0.0;
                 entry_equity = equity;
                 pending_target_quantity = None;
+                pending_halt = false;
             }
         }
 
@@ -299,6 +310,7 @@ pub fn run(
                 // today. The runner does the same thing.
                 if quantity != 0.0 {
                     pending_target_quantity = Some(0.0);
+                    pending_halt = true;
                 }
             }
         }
@@ -331,12 +343,17 @@ pub fn run(
                 let current_exposure = quantity * candle.close / marked_equity;
                 // Only trade when the drift is worth the fee.
                 if (effective - current_exposure).abs() >= threshold {
-                    match crate::guard::check_order(
+                    // What the runner would send (`guard::admit`): the order,
+                    // the close alone when only a flip's opening half is
+                    // refused, or nothing.
+                    let admission = crate::guard::admit(
                         target_quantity - quantity, quantity, price, marked_equity,
-                        strategy.max_notional_multiple(), &limits)
-                    {
-                        Some(denied) => refusals.note(denied),
-                        None => pending_target_quantity = Some(target_quantity),
+                        strategy.max_notional_multiple(), &limits);
+                    if let Some(denied) = admission.denied {
+                        refusals.note(denied);
+                    }
+                    if admission.base_delta != 0.0 {
+                        pending_target_quantity = Some(quantity + admission.base_delta);
                     }
                 }
             }
@@ -488,6 +505,29 @@ mod tests {
             guarded.final_equity,
             unguarded.final_equity
         );
+    }
+
+    /// One order that closes one side and opens the other books its closing
+    /// leg as a reversal, and the breaker's stand-down as the breaker — both
+    /// used to read "signal".
+    #[test]
+    fn a_flip_is_a_reversal_and_the_breakers_close_says_so() {
+        let json = r#"{"id":"flip","name":"flip",
+             "market":{"instId":"BTC-USDT-SWAP","instType":"SWAP","bar":"1H"},
+             "signals":{"exposure":"sign(19.5 - bar_index)"},
+             "sizing":{"mode":"equityPct","value":100},
+             "risk":{"leverage":1,"rebalanceThreshold":0.01}}"#;
+        let flips = CompiledStrategy::compile(serde_json::from_str::<Manifest>(json).unwrap(), &[]).unwrap();
+        let bars: Vec<Candle> = (0..40)
+            .map(|i| Candle { ts_ms: i * 3_600_000, open: 100.0, high: 100.5, low: 99.5, close: 100.0, volume: 1.0, confirmed: 1 })
+            .collect();
+        let result = run(&flips, &bars, &BacktestConfig::default()).unwrap();
+        assert_eq!(result.trades.iter().filter(|t| t.exit_reason == ExitReason::Reversal).count(), 1,
+                   "{:?}", result.trades.iter().map(|t| t.exit_reason).collect::<Vec<_>>());
+
+        let halted = run(&strategy(r#","maxDailyLossPct":3"#, 1.0), &falling(60, 0.01), &BacktestConfig::default()).unwrap();
+        assert!(halted.trades.iter().any(|t| t.exit_reason == ExitReason::DailyLossHalt),
+                "{:?}", halted.trades.iter().map(|t| t.exit_reason).collect::<Vec<_>>());
     }
 
     #[test]

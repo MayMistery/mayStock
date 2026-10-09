@@ -89,7 +89,7 @@ pub fn check_order(
         });
     }
 
-    let reduces = reduces_exposure(base_delta, held_base);
+    let opening = opening_base(base_delta, held_base);
     match limits.state {
         TradingState::Halted => {
             return Some(OrderDenied {
@@ -97,7 +97,7 @@ pub fn check_order(
                 by_policy: true,
             })
         }
-        TradingState::Reducing if !reduces => {
+        TradingState::Reducing if opening > 0.0 => {
             return Some(OrderDenied {
                 reason: "当前仅允许减仓".to_string(),
                 by_policy: true,
@@ -106,15 +106,18 @@ pub fn check_order(
         _ => {}
     }
 
-    // Size limits are deliberately *not* applied to a reduction. Refusing to
-    // close is how a protective limit turns into the thing it was meant to
-    // prevent, and the exposure being closed was already permitted when it was
-    // opened.
-    if reduces {
+    // Size limits judge the exposure an order *adds*, never what it closes.
+    // Refusing to close is how a protective limit turns into the thing it was
+    // meant to prevent, and the exposure being closed was already permitted
+    // when it was opened. That holds for the closing half of a reversal too:
+    // judged whole, a full-size reversal is twice its position, and every one
+    // of them — at any leverage — read as a runaway and was refused, leaving
+    // the position its signal had turned against.
+    if opening == 0.0 {
         return None;
     }
 
-    let notional = base_delta.abs() * price;
+    let notional = opening * price;
     if let Some(cap) = limits.max_order_notional {
         if notional > cap {
             return Some(OrderDenied {
@@ -139,17 +142,61 @@ pub fn check_order(
     None
 }
 
-/// Does this order move the position towards flat?
-///
-/// A delta that overshoots through zero into the opposite side does *not*
-/// count: it closes one position and opens another, and the opening half
-/// deserves the same scrutiny as any other entry.
-pub fn reduces_exposure(base_delta: f64, held_base: f64) -> bool {
-    if held_base == 0.0 {
-        return false;
+/// The part of an order that adds exposure, in coins: all of it from flat or
+/// when adding to a position, the overshoot past flat when it reverses one,
+/// nothing when it only reduces. A reversal closes one position and opens
+/// another, and the opening half deserves the same scrutiny as any entry —
+/// that half, not the whole.
+pub fn opening_base(base_delta: f64, held_base: f64) -> f64 {
+    if held_base == 0.0 || (base_delta > 0.0) == (held_base > 0.0) {
+        return base_delta.abs();
     }
-    let opposing = (base_delta > 0.0) != (held_base > 0.0);
-    opposing && base_delta.abs() <= held_base.abs() + 1e-12
+    let overshoot = base_delta.abs() - held_base.abs();
+    if overshoot > 1e-12 { overshoot } else { 0.0 }
+}
+
+/// Does this order only move the position towards flat?
+pub fn reduces_exposure(base_delta: f64, held_base: f64) -> bool {
+    held_base != 0.0 && base_delta != 0.0 && opening_base(base_delta, held_base) == 0.0
+}
+
+/// What an order may actually send.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Admission {
+    /// Coins to send, signed: the order as asked, the close alone, or zero.
+    pub base_delta: f64,
+    /// Why the order — or, when the close alone goes, its opening half — was
+    /// refused.
+    pub denied: Option<OrderDenied>,
+}
+
+/// The whole order when the guard allows it. When it reverses a position and
+/// the whole is refused — its opening half too large, or the book only
+/// reducing — the close alone, which every state but a halt allows: a refusal
+/// must never keep a position its signal has turned against
+/// (`TradingState::Reducing` exists so that closing stays available).
+/// Nothing at all only when even the close is refused.
+///
+/// The live decision and the backtest both send what this admits, so a
+/// refused reversal is the same flat position in both.
+pub fn admit(
+    base_delta: f64,
+    held_base: f64,
+    price: f64,
+    equity: f64,
+    max_multiple: f64,
+    limits: &OrderLimits,
+) -> Admission {
+    let Some(denied) = check_order(base_delta, held_base, price, equity, max_multiple, limits) else {
+        return Admission { base_delta, denied: None };
+    };
+    let reverses = held_base != 0.0
+        && (base_delta > 0.0) != (held_base > 0.0)
+        && opening_base(base_delta, held_base) > 0.0;
+    if reverses && check_order(-held_base, held_base, price, equity, max_multiple, limits).is_none() {
+        return Admission { base_delta: -held_base, denied: Some(denied) };
+    }
+    Admission { base_delta: 0.0, denied: Some(denied) }
 }
 
 #[cfg(test)]
@@ -248,5 +295,59 @@ mod tests {
         assert!(reduces_exposure(1.0, -5.0));
         assert!(!reduces_exposure(1.0, 5.0));
         assert!(!reduces_exposure(1.0, 0.0), "from flat, nothing is a reduction");
+        assert!(!reduces_exposure(-9.0, 5.0), "a reversal opens the other side");
+    }
+
+    #[test]
+    fn the_opening_part_of_an_order_is_what_it_adds() {
+        for (delta, held, opening) in [
+            (3.0, 0.0, 3.0),    // from flat
+            (-3.0, 0.0, 3.0),
+            (2.0, 5.0, 2.0),    // adding
+            (-2.0, 5.0, 0.0),   // trimming
+            (-5.0, 5.0, 0.0),   // closing
+            (-9.0, 5.0, 4.0),   // reversing: the overshoot
+            (9.0, -5.0, 4.0),
+        ] {
+            assert!((opening_base(delta, held) - opening).abs() < 1e-12, "{delta} on {held}");
+        }
+    }
+
+    /// Walks every instrument that can be reversed, at every whole leverage it
+    /// allows: a full-size reversal — twice the position in one order — must
+    /// pass, because what it opens is one full-size position. Judged whole it
+    /// read as a runaway at every leverage, and live the reversal (close
+    /// included) was refused.
+    #[test]
+    fn a_full_size_reversal_passes_at_every_leverage() {
+        let equity = 10_000.0;
+        let price = 100.0;
+        for inst_type in InstrumentType::ALL.into_iter().filter(|t| t.allows_short() && !t.is_option()) {
+            let mut leverage = 1.0;
+            while leverage <= inst_type.max_leverage() {
+                let held = equity * leverage / price;
+                let denied = check_order(-2.0 * held, held, price, equity, leverage, &OrderLimits::default());
+                assert!(denied.is_none(), "{inst_type:?} {leverage}x: {denied:?}");
+                leverage += 1.0;
+            }
+        }
+    }
+
+    /// A reversal refused whole still closes: its opening half too large for
+    /// the per-order cap, or the book only reducing. Only a halt sends nothing.
+    #[test]
+    fn a_refused_reversal_still_closes() {
+        let capped = OrderLimits { max_order_notional: Some(300.0), state: TradingState::Active };
+        let reducing = OrderLimits { max_order_notional: None, state: TradingState::Reducing };
+        for limits in [capped, reducing] {
+            let admitted = admit(-9.0, 5.0, 100.0, 10_000.0, 1.0, &limits);
+            assert_eq!(admitted.base_delta, -5.0, "{limits:?}");
+            assert!(admitted.denied.is_some(), "the refused half is reported");
+        }
+        let halted = OrderLimits { max_order_notional: None, state: TradingState::Halted };
+        assert_eq!(admit(-9.0, 5.0, 100.0, 10_000.0, 1.0, &halted).base_delta, 0.0);
+        // An entry refused outright sends nothing; one allowed goes whole.
+        assert_eq!(admit(9.0, 0.0, 100.0, 10_000.0, 1.0, &capped).base_delta, 0.0);
+        assert_eq!(admit(2.0, 0.0, 100.0, 10_000.0, 1.0, &capped), Admission { base_delta: 2.0, denied: None });
     }
 }

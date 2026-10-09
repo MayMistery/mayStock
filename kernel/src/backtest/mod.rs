@@ -96,6 +96,11 @@ impl Default for BacktestConfig {
 #[serde(rename_all = "camelCase")]
 pub enum ExitReason {
     Signal,
+    /// The opposite entry fired while holding: this close is the first leg
+    /// of a reversal, and the new side opens on the same fill. Its own name
+    /// because a report where most exits read "signal" hides whether a
+    /// strategy leaves by its exit rule or is turned over by the other side.
+    Reversal,
     StopLoss,
     TakeProfit,
     TrailingStop,
@@ -104,6 +109,22 @@ pub enum ExitReason {
     EndOfData,
     /// An option contract reached its settlement and paid its intrinsic value.
     Expiry,
+}
+
+impl ExitReason {
+    /// Every reason, for anything that has to cover them all; the app's list
+    /// is checked against this one (`ms_exit_reasons`).
+    pub const ALL: [ExitReason; 9] = [
+        ExitReason::Signal,
+        ExitReason::Reversal,
+        ExitReason::StopLoss,
+        ExitReason::TakeProfit,
+        ExitReason::TrailingStop,
+        ExitReason::Liquidation,
+        ExitReason::DailyLossHalt,
+        ExitReason::EndOfData,
+        ExitReason::Expiry,
+    ];
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -462,11 +483,18 @@ pub fn run(
 
         // --- 1. Execute the order decided at the previous bar's close.
         if let Some(target) = pending_target.take() {
-            // Cooldown counts from the *previous* exit: reversing straight out
-            // of a losing side is the signal working, not churn.
-            let cooldown_reference = last_exit_index;
+            // A reversal — the opposite entry firing while holding — opens its
+            // new side whatever the cooldown, which only gates an entry from
+            // flat: reversing out of a losing side is the signal working, not
+            // churn. That is the live rule (`decide::decide_live` checks the
+            // cooldown only when nothing is held). This loop used to measure
+            // a reversal's cooldown from the exit before it, so a reversal
+            // chained inside the window closed one side and opened nothing —
+            // a strategy the runner does not run.
+            let mut reversing = false;
             if let Some(existing) = position {
                 if Some(existing.direction) != target {
+                    reversing = target.is_some();
                     let fill = ExitFill::market(
                         &costs, existing.direction, existing.quantity, candle.open, slippage);
                     close_position(
@@ -474,7 +502,7 @@ pub fn run(
                         fill,
                         candle.ts_ms,
                         index,
-                        ExitReason::Signal,
+                        if reversing { ExitReason::Reversal } else { ExitReason::Signal },
                         &mut equity,
                         &mut trades,
                     );
@@ -483,8 +511,8 @@ pub fn run(
             }
             if position.is_none() && halted_day.is_none() {
                 if let Some(direction) = target {
-                    let since_exit = cooldown_reference.map(|exit| index - exit);
-                    if crate::decide::can_enter(since_exit, manifest.risk.cooldown_bars) {
+                    let since_exit = last_exit_index.map(|exit| index - exit);
+                    if reversing || crate::decide::can_enter(since_exit, manifest.risk.cooldown_bars) {
                         let fill = fill_price(candle.open, direction, false, slippage);
                         // ATR as known at the decision bar — never this bar's.
                         let atr = atr_series.as_ref().map(|s| {
@@ -1154,6 +1182,53 @@ mod tests {
 
         let gapped = run(&strategy, &flat_then(3, (85.0, 86.0, 80.0, 85.0), 0), &costs(0.0, 0.0)).unwrap();
         first(&gapped, ExitReason::Liquidation);
+    }
+
+    /// A reversal opens its new side whatever the cooldown — the live rule —
+    /// however deep the chain: every reversal close is followed by an entry
+    /// on the other side at the same fill. The second reversal here falls
+    /// inside the first one's cooldown, which used to close the short and
+    /// open nothing.
+    #[test]
+    fn a_chained_reversal_inside_the_cooldown_still_opens_the_new_side() {
+        let strategy = compile(
+            r#"{"id":"r","name":"r","market":{"instId":"BTC-USDT-SWAP","instType":"SWAP","bar":"1H"},
+                "signals":{"longEntry":"close > 100","shortEntry":"close < 100"},
+                "sizing":{"mode":"equityPct","value":50},"risk":{"leverage":1,"cooldownBars":50}}"#);
+        let mut bars: Vec<Candle> = (0..4).map(|i| bar(i, 101.0, 101.0, 101.0, 101.0)).collect();
+        bars.extend((4..8).map(|i| bar(i, 99.0, 99.0, 99.0, 99.0)));
+        bars.extend((8..12).map(|i| bar(i, 101.0, 101.0, 101.0, 101.0)));
+        let result = run(&strategy, &bars, &costs(0.0, 0.0)).unwrap();
+
+        let reversals: Vec<&Trade> =
+            result.trades.iter().filter(|t| t.exit_reason == ExitReason::Reversal).collect();
+        assert_eq!(reversals.len(), 2, "{:?}", result.trades.iter().map(|t| t.exit_reason).collect::<Vec<_>>());
+        for closed in reversals {
+            assert!(result.trades.iter().any(|t| t.entry_ts == closed.exit_ts && t.direction != closed.direction),
+                    "the reversal at {} closed without opening the other side", closed.exit_ts);
+        }
+        // A plain exit to flat still waits out the cooldown.
+        assert!(result.trades.iter().all(|t| t.exit_reason != ExitReason::Signal));
+    }
+
+    /// A reason added to the enum fails to compile here until it is placed;
+    /// the arm is the reminder that it belongs in `ALL` too.
+    #[test]
+    fn all_lists_every_exit_reason_once() {
+        let position = |reason: ExitReason| match reason {
+            ExitReason::Signal => 0,
+            ExitReason::Reversal => 1,
+            ExitReason::StopLoss => 2,
+            ExitReason::TakeProfit => 3,
+            ExitReason::TrailingStop => 4,
+            ExitReason::Liquidation => 5,
+            ExitReason::DailyLossHalt => 6,
+            ExitReason::EndOfData => 7,
+            ExitReason::Expiry => 8,
+        };
+        for (index, reason) in ExitReason::ALL.iter().enumerate() {
+            assert_eq!(position(*reason), index, "{reason:?}");
+        }
     }
 
     /// Every engine books exactly what it pays: final equity is the initial
