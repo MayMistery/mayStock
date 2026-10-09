@@ -95,7 +95,7 @@
 | 深度 | WS `books5` @ public（5 档快照/100ms）+ 面板打开时 REST `GET /api/v5/market/books?sz=50` | 深度图用 50 档，实时买一卖一用 books5 |
 | 标的元数据 | REST `GET /api/v5/public/instruments?instType=SPOT` | tickSz→小数位，添加标的时校验 |
 | 心跳 | 空闲 18s 客户端发 `"ping"` → `"pong"` | 30s 无数据服务端断连 |
-| 交易 | `okx` CLI（`npm i -g @okx_ai/okx-trade-cli`）：`okx spot place --instId … --json [--demo]`、`okx account balance --json` | 官方 Agent Trade Kit |
+| 交易 | Rust 内核直接签名 REST（`kernel/src/trade`，见 `docs/KERNEL.md` §1.0.1）；密钥在官方 `okx` CLI 写的 `~/.okx/config.toml`，App 不另存 | CLI 程序本身只剩账单流水（`okx account bills`）在用 |
 
 限频遵循：REST candles 20 req/2s，回填分页间隔 ≥120ms；UI 侧节流不影响推送接收。
 

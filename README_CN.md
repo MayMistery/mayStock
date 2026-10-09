@@ -114,8 +114,10 @@ okx config   # API Key 存在官方 CLI 里，不经过 MayStock
 ```
 
 `maystock-e2e doctor` 走的就是 App 线上同一套代码：REST 行情/元数据/回填、
-双 WebSocket、实时 tick/K线/盘口、REST/WS 价格一致性。`okx` CLI 检测单独报告；
-未安装可选 CLI 时，交易功能会在 App 内保持隐藏。
+双 WebSocket、实时 tick/K线/盘口、REST/WS 价格一致性。OKX 下单由 App 的 Rust 内核
+直接签名，密钥用官方 CLI 的 `okx config` 写进 `~/.okx/config.toml`（App 不另存）；
+`~/.okx/config.toml` 里有当前环境的 profile 就能交易，没有时账户页会写明缺什么。
+CLI 程序本身只剩账单流水在用。
 
 ```bash
 ./Scripts/make.sh snapshot   # 把悬浮面板与终端每一页画成 dist/snapshots/*.png

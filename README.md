@@ -139,12 +139,16 @@ Swift 6.3.2 Command Line Tools. With the macOS 27 SDK the Command Line Tools
 lack the SwiftUI macro plugin, so the build script also looks for one in an
 installed Xcode; `swift build` on its own needs `-Xswiftc -plugin-path` there.
 
-Optional trading support:
+Trading on OKX: MayStock signs orders itself, in its Rust kernel, with the API
+key the official CLI stores — so the key is set up with the CLI, never in
+MayStock:
 
 ```bash
 npm install -g @okx_ai/okx-trade-cli
-okx config   # store API keys with the official CLI, not with MayStock
+okx config   # writes ~/.okx/config.toml; one profile per environment (demo, live)
 ```
+
+The CLI binary itself is used only for the bills ledger.
 
 ## Verify (end-to-end)
 
@@ -154,8 +158,9 @@ okx config   # store API keys with the official CLI, not with MayStock
 
 `maystock-e2e doctor` exercises the exact production code paths: REST
 ticker/metadata/backfill, both WebSockets, live ticks/candles/depth, and
-REST/WS price coherence. `okx` CLI detection is reported separately; trading
-stays hidden in the app until the optional CLI is installed.
+REST/WS price coherence. Trading is available once `~/.okx/config.toml` holds a
+profile for the active environment; until then the account page says what is
+missing.
 
 ```bash
 ./Scripts/make.sh snapshot   # draw the panel and every terminal page to dist/snapshots/*.png
