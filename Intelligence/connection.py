@@ -152,15 +152,26 @@ def _path(value: str, home: Path) -> Path:
     return Path(value)
 
 
-def resolve_connection(environ: Mapping[str, str] | None = None,
-                       home: str | Path | None = None) -> ConnectionProfile:
+def connection_path(environ: Mapping[str, str] | None = None,
+                    home: str | Path | None = None) -> Path:
+    """The connection file the runtime reads: the one MAYSTOCK_INTELLIGENCE_CONNECTION
+    names, else the app's own. Decided here only — the app asks for it
+    (`runner.py --connection-file`) rather than computing a path of its own."""
     inherited = dict(os.environ if environ is None else environ)
     home_directory = Path(home if home is not None else inherited.get("HOME") or Path.home())
     dedicated_override = inherited.get("MAYSTOCK_INTELLIGENCE_CONNECTION")
     if "MAYSTOCK_INTELLIGENCE_CONNECTION" in inherited and not dedicated_override:
         raise _error("MAYSTOCK_INTELLIGENCE_CONNECTION must name a connection file")
-    connection = (_path(dedicated_override, home_directory) if dedicated_override else
-                  home_directory / "Library/Application Support/MayStock/Intelligence/connection.json")
+    return (_path(dedicated_override, home_directory) if dedicated_override else
+            home_directory / "Library/Application Support/MayStock/Intelligence/connection.json")
+
+
+def resolve_connection(environ: Mapping[str, str] | None = None,
+                       home: str | Path | None = None) -> ConnectionProfile:
+    inherited = dict(os.environ if environ is None else environ)
+    home_directory = Path(home if home is not None else inherited.get("HOME") or Path.home())
+    dedicated_override = inherited.get("MAYSTOCK_INTELLIGENCE_CONNECTION")
+    connection = connection_path(inherited, home_directory)
     if dedicated_override and not connection.is_file():
         raise _error("MAYSTOCK_INTELLIGENCE_CONNECTION does not name a readable file")
 

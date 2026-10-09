@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from Intelligence.connection import AUTH_ENV, FIXED_ENV, isolated_environment, resolve_connection
+from Intelligence.connection import AUTH_ENV, FIXED_ENV, connection_path, isolated_environment, resolve_connection
 from Intelligence.research import ResearchError
 
 
@@ -228,3 +228,21 @@ class ConnectionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConnectionPathTests(unittest.TestCase):
+    """The path rule lives in connection_path; resolve_connection and the app's
+    `--connection-file` both take it from there."""
+
+    def test_default_is_the_apps_own_file_under_home(self):
+        self.assertEqual(connection_path({}, home="/Users/someone"),
+                         Path("/Users/someone/Library/Application Support/MayStock/Intelligence/connection.json"))
+
+    def test_override_expands_tilde_against_home(self):
+        self.assertEqual(connection_path({"MAYSTOCK_INTELLIGENCE_CONNECTION": "~/route.json"}, home="/Users/someone"),
+                         Path("/Users/someone/route.json"))
+
+    def test_an_empty_override_is_an_error_not_the_default(self):
+        with self.assertRaises(ResearchError) as raised:
+            connection_path({"MAYSTOCK_INTELLIGENCE_CONNECTION": ""}, home="/Users/someone")
+        self.assertIn("CONNECTION_CONFIG", str(raised.exception))

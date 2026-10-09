@@ -26,14 +26,14 @@ import urllib.parse
 sys.dont_write_bytecode = True
 
 if __package__:
-    from .connection import AUTH_ENV, resolve_connection, isolated_environment
+    from .connection import AUTH_ENV, connection_path, resolve_connection, isolated_environment
     from .model_diagnostics import model_error, model_error_fields
     from .model_selection import DEFAULT_MODEL, normalize_model
     from .research import SEARCH_TOPICS, Research, ResearchError
     from .schema import MODEL_REPORT_SCHEMA
     from .validation import parse_request, validate_report, window
 else:
-    from connection import AUTH_ENV, resolve_connection, isolated_environment
+    from connection import AUTH_ENV, connection_path, resolve_connection, isolated_environment
     from model_diagnostics import model_error, model_error_fields
     from model_selection import DEFAULT_MODEL, normalize_model
     from research import SEARCH_TOPICS, Research, ResearchError
@@ -376,9 +376,19 @@ def main():
     group.add_argument("--doctor", action="store_true")
     group.add_argument("--smoke-model", action="store_true")
     group.add_argument("--smoke-retrieval", action="store_true")
+    group.add_argument("--connection-file", action="store_true",
+                       help="Where the connection file is, and whether it exists; answered before the file is read, so a broken one can still be found and fixed")
     parser.add_argument("--model", default=MODEL,
                         help="Model for --doctor or --smoke-model; report generation uses stdin request.model")
     args = parser.parse_args()
+    if args.connection_file:
+        try:
+            path = connection_path()
+            print(json.dumps({"path": str(path), "exists": path.exists()}, ensure_ascii=False))
+            return 0
+        except ResearchError as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+            return 1
     try:
         profile = configure_runtime()
         diagnostics = profile.diagnostics()

@@ -129,12 +129,57 @@ public struct IntelligenceBridge: Sendable {
         }
     }
 
-    public func generate(_ request: IntelligenceRequest) async throws -> IntelligenceReport {
+    /// The runner's process environment: the app's own, with a PATH a Finder
+    /// launch lacks, plus `overrides`. Routing isolation is the runner's job
+    /// (`connection.py`), so nothing else is stripped here.
+    private func runnerEnvironment(_ overrides: [String: String] = [:]) -> [String: String] {
         var environment = ProcessInfo.processInfo.environment
-        // Finder launches have a minimal PATH. No login shell is needed.
         environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + (environment["PATH"] ?? "")
         environment["PYTHONUNBUFFERED"] = "1"
         environment.removeValue(forKey: "CLAUDECODE")
+        return environment.merging(overrides) { _, override in override }
+    }
+
+    /// One of the runner's own commands (`--doctor`, `--connection-file`),
+    /// its stdout decoded; its sanitized error envelope becomes the error.
+    private func command<T: Decodable>(_ arguments: [String], overrides: [String: String] = [:]) async throws -> T {
+        let output: Subprocess.Outcome
+        do {
+            output = try await Subprocess.run(
+                executable: python.path, arguments: [script.path] + arguments,
+                environment: runnerEnvironment(overrides), workingDirectory: script.deletingLastPathComponent(),
+                stdin: nil, timeout: 60, maxOutputBytes: 1_000_000)
+        } catch {
+            throw IntelligenceBridgeError.failed("情报运行环境启动失败，请检查 Python SDK 安装。")
+        }
+        if output.exitCode != 0 {
+            let message = (try? JSONDecoder().decode(RunnerErrorEnvelope.self, from: output.stdout))?.error
+            throw IntelligenceBridgeError.failed(message ?? "情报运行环境退出码 \(output.exitCode)")
+        }
+        do {
+            return try JSONDecoder().decode(T.self, from: output.stdout)
+        } catch {
+            throw IntelligenceBridgeError.failed("情报运行环境的输出无法读取：\(error)")
+        }
+    }
+
+    /// What route the runtime would take — and whether a connection file is
+    /// valid: with `connectionFile` it reads that file in place of its own
+    /// (`MAYSTOCK_INTELLIGENCE_CONNECTION`), so a candidate can be checked by
+    /// the runtime's own rules before it replaces anything.
+    public func doctor(connectionFile: URL? = nil) async throws -> IntelligenceRoute {
+        try await command(["--doctor"], overrides: connectionFile.map { ["MAYSTOCK_INTELLIGENCE_CONNECTION": $0.path] } ?? [:])
+    }
+
+    /// Where the runtime reads its connection file, as the runtime decides it.
+    public func connectionFile() async throws -> IntelligenceConnectionFile {
+        struct Location: Decodable { let path: String; let exists: Bool }
+        let location: Location = try await command(["--connection-file"])
+        return IntelligenceConnectionFile(url: URL(fileURLWithPath: location.path))
+    }
+
+    public func generate(_ request: IntelligenceRequest) async throws -> IntelligenceReport {
+        let environment = runnerEnvironment()
         let output: Subprocess.Outcome
         do {
             output = try await Subprocess.run(executable: python.path, arguments: [script.path],
@@ -150,8 +195,7 @@ public struct IntelligenceBridge: Sendable {
         for line in Self.noticeLines(fromStderr: output.stderr) { Log.warn(line) }
         guard output.exitCode == 0 else {
             // Only expose the runner's deliberately sanitized error envelope, never raw stderr.
-            struct RunnerError: Decodable { var error: String }
-            let message = (try? JSONDecoder().decode(RunnerError.self, from: output.stdout))?.error
+            let message = (try? JSONDecoder().decode(RunnerErrorEnvelope.self, from: output.stdout))?.error
             throw IntelligenceBridgeError.failed(message ?? "Claude 研究失败（退出码 \(output.exitCode)）；已保留上次结果。")
         }
         guard let report = try? IntelligenceJSON.decoder().decode(IntelligenceReport.self, from: output.stdout),
@@ -165,6 +209,9 @@ public struct IntelligenceBridge: Sendable {
         return report
     }
 }
+
+/// The runner's sanitized error, the one thing it prints on failure.
+private struct RunnerErrorEnvelope: Decodable { var error: String }
 
 public enum IntelligenceBridgeError: LocalizedError {
     case failed(String)

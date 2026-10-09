@@ -28,7 +28,7 @@ MayStock 的原生情报窗口提供今天前 7 天至后 30 天的事件日历�
 
 `~/Library/Application Support/MayStock/Intelligence/connection.json`
 
-文件内容是环境变量名到字符串值的 JSON 映射，支持 `ANTHROPIC_BASE_URL`、`ANTHROPIC_CUSTOM_HEADERS`、`ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_API_KEY` 等连接字段。该文件应保持权限 `0600`，不放入仓库或应用包。可用 `MAYSTOCK_INTELLIGENCE_CONNECTION` 指向其他受保护文件。认证值不会进入研究提示词、日志或报告。
+文件内容是环境变量名到字符串值的 JSON 映射，支持 `ANTHROPIC_BASE_URL`、`ANTHROPIC_CUSTOM_HEADERS`、`ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_API_KEY` 等连接字段。该文件应保持权限 `0600`，不放入仓库或应用包。可用 `MAYSTOCK_INTELLIGENCE_CONNECTION` 指向其他受保护文件。认证值不会进入研究提示词、日志或报告。也可以在「设置 → 模型路由 · 情报站」里改其中的 `ANTHROPIC_BASE_URL` 和 `ANTHROPIC_CUSTOM_HEADERS`（header 值只显示掩码）：文件位置由 `runner.py --connection-file` 回答，新内容先写成候选文件、由 `--doctor` 按运行环境自己的规则校验，通过才原子替换，不通过则原文件不动；其它键原样保留；两项都清空时移除文件而不是写成 `{}`（空连接文件等于只用原生登录）。
 
 连接按完整配置组选择，优先级为：**情报专用连接文件 > 当前进程的连接环境变量 > Claude 用户设置中的允许列表 `env` > 原生登录**。存在专用文件时，启动器继承的地址、API key、OAuth 和云服务路由不会覆盖或补入该文件；不会把不同来源的地址和凭证拼接。专用文件损坏或显式指定的文件不存在时会报告 `CONNECTION_CONFIG`，保留已有情报。代理与 CA 设置可独立继承，专用文件中显式设置的值优先。
 

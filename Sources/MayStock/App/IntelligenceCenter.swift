@@ -149,7 +149,7 @@ final class IntelligenceCenter {
             guard let self else { return }
             defer { self.isRunning = false; self.activeKind = nil }
             do {
-                let bridge = try self.resolveBridge()
+                let bridge = try self.runtimeBridge()
                 let instruments = Array(Set(self.watchlist())).sorted()
                 var quotes: [IntelligenceQuote] = []
                 // Hidden menu items are still watched. Read public prices for those too.
@@ -237,7 +237,9 @@ final class IntelligenceCenter {
         }
     }
 
-    private func resolveBridge() throws -> IntelligenceBridge {
+    /// The runtime the intelligence station runs on — also what the settings
+    /// page asks about the connection file.
+    func runtimeBridge() throws -> IntelligenceBridge {
         let env = ProcessInfo.processInfo.environment
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()

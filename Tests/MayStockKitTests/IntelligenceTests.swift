@@ -106,3 +106,81 @@ struct IntelligenceRunnerNoticeTests {
         #expect(IntelligenceBridge.noticeLines(fromStderr: Data()).isEmpty)
     }
 }
+
+/// The connection file is changed only through the runtime's own check, and
+/// never loses what the page does not edit.
+@Suite("Intelligence connection file")
+struct IntelligenceConnectionFileTests {
+    /// A stand-in runtime: `--doctor` rejects a candidate containing "reject",
+    /// and reports the route source the way the runtime does.
+    private func fixture() throws -> (dir: URL, bridge: IntelligenceBridge, file: IntelligenceConnectionFile) {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("maystock-connection-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let script = dir.appendingPathComponent("runner.sh")
+        try """
+        case "$1" in
+          --doctor)
+            f="$MAYSTOCK_INTELLIGENCE_CONNECTION"
+            if [ -n "$f" ] && grep -q reject "$f"; then echo '{"error":"CONNECTION_CONFIG: rejected for the test"}'; exit 1; fi
+            if [ -n "$f" ]; then src=connection; else src=native; fi
+            echo "{\\"source\\":\\"$src\\",\\"origin\\":null,\\"headerNames\\":[],\\"ignoredEnvironmentKeys\\":[],\\"routingConfigured\\":false}" ;;
+        esac
+        """.write(to: script, atomically: true, encoding: .utf8)
+        let bridge = IntelligenceBridge(python: URL(fileURLWithPath: "/bin/sh"), script: script)
+        let file = IntelligenceConnectionFile(url: dir.appendingPathComponent("Intelligence/connection.json"))
+        return (dir, bridge, file)
+    }
+
+    private func write(_ object: [String: Any], to file: IntelligenceConnectionFile) throws {
+        try FileManager.default.createDirectory(at: file.url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try JSONSerialization.data(withJSONObject: object).write(to: file.url)
+    }
+
+    @Test("改一项：别的键原样保留（含非字符串值），权限 0600，路由按运行环境的回答")
+    func updateKeepsEverythingElse() async throws {
+        let (dir, bridge, file) = try fixture()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try write(["ANTHROPIC_AUTH_TOKEN": "keep-me", "nested": ["a": 1], "ANTHROPIC_BASE_URL": "https://old.test"], to: file)
+        let route = try await file.update(baseURL: " https://new.test ", headers: nil, using: bridge)
+        #expect(route.source == "connection")
+        let object = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: file.url)) as? [String: Any])
+        #expect(object["ANTHROPIC_BASE_URL"] as? String == "https://new.test")
+        #expect(object["ANTHROPIC_AUTH_TOKEN"] as? String == "keep-me")
+        #expect((object["nested"] as? [String: Any])?["a"] as? Int == 1)
+        let mode = try FileManager.default.attributesOfItem(atPath: file.url.path)[.posixPermissions] as? Int
+        #expect(mode == 0o600)
+    }
+
+    @Test("运行环境拒绝的候选不替换原文件，也不留下候选文件")
+    func aRejectedCandidateLeavesTheFileAsItWas() async throws {
+        let (dir, bridge, file) = try fixture()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try write(["ANTHROPIC_BASE_URL": "https://old.test"], to: file)
+        let before = try Data(contentsOf: file.url)
+        await #expect(throws: IntelligenceBridgeError.self) {
+            _ = try await file.update(baseURL: "https://reject.test", headers: nil, using: bridge)
+        }
+        #expect(try Data(contentsOf: file.url) == before)
+        let left = try FileManager.default.contentsOfDirectory(atPath: file.url.deletingLastPathComponent().path)
+        #expect(left == ["connection.json"])
+    }
+
+    @Test("两项都清空就移除文件，不写成 {}；空串只删那一项")
+    func emptyingRemovesTheFile() async throws {
+        let (dir, bridge, file) = try fixture()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try write(["ANTHROPIC_BASE_URL": "https://old.test", "ANTHROPIC_CUSTOM_HEADERS": "x-relay-api-key: abc"], to: file)
+        _ = try await file.update(baseURL: "", headers: nil, using: bridge)
+        #expect(try file.route().baseURL == nil && file.route().headers == "x-relay-api-key: abc")
+        let route = try await file.update(baseURL: nil, headers: "", using: bridge)
+        #expect(!file.exists, "an empty route file would mean the native login")
+        #expect(route.source == "native")
+    }
+
+    @Test("掩码只留长值的末四位；没有冒号的行整行遮住")
+    func maskedHeadersRevealNothingShort() {
+        let masked = IntelligenceConnectionFile.maskedHeaders("x-relay-passthrough: anthropic\nx-relay-api-key: sk-0123456789abcd\nnot-a-header-line-secret")
+        #expect(masked == "x-relay-passthrough: ••••opic\nx-relay-api-key: ••••abcd\n••••")
+        #expect(IntelligenceConnectionFile.maskedHeaders("k: short") == "k: ••••")
+    }
+}
