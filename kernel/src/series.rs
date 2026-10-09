@@ -8,9 +8,12 @@
 //! All functions are total: they accept any length input, including empty, and
 //! return a vector of exactly the same length.
 //!
-//! This is a direct port of `Sources/MayStockKit/Strategy/Indicators.swift`.
-//! The two must agree bar for bar — `tests/differential.rs` on the Swift side
-//! is what keeps them honest.
+//! The only implementation. It began as a port of a Swift twin that has since
+//! been deleted (`docs/KERNEL.md` §4.1); what pins it now is the unit tests
+//! below, function by function, and `KernelGoldenTests` on the Swift side,
+//! which freezes whole backtests built on it.
+
+use std::collections::VecDeque;
 
 pub type Series = Vec<f64>;
 
@@ -99,7 +102,56 @@ pub fn ema(x: &[f64], period: usize) -> Series {
 }
 
 /// Linearly weighted moving average — the most recent bar carries weight `period`.
+///
+/// Slid in O(1) a bar: dropping the oldest sample lowers every remaining
+/// weight by one, which is subtracting the plain sum, and the new sample
+/// enters at full weight. Both sums are recomputed exactly whenever a window
+/// is entered clean and once per window length after that, so rounding cannot
+/// build up over a long series.
 pub fn wma(x: &[f64], period: usize) -> Series {
+    if period == 0 || x.is_empty() {
+        return nans(x.len());
+    }
+    let mut out = nans(x.len());
+    let denominator = (period * (period + 1) / 2) as f64;
+    let mut plain = 0.0; // Σ x over the window
+    let mut weighted = 0.0; // Σ weight · x, oldest weight 1, newest `period`
+    let mut nans_in_window = 0usize;
+    // Bars slid since the sums were last exact; `None` when they describe no
+    // window at all.
+    let mut since_exact: Option<usize> = None;
+    for i in 0..x.len() {
+        if x[i].is_nan() {
+            nans_in_window += 1;
+        }
+        if i >= period && x[i - period].is_nan() {
+            nans_in_window -= 1;
+        }
+        if i + 1 < period || nans_in_window > 0 {
+            since_exact = None;
+            continue;
+        }
+        match since_exact {
+            Some(slid) if slid + 1 < period => {
+                weighted += period as f64 * x[i] - plain;
+                plain += x[i] - x[i - period];
+                since_exact = Some(slid + 1);
+            }
+            _ => {
+                let window = &x[i + 1 - period..=i];
+                plain = window.iter().sum();
+                weighted = window.iter().enumerate().map(|(k, v)| (k + 1) as f64 * v).sum();
+                since_exact = Some(0);
+            }
+        }
+        out[i] = weighted / denominator;
+    }
+    out
+}
+
+/// The nested loop `wma` replaced, kept as its reference.
+#[cfg(test)]
+fn naive_wma(x: &[f64], period: usize) -> Series {
     if period == 0 || x.is_empty() {
         return nans(x.len());
     }
@@ -112,9 +164,6 @@ pub fn wma(x: &[f64], period: usize) -> Series {
         let mut acc = 0.0;
         let mut complete = true;
         for k in 0..period {
-            // Grouped so the intermediate never goes negative: `i - period`
-            // alone underflows on usize where the Swift original, using signed
-            // Int, quietly produced the right index.
             let value = x[i + 1 + k - period];
             if value.is_nan() {
                 complete = false;
@@ -219,17 +268,31 @@ pub fn roc(x: &[f64], period: usize) -> Series {
 // MARK: Volatility
 
 /// Population standard deviation over a rolling window — the convention
-/// Bollinger Bands are defined with.
+/// Bollinger Bands are defined with. Unknown when the window holds a NaN.
 pub fn stdev(x: &[f64], period: usize) -> Series {
+    if period == 0 || x.is_empty() {
+        return nans(x.len());
+    }
+    let mut out = nans(x.len());
+    let mut window = WindowMoments::new(x, period);
+    for i in 0..x.len() {
+        window.advance(i);
+        if i + 1 >= period && window.count == period {
+            out[i] = window.variance(0).sqrt();
+        }
+    }
+    out
+}
+
+/// The two-pass loop `stdev` replaced, kept as its reference.
+#[cfg(test)]
+fn naive_stdev(x: &[f64], period: usize) -> Series {
     if period == 0 || x.is_empty() {
         return nans(x.len());
     }
     let mean = sma(x, period);
     let mut out = nans(x.len());
     for i in 0..x.len() {
-        // The window guard is explicit rather than inferred from `mean[i]`:
-        // relying on the mean to imply `i + 1 >= period` is true but leaves an
-        // underflow one edit away.
         if i + 1 < period || mean[i].is_nan() {
             continue;
         }
@@ -241,6 +304,89 @@ pub fn stdev(x: &[f64], period: usize) -> Series {
         out[i] = (acc / period as f64).sqrt();
     }
     out
+}
+
+/// Count, sum and sum of squares of the valid samples in a window sliding one
+/// bar at a time — what a rolling deviation needs, in O(1) a bar where summing
+/// each window afresh is O(period).
+///
+/// The sums are kept relative to an anchor at the window's mean, so squaring
+/// prices in the tens of thousands does not cancel away the variance of a
+/// quiet stretch, and they are recomputed exactly — anchor included — once per
+/// window length, so rounding cannot accumulate over a long series. They are
+/// also recomputed whenever the variance collapses against them (noise
+/// sliding out, a flat stretch sliding in), where the subtraction would keep
+/// only rounding: measured, a two-bar window on a flat run read 2.4e-7 where
+/// the truth is 0. A recompute costs one window and resets the anchor to
+/// where the values now are, so the pass stays O(n) in practice.
+pub(crate) struct WindowMoments<'a> {
+    x: &'a [f64],
+    period: usize,
+    anchor: f64,
+    /// Valid samples in the window.
+    pub count: usize,
+    sum: f64,
+    sum_sq: f64,
+    since_exact: usize,
+}
+
+impl<'a> WindowMoments<'a> {
+    pub fn new(x: &'a [f64], period: usize) -> Self {
+        Self { x, period: period.max(1), anchor: 0.0, count: 0, sum: 0.0, sum_sq: 0.0, since_exact: usize::MAX }
+    }
+
+    /// Move the window to end at `i`. Called for `i` = 0, 1, 2, … in turn.
+    pub fn advance(&mut self, i: usize) {
+        if self.since_exact >= self.period {
+            self.recompute(i);
+            return;
+        }
+        self.add(self.x[i], 1.0);
+        if i >= self.period {
+            self.add(self.x[i - self.period], -1.0);
+        }
+        self.since_exact += 1;
+        if self.count > 0 && self.numerator() < 1e-6 * self.sum_sq {
+            self.recompute(i);
+        }
+    }
+
+    /// Σ (x − mean)², from the anchored sums.
+    fn numerator(&self) -> f64 {
+        self.sum_sq - self.sum * self.sum / self.count as f64
+    }
+
+    fn add(&mut self, value: f64, sign: f64) {
+        if value.is_nan() {
+            return;
+        }
+        let d = value - self.anchor;
+        self.sum += sign * d;
+        self.sum_sq += sign * d * d;
+        if sign > 0.0 {
+            self.count += 1;
+        } else {
+            self.count -= 1;
+        }
+    }
+
+    fn recompute(&mut self, i: usize) {
+        let window = &self.x[(i + 1).saturating_sub(self.period)..=i];
+        let valid = window.iter().filter(|v| !v.is_nan());
+        let (count, total) = valid.clone().fold((0usize, 0.0), |(n, t), v| (n + 1, t + v));
+        self.anchor = if count > 0 { total / count as f64 } else { 0.0 };
+        self.count = count;
+        self.sum = valid.clone().map(|v| v - self.anchor).sum();
+        self.sum_sq = valid.map(|v| (v - self.anchor) * (v - self.anchor)).sum();
+        self.since_exact = 0;
+    }
+
+    /// Variance of the valid samples, `ddof` 0 for the population and 1 for a
+    /// sample. Never negative: rounding cannot be allowed to take a square
+    /// root of one.
+    pub fn variance(&self, ddof: usize) -> f64 {
+        (self.numerator() / (self.count as f64 - ddof as f64)).max(0.0)
+    }
 }
 
 /// True range: `max(h-l, |h-prevClose|, |l-prevClose|)`.
@@ -277,7 +423,54 @@ pub fn lowest(x: &[f64], period: usize) -> Series {
     rolling_extreme(x, period, false)
 }
 
+/// Sliding extreme over a monotonic deque: O(n), where the nested loop it
+/// replaced was O(n · period). That was nothing at `highest(high, 20)` on 1H
+/// bars and quadratic at the windows 1m research uses — a seven-day channel on
+/// minute bars is 10 080 bars a window, about 1.4e9 comparisons per series on
+/// the 200 000-bar runs the runner allows (`BacktestRunner.maxBars`).
+///
+/// Same answer bar for bar, NaN included: a window holding any NaN is unknown.
+/// `naive_rolling_extreme` is kept as the reference the test checks it against.
 fn rolling_extreme(x: &[f64], period: usize, want_max: bool) -> Series {
+    if period == 0 || x.is_empty() {
+        return nans(x.len());
+    }
+    let mut out = nans(x.len());
+    // Indices still able to be the extreme, oldest first; their values only
+    // fall (for a max) from front to back, so the front is the answer.
+    let mut candidates: VecDeque<usize> = VecDeque::new();
+    let mut nans_in_window = 0usize;
+    for i in 0..x.len() {
+        if i >= period {
+            let leaving = i - period;
+            if x[leaving].is_nan() {
+                nans_in_window -= 1;
+            } else if candidates.front() == Some(&leaving) {
+                candidates.pop_front();
+            }
+        }
+        if x[i].is_nan() {
+            nans_in_window += 1;
+        } else {
+            // A value at least as extreme makes every older one behind it
+            // irrelevant for as long as it stays in the window.
+            while candidates.back().is_some_and(|&back| {
+                if want_max { x[back] <= x[i] } else { x[back] >= x[i] }
+            }) {
+                candidates.pop_back();
+            }
+            candidates.push_back(i);
+        }
+        if i + 1 >= period && nans_in_window == 0 {
+            out[i] = candidates.front().map_or(f64::NAN, |&front| x[front]);
+        }
+    }
+    out
+}
+
+/// The nested loop `rolling_extreme` replaced, kept as its reference.
+#[cfg(test)]
+fn naive_rolling_extreme(x: &[f64], period: usize, want_max: bool) -> Series {
     if period == 0 || x.is_empty() {
         return nans(x.len());
     }
@@ -401,6 +594,78 @@ mod tests {
 
     fn approx(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
+    }
+
+    /// A series with what breaks sliding windows: NaN runs, a single NaN every
+    /// so often, a plateau of equal values, and prices at BTC's magnitude
+    /// moving by cents — where squaring before subtracting loses the variance.
+    fn awkward_series() -> Vec<f64> {
+        let mut seed = 12_345u64;
+        (0..600)
+            .map(|i| {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                if i % 97 == 0 || (201..210).contains(&i) {
+                    f64::NAN
+                } else if (300..340).contains(&i) {
+                    42.0
+                } else if (400..470).contains(&i) {
+                    65_000.0 + ((seed >> 33) % 100) as f64 / 100.0
+                } else {
+                    ((seed >> 33) % 1000) as f64 / 10.0
+                }
+            })
+            .collect()
+    }
+
+    fn agree(name: &str, period: usize, fast: &[f64], slow: &[f64]) {
+        assert_eq!(fast.len(), slow.len());
+        for (i, (f, s)) in fast.iter().zip(slow).enumerate() {
+            assert_eq!(f.is_nan(), s.is_nan(), "{name}({period}) bar {i}: {f} vs {s}");
+            if !f.is_nan() {
+                assert!((f - s).abs() <= 1e-9 * s.abs().max(1.0), "{name}({period}) bar {i}: {f} vs {s}");
+            }
+        }
+    }
+
+    /// The sliding versions against the loops they replaced.
+    #[test]
+    fn the_sliding_averages_match_the_loops_they_replaced() {
+        let x = awkward_series();
+        for period in [0, 1, 2, 3, 7, 20, 121, 599, 600, 601] {
+            agree("wma", period, &wma(&x, period), &naive_wma(&x, period));
+            agree("stdev", period, &stdev(&x, period), &naive_stdev(&x, period));
+        }
+    }
+
+    /// The deque against the loop it replaced, over windows from one bar to
+    /// longer than the series, NaN runs, and a plateau of equal values — where
+    /// a deque that pops on `<` instead of `<=` keeps stale indices.
+    #[test]
+    fn the_sliding_extreme_matches_the_nested_loop() {
+        let mut seed = 12_345u64;
+        let x: Vec<f64> = (0..600)
+            .map(|i| {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                if i % 97 == 0 || (201..210).contains(&i) {
+                    f64::NAN
+                } else if (300..340).contains(&i) {
+                    42.0
+                } else {
+                    ((seed >> 33) % 1000) as f64 / 10.0
+                }
+            })
+            .collect();
+        for period in [0, 1, 2, 3, 7, 20, 121, 599, 600, 601] {
+            for want_max in [true, false] {
+                let fast = rolling_extreme(&x, period, want_max);
+                let slow = naive_rolling_extreme(&x, period, want_max);
+                assert_eq!(fast.len(), slow.len());
+                for (i, (f, s)) in fast.iter().zip(&slow).enumerate() {
+                    assert!(f.to_bits() == s.to_bits() || (f.is_nan() && s.is_nan()),
+                            "period {period} max {want_max} bar {i}: {f} vs {s}");
+                }
+            }
+        }
     }
 
     #[test]

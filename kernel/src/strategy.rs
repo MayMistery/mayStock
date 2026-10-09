@@ -669,22 +669,7 @@ impl CompiledStrategy {
             evaluator.evaluate(expr)?;
         }
 
-        let mut warmup = all
-            .iter()
-            .map(|e| eval::warmup_bars(e, &params, &known))
-            .max()
-            .unwrap_or(0);
-        // Volatility targeting needs a full lookback of returns before it can
-        // size anything, which is independent of what the signal expressions
-        // need. Folding it in here keeps one definition of "how much history
-        // does this strategy require" for both the backtester and the runner.
-        // The option pricing model reads the same realised-volatility window,
-        // so an option strategy needs it primed for the same reason.
-        if manifest.sizing.mode == SizingMode::VolatilityTarget
-            || manifest.market.inst_type.is_option()
-        {
-            warmup = warmup.max(manifest.risk.vol_lookback_bars + 1);
-        }
+        let warmup = Self::warmup_for(&manifest, &all, &params, &known).map_err(ExprError::Policy)?;
 
         let free_parameter_count = manifest
             .params
@@ -769,16 +754,7 @@ impl CompiledStrategy {
             evaluator.evaluate(expr).ok()?;
         }
 
-        let mut warmup = all
-            .iter()
-            .map(|e| eval::warmup_bars(e, &params, &known))
-            .max()
-            .unwrap_or(0);
-        if self.manifest.sizing.mode == SizingMode::VolatilityTarget
-            || self.manifest.market.inst_type.is_option()
-        {
-            warmup = warmup.max(self.manifest.risk.vol_lookback_bars + 1);
-        }
+        let warmup = Self::warmup_for(&self.manifest, &all, &params, &known).ok()?;
 
         Some(Self {
             manifest: self.manifest.clone(),
@@ -792,6 +768,36 @@ impl CompiledStrategy {
             free_parameter_count: self.free_parameter_count,
             known_series: self.known_series.clone(),
         })
+    }
+
+    /// How many leading bars this strategy cannot decide on: the most any of
+    /// its expressions needs, and a full volatility lookback where sizing or
+    /// the option pricing model reads one. One definition for the backtester
+    /// and the runner, and for both `compile` and `with_params` — which each
+    /// used to carry a copy. Refused when it cannot fit in one run
+    /// (`expr::MAX_BARS`).
+    fn warmup_for(
+        manifest: &Manifest,
+        expressions: &[&Expr],
+        params: &HashMap<String, f64>,
+        known: &[&str],
+    ) -> Result<usize, String> {
+        let mut warmup = expressions
+            .iter()
+            .map(|e| eval::warmup_bars(e, params, known))
+            .max()
+            .unwrap_or(0);
+        if manifest.sizing.mode == SizingMode::VolatilityTarget || manifest.market.inst_type.is_option() {
+            warmup = warmup.max(manifest.risk.vol_lookback_bars + 1);
+        }
+        let ceiling = crate::expr::MAX_BARS;
+        if warmup + 2 > ceiling {
+            return Err(format!(
+                "预热要 {warmup} 根 K 线，单次最多只有 {ceiling} 根，连一根可交易的都剩不下：\
+                 这个清单既不能回测也不能实盘决策"
+            ));
+        }
+        Ok(warmup)
     }
 
     /// Why an option manifest cannot run as written, or `None` when it can.
@@ -913,6 +919,33 @@ mod tests {
       "sizing": { "mode": "riskPerTrade", "value": 1 },
       "risk": { "atrStop": { "period": 14, "mult": 2.5 }, "maxDailyLossPct": 5, "leverage": 1 }
     }"#;
+
+    /// A manifest whose warm-up cannot fit inside one run is refused at
+    /// compile — whether one long window, a nested EMA that compounds, or a
+    /// parameter a sweep moves past the line — and one that fits compiles at
+    /// the size 1m research needs.
+    #[test]
+    fn a_warm_up_longer_than_a_run_is_refused() {
+        let compile = |long_entry: &str, params: &str| {
+            let json = format!(
+                r#"{{"id":"w","market":{{"instId":"BTC-USDT","bar":"1m"}},"params":{params},
+                     "signals":{{"longEntry":"{long_entry}"}},"risk":{{"leverage":1}}}}"#
+            );
+            CompiledStrategy::compile(serde_json::from_str(&json).unwrap(), &[])
+        };
+        let ceiling = crate::expr::MAX_BARS;
+        let week = compile("close > ref(highest(high, 10080), 1)", "[]").unwrap();
+        assert!(week.warmup_bars >= 10_080 && week.warmup_bars < ceiling);
+        assert!(compile(&format!("close > sma(close, {})", ceiling / 2), "[]").is_ok());
+        for refused in [format!("close > sma(close, {ceiling})"), format!("close > ema(ema(close, {}), 10)", ceiling / 3)] {
+            let error = compile(&refused, "[]").unwrap_err();
+            assert!(matches!(&error, ExprError::Policy(reason) if reason.contains("预热")), "{refused}: {error:?}");
+        }
+        let swept = compile("close > ema(close, n)", r#"[{"name":"n","default":20,"min":10,"max":100000}]"#).unwrap();
+        assert!(swept.with_params(&HashMap::from([("n".to_string(), 1_000.0)])).is_some());
+        assert!(swept.with_params(&HashMap::from([("n".to_string(), 90_000.0)])).is_none(),
+                "an EMA of 90 000 needs 270 000 bars to warm up");
+    }
 
     #[test]
     fn a_real_example_manifest_compiles() {

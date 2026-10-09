@@ -852,16 +852,15 @@ pub fn realised_volatility(closes: &[f64], lookback: usize, bars_per_year: f64) 
         }
     }
 
-    for index in lookback..closes.len() {
-        let window = &returns[(index + 1 - lookback)..=index];
-        let valid: Vec<f64> = window.iter().copied().filter(|v| !v.is_nan()).collect();
-        if valid.len() <= 2 {
-            continue;
+    // Slid a bar at a time (`series::WindowMoments`): a week of minute bars
+    // is a 10 080-bar lookback, and summing each window afresh made that
+    // 10 080 times the work of the series.
+    let mut window = crate::series::WindowMoments::new(&returns, lookback);
+    for index in 0..closes.len() {
+        window.advance(index);
+        if index >= lookback && window.count > 2 {
+            out[index] = window.variance(1).sqrt() * bars_per_year.sqrt() * 100.0;
         }
-        let mean = valid.iter().sum::<f64>() / valid.len() as f64;
-        let variance: f64 = valid.iter().map(|v| (v - mean) * (v - mean)).sum();
-        let deviation = (variance / (valid.len() - 1) as f64).sqrt();
-        out[index] = deviation * bars_per_year.sqrt() * 100.0;
     }
     out
 }
@@ -1183,6 +1182,52 @@ mod tests {
             .unwrap();
         assert!((live - simulated.unwrap()).abs() < 1e-9,
                 "live {live} vs backtest {:?}", simulated);
+    }
+
+    /// The sliding version against the per-window loop it replaced.
+    #[test]
+    fn realised_volatility_matches_the_loop_it_replaced() {
+        let naive = |closes: &[f64], lookback: usize, bars_per_year: f64| -> Vec<f64> {
+            let mut out = vec![f64::NAN; closes.len()];
+            if lookback <= 1 || closes.len() <= lookback {
+                return out;
+            }
+            let mut returns = vec![f64::NAN; closes.len()];
+            for index in 1..closes.len() {
+                if closes[index - 1] > 0.0 && closes[index] > 0.0 {
+                    returns[index] = closes[index] / closes[index - 1] - 1.0;
+                }
+            }
+            for index in lookback..closes.len() {
+                let valid: Vec<f64> = returns[(index + 1 - lookback)..=index].iter().copied().filter(|v| !v.is_nan()).collect();
+                if valid.len() <= 2 {
+                    continue;
+                }
+                let mean = valid.iter().sum::<f64>() / valid.len() as f64;
+                let variance: f64 = valid.iter().map(|v| (v - mean) * (v - mean)).sum();
+                out[index] = (variance / (valid.len() - 1) as f64).sqrt() * bars_per_year.sqrt() * 100.0;
+            }
+            out
+        };
+        let mut seed = 99u64;
+        let mut price = 60_000.0;
+        let closes: Vec<f64> = (0..900)
+            .map(|i| {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                price *= 1.0 + (((seed >> 33) % 1000) as f64 / 1000.0 - 0.5) * 0.01;
+                if i % 131 == 0 || (500..505).contains(&i) { f64::NAN } else { price }
+            })
+            .collect();
+        for lookback in [2, 3, 24, 60, 400, 899, 900] {
+            let fast = realised_volatility(&closes, lookback, 8_760.0);
+            let slow = naive(&closes, lookback, 8_760.0);
+            for (i, (f, s)) in fast.iter().zip(&slow).enumerate() {
+                assert_eq!(f.is_nan(), s.is_nan(), "lookback {lookback} bar {i}: {f} vs {s}");
+                if !f.is_nan() {
+                    assert!((f - s).abs() <= 1e-9 * s.abs().max(1.0), "lookback {lookback} bar {i}: {f} vs {s}");
+                }
+            }
+        }
     }
 
     #[test]

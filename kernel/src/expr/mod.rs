@@ -236,9 +236,21 @@ pub const MARKET_SERIES: &[&str] = &[
     "open", "high", "low", "close", "volume", "hl2", "hlc3", "ohlc4", "bar_index",
 ];
 
-/// Longest rolling window any single function may request. Guards an imported
-/// manifest from asking for `sma(close, 10_000_000)`.
-pub const MAX_PERIOD: usize = 5_000;
+/// The most candles one backtest or one live decision is handed — the app's
+/// history fetch stops here (`ms_max_bars`). Sized for minute bars: 200 000 is
+/// 139 days of 1m, room for a week-long channel (10 080 bars) with months to
+/// trade it over. No manifest may need more than this to warm up
+/// (`CompiledStrategy::compile`): one that did could never be tested or
+/// traded.
+pub const MAX_BARS: usize = 200_000;
+
+/// Longest rolling window any single function may request: no longer than a
+/// run can hold, so an imported manifest cannot ask for
+/// `sma(close, 10_000_000)`. Nested and EMA-family windows compound past
+/// this; the compiler's warm-up check is what keeps those inside a run. It
+/// used to be 5 000 while a run held 12 000 bars, so a legal
+/// `ema(close, 5000)` — warm-up 15 000 — could never trade at all.
+pub const MAX_PERIOD: usize = MAX_BARS;
 
 /// Reserved words that can never be used as a bare identifier.
 pub const KEYWORDS: &[&str] = &["and", "or", "not", "crosses_above", "crosses_below"];

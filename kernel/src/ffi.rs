@@ -965,6 +965,16 @@ pub unsafe extern "C" fn ms_instrument_policy(
     })
 }
 
+// MARK: - Run size
+
+/// The most candles one backtest or one live decision is handed
+/// (`expr::MAX_BARS`). The app caps its history fetch here rather than at a
+/// number of its own, so a manifest the compiler accepts always fits.
+#[no_mangle]
+pub extern "C" fn ms_max_bars() -> u64 {
+    crate::expr::MAX_BARS as u64
+}
+
 // MARK: - Exit reasons
 
 /// Every reason a backtest trade can end with, in the kernel's spelling, as a

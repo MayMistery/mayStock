@@ -1,4 +1,5 @@
 import Foundation
+import CMayStockKernel
 
 public enum BacktestPhase: Sendable, Equatable {
     case fetchingCandles(loaded: Int, target: Int)
@@ -38,9 +39,11 @@ public enum BacktestRunnerError: Error, CustomStringConvertible, Sendable, Equat
 }
 
 public struct BacktestRunner: Sendable {
-    /// Ceiling on candles per report. A year of 1H bars (~8,760) fits; a year
-    /// of 5m bars does not, and the report says so rather than lying about coverage.
-    public static let maxBars = 12_000
+    /// Ceiling on candles per report: the kernel's (`expr::MAX_BARS`), so a
+    /// manifest the compiler accepts always fits. 200 000 is all of a
+    /// perpetual's hourly history and 139 days of 1m; past it the report says
+    /// what it covered rather than lying about coverage.
+    public static let maxBars = Int(ms_max_bars())
 
     /// History comes from the strategy's own venue; funding and the
     /// alternative-data feeds are OKX's and only ever asked for OKX markets.
