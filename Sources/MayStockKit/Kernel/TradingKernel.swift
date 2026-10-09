@@ -138,6 +138,8 @@ public final class KernelStrategy: @unchecked Sendable {
         // Thrown rather than dropped: without it the kernel would size against
         // the instrument's default fee, not the venue's.
         let feesJSON = try account.fees.map(encodeJSON)
+        // Thrown too: without them the kernel sizes past the venue's limit.
+        let tiersJSON = try account.positionTiers.map(encodeJSON)
         return try withKernelCandles(candles) { buffer, count in
             let json = try callReturningString { error in
                 ms_strategy_decide(
@@ -150,6 +152,7 @@ public final class KernelStrategy: @unchecked Sendable {
                     account.now.map { Int64(($0.timeIntervalSince1970 * 1000).rounded()) } ?? 0,
                     try? encodeJSON(account.limits),
                     feesJSON,
+                    tiersJSON,
                     error)
             }
             return try JSONDecoder().decode(KernelDecision.self, from: Data(json.utf8))

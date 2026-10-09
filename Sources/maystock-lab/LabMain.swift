@@ -163,6 +163,7 @@ struct LabMain {
 
         if result.liquidations > 0 { Out.warn("发生 \(result.liquidations) 次强平") }
         if result.fundingUnmodelled { Out.warn("未取到资金费率历史，永续成本被低估") }
+        for note in result.positionTierNotes { Out.warn(note) }
         if result.guardRefusals > 0 {
             Out.warn("风控拒绝了 \(result.guardRefusals) 次开仓（实盘同样会拒）：\(result.guardRefusal ?? "原因未给出")")
         }
@@ -190,6 +191,7 @@ struct LabMain {
             strategy: strategy, capital: capital, maxDays: days,
             preloaded: BacktestHistory(
                 candles: candles, fundingRates: config.fundingRates,
+                positionTiers: config.positionTiers,
                 series: data.series, coverage: data.coverage))
         Out.row([("窗口", 8), ("日均", -10), ("总收益", -10), ("回撤", -9),
                  ("交易", -6), ("夏普", -7), ("买入持有", -10)])

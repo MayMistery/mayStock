@@ -51,6 +51,8 @@ pub fn run(
     // the simulation never trades an order the runner would refuse.
     let limits = crate::guard::OrderLimits::default();
     let mut refusals = super::GuardRefusals::default();
+    let position_limit = lender.position_limit();
+    let mut limited = 0usize;
 
     let Some(exposure_expression) = strategy.exposure.as_ref() else {
         return Ok(empty_result(strategy, &candles, config));
@@ -124,6 +126,7 @@ pub fn run(
             let at_fill = Footing {
                 costs: &costs, capital: equity + unrealised_for(quantity, average_price, fill, accrued_funding),
                 price: fill, leverage, regime, held_base: quantity, held_basis: average_price,
+                max_base: position_limit,
             };
             let target = at_fill.affordable(decided);
             let delta = target - quantity;
@@ -366,7 +369,7 @@ pub fn run(
                 // position read its own loss as room to add.
                 let footing = Footing {
                     costs: &costs, capital: marked_equity, price: close, leverage, regime,
-                    held_base: quantity, held_basis: average_price,
+                    held_base: quantity, held_basis: average_price, max_base: position_limit,
                 };
                 let current_exposure = exposure_of(quantity, marked_equity, close, leverage);
                 // Only trade when the drift is worth the fee. The ceiling only
@@ -392,6 +395,10 @@ pub fn run(
                     }
                     if admission.base_delta != 0.0 {
                         pending_target_quantity = Some(quantity + admission.base_delta);
+                        let wanted = crate::sizing::exposure_base(effective, marked_equity, close, leverage);
+                        if footing.limited_by_venue(wanted).is_some() {
+                            limited += 1;
+                        }
                     }
                 }
             }
@@ -474,6 +481,9 @@ pub fn run(
             && config.funding_rates.is_empty(),
         guard_refusals: refusals.count,
         guard_refusal: refusals.first,
+        position_tiers_unmodelled: super::liquidation::tiers_unmodelled(strategy, config),
+        position_limit,
+        position_limited: limited,
         metrics,
     })
 }

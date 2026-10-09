@@ -60,6 +60,12 @@ pub struct BacktestConfig {
     /// (`liquidation::finra_maintenance`).
     #[serde(rename = "maintenanceMarginRate", default)]
     pub maintenance_margin_rate: Option<f64>,
+    /// The venue's position tiers for the instrument, in base units: each
+    /// position owes its tier's maintenance rate and may grow no further than
+    /// its leverage allows (`tiers::PositionTiers`). Isolated margin only, and
+    /// not together with `maintenance_margin_rate`.
+    #[serde(rename = "positionTiers", default)]
+    pub position_tiers: Option<Vec<crate::tiers::PositionTier>>,
     /// Real funding history; empty means funding is not modelled (flagged in
     /// the report rather than silently assumed to be zero).
     #[serde(rename = "fundingRates", default)]
@@ -89,6 +95,7 @@ impl Default for BacktestConfig {
         Self {
             initial_capital: 10_000.0,
             maintenance_margin_rate: None,
+            position_tiers: None,
             funding_rates: Vec::new(),
             fees: None,
             slippage_bps: None,
@@ -209,6 +216,18 @@ pub struct BacktestResult {
     /// Why the first refusal was refused.
     #[serde(rename = "guardRefusal")]
     pub guard_refusal: Option<String>,
+    /// True when an isolated position ran without the venue's position tiers:
+    /// one maintenance rate at every size, and no position limit
+    /// (`liquidation::tiers_unmodelled`).
+    #[serde(rename = "positionTiersUnmodelled")]
+    pub position_tiers_unmodelled: bool,
+    /// The most the venue let a position hold at the run's leverage, in base
+    /// units, where its tiers were given.
+    #[serde(rename = "positionLimit")]
+    pub position_limit: Option<f64>,
+    /// Orders that limit cut short: the capital would have carried more.
+    #[serde(rename = "positionLimited")]
+    pub position_limited: usize,
     /// What the candle series itself was like.
     ///
     /// A backtest run over history with holes in it is not wrong so much as
@@ -350,6 +369,7 @@ pub fn run(
     // drawdown brake is a live risk control, not a rule of the strategy.
     let limits = crate::guard::OrderLimits::default();
     let mut refusals = GuardRefusals::default();
+    let mut limited = 0usize;
 
     if candles.len() <= 1 {
         return Ok(empty_result(strategy, &candles, config));
@@ -463,8 +483,10 @@ pub fn run(
                             index,
                             &mut equity,
                             leverage,
+                            lender.position_limit(),
                             &limits,
                             &mut refusals,
+                            &mut limited,
                             &costs,
                             atr,
                         );
@@ -641,6 +663,9 @@ pub fn run(
             && config.funding_rates.is_empty(),
         guard_refusals: refusals.count,
         guard_refusal: refusals.first,
+        position_tiers_unmodelled: liquidation::tiers_unmodelled(strategy, config),
+        position_limit: lender.position_limit(),
+        position_limited: limited,
         metrics,
     })
 }
@@ -672,8 +697,10 @@ fn open_position(
     index: usize,
     equity: &mut f64,
     leverage: f64,
+    position_limit: Option<f64>,
     limits: &crate::guard::OrderLimits,
     refusals: &mut GuardRefusals,
+    limited: &mut usize,
     costs: &Costs,
     atr: Option<f64>,
 ) {
@@ -684,13 +711,20 @@ fn open_position(
     let stop_distance = crate::sizing::stop_distance(strategy, price, atr);
 
     // Sized from flat — a reversal has already closed and paid for the close —
-    // so that the margin and this fill's fee together fit in the equity left.
+    // so that the margin and this fill's fee together fit in the equity left,
+    // and the position under the venue's limit.
     let footing = crate::sizing::Footing {
         costs, capital: *equity, price, leverage, regime: manifest.market.inst_type.margin_regime(),
-        held_base: 0.0, held_basis: 0.0,
+        held_base: 0.0, held_basis: 0.0, max_base: position_limit,
     };
     let Some(base) = crate::sizing::target_base(strategy, &footing, stop_distance, direction)
     else { return };
+    if crate::sizing::wanted_base(strategy, &footing, stop_distance, direction)
+        .and_then(|wanted| footing.limited_by_venue(wanted))
+        .is_some()
+    {
+        *limited += 1;
+    }
 
     // The same pre-trade limits the live runner applies. Only a sizing bug
     // ever reaches them, and this is where such a bug should surface: a
@@ -913,6 +947,9 @@ fn empty_result(
             && config.funding_rates.is_empty(),
         guard_refusals: 0,
         guard_refusal: None,
+        position_tiers_unmodelled: liquidation::tiers_unmodelled(strategy, config),
+        position_limit: None,
+        position_limited: 0,
         metrics: Metrics::compute(
             &[],
             &[],
@@ -1356,6 +1393,99 @@ mod tests {
             }
         }
         assert!(walked > 100, "walked {walked}");
+    }
+
+    /// A tier table for the walks at 100 with 10 000: whatever the leverage,
+    /// the limit it allows is below what a full-size position would hold
+    /// (100 × leverage base units).
+    fn tight_tiers() -> Vec<crate::tiers::PositionTier> {
+        [(10.0, 0.005, 50.0), (20.0, 0.0075, 40.0), (30.0, 0.01, 20.0), (40.0, 0.02, 10.0), (50.0, 0.05, 5.0)]
+            .into_iter()
+            .map(|(max_base, maintenance_margin_rate, max_leverage)| crate::tiers::PositionTier {
+                max_base, maintenance_margin_rate, max_leverage,
+            })
+            .collect()
+    }
+
+    /// A run on the venue's tiers holds no position past what its leverage
+    /// allows. Walked over every whole leverage a perpetual allows, long and
+    /// short, through both engines, under a table whose limit is always below
+    /// full size: every position stops at the limit, the run reports the limit
+    /// and counts the orders it cut, and says it ran on the tiers. A run
+    /// without them says so — for exactly the families held on isolated
+    /// margin.
+    #[test]
+    fn a_run_on_the_venues_tiers_holds_no_position_past_its_leverages_limit() {
+        let table = crate::tiers::PositionTiers::new(tight_tiers()).unwrap();
+        let mut walked = 0;
+        let mut leverage = 1.0;
+        while leverage <= InstrumentType::Swap.max_leverage() {
+            let limit = table.max_base(leverage).unwrap();
+            for direction in [Direction::Long, Direction::Short] {
+                let continuous = compile(&format!(
+                    r#"{{"id":"c","name":"c","market":{{"instId":"X","instType":"SWAP","bar":"1H"}},
+                         "signals":{{"exposure":"{}"}},"sizing":{{"mode":"equityPct","value":100}},
+                         "risk":{{"leverage":{leverage},"rebalanceThreshold":0.001}}}}"#, direction.sign()));
+                // A threshold below the smallest limit's exposure (10 of 50×
+                // 10 000 at 100 is 0.002), so the capped order still goes.
+                for (engine, strategy) in [("binary", always_in(InstrumentType::Swap, direction, leverage)), ("continuous", continuous)] {
+                    let config = BacktestConfig { position_tiers: Some(tight_tiers()), ..costs(5.0, 3.0) };
+                    let result = run(&strategy, &flat(24), &config).unwrap();
+                    let label = format!("{engine} {leverage}x {direction:?}");
+                    assert_eq!(result.position_limit, Some(limit), "{label}");
+                    assert!(!result.position_tiers_unmodelled, "{label}");
+                    assert!(!result.trades.is_empty(), "{label}: traded nothing");
+                    assert!(result.trades.iter().all(|t| t.quantity <= limit * (1.0 + 1e-12)),
+                            "{label}: past {limit}: {:?}", result.trades.iter().map(|t| t.quantity).collect::<Vec<_>>());
+                    assert!(result.trades.iter().any(|t| (t.quantity - limit).abs() <= 1e-9 * limit), "{label}: never at the limit");
+                    assert!(result.position_limited >= 1, "{label}: cut, and not counted");
+                    walked += 1;
+                }
+            }
+            leverage += 1.0;
+        }
+        assert!(walked >= 200, "walked {walked}");
+        for family in InstrumentType::ALL {
+            let leverage = 1.0;
+            let strategy = if family.is_option() {
+                compile(r#"{"id":"o","name":"o","market":{"instId":"BTC-USDT","instType":"OPTION","bar":"1H"},
+                            "signals":{"longEntry":"close > 0"},"sizing":{"mode":"equityPct","value":10},
+                            "risk":{"leverage":1}}"#)
+            } else {
+                always_in_with(family, Direction::Long, leverage, 50.0, "")
+            };
+            let result = run(&strategy, &flat(24), &costs(5.0, 3.0)).unwrap();
+            assert_eq!(result.position_tiers_unmodelled, family.margin_regime() == MarginRegime::Isolated, "{family:?}");
+            assert_eq!((result.position_limit, result.position_limited), (None, 0), "{family:?}");
+        }
+    }
+
+    /// Tiers the venue would not have are refused rather than simulated: a
+    /// leverage no tier allows (the venue will not set it), tiers and a rate
+    /// both, tiers for a regime that has none, and a table that is not one.
+    #[test]
+    fn tiers_the_venue_would_not_have_are_refused() {
+        let with = |tiers: Vec<crate::tiers::PositionTier>, rate: Option<f64>| BacktestConfig {
+            position_tiers: Some(tiers), maintenance_margin_rate: rate, ..costs(5.0, 3.0)
+        };
+        let refused = |strategy: &CompiledStrategy, config: &BacktestConfig| match run(strategy, &flat(24), config) {
+            Err(ExprError::Policy(why)) => why,
+            other => panic!("not refused: {:?}", other.map(|r| r.trades.len())),
+        };
+        let mut low = tight_tiers();
+        low.iter_mut().for_each(|tier| tier.max_leverage = tier.max_leverage.min(20.0));
+        assert!(refused(&always_in(InstrumentType::Swap, Direction::Long, 25.0), &with(low, None)).contains("25"));
+        assert!(refused(&always_in(InstrumentType::Swap, Direction::Long, 5.0), &with(tight_tiers(), Some(0.01))).contains("只能给一个"));
+        for family in InstrumentType::ALL.into_iter().filter(|f| f.margin_regime() != MarginRegime::Isolated && !f.is_option()) {
+            assert!(refused(&always_in(family, Direction::Long, 1.0), &with(tight_tiers(), None)).contains("逐仓"), "{family:?}");
+        }
+        let mut unsorted = tight_tiers();
+        unsorted.swap(0, 1);
+        assert!(refused(&always_in(InstrumentType::Swap, Direction::Long, 5.0), &with(unsorted, None)).contains("档位表无效"));
+        let mut continuous = BacktestConfig { maintenance_margin_rate: Some(1.5), ..costs(5.0, 3.0) };
+        assert!(refused(&always_in(InstrumentType::Swap, Direction::Long, 5.0), &continuous).contains("维持保证金率"));
+        continuous.maintenance_margin_rate = Some(f64::NAN);
+        assert!(refused(&always_in(InstrumentType::Swap, Direction::Long, 5.0), &continuous).contains("维持保证金率"));
     }
 
     /// Regulation T has no floor under the loss: the broker sells into the

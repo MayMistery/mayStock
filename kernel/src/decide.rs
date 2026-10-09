@@ -12,10 +12,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::candle::Candle;
 use crate::expr::eval::{truthy, Evaluator};
-use crate::expr::ExprResult;
+use crate::expr::{ExprError, ExprResult};
 use crate::options::{self, OptionKind};
 use crate::sizing::Footing;
 use crate::strategy::{CompiledStrategy, SizingMode};
+use crate::tiers::PositionTiers;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -305,6 +306,11 @@ pub struct AccountState {
     /// same `CompiledStrategy::costs`. Sizing needs it: what an entry commits
     /// is its margin and its fee (`sizing::Footing`).
     pub fees: Option<Vec<crate::fees::FeeComponent>>,
+    /// The venue's position tiers for the instrument, in base units — what
+    /// `BacktestConfig::position_tiers` is to a backtest. Sizing stops at the
+    /// most a position may hold at the decision's leverage, as the backtest's
+    /// does; the venue refuses an order past it.
+    pub position_tiers: Option<Vec<crate::tiers::PositionTier>>,
 }
 
 impl Default for AccountState {
@@ -320,6 +326,7 @@ impl Default for AccountState {
             limits: crate::guard::OrderLimits::default(),
             entry_price: 0.0,
             fees: None,
+            position_tiers: None,
         }
     }
 }
@@ -336,6 +343,19 @@ fn refused_reason(refusal: &crate::guard::OrderDenied, closing_only: bool) -> St
 
 /// What the status line adds when sizing stopped at the capital's ceiling.
 const SIZED_TO_CAPITAL: &str = "保证金加开仓手续费按资金上限定仓";
+
+/// Why sizing stopped short of what the strategy asked, when the venue's
+/// position limit stopped it: that limit, or — where no tier allows the
+/// leverage at all — that nothing can be opened.
+fn venue_note(footing: &Footing, wanted_base: f64, leverage: f64, tiers: Option<&PositionTiers>) -> Option<String> {
+    let limit = footing.limited_by_venue(wanted_base)?;
+    Some(match tiers {
+        Some(tiers) if limit <= 0.0 => {
+            format!("杠杆 {leverage}× 超过交易所档位表允许的最高 {}×，不能开仓", tiers.max_leverage())
+        }
+        _ => format!("交易所档位：{leverage}× 下单个仓位最多持有 {limit} 单位标的"),
+    })
+}
 
 /// A status line with its note, when there is one.
 fn with_note(reason: String, note: Option<&str>) -> String {
@@ -502,6 +522,11 @@ pub fn decide_live(
     let leverage = account
         .leverage_cap
         .map_or(manifest_leverage, |cap| manifest_leverage.min(cap));
+    // The venue's limit on a position at this leverage, where its tiers are
+    // known. A leverage no tier allows can add nothing; it can still close.
+    let tiers = account.position_tiers.clone().map(PositionTiers::new).transpose()
+        .map_err(|why| ExprError::Policy(format!("档位表无效：{why}")))?;
+    let position_limit = tiers.as_ref().map(|tiers| tiers.max_base(leverage).unwrap_or(0.0));
 
     // The daily-loss breaker outranks every signal: once it trips the only
     // legitimate action is to close out. Checked before sizing so a halted
@@ -546,6 +571,7 @@ pub fn decide_live(
         costs, capital: account.equity, price, leverage,
         regime: strategy.manifest.market.inst_type.margin_regime(),
         held_base: account.held_base, held_basis: account.entry_price,
+        max_base: position_limit,
     };
 
     if let Some(exposure) = strategy.exposure.as_ref() {
@@ -583,8 +609,11 @@ pub fn decide_live(
         let wanted_base = crate::sizing::exposure_base(wanted_exposure, account.equity, price, leverage);
         let (target_base, cut) = match &costs {
             Ok(costs) => {
-                let target = footing(costs).affordable(wanted_base);
-                (target, (target != wanted_base).then(|| SIZED_TO_CAPITAL.to_string()))
+                let at = footing(costs);
+                let target = at.affordable(wanted_base);
+                let note = venue_note(&at, wanted_base, leverage, tiers.as_ref())
+                    .or_else(|| (target != wanted_base).then(|| SIZED_TO_CAPITAL.to_string()));
+                (target, note)
             }
             Err(why) => {
                 let target = unsized_target(account.held_base, wanted_base);
@@ -726,16 +755,24 @@ pub fn decide_live(
         let sized = match &costs {
             Ok(costs) => {
                 let at = footing(costs);
-                crate::sizing::target_base(strategy, &at, distance, direction)
-                    .map(|base| (base, at.committed(base) >= account.equity * (1.0 - 1e-9)))
-                    .ok_or_else(|| "无法定仓（缺少止损距离，或资金付不起任何仓位的保证金和手续费）".to_string())
+                let wanted = crate::sizing::wanted_base(strategy, &at, distance, direction);
+                let venue = wanted.and_then(|wanted| venue_note(&at, wanted, leverage, tiers.as_ref()));
+                match crate::sizing::target_base(strategy, &at, distance, direction) {
+                    Some(base) => Ok((base, venue.or_else(|| {
+                        (at.committed(base) >= account.equity * (1.0 - 1e-9)).then(|| SIZED_TO_CAPITAL.to_string())
+                    }))),
+                    None => Err(match venue {
+                        Some(note) => format!("无法定仓：{note}"),
+                        None => "无法定仓（缺少止损距离，或资金付不起任何仓位的保证金和手续费）".to_string(),
+                    }),
+                }
             }
             Err(why) => Err(format!("无法定仓：{why}")),
         };
         match sized {
-            Ok((base, at_ceiling)) => {
+            Ok((base, note)) => {
                 target_base = base;
-                cut = at_ceiling.then_some(SIZED_TO_CAPITAL);
+                cut = note;
             }
             Err(reason) => {
                 // The signal is still the signal. Reporting it as "flat"
@@ -818,7 +855,7 @@ pub fn decide_live(
         halt_daily_loss: false,
         reason: match (&admission.denied, target) {
             (Some(refusal), _) => refused_reason(refusal, closing_only),
-            (None, Some(d)) => with_note(format!("信号{}", if d == Direction::Long { "做多" } else { "做空" }), cut),
+            (None, Some(d)) => with_note(format!("信号{}", if d == Direction::Long { "做多" } else { "做空" }), cut.as_deref()),
             (None, None) => "信号平仓".to_string(),
         },
         confirmed_bars: candles.len(),
@@ -1172,6 +1209,42 @@ mod tests {
             }
             let halted = OrderLimits { max_order_notional: None, state: TradingState::Halted };
             assert!(!decide_reversal(&strategy, 3.0, halted).should_trade);
+        }
+    }
+
+    /// Live, the venue's position limit stops sizing where the backtest's
+    /// does, binary or continuous, and the status line says the venue stopped
+    /// it. At a leverage no tier allows nothing is opened, and the line says
+    /// why — while a position the signal has turned against still closes.
+    #[test]
+    fn the_venues_position_limit_stops_a_live_entry_and_says_so() {
+        use crate::tiers::PositionTier;
+        let tier = |max_base, max_leverage| PositionTier { max_base, maintenance_margin_rate: 0.005, max_leverage };
+        let candles: Vec<Candle> = (0..30).map(|i| bar(i * 3_600_000, 100.0, 100.5, 99.5, 100.0)).collect();
+        let decide = |strategy: &CompiledStrategy, current, held: f64, tiers: Vec<PositionTier>| {
+            decide_live(
+                strategy, &candles, current, 5, &std::collections::HashMap::new(),
+                AccountState { equity: 10_000.0, held_base: held, entry_price: 100.0, position_tiers: Some(tiers),
+                               ..AccountState::default() },
+            )
+            .unwrap()
+        };
+        for exposure in [false, true] {
+            // Full size at 10× is 1 000 coins; the venue allows 300.
+            let opening = reversing(10.0, exposure);
+            let capped = decide(&opening, None, 0.0, vec![tier(300.0, 20.0), tier(5_000.0, 5.0)]);
+            assert!(capped.should_trade, "exposure={exposure}: {}", capped.reason);
+            assert!((capped.target_base_quantity + 300.0).abs() < 1e-9, "exposure={exposure}: {}", capped.target_base_quantity);
+            assert!(capped.reason.contains("交易所档位") && capped.reason.contains("300"), "{}", capped.reason);
+
+            // No tier allows 10×: nothing opens, and it says so…
+            let refused = decide(&opening, None, 0.0, vec![tier(300.0, 5.0)]);
+            assert!(!refused.should_trade && refused.target_base_quantity == 0.0, "exposure={exposure}: {}", refused.reason);
+            assert!(refused.reason.contains("超过交易所档位表允许的最高 5×"), "exposure={exposure}: {}", refused.reason);
+            // …but a long the signal has turned against still closes.
+            let closing = decide(&opening, Some(Direction::Long), 50.0, vec![tier(300.0, 5.0)]);
+            assert!(closing.should_trade && (closing.base_delta + 50.0).abs() < 1e-9,
+                    "exposure={exposure}: {} {}", closing.base_delta, closing.reason);
         }
     }
 

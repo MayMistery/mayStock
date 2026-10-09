@@ -60,6 +60,14 @@ public struct OKXVenue: ExchangeVenue {
         try await market(mode).instrumentMeta(instId: instId)
     }
 
+    /// A perpetual's isolated tiers; the demo states its own (2026-10-09: SOL's
+    /// first tier ends at 2 500 contracts on the demo, 5 000 on the real
+    /// market). Only a perpetual is tiered here.
+    public func positionTiers(instId: String, mode: TradingMode) async throws -> [KernelPositionTier]? {
+        guard venue.instrumentType(of: instId) == .swap else { return nil }
+        return try await market(mode).positionTiers(instId: instId)
+    }
+
     /// Options are marked, not last-traded: a thin book's last print can be
     /// hours old, while the mark is refreshed continuously and is the number
     /// the exchange itself values the position at.

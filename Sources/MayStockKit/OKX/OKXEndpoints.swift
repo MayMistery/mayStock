@@ -63,6 +63,8 @@ actor OKXPublicPacer {
         case "api/v5/market/candles": return .milliseconds(60)
         case "api/v5/market/history-candles": return .milliseconds(110)
         case "api/v5/public/funding-rate-history": return .milliseconds(220)
+        // 10 requests per 2 seconds.
+        case "api/v5/public/position-tiers": return .milliseconds(220)
         default: return .milliseconds(120)
         }
     }

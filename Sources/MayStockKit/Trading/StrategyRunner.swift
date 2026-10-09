@@ -1163,6 +1163,7 @@ public final class StrategyRunner {
         }
         dayAnchors[strategy.id] = anchor
 
+        let tiers = await positionTiers(instId: market.instId, host: host)
         let decision: KernelDecision
         do {
             decision = try decide(
@@ -1185,7 +1186,10 @@ public final class StrategyRunner {
                     // The fee a backtest of this manifest charges, so an entry
                     // is sized to fit its margin and its fee in the equity
                     // exactly as it was simulated.
-                    fees: strategy.manifest.fallbackCosts(under: host.portfolio.feeSchedules)?.fees))
+                    fees: strategy.manifest.fallbackCosts(under: host.portfolio.feeSchedules)?.fees,
+                    // The venue's limit at this leverage, as the backtest
+                    // stopped at it.
+                    positionTiers: tiers))
         } catch {
             update(strategy.id) {
                 $0.status = .failed
@@ -1784,6 +1788,32 @@ public final class StrategyRunner {
     /// call.
     public static let accountConfigTTL: TimeInterval = 3_600
     private var accountConfigCache: (config: AccountTradingConfig, at: Date)?
+
+    /// How long a read of an instrument's position tiers is reused. OKX
+    /// changes them rarely, and a decision waits on the read.
+    public static let positionTiersTTL: TimeInterval = 3_600
+    private var positionTiersCache: [String: (tiers: [KernelPositionTier]?, at: Date)] = [:]
+
+    /// The instrument's position tiers in the environment the runner trades,
+    /// cached. Nil where the venue states none, or when they have never been
+    /// readable — then the kernel sizes without the venue's limit and the
+    /// exchange refuses an order past it (51004); the log says the read
+    /// failed, so the refusal can be traced to it.
+    private func positionTiers(instId: String, host: StrategyRunnerHost) async -> [KernelPositionTier]? {
+        let mode = host.portfolio.mode
+        let key = "\(mode.rawValue)|\(instId)"
+        if let cached = positionTiersCache[key], Date().timeIntervalSince(cached.at) < Self.positionTiersTTL {
+            return cached.tiers
+        }
+        do {
+            let tiers = try await host.venue.positionTiers(instId: instId, mode: mode)
+            positionTiersCache[key] = (tiers, Date())
+            return tiers
+        } catch {
+            Log.warn("runner: \(instId) 仓位档位表读不到（\(error)），沿用上次读数；从没读到过就不按档位限仓")
+            return positionTiersCache[key]?.tiers
+        }
+    }
 
     /// The account's position mode and margin level, cached. Nil when it has
     /// never been readable, in which case callers fall back to the long/short

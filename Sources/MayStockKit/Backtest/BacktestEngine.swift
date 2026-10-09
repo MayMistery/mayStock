@@ -38,6 +38,11 @@ public struct BacktestConfig: Sendable {
     /// FINRA's minimum (25% of a long, 30% of a short and more below $16.67)
     /// is the kernel's Reg T rule and applies beneath any rate given.
     public var maintenanceMarginRate: Double?
+    /// The venue's position tiers for a perpetual, in base units
+    /// (`OKXRESTClient.positionTiers`): each position owes its tier's
+    /// maintenance and holds no more than its leverage allows. Nil runs on
+    /// one rate at every size and no limit, and the result says so.
+    public var positionTiers: [KernelPositionTier]?
     /// Real funding history; empty means funding is not modelled (flagged in the report).
     public var fundingRates: [FundingRate]
     /// Fees and slippage to charge when a manifest does not state its own,
@@ -56,6 +61,7 @@ public struct BacktestConfig: Sendable {
     public init(
         initialCapital: Double = 10_000,
         maintenanceMarginRate: Double? = nil,
+        positionTiers: [KernelPositionTier]? = nil,
         fundingRates: [FundingRate] = [],
         feeSchedules: FeeSchedules = FeeSchedules(),
         externalSeries: [String: [Double]] = [:],
@@ -63,6 +69,7 @@ public struct BacktestConfig: Sendable {
     ) {
         self.initialCapital = initialCapital
         self.maintenanceMarginRate = maintenanceMarginRate
+        self.positionTiers = positionTiers
         self.fundingRates = fundingRates
         self.feeSchedules = feeSchedules
         self.externalSeries = externalSeries
@@ -85,6 +92,7 @@ public struct BacktestConfig: Sendable {
         return KernelBacktestConfig(
             initialCapital: initialCapital,
             maintenanceMarginRate: maintenanceMarginRate,
+            positionTiers: positionTiers,
             fundingRates: fundingRates.map { KernelFundingRate(ts: $0.ts, rate: $0.rate) },
             fees: fallback?.fees,
             slippageBps: fallback?.slippageBps,
@@ -241,6 +249,14 @@ public struct BacktestResult: Sendable {
     /// them too — and why the first was. A sound strategy has none.
     public let guardRefusals: Int
     public let guardRefusal: String?
+    /// True when an isolated position ran without the venue's position tiers:
+    /// one maintenance rate at every size, and no position limit.
+    public let positionTiersUnmodelled: Bool
+    /// The most the venue let a position hold at the run's leverage, in base
+    /// units, and how many orders that limit cut short — the capital would
+    /// have carried more.
+    public let positionLimit: Double?
+    public let positionLimited: Int
     /// Gaps, duplicates and malformed bars in the history this ran over.
     ///
     /// A backtest over holed history is not so much wrong as *less than it
@@ -267,6 +283,7 @@ public struct BacktestResult: Sendable {
         barCount: Int, initialCapital: Double, finalEquity: Double,
         trades: [BacktestTrade], equityCurve: [EquityPoint], liquidations: Int,
         warmupBars: Int, fundingUnmodelled: Bool, guardRefusals: Int = 0, guardRefusal: String? = nil,
+        positionTiersUnmodelled: Bool = false, positionLimit: Double? = nil, positionLimited: Int = 0,
         dataQuality: KernelDataQuality? = nil, metrics: BacktestMetrics
     ) {
         self.strategyId = strategyId
@@ -283,6 +300,9 @@ public struct BacktestResult: Sendable {
         self.fundingUnmodelled = fundingUnmodelled
         self.guardRefusals = guardRefusals
         self.guardRefusal = guardRefusal
+        self.positionTiersUnmodelled = positionTiersUnmodelled
+        self.positionLimit = positionLimit
+        self.positionLimited = positionLimited
         self.dataQuality = dataQuality
         self.metrics = metrics
     }
@@ -344,6 +364,9 @@ extension BacktestResult {
             fundingUnmodelled: kernel.fundingUnmodelled,
             guardRefusals: kernel.guardRefusals,
             guardRefusal: kernel.guardRefusal,
+            positionTiersUnmodelled: kernel.positionTiersUnmodelled,
+            positionLimit: kernel.positionLimit,
+            positionLimited: kernel.positionLimited,
             dataQuality: kernel.dataQuality,
             metrics: BacktestMetrics(kernel: kernel.metrics))
     }

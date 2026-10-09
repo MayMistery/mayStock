@@ -230,9 +230,24 @@ enum Lab {
         }
     }
 
+    /// A perpetual's position tiers, or nil for anything else. A failed read
+    /// is said: without them the run holds every position to one maintenance
+    /// rate and no position limit, and its result says so too.
+    static func positionTiers(
+        strategy: CompiledStrategy, sources: MarketDataSources = MarketDataSources()
+    ) async -> [KernelPositionTier]? {
+        guard strategy.market.instType == .swap else { return nil }
+        do {
+            return try await sources.okx.positionTiers(instId: strategy.market.instId)
+        } catch {
+            Out.warn("仓位档位表取不到（\(error)），维持保证金率按品种默认值估算，仓位不受档位的杠杆上限约束")
+            return nil
+        }
+    }
+
     /// A backtest config with everything the manifest and the account imply —
-    /// external series, funding, fees. The one place these are assembled, so a
-    /// command cannot quietly omit one.
+    /// external series, funding, position tiers, fees. The one place these are
+    /// assembled, so a command cannot quietly omit one.
     static func config(
         strategy: CompiledStrategy, capital: Double, schedules: FeeSchedules,
         data: (candles: [Candle], series: [String: [Double]], coverage: [SeriesCoverage]),
@@ -242,6 +257,7 @@ enum Lab {
             initialCapital: capital, feeSchedules: schedules, externalSeries: data.series)
         config.fundingRates = await fundingRates(
             strategy: strategy, candles: data.candles, days: days)
+        config.positionTiers = await positionTiers(strategy: strategy)
         return config
     }
 

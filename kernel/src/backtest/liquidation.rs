@@ -8,8 +8,10 @@
 //!
 //! - **Isolated margin** (a perpetual on OKX) counts the margin posted at the
 //!   entry, less the funding settled out of it, plus the unrealised P&L. It
-//!   requires the maintenance rate of the position's *current* value, plus the
-//!   fee a close would pay there. For a long that is a price ratio of
+//!   requires the maintenance rate of the position's *current* value — its
+//!   tier's, by its size, where the venue's tiers are known
+//!   (`tiers::PositionTiers`) — plus the fee a close would pay there. For a
+//!   long that is a price ratio of
 //!   `(1 − 1/L) / (1 − mmr − fee)`, for a short `(1 + 1/L) / (1 + mmr + fee)`.
 //!   Measured on the OKX demo account 2026-10-09 — ETH-USDT-SWAP and
 //!   SOL-USDT-SWAP, tier-one maintenance 0.4% and 0.5%, VIP1 taker 0.045%,
@@ -40,6 +42,7 @@ use super::{closing_side, BacktestConfig, ExitFill};
 use crate::decide::Direction;
 use crate::expr::{ExprError, ExprResult};
 use crate::strategy::{CompiledStrategy, Costs, MarginRegime};
+use crate::tiers::PositionTiers;
 
 /// FINRA Rule 4210(c), the least maintenance a broker may hold against a
 /// position on Regulation T margin, per share at `price`: 25% of a long's
@@ -71,17 +74,24 @@ pub(crate) struct Holding {
 }
 
 /// Who lends against a run's positions, on what terms: the instrument's margin
-/// regime, the manifest's leverage, the maintenance rate held against them,
-/// and what a closing fill pays. One per run, asked by both engines.
+/// regime, the manifest's leverage, the maintenance held against them, and
+/// what a closing fill pays. One per run, asked by both engines.
 pub(crate) struct Lender<'a> {
     regime: MarginRegime,
     leverage: f64,
-    maintenance: f64,
+    maintenance: Maintenance,
     costs: &'a Costs,
     /// The last level worked out and the position it was worked out for. A
     /// level moves only when the position does — a fill, a funding
     /// settlement — and the engines ask on every bar.
     last: Cell<Option<(Holding, Option<f64>)>>,
+}
+
+/// The maintenance rate a position owes on its current value: one rate, or
+/// its tier's by its size.
+enum Maintenance {
+    Rate(f64),
+    Tiers(PositionTiers),
 }
 
 /// How many times the search for a bracket doubles its far end. Past this a
@@ -90,16 +100,43 @@ const DOUBLINGS: usize = 64;
 
 impl<'a> Lender<'a> {
     pub(crate) fn new(regime: MarginRegime, leverage: f64, maintenance: f64, costs: &'a Costs) -> Self {
+        Self::with(regime, leverage, Maintenance::Rate(maintenance), costs)
+    }
+
+    /// A lender on isolated margin that holds a position to its tier.
+    pub(crate) fn tiered(leverage: f64, tiers: PositionTiers, costs: &'a Costs) -> Self {
+        Self::with(MarginRegime::Isolated, leverage, Maintenance::Tiers(tiers), costs)
+    }
+
+    fn with(regime: MarginRegime, leverage: f64, maintenance: Maintenance, costs: &'a Costs) -> Self {
         Self { regime, leverage: leverage.max(1.0), maintenance, costs, last: Cell::new(None) }
     }
 
-    /// The lender of one run. The maintenance rate is the caller's, else the
-    /// instrument's documented default (`InstrumentType::default_maintenance_margin_rate`),
-    /// else none beyond the regime's own floor; one that is not a share of the
-    /// position's value — negative, NaN, or 100% and more, which no position
-    /// could ever meet — is refused rather than simulated.
+    /// The lender of one run. The maintenance is the venue's tiers where the
+    /// caller hands them over, else the caller's rate, else the instrument's
+    /// documented default (`InstrumentType::default_maintenance_margin_rate`),
+    /// else none beyond the regime's own floor. Refused rather than simulated:
+    /// a rate that is not a share of the position's value (negative, NaN, or
+    /// 100% and more, which no position could meet); tiers and a rate both,
+    /// which contradict each other; tiers for a regime that has none; and a
+    /// leverage no tier allows, which the venue will not set.
     pub(crate) fn for_run(strategy: &CompiledStrategy, config: &BacktestConfig, costs: &'a Costs) -> ExprResult<Self> {
         let inst_type = strategy.manifest.market.inst_type;
+        let (regime, leverage) = (inst_type.margin_regime(), strategy.leverage());
+        if let Some(rows) = &config.position_tiers {
+            if config.maintenance_margin_rate.is_some() {
+                return Err(ExprError::Policy("维持保证金率和档位表只能给一个：档位表里每一档有自己的维持保证金率".into()));
+            }
+            if regime != MarginRegime::Isolated {
+                return Err(ExprError::Policy(format!("档位表只适用于逐仓保证金，{inst_type:?} 不是")));
+            }
+            let tiers = PositionTiers::new(rows.clone()).map_err(|why| ExprError::Policy(format!("档位表无效：{why}")))?;
+            if tiers.max_base(leverage).is_none() {
+                return Err(ExprError::Policy(format!(
+                    "杠杆 {leverage}× 超过档位表允许的最高杠杆 {}×，交易所不会设这个杠杆", tiers.max_leverage())));
+            }
+            return Ok(Self::tiered(leverage, tiers, costs));
+        }
         let maintenance = config
             .maintenance_margin_rate
             .or_else(|| inst_type.default_maintenance_margin_rate())
@@ -109,7 +146,24 @@ impl<'a> Lender<'a> {
                 "维持保证金率 {maintenance} 不是仓位价值的一个比例（应在 0 到 1 之间，不含 1）"
             )));
         }
-        Ok(Self::new(inst_type.margin_regime(), strategy.leverage(), maintenance, costs))
+        Ok(Self::new(regime, leverage, maintenance, costs))
+    }
+
+    /// The most a position may hold at this run's leverage, where the venue's
+    /// tiers say (`sizing::Footing::max_base`).
+    pub(crate) fn position_limit(&self) -> Option<f64> {
+        match &self.maintenance {
+            Maintenance::Tiers(tiers) => tiers.max_base(self.leverage),
+            Maintenance::Rate(_) => None,
+        }
+    }
+
+    /// The maintenance rate `held` owes on its current value.
+    fn maintenance_rate(&self, held: &Holding) -> f64 {
+        match &self.maintenance {
+            Maintenance::Rate(rate) => *rate,
+            Maintenance::Tiers(tiers) => tiers.maintenance_rate(held.quantity),
+        }
     }
 
     /// The margin posted against an isolated position: its value at the price
@@ -132,10 +186,10 @@ impl<'a> Lender<'a> {
         let value = held.quantity * price;
         match self.regime {
             MarginRegime::Isolated => {
-                self.maintenance * value + self.costs.fee(closing_side(held.direction), held.quantity, value)
+                self.maintenance_rate(held) * value + self.costs.fee(closing_side(held.direction), held.quantity, value)
             }
             MarginRegime::RegT => {
-                held.quantity * (self.maintenance * price).max(finra_maintenance(held.direction, price))
+                held.quantity * (self.maintenance_rate(held) * price).max(finra_maintenance(held.direction, price))
             }
             MarginRegime::None => 0.0,
         }
@@ -240,6 +294,14 @@ impl<'a> Lender<'a> {
             }
         }
     }
+}
+
+/// Whether a run on `strategy` went without the venue's position tiers where
+/// they apply — an isolated position held to one maintenance rate at every
+/// size, and to no position limit. Reported with every result, as missing
+/// funding is.
+pub(crate) fn tiers_unmodelled(strategy: &CompiledStrategy, config: &BacktestConfig) -> bool {
+    strategy.manifest.market.inst_type.margin_regime() == MarginRegime::Isolated && config.position_tiers.is_none()
 }
 
 /// Where the position turns from closed out to covered, between `inside`,
@@ -486,6 +548,55 @@ mod tests {
         let house = Lender::new(MarginRegime::RegT, 2.0, 0.4, &costs)
             .liquidation_level(&held(Direction::Long, 10.0, 100.0, 0.0, 500.0));
         assert!(close(house, 100.0 * 0.5 / 0.6));
+    }
+
+    /// The SOL-USDT-SWAP position measured in its second tier on the OKX demo
+    /// account, 2026-10-09: 2 600 contracts of one SOL at 40×, entered at
+    /// 110.6119345, liquidated by OKX's estimate at 108.72088769467265 — the
+    /// level at the second tier's 0.75% on the whole position, a tick towards
+    /// the entry. Held to the first tier's 0.5% it would sit 0.27 lower.
+    #[test]
+    fn a_position_past_the_first_tier_is_held_to_its_own_tiers_rate() {
+        let costs = Costs::flat(4.5, 0.0);
+        let position = held(Direction::Long, 2_600.0, 110.6119345, 0.0, 0.0);
+        let level = Lender::tiered(40.0, crate::tiers::tests::sol_demo(), &costs).liquidation_level(&position).unwrap();
+        let okx = 108.72088769467265;
+        assert!(okx - level > 0.0 && okx - level <= 0.01 + 1e-9, "{level} vs OKX {okx}");
+        let first_tier = Lender::new(MarginRegime::Isolated, 40.0, 0.005, &costs).liquidation_level(&position).unwrap();
+        assert!(okx - first_tier > 0.25, "{first_tier}");
+    }
+
+    /// Walks every tier of a table, on both sides of every tier's limit, at
+    /// every whole leverage the tier allows, long and short: a position held to
+    /// the tiers sits exactly where one held to its own tier's rate does.
+    #[test]
+    fn a_tiered_level_is_the_level_at_the_rate_of_the_tier_the_size_falls_in() {
+        use crate::tiers::PositionTier;
+        let rows = vec![
+            PositionTier { max_base: 2_500.0, maintenance_margin_rate: 0.005, max_leverage: 50.0 },
+            PositionTier { max_base: 10_000.0, maintenance_margin_rate: 0.0075, max_leverage: 40.0 },
+            PositionTier { max_base: 20_000.0, maintenance_margin_rate: 0.01, max_leverage: 33.33 },
+        ];
+        let costs = Costs::flat(5.0, 0.0);
+        let mut walked = 0;
+        for (index, tier) in rows.iter().enumerate() {
+            let below = if index == 0 { 0.0 } else { rows[index - 1].max_base };
+            for size in [below + (tier.max_base - below) * 0.01, tier.max_base] {
+                let mut leverage = 1.0;
+                while leverage <= tier.max_leverage {
+                    for direction in [Direction::Long, Direction::Short] {
+                        let position = held(direction, size, 100.0, 0.0, 0.0);
+                        let tiered = Lender::tiered(leverage, PositionTiers::new(rows.clone()).unwrap(), &costs);
+                        let flat = Lender::new(MarginRegime::Isolated, leverage, tier.maintenance_margin_rate, &costs);
+                        assert_eq!(tiered.liquidation_level(&position), flat.liquidation_level(&position),
+                                   "{size} at {leverage}x {direction:?}");
+                        walked += 1;
+                    }
+                    leverage += 1.0;
+                }
+            }
+        }
+        assert!(walked > 400, "walked {walked}");
     }
 
     #[test]

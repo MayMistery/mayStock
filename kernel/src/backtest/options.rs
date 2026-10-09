@@ -82,6 +82,9 @@ pub fn run(
     let manifest = &strategy.manifest;
     let spec = strategy.options_spec();
     let costs = super::resolve_costs(strategy, config)?;
+    // Nothing is lent against a bought option, but a margin setting it cannot
+    // have — tiers, a rate that is no rate — is refused here as anywhere.
+    super::liquidation::Lender::for_run(strategy, config, &costs)?;
     let slippage = costs.slippage_bps / 10_000.0;
     // The same pre-trade caps the runner applies; see the binary engine.
     let limits = crate::guard::OrderLimits::default();
@@ -318,6 +321,9 @@ pub fn run(
         funding_unmodelled: false,
         guard_refusals: refusals.count,
         guard_refusal: refusals.first,
+        position_tiers_unmodelled: super::liquidation::tiers_unmodelled(strategy, config),
+        position_limit: None,
+        position_limited: 0,
         metrics,
     })
 }

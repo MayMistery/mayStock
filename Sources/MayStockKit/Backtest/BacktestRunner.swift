@@ -4,6 +4,7 @@ import CMayStockKernel
 public enum BacktestPhase: Sendable, Equatable {
     case fetchingCandles(loaded: Int, target: Int)
     case fetchingFunding
+    case fetchingPositionTiers
     case fetchingAlternativeData
     case simulating(BacktestWindow)
     case finished
@@ -13,6 +14,7 @@ public enum BacktestPhase: Sendable, Equatable {
         case .fetchingCandles(let loaded, let target):
             return "拉取历史 K 线 \(loaded)/\(target)"
         case .fetchingFunding: return "拉取资金费率历史"
+        case .fetchingPositionTiers: return "拉取仓位档位表"
         case .fetchingAlternativeData: return "拉取另类数据"
         case .simulating(let window): return "回测 \(window.displayName)"
         case .finished: return "完成"
@@ -109,6 +111,7 @@ public struct BacktestRunner: Sendable {
         let config = BacktestConfig(
             initialCapital: capital,
             maintenanceMarginRate: maintenanceMarginRate,
+            positionTiers: history.positionTiers,
             fundingRates: history.fundingRates,
             feeSchedules: feeSchedules,
             externalSeries: history.series)
@@ -145,6 +148,10 @@ public struct BacktestRunner: Sendable {
         if let fundingNote {
             coverageNote = [coverageNote, fundingNote].compactMap { $0 }.joined(separator: " ")
         }
+        if let failure = history.positionTiersFailure {
+            coverageNote = [coverageNote, "仓位档位表取不到（\(failure)），维持保证金率按品种默认值估算，仓位不受档位的杠杆上限约束。"]
+                .compactMap { $0 }.joined(separator: " ")
+        }
 
         // A series that only covers part of the window makes the long windows
         // untestable; say so rather than silently backtesting on NaNs.
@@ -173,8 +180,8 @@ public struct BacktestRunner: Sendable {
 
     /// Download what a report replays: the candles — shared with any report
     /// running alongside on the same market (`BacktestHistoryMemo`) — the
-    /// funding a perpetual paid over them, and the manifest's declared series
-    /// aligned to them.
+    /// funding a perpetual paid over them and its position tiers, and the
+    /// manifest's declared series aligned to them.
     private func assemble(
         strategy: CompiledStrategy, targetBars: Int, longestDays: Int,
         onPhase: (@Sendable (BacktestPhase) -> Void)?
@@ -204,6 +211,14 @@ public struct BacktestRunner: Sendable {
                 // due", the cheapest answer there is.
                 Log.warn("backtest: \(market.instId) 资金费率历史取不到：\(error)")
                 history.fundingFailure = String(describing: error)
+            }
+            onPhase?(.fetchingPositionTiers)
+            do {
+                // Today's table, for the whole history: OKX serves no other.
+                history.positionTiers = try await rest.positionTiers(instId: market.instId)
+            } catch {
+                Log.warn("backtest: \(market.instId) 仓位档位表取不到：\(error)")
+                history.positionTiersFailure = String(describing: error)
             }
         }
         if strategy.usesAlternativeData {
@@ -268,17 +283,24 @@ public struct BacktestHistory: Sendable {
     public var fundingRates: [FundingRate] = []
     /// Why the funding record could not be read, when it could not.
     public var fundingFailure: String?
+    /// A perpetual's position tiers in base units (`OKXRESTClient.positionTiers`);
+    /// nil for anything else, or when they could not be read — and why not.
+    public var positionTiers: [KernelPositionTier]?
+    public var positionTiersFailure: String?
     /// Aligned to `candles`, index for index.
     public var series: [String: [Double]] = [:]
     public var coverage: [SeriesCoverage] = []
 
     public init(
         candles: [Candle], fundingRates: [FundingRate] = [], fundingFailure: String? = nil,
+        positionTiers: [KernelPositionTier]? = nil, positionTiersFailure: String? = nil,
         series: [String: [Double]] = [:], coverage: [SeriesCoverage] = []
     ) {
         self.candles = candles
         self.fundingRates = fundingRates
         self.fundingFailure = fundingFailure
+        self.positionTiers = positionTiers
+        self.positionTiersFailure = positionTiersFailure
         self.series = series
         self.coverage = coverage
     }

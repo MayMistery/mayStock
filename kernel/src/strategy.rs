@@ -192,11 +192,13 @@ impl InstrumentType {
     }
 
     /// Maintenance margin rate, as a share of a position's current value,
-    /// when a backtest states none. A perpetual's is one rate for every
-    /// contract and size — OKX's is per instrument and tier, and the tier-one
-    /// rates read 2026-10-09 run from 0.4% (BTC, ETH) to 2% (LINK on the demo
-    /// account). A margined stock has no house rate to assume: FINRA's minimum
-    /// is the requirement, and it is the Reg T regime's own
+    /// when a backtest states none and is handed no position tiers. A
+    /// perpetual's is then one rate for every contract and size, where OKX's
+    /// is per instrument and tier (`tiers::PositionTiers`; tier one read
+    /// 2026-10-09 runs from 0.4% for BTC and ETH to 2% for LINK on the demo
+    /// account), and the result says the tiers went unmodelled. A margined
+    /// stock has no house rate to assume: FINRA's minimum is the requirement,
+    /// and it is the Reg T regime's own
     /// (`backtest::liquidation::finra_maintenance`), beneath any rate stated.
     pub fn default_maintenance_margin_rate(self) -> Option<f64> {
         match self {

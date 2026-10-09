@@ -235,6 +235,10 @@ pub unsafe extern "C" fn ms_strategy_decide(
     // components, for a manifest that states no costs; NULL leaves the
     // instrument's documented default.
     fees_json: *const c_char,
+    // The venue's position tiers for the instrument, in base units, as a JSON
+    // array of `tiers::PositionTier`; NULL when they are not known, and then
+    // no position limit applies.
+    tiers_json: *const c_char,
     error_out: *mut *mut c_char,
 ) -> *mut c_char {
     guarded(error_out, ptr::null_mut(), || {
@@ -269,6 +273,11 @@ pub unsafe extern "C" fn ms_strategy_decide(
                 fees: match borrow_str(fees_json) {
                     Some(text) if !text.trim().is_empty() => Some(serde_json::from_str(text)
                         .map_err(|e| format!("费率模型解析失败：{e}"))?),
+                    _ => None,
+                },
+                position_tiers: match borrow_str(tiers_json) {
+                    Some(text) if !text.trim().is_empty() => Some(serde_json::from_str(text)
+                        .map_err(|e| format!("档位表解析失败：{e}"))?),
                     _ => None,
                 },
             },
@@ -459,7 +468,7 @@ mod tests {
         let mut error: *mut c_char = ptr::null_mut();
         let json = unsafe {
             ms_strategy_decide(handle, bars.as_ptr(), bars.len(), 0, 0, ptr::null(),
-                               10_000.0, 0.0, 10_000.0, -1.0, -1, false, 0.0, 0, ptr::null(), ptr::null(), &mut error)
+                               10_000.0, 0.0, 10_000.0, -1.0, -1, false, 0.0, 0, ptr::null(), ptr::null(), ptr::null(), &mut error)
         };
         assert!(error.is_null());
         let value: serde_json::Value = serde_json::from_str(&take_string(json)).unwrap();
@@ -475,7 +484,7 @@ mod tests {
         let mut error: *mut c_char = ptr::null_mut();
         let json =
             unsafe { ms_strategy_decide(handle, ptr::null(), 0, 0, 0, ptr::null(),
-                               10_000.0, 0.0, 10_000.0, -1.0, -1, false, 0.0, 0, ptr::null(), ptr::null(), &mut error) };
+                               10_000.0, 0.0, 10_000.0, -1.0, -1, false, 0.0, 0, ptr::null(), ptr::null(), ptr::null(), &mut error) };
         assert!(error.is_null());
         let value: serde_json::Value = serde_json::from_str(&take_string(json)).unwrap();
         assert_eq!(value["target"], 0);
