@@ -180,6 +180,15 @@ struct KernelGoldenTests {
         "continuousExposure": Golden(
             trades: 19, finalEquity: 30040.23065, totalReturnPct: 0.134102,
             maxDrawdownPct: 5.089221, winRate: 26.315789, feesPaid: 419.574133),
+        // 2026-10-09: new. Every other golden ends before a liquidation, so the
+        // level that triggers one was pinned by none. At 50× on 0.5% and 5 bps
+        // OKX liquidates a long 1.46% and a short 1.44% against the entry, and
+        // the 1.7% stop sits past both: it never fills — 16 liquidations, 16
+        // reversals. The rule this replaced (1.99%) filled it first: 12 stops,
+        // 2 liquidations, and a final equity of 1 158 785.03 (+3 762.6%).
+        "liquidationAtLeverage": Golden(
+            trades: 33, finalEquity: 630129.559897, totalReturnPct: 2000.431866,
+            maxDrawdownPct: 79.067225, winRate: 42.424242, feesPaid: 76812.007221),
     ]
 
     @Test func movingAverageCrossover() throws {
@@ -255,6 +264,23 @@ struct KernelGoldenTests {
             bars: Self.candles(1_500, seed: 17),
             exercises: [.stopLoss],
             expect: Self.GOLDENS["shortsAndLeverage"]!)
+    }
+    @Test func liquidationAtLeverage() throws {
+        try check("liquidationAtLeverage",
+            Self.manifest(
+                instType: "SWAP",
+                signals: """
+                {"longEntry": "ema(close, fast) crosses_above ema(close, slow)",
+                 "longExit": "ema(close, fast) crosses_below ema(close, slow)",
+                 "shortEntry": "ema(close, fast) crosses_below ema(close, slow)",
+                 "shortExit": "ema(close, fast) crosses_above ema(close, slow)"}
+                """,
+                sizing: #"{"mode":"equityPct","value":20}"#,
+                risk: #"{"leverage":50,"stopLossPct":1.7}"#,
+                costs: #"{"feeBps":5,"slippageBps":5}"#),
+            bars: Self.candles(1_500, seed: 19),
+            exercises: [.liquidation],
+            expect: Self.GOLDENS["liquidationAtLeverage"]!)
     }
     @Test func continuousExposure() throws {
         try check("continuousExposure",

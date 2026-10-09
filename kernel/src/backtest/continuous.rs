@@ -7,10 +7,10 @@
 //! adjusted incrementally, so holding through a flat signal costs nothing —
 //! which is what makes a turnover comparison meaningful.
 
+use super::liquidation::{Holding, Lender};
 use super::{
-    bucket_funding, empty_result, liquidation_buffer, liquidation_fill, market_price, resolve_costs,
-    resolve_maintenance, BacktestConfig, BacktestResult, EquityPoint, ExitFill, ExitReason, Metrics,
-    Trade,
+    bucket_funding, empty_result, market_price, resolve_costs, BacktestConfig, BacktestResult, EquityPoint,
+    ExitFill, ExitReason, Metrics, Trade,
 };
 use crate::candle::Candle;
 use crate::decide::{realised_volatility, volatility_scale, Direction};
@@ -41,7 +41,7 @@ pub fn run(
 
     let manifest = &strategy.manifest;
     let costs = resolve_costs(strategy, config)?;
-    let maintenance = resolve_maintenance(strategy, config);
+    let lender = Lender::for_run(strategy, config, &costs)?;
     let calendar = manifest.market.calendar();
     let slippage = costs.slippage_bps / 10_000.0;
     let allows_short = manifest.market.inst_type.allows_short();
@@ -247,34 +247,28 @@ pub fn run(
             }
         }
 
-        // --- 2. Funding on the held position.
-        if quantity != 0.0 {
-            if let Some(rates) = funding_by_bar.get(&index) {
-                for rate in rates {
-                    accrued_funding += rate
-                        * quantity.abs()
-                        * candle.close
-                        * if quantity > 0.0 { 1.0 } else { -1.0 };
-                }
-            }
-        }
-
-        // --- 2b. Liquidation. A scaled position changes size every rebalance,
-        //         so the level is recomputed from what is currently held rather
-        //         than fixed at entry; what the liquidation then costs is the
-        //         binary engine's rule too (`liquidation_fill`).
-        if quantity != 0.0 && leverage > 1.0 {
-            let direction = if quantity > 0.0 { Direction::Long } else { Direction::Short };
+        // --- 2. Liquidation, where the binary engine's lender puts it: a
+        //        scaled position changes size every rebalance, so its level is
+        //        the position's as it stands now — what is held, at what basis,
+        //        with the funding it has settled — never fixed at entry.
+        let liquidation = (quantity != 0.0)
+            .then(|| Holding {
+                direction: if quantity > 0.0 { Direction::Long } else { Direction::Short },
+                quantity: quantity.abs(),
+                basis: average_price,
+                funding: accrued_funding,
+                capital: equity,
+            })
+            .and_then(|held| Some((held, lender.liquidation_level(&held)?)));
+        if let Some((held, level)) = liquidation {
+            let direction = held.direction;
             let sign = direction.sign();
-            let level = average_price * (1.0 - sign * liquidation_buffer(regime, maintenance, leverage));
             let adverse_extreme = if quantity > 0.0 { candle.low } else { candle.high };
             if sign * (level - adverse_extreme) >= 0.0 {
                 // Opened past the level, or reached it inside the bar.
                 let trigger = if sign * (level - candle.open) >= 0.0 { candle.open } else { level };
-                let size = quantity.abs();
-                let fill = liquidation_fill(
-                    regime, direction, size, average_price, leverage, accrued_funding, trigger,
-                    slippage, &costs);
+                let size = held.quantity;
+                let fill = lender.liquidation_fill(&held, trigger, slippage);
                 let gross = sign * (fill.price - average_price) * size;
                 equity += gross - fill.fee - accrued_funding;
                 let fees = accrued_fees + fill.fee;
@@ -304,6 +298,20 @@ pub fn run(
                 entry_equity = equity;
                 pending_target_quantity = None;
                 pending_halt = false;
+            }
+        }
+
+        // --- 2b. Funding on the held position, settled at this bar's close
+        //         after its range was checked — the binary engine's order, so
+        //         a settlement moves both engines' levels from the next bar.
+        if quantity != 0.0 {
+            if let Some(rates) = funding_by_bar.get(&index) {
+                for rate in rates {
+                    accrued_funding += rate
+                        * quantity.abs()
+                        * candle.close
+                        * if quantity > 0.0 { 1.0 } else { -1.0 };
+                }
             }
         }
 
@@ -546,22 +554,26 @@ mod tests {
     }
 
     /// The binary engine's walk, for a scaled position: every family this
-    /// engine trades, at every whole leverage it allows, at full exposure
-    /// either way it can face, through the worst bar its margin defines — a gap
-    /// far past the liquidation level where the position is lent against, all
-    /// but the whole price where it is not. What the position committed was
-    /// its margin and its fee, so the run ends at or above zero, and a
-    /// liquidation takes what was committed: all of it, but for the slippage
-    /// between the close it was sized at and the open it filled at — which
-    /// leaves a short a little, and is cut from a long where it fills.
+    /// engine trades, at every whole leverage it allows — 1× included — at
+    /// full exposure either way it can face, through the worst bar its lender
+    /// defines: a gap far past an isolated level, a Reg T call met inside its
+    /// bar, all but the whole price where there is no level. What the position
+    /// committed was its margin and its fee, so the run ends at or above zero,
+    /// and an isolated liquidation takes what was committed: all of it, but
+    /// for the slippage between the close it was sized at and the open it
+    /// filled at — which leaves a short a little, and is cut from a long where
+    /// it fills. A 1× short used to have no level and rode the gap.
     #[test]
     fn a_full_exposure_position_never_commits_more_than_the_equity_behind_it() {
         use crate::strategy::MarginRegime;
         let config = BacktestConfig { fees: Some(vec![crate::fees::FeeComponent::flat_bps(5.0)]),
                                       slippage_bps: Some(3.0), ..BacktestConfig::default() };
+        let at = |i: i64, open: f64, high: f64, low: f64, close: f64| {
+            Candle { ts_ms: i * 3_600_000, open, high, low, close, volume: 1.0, confirmed: 1 }
+        };
+        let quiet = |count: i64, price: f64| -> Vec<Candle> { (0..count).map(|i| at(i, price, price, price, price)).collect() };
         let mut walked = 0;
         for family in InstrumentType::ALL.into_iter().filter(|f| !f.is_option()) {
-            let maintenance = family.default_maintenance_margin_rate().unwrap_or(0.0);
             let mut leverage = 1.0;
             while leverage <= family.max_leverage() {
                 let exposures: &[f64] = if family.allows_short() { &[1.0, -1.0] } else { &[1.0] };
@@ -572,36 +584,49 @@ mod tests {
                              "risk":{{"leverage":{leverage},"rebalanceThreshold":0.05}}}}"#,
                         serde_json::to_value(family).unwrap());
                     let strategy = CompiledStrategy::compile(serde_json::from_str::<Manifest>(&json).unwrap(), &[]).unwrap();
-                    let lends = leverage > 1.0 && family.margin_regime() != MarginRegime::None;
-                    let worst = if lends && family.margin_regime() == MarginRegime::Isolated {
-                        let buffer = liquidation_buffer(family.margin_regime(), maintenance, leverage);
-                        100.0 * (1.0 - exposure * buffer * 1.5)
-                    } else if lends {
-                        // A Reg T call is met inside its bar below.
-                        100.0 * (1.0 - exposure * liquidation_buffer(family.margin_regime(), maintenance, leverage))
-                    } else {
-                        100.0 * (1.0 - exposure * 0.99)
+                    // The position it holds on quiet bars, as its lender sees it.
+                    let costs = resolve_costs(&strategy, &config).unwrap();
+                    let lender = Lender::for_run(&strategy, &config, &costs).unwrap();
+                    let entry = run(&strategy, &quiet(10, 100.0), &config).unwrap().trades[0].clone();
+                    let side = if entry.direction == Direction::Long { OrderSide::Buy } else { OrderSide::Sell };
+                    let held = Holding {
+                        direction: entry.direction, quantity: entry.quantity, basis: entry.entry_price, funding: 0.0,
+                        capital: config.initial_capital - costs.fee(side, entry.quantity, entry.notional),
                     };
-                    let mut bars: Vec<Candle> = (0..6)
-                        .map(|i| Candle { ts_ms: i * 3_600_000, open: 100.0, high: 100.0, low: 100.0, close: 100.0, volume: 1.0, confirmed: 1 })
-                        .collect();
-                    let (open, high, low) = if lends && family.margin_regime() == MarginRegime::RegT {
-                        (100.0, worst.max(100.0), worst.min(100.0))
-                    } else {
-                        (worst, worst, worst)
+                    let level = lender.liquidation_level(&held);
+                    let mut bars = quiet(6, 100.0);
+                    let worst = match (level, family.margin_regime()) {
+                        // Opened far past the liquidation level.
+                        (Some(level), MarginRegime::Isolated) => {
+                            let gap = level * (1.0 - exposure * 0.5);
+                            at(6, gap, gap, gap, gap)
+                        }
+                        // The call met inside the bar.
+                        (Some(level), _) => at(6, 100.0, level.max(100.0), level.min(100.0), level),
+                        // No level: all but the whole price, either way.
+                        (None, _) => {
+                            let moved = 100.0 * (1.0 - exposure * 0.99);
+                            at(6, moved, moved, moved, moved)
+                        }
                     };
-                    bars.push(Candle { ts_ms: 6 * 3_600_000, open, high, low, close: worst, volume: 1.0, confirmed: 1 });
-                    bars.extend((7..10).map(|i| Candle { ts_ms: i * 3_600_000, open: worst, high: worst, low: worst, close: worst, volume: 1.0, confirmed: 1 }));
+                    bars.push(worst);
+                    bars.extend((7..10).map(|i| at(i, worst.close, worst.close, worst.close, worst.close)));
 
                     let result = run(&strategy, &bars, &config).unwrap();
                     let label = format!("{family:?} {leverage}x exposure {exposure}");
                     assert!(result.final_equity >= -1e-9 * config.initial_capital,
                             "{label}: ends at {} after {:?}", result.final_equity,
                             result.trades.iter().map(|t| t.exit_reason).collect::<Vec<_>>());
-                    if lends && family.margin_regime() == MarginRegime::Isolated {
-                        assert_eq!(result.liquidations, 1, "{label}");
-                        let slipped = config.initial_capital * 3.0 / 10_000.0;
-                        assert!(result.final_equity <= slipped * 1.01, "{label}: {}", result.final_equity);
+                    match level {
+                        Some(_) => {
+                            assert_eq!(result.liquidations, 1, "{label}");
+                            if family.margin_regime() == MarginRegime::Isolated {
+                                let slipped = config.initial_capital * 3.0 / 10_000.0;
+                                assert!(result.final_equity <= slipped * 1.01, "{label}: {}", result.final_equity);
+                            }
+                        }
+                        None => assert!(exposure > 0.0 || family.margin_regime() == MarginRegime::None,
+                                        "{label}: lent against with no level"),
                     }
                     walked += 1;
                 }

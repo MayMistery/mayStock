@@ -308,8 +308,10 @@ public struct KernelDecision: Decodable, Sendable, Equatable {
 
 public struct KernelBacktestConfig: Encodable, Sendable {
     public var initialCapital: Double
-    /// Nil takes the instrument's documented default: OKX's tier-one rate on a
-    /// perpetual, FINRA's 25% minimum on a margined stock.
+    /// A share of the position's current value. Nil takes the instrument's
+    /// documented default: one rate for every perpetual, and on a margined
+    /// stock none — FINRA's minimum, which the kernel's Reg T rule applies
+    /// beneath any rate given, is the requirement.
     public var maintenanceMarginRate: Double?
     public var fundingRates: [KernelFundingRate]
     /// The fee schedule's model, used only when the manifest states no costs.

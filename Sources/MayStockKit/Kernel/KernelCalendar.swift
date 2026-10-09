@@ -109,6 +109,7 @@ public struct KernelInstrumentPolicy: Decodable, Sendable, Equatable {
     /// to be asked what one contract is worth.
     public let tradesInContracts: Bool
     public let marginRegime: String
+    /// Nil where the regime's own rule is the requirement (Reg T: FINRA's).
     public let defaultMaintenanceMarginRate: Double?
     /// Cost model the kernel assumes when neither the manifest nor the fee
     /// schedule states one. Nil means the type has no defensible default.

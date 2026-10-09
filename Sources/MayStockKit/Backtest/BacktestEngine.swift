@@ -32,9 +32,11 @@ public enum BacktestError: Error, CustomStringConvertible, Sendable, Equatable {
 
 public struct BacktestConfig: Sendable {
     public var initialCapital: Double
-    /// Maintenance margin rate for the liquidation check. Nil takes the
-    /// instrument's documented default — OKX's tier-one rate on a perpetual,
-    /// FINRA's 25% minimum on a margined stock.
+    /// Maintenance margin rate for the liquidation check, as a share of the
+    /// position's current value. Nil takes the instrument's documented
+    /// default — one rate for every perpetual; on a margined stock none, since
+    /// FINRA's minimum (25% of a long, 30% of a short and more below $16.67)
+    /// is the kernel's Reg T rule and applies beneath any rate given.
     public var maintenanceMarginRate: Double?
     /// Real funding history; empty means funding is not modelled (flagged in the report).
     public var fundingRates: [FundingRate]

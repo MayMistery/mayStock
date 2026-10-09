@@ -85,19 +85,22 @@ impl Venue {
 // MARK: - Instrument
 
 /// How margin is lent against a position, which decides where it is
-/// liquidated.
+/// liquidated (`backtest::liquidation::Lender`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MarginRegime {
     /// No borrowing: the position is fully paid for and cannot be liquidated.
     None,
     /// Isolated margin on a derivative: the position is backed by
-    /// `notional / leverage`, and is closed out when the loss eats that
-    /// collateral down to the maintenance rate.
+    /// `notional / leverage`, and is closed out when that margin, less the
+    /// funding settled out of it and plus the unrealised P&L, falls to the
+    /// maintenance rate of the position's *current* value and the fee a close
+    /// would pay — OKX's rule, measured.
     Isolated,
-    /// Regulation T margin on a stock: the broker lends against the shares and
-    /// calls the loan when equity falls below the maintenance share of the
-    /// position's *current* value.
+    /// Regulation T margin on a stock: the broker lends against the account,
+    /// and calls the loan when the account's equity falls below the
+    /// maintenance share of the position's *current* value — FINRA's minimum
+    /// at least, which asks more of a short than of a long.
     RegT,
 }
 
@@ -131,7 +134,8 @@ pub struct InstrumentPolicy {
     pub trades_in_contracts: bool,
     #[serde(rename = "marginRegime")]
     pub margin_regime: MarginRegime,
-    /// Maintenance margin assumed when a backtest states none.
+    /// Maintenance margin rate assumed when a backtest states none; absent
+    /// where the regime's own rule is the requirement (Reg T: FINRA's).
     #[serde(rename = "defaultMaintenanceMarginRate")]
     pub default_maintenance_margin_rate: Option<f64>,
     /// Cost model assumed when neither the manifest nor the caller states one.
@@ -187,13 +191,18 @@ impl InstrumentType {
         }
     }
 
-    /// Maintenance margin when a backtest states none: OKX's tier-one rate on
-    /// a perpetual, and FINRA's 25% minimum on a margined stock.
+    /// Maintenance margin rate, as a share of a position's current value,
+    /// when a backtest states none. A perpetual's is one rate for every
+    /// contract and size — OKX's is per instrument and tier, and the tier-one
+    /// rates read 2026-10-09 run from 0.4% (BTC, ETH) to 2% (LINK on the demo
+    /// account). A margined stock has no house rate to assume: FINRA's minimum
+    /// is the requirement, and it is the Reg T regime's own
+    /// (`backtest::liquidation::finra_maintenance`), beneath any rate stated.
     pub fn default_maintenance_margin_rate(self) -> Option<f64> {
         match self {
             Self::Spot => None,
             Self::Swap => Some(0.005),
-            Self::Stock => Some(0.25),
+            Self::Stock => None,
             Self::Option => None,
         }
     }
@@ -1153,9 +1162,11 @@ mod tests {
                 !policy.allows_leverage,
                 "{inst_type:?}"
             );
+            // Isolated margin has no requirement but a rate; Reg T carries
+            // FINRA's minimum itself.
             assert_eq!(
                 policy.default_maintenance_margin_rate.is_some(),
-                policy.allows_leverage,
+                policy.margin_regime == MarginRegime::Isolated,
                 "{inst_type:?}"
             );
             // The policy survives the wire, since Swift reads it from JSON.
