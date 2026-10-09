@@ -25,6 +25,7 @@ struct LabMain {
             case "ic": try await informationCoefficient(arguments)
             case "factors": try await factors(arguments)
             case "oracle": try await oracle(arguments)
+            case "ranges": try await ranges(arguments)
             case "review": try await review(arguments)
             case "list": list()
             case "help", "--help", "-h": usage()
@@ -90,6 +91,11 @@ struct LabMain {
               **上帝视角上限**：假设你能预知未来、完美抓住每一个波段，能赚多少？
               同时统计「前高前低」在真实数据里到底有多少次挡住了价格。
               这是唯一刻意使用未来函数的地方，用来给一切策略划出天花板。
+
+          ranges <标的> [--days 90] [--bars 1m,5m,15m,1H] [--venue okx|schwab]
+              每个粒度单根 K 线的振幅分布（中位 / P90 / P99 / 最大）。止盈止损距离小于
+              单根振幅时，同根先碰哪条线回测并不知道，结果由「按止损算」的假设决定；
+              按「距离 ≥ 3 × P99」挑最粗的可用粒度。
 
           review [--apply] [--json] [--log <路径>] [--dir <目录>]
                  [--seed-policy [--force]]
@@ -773,6 +779,54 @@ struct LabMain {
         for note in (results.first?.biases.notes ?? []) { Out.warn(note) }
         Out.note("做空腿未计融券成本与可借券约束；现货做空在 OKX 需要杠杆账户，"
                  + "「仅做多」那一列才是现货可直接实现的口径。")
+    }
+
+    // MARK: ranges
+
+    /// How far one bar moves, by granularity: the measurement behind choosing
+    /// a bar fine enough for a strategy's stops and targets.
+    static func ranges(_ arguments: Arguments) async throws {
+        guard let raw = arguments.positionals.first else {
+            throw LabError.usage("用法：maystock-lab ranges <标的> [--days 90] [--bars 1m,5m,15m,1H]")
+        }
+        let venue = arguments.string("venue").flatMap { Venue(rawValue: $0.lowercased()) }
+            ?? (raw.uppercased().contains("-USD") ? .okx : .schwab)
+        let instId = venue.canonicalInstId(raw)
+        let days = arguments.int("days", default: 90)
+        let bars = (arguments.string("bars") ?? "1m,5m,15m,1H").split(separator: ",")
+            .compactMap { BarInterval(rawValue: String($0)) }
+            .filter { venue.supportedBars.contains($0) }
+        let source = MarketDataSources().source(for: venue)
+        let calendar = StrategyMarket(instId: instId, instType: venue.instrumentType(of: instId), bar: .h1, venue: venue)
+
+        Out.heading("单根振幅 · \(venue.displayName) · \(instId) · 最近 \(days) 天")
+        Out.note("振幅 = (最高 − 最低) / 开盘；只算已收盘的 K 线。")
+        Out.row([("粒度", 6), ("根数", -9), ("中位", -8), ("P90", -8), ("P99", -8), ("最大", -8),
+                 ("≥0.5%", -8), ("≥1.5%", -8), ("3×P99", -8), ("下载", -8)])
+        for bar in bars {
+            var market = calendar
+            market.bar = bar
+            let target = Swift.min(market.calendar.barCount(days: days), BacktestRunner.maxBars)
+            let started = Date()
+            let candles = try await source.historyCandles(instId: instId, bar: bar, target: target, progress: nil)
+            let took = Date().timeIntervalSince(started)
+            let moves = candles.filter { $0.confirmed && $0.open > 0 }
+                .map { ($0.high - $0.low) / $0.open * 100 }.sorted()
+            guard !moves.isEmpty, let first = candles.first, let last = candles.last else {
+                Out.row([(bar.rawValue, 6), ("无数据", -9)]); continue
+            }
+            let quantile = { (p: Double) in moves[Swift.min(moves.count - 1, Int(p * Double(moves.count)))] }
+            let share = { (floor: Double) in Double(moves.filter { $0 >= floor }.count) / Double(moves.count) * 100 }
+            let pct = { (value: Double) in PriceFormatter.decimals(value, value < 0.1 ? 3 : 2) + "%" }
+            Out.row([
+                (bar.rawValue, 6), ("\(moves.count)", -9), (pct(quantile(0.5)), -8), (pct(quantile(0.9)), -8),
+                (pct(quantile(0.99)), -8), (pct(moves[moves.count - 1]), -8), (pct(share(0.5)), -8),
+                (pct(share(1.5)), -8), (pct(3 * quantile(0.99)), -8), ("\(Int(took.rounded())) 秒", -8),
+            ])
+            Out.note("\(bar.rawValue) 区间 \(first.ts.formatted(.iso8601)) → \(last.ts.formatted(.iso8601))")
+        }
+        Out.rule()
+        Out.note("止盈止损距离小于「3×P99」的粒度，同根先碰哪条线回测并不知道，结果由最坏假设决定。")
     }
 
     // MARK: oracle
