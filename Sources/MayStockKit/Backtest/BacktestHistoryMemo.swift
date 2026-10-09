@@ -17,7 +17,9 @@ actor BacktestHistoryMemo {
     static let shared = BacktestHistoryMemo()
 
     /// How long a finished download may be reused: one batch of reports, not
-    /// a session — "today's backtest" means today's bars.
+    /// a session — "today's backtest" means today's bars. Counted from when
+    /// it finished; one still running is never dropped, since a whole minute
+    /// history can take longer than this to arrive.
     static let lifetime: TimeInterval = 600
 
     private struct Key: Hashable {
@@ -27,10 +29,11 @@ actor BacktestHistoryMemo {
     }
 
     private struct Entry {
+        let id = UUID()
         let target: Int
-        let started: Date
         let download: Task<[Candle], Error>
         var watchers: [@Sendable (Int) -> Void]
+        var finished: Date?
     }
 
     private var entries: [Key: Entry] = [:]
@@ -44,7 +47,7 @@ actor BacktestHistoryMemo {
     ) async throws -> [Candle] {
         let key = Key(venue: venue, instId: instId, bar: bar)
         let now = Date()
-        entries = entries.filter { now.timeIntervalSince($0.value.started) < Self.lifetime }
+        entries = entries.filter { $0.value.finished.map { now.timeIntervalSince($0) < Self.lifetime } ?? true }
 
         if var entry = entries[key], entry.target >= target {
             if let progress { entry.watchers.append(progress) }
@@ -58,12 +61,15 @@ actor BacktestHistoryMemo {
                 Task { await self?.report(key, loaded: loaded) }
             }
         }
-        entries[key] = Entry(target: target, started: now, download: download, watchers: progress.map { [$0] } ?? [])
+        let entry = Entry(target: target, download: download, watchers: progress.map { [$0] } ?? [])
+        entries[key] = entry
         do {
-            return try await download.value
+            let candles = try await download.value
+            if entries[key]?.id == entry.id { entries[key]?.finished = Date() }
+            return candles
         } catch {
             // A failed download is not reused: the next report asks afresh.
-            if entries[key]?.started == now { entries[key] = nil }
+            if entries[key]?.id == entry.id { entries[key] = nil }
             throw error
         }
     }
