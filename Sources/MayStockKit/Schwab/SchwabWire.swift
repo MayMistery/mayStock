@@ -368,7 +368,9 @@ public enum SchwabWire {
     // MARK: Quotes
 
     /// Tickers by symbol. Symbols Schwab did not answer for are absent; the
-    /// caller decides whether that is an unknown instrument.
+    /// caller decides whether that is an unknown instrument. So is a quote
+    /// that carries no time of its own: stamping it with the local clock, as
+    /// this once did, made an old print read as a fresh one.
     public static func tickers(from data: Data, hours: USSessionHours?, now: Date) throws -> [String: Ticker] {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw SchwabAPIError.decoding("quotes 不是 JSON 对象")
@@ -377,11 +379,10 @@ public enum SchwabWire {
         for (symbol, value) in object {
             guard symbol != "errors", let entry = value as? [String: Any],
                   let quote = entry["quote"] as? [String: Any],
-                  let last = number(quote, "lastPrice") ?? number(quote, "mark") else { continue }
+                  let last = number(quote, "lastPrice") ?? number(quote, "mark"),
+                  let stamp = number(quote, "tradeTime") ?? number(quote, "quoteTime") else { continue }
             let previousClose = number(quote, "closePrice") ?? last
-            let tradeTime = (number(quote, "tradeTime") ?? number(quote, "quoteTime")).map {
-                Date(timeIntervalSince1970: $0 / 1000)
-            } ?? now
+            let tradeTime = Date(timeIntervalSince1970: stamp / 1000)
             let phase: MarketPhase = hours?.phase(at: now)
                 ?? USSessionHours.standard(on: now, open: quote["securityStatus"] as? String != "Closed").phase(at: now)
             out[symbol] = Ticker(
@@ -390,7 +391,10 @@ public enum SchwabWire {
                 reference: previousClose, open: number(quote, "openPrice"),
                 high: number(quote, "highPrice") ?? last, low: number(quote, "lowPrice") ?? last,
                 volume: number(quote, "totalVolume") ?? 0,
-                basis: .previousClose, phase: phase, ts: tradeTime)
+                basis: .previousClose, phase: phase, ts: tradeTime,
+                // Schwab says per quote whether it is real-time: an account
+                // without the exchange agreements is served delayed ones.
+                delayed: (entry["realtime"] as? Bool).map { !$0 })
         }
         return out
     }

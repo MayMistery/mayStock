@@ -240,7 +240,11 @@ final class AppState {
         // Fired alerts: notification + optional sound + optional shell hook.
         alerts.onAlert = { [weak self] event in
             guard let self else { return }
-            self.notifications.post(title: event.title, body: event.body, sound: event.rule.playSound)
+            // An alert on a delayed quote fired on a price from the past; the
+            // notification says so rather than reading as now.
+            let delayed = self.hub.session(for: event.rule.instId)?.ticker?.delayed == true
+            let body = delayed ? event.body + "\n延时报价：数据源声明这不是实时行情" : event.body
+            self.notifications.post(title: event.title, body: body, sound: event.rule.playSound)
             if let hook = event.rule.shellHook, !hook.isEmpty {
                 Self.runShellHook(hook, event: event)
             }

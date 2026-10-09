@@ -138,12 +138,17 @@ public struct Ticker: Sendable, Equatable {
     /// Session phase on a market that has sessions; nil on a continuous one.
     public let phase: MarketPhase?
     public let ts: Date
+    /// The source's own word on whether this quote is delayed: true when it
+    /// says delayed, false when it says real-time, nil when it says nothing
+    /// (Yahoo, OKX). Read, never guessed: a delayed quote moves an alert by
+    /// fifteen minutes, so the screens and the alert say so.
+    public let delayed: Bool?
 
     public init(
         instId: String, last: Double, bid: Double?, ask: Double?,
         reference: Double, open: Double? = nil, high: Double, low: Double, volume: Double,
         basis: ChangeBasis, phase: MarketPhase? = nil, ts: Date,
-        references: [ChangeBasis: Double] = [:], rangeLabel: String? = nil
+        references: [ChangeBasis: Double] = [:], rangeLabel: String? = nil, delayed: Bool? = nil
     ) {
         self.references = references.merging([basis: reference]) { _, stated in stated }
         self.rangeLabel = rangeLabel ?? (basis == .previousClose ? "今日" : "24h")
@@ -159,6 +164,7 @@ public struct Ticker: Sendable, Equatable {
         self.basis = basis
         self.phase = phase
         self.ts = ts
+        self.delayed = delayed
     }
 
     public var change: Double { last - reference }
@@ -170,7 +176,7 @@ public struct Ticker: Sendable, Equatable {
         return Ticker(
             instId: instId, last: last, bid: bid, ask: ask, reference: reference, open: open,
             high: high, low: low, volume: volume, basis: target, phase: phase, ts: ts,
-            references: references, rangeLabel: rangeLabel)
+            references: references, rangeLabel: rangeLabel, delayed: delayed)
     }
 
     /// The change in percent on a given basis, when the venue published its

@@ -189,8 +189,14 @@ struct PanelRootView: View {
                 stat("卖一", (ticker?.ask ?? session.liveBook?.bestAsk).map { PriceFormatter.price($0, decimals: decimals) }, tint: Theme.down)
             } else {
                 // A stock's day: where it opened, where it has been, what it
-                // closed at yesterday, and how much of it changed hands.
-                stat("今开", ticker?.open.map { PriceFormatter.price($0, decimals: decimals) })
+                // closed at yesterday, and how much of it changed hands. The
+                // touch replaces the open when the quote carries one —
+                // Schwab's does, Yahoo's does not.
+                if let bid = ticker?.bid, let ask = ticker?.ask {
+                    stat("买 / 卖", PriceFormatter.price(bid, decimals: decimals) + " / " + PriceFormatter.price(ask, decimals: decimals))
+                } else {
+                    stat("今开", ticker?.open.map { PriceFormatter.price($0, decimals: decimals) })
+                }
                 stat("\(period)高", ticker.map { PriceFormatter.price($0.high, decimals: decimals) })
                 stat("\(period)低", ticker.map { PriceFormatter.price($0.low, decimals: decimals) })
                 stat("昨收", ticker.map { PriceFormatter.price($0.reference, decimals: decimals) })
@@ -259,6 +265,9 @@ struct PanelRootView: View {
     private func footer(_ session: InstrumentSession) -> some View {
         HStack(spacing: 6) {
             Text("数据源 \(appState.hub.sourceName(for: session.venue))").lineLimit(1)
+            if session.ticker?.delayed == true {
+                Text("· 延时报价").foregroundStyle(Theme.down).help("数据源声明这不是实时行情")
+            }
             if let issue = session.issue {
                 Text("· ⚠ 读不到报价：\(issue)").lineLimit(1).foregroundStyle(Theme.down).help(issue)
             } else if let last = session.lastUpdate {

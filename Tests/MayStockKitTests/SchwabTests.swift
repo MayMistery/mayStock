@@ -10,9 +10,13 @@ private enum Fixture {
       "quote":{"askPrice":410.12,"bidPrice":410.05,"closePrice":400.0,"highPrice":415.5,"lastPrice":410.1,
                "lowPrice":398.2,"openPrice":402.0,"totalVolume":81234567,"tradeTime":1757950200000,"securityStatus":"Normal"},
       "reference":{"description":"Tesla Inc","exchange":"Q","exchangeName":"NASDAQ"}},
-     "QQQ":{"assetMainType":"EQUITY","symbol":"QQQ",
+     "QQQ":{"assetMainType":"EQUITY","symbol":"QQQ","realtime":false,
       "quote":{"askPrice":500.5,"bidPrice":500.4,"closePrice":495.0,"highPrice":502.0,"lastPrice":500.45,
                "lowPrice":494.1,"openPrice":496.0,"totalVolume":12345678,"tradeTime":1757950200000,"securityStatus":"Normal"}},
+     "MU":{"assetMainType":"EQUITY","symbol":"MU","realtime":true,
+      "quote":{"closePrice":100.0,"lastPrice":101.0,"tradeTime":1757950200000,"securityStatus":"Normal"}},
+     "UNDATED":{"assetMainType":"EQUITY","symbol":"UNDATED",
+      "quote":{"closePrice":10.0,"lastPrice":10.5,"securityStatus":"Normal"}},
      "errors":{"invalid_symbols":["NOPE"]}}
     """
 
@@ -204,6 +208,15 @@ struct SchwabWireTests {
         #expect(tickers["QQQ"] != nil)
         #expect(tickers["errors"] == nil)
         #expect(tickers["NOPE"] == nil)
+        // Whether a quote is real-time is Schwab's word, per quote; silence
+        // stays silence.
+        #expect(tickers["QQQ"]?.delayed == true)
+        #expect(tickers["MU"]?.delayed == false)
+        #expect(tesla.delayed == nil)
+        #expect(tickers["UNDATED"] == nil, "a quote with no time of its own is not a current one")
+        let declared = Ticker(instId: "X", last: 10, bid: nil, ask: nil, reference: 9, high: 10, low: 9, volume: 1,
+                              basis: .previousClose, ts: now, references: [.rolling24h: 8], delayed: true)
+        #expect(declared.rebased(to: .rolling24h).delayed == true, "rebasing keeps the source's word")
     }
 
     @Test("交易时段：开市日三段，休市日全天 closed，兜底表也一样")

@@ -437,7 +437,7 @@ public actor SchwabMarketFeed: MarketFeed {
             announce(.schwab)
             for symbol in symbols {
                 guard let ticker = tickers[symbol] else {
-                    noteFailure(symbol, reason: "嘉信的报价里没有这个代码")
+                    noteFailure(symbol, reason: "嘉信没有给出这个代码的可用报价（缺价格或时间）")
                     continue
                 }
                 noteRead(symbol)

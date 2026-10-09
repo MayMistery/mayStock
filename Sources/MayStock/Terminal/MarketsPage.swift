@@ -46,6 +46,10 @@ private struct WatchlistColumn: View {
     @State private var newVenue: Venue = .okx
     @State private var validating = false
     @State private var addError: String?
+    /// What the venue's source finds for the text being typed, a moment after
+    /// typing stops — a name finds its symbol without knowing it first.
+    @State private var suggestions: [InstrumentMatch] = []
+    @State private var suggestionTask: Task<Void, Never>?
 
     private var items: [WatchItem] { appState.store.config.watchlist }
 
@@ -91,6 +95,10 @@ private struct WatchlistColumn: View {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 5) {
                     Text(item.displayLabel).font(Theme.Text.bodyMedium)
+                    if session?.ticker?.delayed == true {
+                        Badge(text: "延时", tint: Theme.down, size: .small)
+                            .help("数据源声明这不是实时行情")
+                    }
                     if let issue = session?.issue {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .font(.system(size: 9)).foregroundStyle(Theme.down)
@@ -141,10 +149,12 @@ private struct WatchlistColumn: View {
             }
             .pickerStyle(.segmented).labelsHidden().controlSize(.small)
             HStack(spacing: 6) {
-                TextField(newVenue == .okx ? "添加标的，如 ETH-USDT" : "添加美股代码，如 TSLA", text: $newInstId)
+                TextField(newVenue == .okx ? "添加标的，如 ETH-USDT" : "添加美股代码或公司名，如 TSLA", text: $newInstId)
                     .textFieldStyle(.roundedBorder)
                     .font(Theme.Text.mono)
                     .onSubmit { Task { await add() } }
+                    .onChange(of: newInstId) { _, text in suggest(text) }
+                    .onChange(of: newVenue) { _, _ in suggest(newInstId) }
                 if validating {
                     ProgressView().controlSize(.small)
                 } else {
@@ -155,8 +165,51 @@ private struct WatchlistColumn: View {
             if let addError {
                 Text(addError).font(Theme.Text.caption).foregroundStyle(Theme.down)
             }
+            ForEach(suggestions.prefix(5)) { match in
+                Button {
+                    newInstId = match.instId
+                    suggestions = []
+                    Task { await add() }
+                } label: {
+                    HStack(spacing: 6) {
+                        Text(match.instId).font(Theme.Text.mono)
+                        Text(match.name).lineLimit(1).foregroundStyle(.secondary)
+                        Spacer(minLength: 0)
+                        Text(match.exchange).foregroundStyle(.tertiary)
+                    }
+                    .font(Theme.Text.caption)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
         }
         .padding(10)
+    }
+
+    /// Ask the venue's source what the text names, 300 ms after the last
+    /// keystroke, dropping any answer to text that has since changed. A
+    /// failed search is said where the add error goes, not shown as nothing.
+    private func suggest(_ text: String) {
+        suggestionTask?.cancel()
+        addError = nil
+        let query = text.trimmingCharacters(in: .whitespaces)
+        guard query.count >= 1, let source = appState.hub.source(for: newVenue) else {
+            suggestions = []
+            return
+        }
+        suggestionTask = Task {
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            do {
+                let found = try await source.search(query)
+                guard !Task.isCancelled else { return }
+                suggestions = found.filter { match in !items.contains { $0.instId == match.instId } }
+            } catch {
+                guard !Task.isCancelled else { return }
+                suggestions = []
+                addError = "搜索失败：\(error)"
+            }
+        }
     }
 
     /// Validate against the venue's own source before adding, so the list
@@ -189,7 +242,9 @@ private struct WatchlistColumn: View {
             }
             let venue = newVenue
             appState.store.update { $0.watchlist.append(WatchItem(venue: venue, instId: match.instId)) }
+            suggestionTask?.cancel()
             newInstId = ""
+            suggestions = []
             selection.instId = match.instId
         } catch {
             addError = "校验失败：\(error)"
@@ -353,6 +408,13 @@ private struct InstrumentDetail: View {
                          caption: "涨跌幅的基准")
                 StatTile(label: "成交量", value: ticker.map { PriceFormatter.compact($0.volume) } ?? "—",
                          caption: "股 · 常规时段")
+                // Shown when the quote carries them (Schwab's does, Yahoo's
+                // does not), not by venue: one venue, two sources.
+                if let bid = ticker?.bid, let ask = ticker?.ask {
+                    StatTile(label: "买一", value: PriceFormatter.price(bid, decimals: decimals), tint: Theme.up)
+                    StatTile(label: "卖一", value: PriceFormatter.price(ask, decimals: decimals), tint: Theme.down,
+                             caption: "价差 " + PriceFormatter.price(ask - bid, decimals: decimals))
+                }
                 StatTile(label: "时段", value: session.marketPhase?.displayName ?? "—",
                          caption: "纽约 09:30–16:00")
             }

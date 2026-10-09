@@ -251,6 +251,7 @@ final class StatusItemController: NSObject {
             on: button, active: pending > 0,
             reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
         button.toolTip = [StatusItemAlertStyle.toolTip(pending: pending), toolTip(ticker: ticker, connection: connection),
+                          ticker?.delayed == true ? "延时报价：数据源声明这不是实时行情" : nil,
                           session.issue.map { "⚠ 读不到报价：\($0)" }]
             .compactMap { $0 }.joined(separator: "\n")
     }
