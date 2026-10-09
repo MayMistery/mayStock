@@ -360,7 +360,7 @@ struct StrategyConfigTests {
         config.strategy.capital[.okx] = 5_000
         config.strategy.setCapital(2_000, for: "ema-trend", on: .okx)
         config.strategy.setRunning(true, for: "ema-trend")
-        try ConfigIO(directory: dir).save(config)
+        try ConfigIO(directory: dir).update { $0 = config }
 
         let loaded = ConfigIO(directory: dir).load()
         #expect(loaded.strategy.allocation(for: "ema-trend")?.capital == 2_000)

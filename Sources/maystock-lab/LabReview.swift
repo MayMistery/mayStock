@@ -76,29 +76,31 @@ extension LabMain {
 
         var result = PortfolioReview.run(snapshot, policy: policy)
 
-        var outcome: ReviewActionOutcome?
+        var write: ReviewWrite?
         if arguments.has("apply"), !result.actions.isEmpty {
-            let applied = ReviewActuator.apply(result.actions, to: config)
-            if applied.didChange {
-                try backupConfig(configIO.fileURL)
-                try configIO.save(applied.config)
+            let written = ReviewActuator.write(
+                result.actions, checked: config, to: configIO, appRunning: snapshot.appRunning)
+            write = written
+            if let after = written.update?.after.config {
+                // Re-run against the config as the file now holds it, so the
+                // report describes the state that exists rather than the one
+                // we walked in on.
+                var rerun = snapshot
+                rerun.config = after
+                result = PortfolioReview.run(rerun, policy: policy)
             }
-            outcome = applied
-            // Re-run against the config we just wrote, so the report describes
-            // the state that now exists rather than the one we walked in on.
-            var after = snapshot
-            after.config = applied.config
-            result = PortfolioReview.run(after, policy: policy)
+            // How the write itself went is a finding like any other.
+            result.findings += written.findings
         }
 
         if arguments.has("json") {
-            printJSON(result, outcome: outcome, applied: arguments.has("apply"))
+            printJSON(result, write: write, applied: arguments.has("apply"))
         } else {
-            printReport(result, outcome: outcome, snapshot: snapshot, policy: policy)
+            printReport(result, write: write, snapshot: snapshot, policy: policy)
         }
 
         if let path = arguments.string("log") {
-            appendLog(result, outcome: outcome, to: URL(fileURLWithPath: path))
+            appendLog(result, write: write, to: URL(fileURLWithPath: path))
         }
 
         // Exit code carries the verdict, so a wrapper can branch without
@@ -113,7 +115,7 @@ extension LabMain {
     // MARK: Report
 
     private static func printReport(
-        _ result: ReviewResult, outcome: ReviewActionOutcome?,
+        _ result: ReviewResult, write: ReviewWrite?,
         snapshot: ReviewSnapshot, policy: ReviewPolicy
     ) {
         Out.heading("组合复盘 · \(stamp(result.now))")
@@ -155,14 +157,39 @@ extension LabMain {
             if let remedy = finding.remedy { print("      → \(remedy)") }
         }
 
-        if let outcome {
+        if let write {
             Out.heading("已自动执行")
             Out.rule()
-            if outcome.applied.isEmpty { Out.note("无") }
-            for action in outcome.applied { Out.good(action.summary + " —— " + action.reason) }
-            for (action, why) in outcome.rejected {
-                Out.bad("拒绝执行 \(action.summary)：\(why)")
-                print("      不变式挡下了它。能触发这条的只有发出该动作的检查本身有 bug。")
+            if write.failure != nil {
+                Out.bad("无：config.json 没有写进去，见上面的 config.writeFailed")
+            }
+            if let update = write.update {
+                let outcome = update.result
+                if outcome.applied.isEmpty { Out.note("无") }
+                for action in outcome.applied { Out.good(action.summary + " —— " + action.reason) }
+                for (action, why) in outcome.rejected {
+                    Out.bad("拒绝执行 \(action.summary)：\(why)")
+                    print("      不变式挡下了它：要么发出该动作的检查有 bug，要么复盘读取之后文件已被改得让它不再是降风险。")
+                }
+                if !write.movedSinceChecked.isEmpty {
+                    Out.warn("复盘读取之后 config.json 被改过 \(write.movedSinceChecked.count) 处（App 或手工）；"
+                             + "动作按写入那一刻的文件重新套用，并重新过了不变式：")
+                    for change in write.movedSinceChecked { print("      \(change)") }
+                }
+                if let kept = update.keptCopy {
+                    Out.note("改动前的 config.json 另存为 \(kept.lastPathComponent)")
+                }
+                switch write.follower {
+                case .following?:
+                    Out.note("跟随这个 config.json 的 App 会把这次修改并入运行中的配置；"
+                             + "engine-log.txt 里有一行「config.json 在 App 之外被改过」及改了什么")
+                case .nobody? where !write.appRunning:
+                    Out.note("App 没在运行，下次启动时读到这次修改")
+                case .nobody?, .unknown?:
+                    Out.bad("这次修改不一定留得住，见上面的 config.unfollowed / config.followUnknown")
+                case nil:
+                    break
+                }
             }
         } else if !result.actions.isEmpty {
             Out.heading("可自动执行（本次未加 --apply）")
@@ -208,12 +235,19 @@ extension LabMain {
         var appliedActions: [String]
         var rejectedActions: [String]
         var pendingActions: [String]
+        /// What changed in config.json between the checks and the write.
+        var configMovedDuringReview: [String]
+        /// Where the file the actions replaced was kept.
+        var keptCopy: String?
+        /// Who takes the change in: following, nobody, unknown: <why>.
+        var configFollower: String?
         var barsSinceValidation: [String: Int]
     }
 
     private static func printJSON(
-        _ result: ReviewResult, outcome: ReviewActionOutcome?, applied: Bool
+        _ result: ReviewResult, write: ReviewWrite?, applied: Bool
     ) {
+        let outcome = write?.outcome
         let report = JSONReport(
             now: result.now,
             verdict: result.verdict.rawValue,
@@ -228,6 +262,9 @@ extension LabMain {
             appliedActions: outcome?.applied.map { $0.summary + " —— " + $0.reason } ?? [],
             rejectedActions: outcome?.rejected.map { "\($0.action.summary)：\($0.why)" } ?? [],
             pendingActions: applied ? [] : result.actions.map { $0.summary + " —— " + $0.reason },
+            configMovedDuringReview: write?.movedSinceChecked ?? [],
+            keptCopy: write?.update?.keptCopy?.path,
+            configFollower: write?.follower?.label,
             barsSinceValidation: result.evidence.barsSinceValidation)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
@@ -241,7 +278,7 @@ extension LabMain {
     /// new or has been sitting there for six hours — the difference between an
     /// incident and a condition.
     private static func appendLog(
-        _ result: ReviewResult, outcome: ReviewActionOutcome?, to url: URL
+        _ result: ReviewResult, write: ReviewWrite?, to url: URL
     ) {
         struct Line: Encodable {
             var ts: Date
@@ -255,7 +292,7 @@ extension LabMain {
         let line = Line(
             ts: result.now, verdict: result.verdict.rawValue,
             codes: result.findings.map(\.code),
-            applied: outcome?.applied.map(\.summary) ?? [])
+            applied: write?.outcome?.applied.map(\.summary) ?? [])
         guard var data = try? encoder.encode(line) else { return }
         data.append(0x0A)
         try? FileManager.default.createDirectory(
@@ -316,16 +353,6 @@ extension LabMain {
         } catch {
             return false
         }
-    }
-
-    /// Keep the file we are about to overwrite. An unattended writer that
-    /// cannot be undone is a worse problem than whatever it was fixing.
-    private static func backupConfig(_ url: URL) throws {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyyMMdd-HHmmss"
-        let backup = url.deletingLastPathComponent()
-            .appendingPathComponent("config.json.review-\(formatter.string(from: Date()))")
-        try? FileManager.default.copyItem(at: url, to: backup)
     }
 
     private static func money(_ value: Double) -> String {

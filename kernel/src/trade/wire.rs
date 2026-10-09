@@ -371,8 +371,10 @@ fn require_id(field: &str, value: &str) -> Result<(), String> {
 }
 
 /// The `tdMode` an order states — its own, never a default: `margin`
-/// decides it, and an order that skipped it is refused here.
-fn trade_mode(family: Family, stated: Option<&str>) -> Result<String, String> {
+/// decides it, and an order that skipped it is refused here. The max-size
+/// read is checked by the same rule, so it asks about the margin the order
+/// will actually use.
+pub fn trade_mode(family: Family, stated: Option<&str>) -> Result<String, String> {
     if family == Family::Stock {
         return Err("OKX 不交易股票".into());
     }

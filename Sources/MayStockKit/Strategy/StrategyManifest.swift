@@ -612,7 +612,15 @@ public struct StrategyManifest: Codable, Sendable, Equatable, Identifiable {
     /// venue does not trade the instrument at all — there is then no cost
     /// model, and a simulation must refuse rather than run for free.
     public func effectiveCosts(under schedules: FeeSchedules) -> StrategyCosts? {
-        costs ?? schedules.schedule(for: market.venue).costs(for: market.instType)
+        costs ?? fallbackCosts(under: schedules)
+    }
+
+    /// The venue's schedule for this manifest's instrument: what the kernel is
+    /// handed for a manifest that states no costs of its own, by a backtest
+    /// and by a live decision alike, so both size an entry against the same
+    /// fee. Nil when the venue does not trade the instrument.
+    public func fallbackCosts(under schedules: FeeSchedules) -> StrategyCosts? {
+        schedules.schedule(for: market.venue).costs(for: market.instType)
     }
 
     // MARK: Codable with tolerant defaults

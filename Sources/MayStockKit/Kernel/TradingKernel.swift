@@ -135,6 +135,9 @@ public final class KernelStrategy: @unchecked Sendable {
         account: KernelAccountState = KernelAccountState()
     ) throws -> KernelDecision {
         let externalJSON = externalSeries.isEmpty ? nil : try encodeJSON(externalSeries)
+        // Thrown rather than dropped: without it the kernel would size against
+        // the instrument's default fee, not the venue's.
+        let feesJSON = try account.fees.map(encodeJSON)
         return try withKernelCandles(candles) { buffer, count in
             let json = try callReturningString { error in
                 ms_strategy_decide(
@@ -146,6 +149,7 @@ public final class KernelStrategy: @unchecked Sendable {
                     account.entryPrice,
                     account.now.map { Int64(($0.timeIntervalSince1970 * 1000).rounded()) } ?? 0,
                     try? encodeJSON(account.limits),
+                    feesJSON,
                     error)
             }
             return try JSONDecoder().decode(KernelDecision.self, from: Data(json.utf8))
@@ -415,6 +419,23 @@ extension TradingKernel {
         return try JSONDecoder().decode(KernelOptionCandidate?.self, from: Data(json.utf8))
     }
 
+    /// How many contracts an option entry buys: the most whole contracts the
+    /// plan's budget pays for, the premium and the fee to buy them together —
+    /// the rule the option backtest buys by, so the count live is the count
+    /// simulated.
+    public static func optionPurchase(
+        budget: Double, terms: KernelOptionPurchaseTerms
+    ) throws -> KernelOptionPurchase {
+        let request = try encodeJSON(OptionPurchaseRequest(
+            budget: budget, premiumPerUnit: terms.premiumPerUnit, multiplier: terms.multiplier,
+            lot: terms.lot, spot: terms.spot, fees: terms.fees,
+            feeCapPctOfPremium: terms.feeCapPctOfPremium))
+        let json = try callReturningString { error in
+            ms_option_purchase(request, error)
+        }
+        return try JSONDecoder().decode(KernelOptionPurchase.self, from: Data(json.utf8))
+    }
+
     /// How far live equity has drifted from the backtest that justified it.
     public static func compareEquity(
         live: [(ts: Date, equity: Double)], backtest: [(ts: Date, equity: Double)]
@@ -443,6 +464,17 @@ private struct OptionSelectionRequest: Encodable {
     let moneynessPct: Double
     let strikeStep: Double?
     let candidates: [KernelOptionCandidate]
+}
+
+/// Wire shape for `ms_option_purchase`: the budget beside the terms.
+private struct OptionPurchaseRequest: Encodable {
+    let budget: Double
+    let premiumPerUnit: Double
+    let multiplier: Double
+    let lot: Double
+    let spot: Double
+    let fees: FeeModel
+    let feeCapPctOfPremium: Double
 }
 
 /// Wire shape for `ms_resample_trades`.
@@ -603,6 +635,13 @@ extension KernelMetrics {
 /// computed — a confirmed `maystock://order` link. The rule is the one every
 /// strategy order goes through (`guard::check_order`); nothing here restates it.
 public enum KernelGuard {
+    /// The part of an order that adds exposure, in coins: all of it from flat
+    /// or when adding, the overshoot past flat when it reverses, nothing when
+    /// it only reduces — the guard's own definition (`guard::opening_base`).
+    public static func openingBase(baseDelta: Double, heldBase: Double) -> Double {
+        ms_opening_base(baseDelta, heldBase)
+    }
+
     /// Nil when the order passes. A check that could not run is reported as a
     /// refusal, never as a pass.
     public static func checkOrder(

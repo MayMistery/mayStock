@@ -134,36 +134,52 @@ struct KernelGoldenTests {
     /// Frozen at the point the Swift engine was deleted, when the two agreed;
     /// every deliberate move since is dated beside the value it changed.
     static let GOLDENS: [String: Golden] = [
+        // 2026-10-09: full size is the capital over one plus the fee rate —
+        // an entry's margin and opening fee together fit in it (`sizing::Footing`).
         "movingAverageCrossover": Golden(
-            trades: 20, finalEquity: 29551.924786, totalReturnPct: -1.493584,
-            maxDrawdownPct: 14.485792, winRate: 40.0, feesPaid: 1173.391483),
+            trades: 20, finalEquity: 29552.637175, totalReturnPct: -1.491209,
+            maxDrawdownPct: 14.472164, winRate: 40.0, feesPaid: 1172.250547),
         // 2026-10-09: stops and targets fill as the market orders they are
         // live (slippage), and a gap over the target takes the target.
+        // 2026-10-09: full size is the capital over one plus the fee rate —
+        // an entry's margin and opening fee together fit in it (`sizing::Footing`).
         "stopsAndTargets": Golden(
-            trades: 128, finalEquity: 30910.150397, totalReturnPct: 3.033835,
-            maxDrawdownPct: 16.020657, winRate: 38.28125, feesPaid: 8002.975971),
+            trades: 128, finalEquity: 30909.915365, totalReturnPct: 3.033051,
+            maxDrawdownPct: 16.005777, winRate: 38.28125, feesPaid: 7994.737058),
         // 2026-10-09: tightened from 4% to 1.5% — at 4% every trade ended on
         // its signal and the golden pinned nothing about trailing stops.
+        // 2026-10-09: full size is the capital over one plus the fee rate —
+        // an entry's margin and opening fee together fit in it (`sizing::Footing`).
         "trailingStop": Golden(
-            trades: 203, finalEquity: 10123.161502, totalReturnPct: -66.256128,
-            maxDrawdownPct: 66.621004, winRate: 26.108374, feesPaid: 7839.537098),
+            trades: 203, finalEquity: 10134.296885, totalReturnPct: -66.21901,
+            maxDrawdownPct: 66.583929, winRate: 26.108374, feesPaid: 7834.881572),
         // 2026-10-09: the ATR stop pays slippage like any market order.
         "atrRiskSizing": Golden(
             trades: 19, finalEquity: 32983.613607, totalReturnPct: 9.945379,
             maxDrawdownPct: 5.898383, winRate: 42.105263, feesPaid: 424.671903),
+        // 2026-10-09: full size is the capital over one plus the fee rate —
+        // an entry's margin and opening fee together fit in it (`sizing::Footing`).
         "dailyLossBreaker": Golden(
-            trades: 75, finalEquity: 39936.710149, totalReturnPct: 33.122367,
-            maxDrawdownPct: 14.97631, winRate: 40.0, feesPaid: 5521.282679),
+            trades: 75, finalEquity: 39926.571366, totalReturnPct: 33.088571,
+            maxDrawdownPct: 14.962448, winRate: 40.0, feesPaid: 5514.724338),
+        // 2026-10-09: full size is the capital over one plus the fee rate —
+        // an entry's margin and opening fee together fit in it (`sizing::Footing`).
         "cooldownAndMinHold": Golden(
-            trades: 43, finalEquity: 35091.205522, totalReturnPct: 16.970685,
-            maxDrawdownPct: 12.86219, winRate: 46.511628, feesPaid: 2837.714358),
+            trades: 43, finalEquity: 35086.495559, totalReturnPct: 16.954985,
+            maxDrawdownPct: 12.85004, winRate: 46.511628, feesPaid: 2834.642923),
         // 2026-10-09: stop tightened from 5% to 1.5%, which never fired.
+        // 2026-10-09: full size at 3× is the capital over one third plus the
+        // fee rate — margin and opening fee together fit in it; a reversal's
+        // new side is sized after its close has paid.
         "shortsAndLeverage": Golden(
-            trades: 31, finalEquity: 38985.458429, totalReturnPct: 29.951528,
-            maxDrawdownPct: 48.917803, winRate: 38.709677, feesPaid: 2099.2669),
+            trades: 31, finalEquity: 38979.253252, totalReturnPct: 29.930844,
+            maxDrawdownPct: 48.865943, winRate: 38.709677, feesPaid: 2097.053614),
+        // 2026-10-09: a scaled position is sized at the close it is decided
+        // on, against the equity marked there — as the runner sizes it — not
+        // at the next open, and only as far as margin and fee fit the equity.
         "continuousExposure": Golden(
-            trades: 19, finalEquity: 30060.098403, totalReturnPct: 0.200328,
-            maxDrawdownPct: 5.124814, winRate: 26.315789, feesPaid: 419.367307),
+            trades: 19, finalEquity: 30040.23065, totalReturnPct: 0.134102,
+            maxDrawdownPct: 5.089221, winRate: 26.315789, feesPaid: 419.574133),
     ]
 
     @Test func movingAverageCrossover() throws {
@@ -461,6 +477,29 @@ struct LiveSizingParityTests {
         #expect(abs(plan.baseDelta + 0.4) < 1e-12, "close exactly what is held")
     }
 
+    /// The plan is sized against the fee it is handed — the venue's schedule,
+    /// which the backtest of the same manifest falls back to — and each rate
+    /// gives its own exact ceiling: margin and opening fee together are the
+    /// capital. Pins the path from the account state through the FFI.
+    @Test func theLivePlanSizesAgainstTheFeeItIsHanded() throws {
+        let kernel = try KernelStrategy(manifestJSON: KernelGoldenTests.manifest(
+            instType: "SWAP",
+            signals: #"{"longEntry": "close > 0"}"#,
+            risk: #"{"leverage":10}"#,
+            costs: "null"))
+        let bars = KernelGoldenTests.candles(200)
+        let price = bars[bars.count - 1].close
+        for bps in [5.0, 50.0] {
+            let plan = try kernel.decide(
+                candles: bars, current: nil,
+                account: KernelAccountState(equity: 30_000, dayStartEquity: 30_000, fees: .flatBps(bps)))
+            let notional = plan.targetBaseQuantity * price
+            let ceiling = 30_000 / (1.0 / 10 + bps / 10_000)
+            #expect(abs(notional - ceiling) / ceiling < 1e-9, "\(bps) bps: \(notional) vs \(ceiling)")
+            #expect(plan.reason.contains("按资金上限定仓"), "\(plan.reason)")
+        }
+    }
+
     @Test func theRebalanceThresholdIsTheKernelsCall() throws {
         let json = KernelGoldenTests.manifest(
             signals: #"{"exposure": "1"}"#,
@@ -469,7 +508,9 @@ struct LiveSizingParityTests {
         let kernel = try KernelStrategy(manifestJSON: json)
         let bars = KernelGoldenTests.candles(600)
         let price = bars[bars.count - 1].close
-        let full = 30_000 / price
+        // Full size is the position whose cost and 10 bps opening fee together
+        // are the 30,000 — the ceiling every entry is sized to.
+        let full = 30_000 / 1.001 / price
 
         // Already at target — no trade.
         let held = try kernel.decide(
@@ -483,6 +524,8 @@ struct LiveSizingParityTests {
             account: KernelAccountState(equity: 30_000, heldBase: 0, dayStartEquity: 30_000))
         #expect(flat.shouldTrade)
         #expect(abs(flat.targetBaseQuantity - full) / full < 1e-9)
+        #expect(flat.targetExposure == 1, "the exposure asked for, however much of it the capital carries")
+        #expect(flat.reason.contains("按资金上限定仓"), "\(flat.reason)")
     }
 }
 

@@ -87,6 +87,7 @@ char *ms_strategy_decide(const MSStrategy *handle,
                          double entry_price,    /* 0 = flat; seeds the trail */
                          int64_t now_ms,        /* 0 = skip the staleness check */
                          const char *limits_json, /* NULL = default limits */
+                         const char *fees_json,   /* fee components for a manifest without costs; NULL = the instrument's default */
                          char **error_out);
 
 /* --- backtest -------------------------------------------------------- */
@@ -104,6 +105,11 @@ char *ms_backtest_run(const MSStrategy *handle,
  * initialCapital, market ({instId, instType, bar, venue}) and
  * freeParameterCount. Caller frees. */
 char *ms_metrics_compute(const char *request_json, char **error_out);
+
+/* The part of an order that adds exposure, in coins: all of it from flat or
+ * when adding, the overshoot past flat when it reverses, 0 when it only
+ * reduces — the guard's own definition. */
+double ms_opening_base(double base_delta, double held_base);
 
 /* One order against the pre-trade limits, without a strategy handle (an order
  * no strategy computed — a confirmed maystock://order link). max_multiple is
@@ -203,6 +209,12 @@ char *ms_compare_equity(const char *request_json, char **error_out);
  * the result is the chosen candidate as JSON or the literal `null` when
  * nothing qualifies. Caller frees. */
 char *ms_option_select(const char *request_json, char **error_out);
+
+/* How many whole contracts an option entry buys: the most its premium budget
+ * pays for, premium and fee together, by the rule the option backtest buys by.
+ * Request JSON carries budget, premiumPerUnit, multiplier, lot, spot, fees and
+ * feeCapPctOfPremium; the result is {contracts, premium, fee}. Caller frees. */
+char *ms_option_purchase(const char *request_json, char **error_out);
 
 /* Evaluate one DSL expression over the candles; returns a JSON array where
  * warm-up NaNs are null. Caller frees. */

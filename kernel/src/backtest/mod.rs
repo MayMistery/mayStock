@@ -759,8 +759,13 @@ fn open_position(
     let manifest = &strategy.manifest;
     let stop_distance = crate::sizing::stop_distance(strategy, price, atr);
 
-    let Some(notional) = crate::sizing::target_notional(
-        strategy, *equity, price, leverage, stop_distance)
+    // Sized from flat — a reversal has already closed and paid for the close —
+    // so that the margin and this fill's fee together fit in the equity left.
+    let footing = crate::sizing::Footing {
+        costs, capital: *equity, price, leverage, regime: manifest.market.inst_type.margin_regime(),
+        held_base: 0.0, held_basis: 0.0,
+    };
+    let Some(base) = crate::sizing::target_base(strategy, &footing, stop_distance, direction)
     else { return };
 
     // The same pre-trade limits the live runner applies. Only a sizing bug
@@ -771,9 +776,10 @@ fn open_position(
     // Deliberately *not* the live trading-state machine — a portfolio drawdown
     // brake is a live risk control, not a rule of the strategy, and folding it
     // into the simulation would test a different strategy than the one written.
-    let quantity = notional / price;
+    let quantity = base.abs();
+    let notional = quantity * price;
     if let Some(denied) = crate::guard::check_order(
-        quantity * direction.sign(), 0.0, price, *equity, strategy.max_notional_multiple(), limits)
+        base, 0.0, price, *equity, strategy.max_notional_multiple(), limits)
     {
         refusals.note(denied);
         return;
@@ -1112,6 +1118,83 @@ mod tests {
                     "closing fee {exit_fee}");
             assert_eq!(result.liquidations, 1);
         }
+    }
+
+    /// Always in on `direction`'s side at `leverage`, full size.
+    fn always_in(family: crate::strategy::InstrumentType, direction: Direction, leverage: f64) -> CompiledStrategy {
+        let signals = match direction {
+            Direction::Long => r#""longEntry":"close > 0","longExit":"close < 0""#,
+            Direction::Short => r#""shortEntry":"close > 0","shortExit":"close < 0""#,
+        };
+        let family = serde_json::to_value(family).unwrap();
+        compile(&format!(
+            r#"{{"id":"f","name":"f","market":{{"instId":"X","instType":{family},"bar":"1H"}},
+                 "signals":{{{signals}}},"sizing":{{"mode":"equityPct","value":100}},
+                 "risk":{{"leverage":{leverage}}}}}"#
+        ))
+    }
+
+    /// Walks every family the binary engine trades (a bought option has its
+    /// own engine and its own walk), at every whole leverage it allows, long
+    /// and — where it can be — short, at full size. What the entry commits, its
+    /// margin and its fee, never exceeds the equity behind it; so the worst
+    /// exit the family's margin defines leaves the run at or above zero: an
+    /// isolated liquidation takes exactly the margin, a fully paid position at
+    /// most its price, a Reg T call met inside its bar what the move took. A
+    /// full-size isolated liquidation used to end the run at minus the
+    /// opening fee.
+    #[test]
+    fn a_full_size_entry_never_commits_more_than_the_equity_behind_it() {
+        use crate::strategy::{InstrumentType, MarginRegime};
+        let (fee, slippage) = (5.0, 3.0);
+        let mut walked = 0;
+        for family in InstrumentType::ALL.into_iter().filter(|f| !f.is_option()) {
+            let maintenance = family.default_maintenance_margin_rate().unwrap_or(0.0);
+            let mut leverage = 1.0;
+            while leverage <= family.max_leverage() {
+                let sides = if family.allows_short() { vec![Direction::Long, Direction::Short] } else { vec![Direction::Long] };
+                for direction in sides {
+                    let sign = direction.sign();
+                    // The position fills at 100 through the slippage; the bar
+                    // after five quiet ones is the worst its margin allows.
+                    let fill = 100.0 * (1.0 + sign * slippage / 10_000.0);
+                    let lends = leverage > 1.0 && family.margin_regime() != MarginRegime::None;
+                    let level = fill * (1.0 - sign * liquidation_buffer(family.margin_regime(), maintenance, leverage));
+                    let worst = match (lends, family.margin_regime()) {
+                        // Opened far past the liquidation level.
+                        (true, MarginRegime::Isolated) => {
+                            let gap = level * (1.0 - sign * 0.5);
+                            (gap, gap, gap, gap)
+                        }
+                        // The call met inside the bar: the broker sells there.
+                        (true, _) => (100.0, level.max(100.0), level.min(100.0), level),
+                        // Nothing lent: all but the whole price, either way.
+                        (false, _) => {
+                            let moved = 100.0 * (1.0 - sign * 0.99);
+                            (moved, moved, moved, moved)
+                        }
+                    };
+                    let result = run(&always_in(family, direction, leverage), &flat_then(6, worst, 3),
+                                     &costs(fee, slippage)).unwrap();
+                    let label = format!("{family:?} {leverage}x {direction:?}");
+                    let entry = result.trades.first().unwrap_or_else(|| panic!("{label}: never entered"));
+                    let committed = entry.notional / leverage + entry.notional * fee / 10_000.0;
+                    assert!(committed <= result.initial_capital * (1.0 + 1e-12), "{label}: commits {committed}");
+                    assert!(result.final_equity >= -1e-9 * result.initial_capital,
+                            "{label}: ends at {} after {:?}", result.final_equity,
+                            result.trades.iter().map(|t| t.exit_reason).collect::<Vec<_>>());
+                    if lends && family.margin_regime() == MarginRegime::Isolated {
+                        assert_eq!(result.liquidations, 1, "{label}");
+                        assert!(result.final_equity.abs() < 1e-9 * result.initial_capital,
+                                "{label}: a full-size liquidation takes everything committed and no more — {}",
+                                result.final_equity);
+                    }
+                    walked += 1;
+                }
+                leverage += 1.0;
+            }
+        }
+        assert!(walked > 100, "walked {walked}");
     }
 
     /// Regulation T has no floor under the loss: the broker sells into the

@@ -399,7 +399,8 @@ pub fn option_fee(
     on_notional.min(cap).max(0.0)
 }
 
-/// Premium the strategy may spend on one entry, in quote currency.
+/// What the strategy may spend on one entry, in quote currency — the premium
+/// and the fee to buy it together (`affordable_contracts`).
 ///
 /// The premium *is* the position's maximum loss, so `equityPct` and
 /// `riskPerTrade` mean the same thing here: the share of the budget put at
@@ -419,15 +420,67 @@ pub fn premium_budget(strategy: &CompiledStrategy, equity: f64) -> Option<f64> {
     (capped > 0.0).then_some(capped)
 }
 
-/// Whole contracts a budget buys at a premium, rounded down to the lot; zero
-/// when it cannot afford one.
-pub fn contracts_for(budget: f64, premium_per_unit: f64, multiplier: f64, lot: f64) -> f64 {
+/// Whole contracts bought out of a budget, and what they cost it, in quote
+/// currency.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Purchase {
+    pub contracts: f64,
+    pub premium: f64,
+    pub fee: f64,
+}
+
+/// What a contract is and what buying it costs: the terms `affordable_purchase`
+/// sizes on, in quote currency — the backtest's model contract or, live, the
+/// listed one at the price the order may pay.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurchaseTerms {
+    /// The most the order pays per unit of underlying.
+    pub premium_per_unit: f64,
+    /// Units of underlying one contract covers.
+    pub multiplier: f64,
+    /// The smallest step a contract count moves in.
+    pub lot: f64,
+    /// The underlying's price, which the fee is charged on.
+    pub spot: f64,
+    pub fees: Vec<FeeComponent>,
+    /// The exchange's cap on that fee, as a share of the premium.
+    pub fee_cap_pct_of_premium: f64,
+}
+
+/// The most whole contracts `budget` pays for — the premium and the fee to buy
+/// them together — rounded down to the lot; none when it cannot pay for one.
+///
+/// A bought option is paid for in full, so its premium is its margin and the
+/// rule is the one every entry follows (`sizing::Footing`): what it commits
+/// fits in what it may spend. Sized on the premium alone, a budget that was the
+/// whole capital bought contracts whose fee then took the cash below zero.
+pub fn affordable_purchase(budget: f64, terms: &PurchaseTerms) -> Purchase {
+    let PurchaseTerms { premium_per_unit, multiplier, spot, fee_cap_pct_of_premium, .. } = *terms;
+    let purchase = |contracts: f64| {
+        let units = contracts * multiplier;
+        Purchase {
+            contracts,
+            premium: units * premium_per_unit,
+            fee: option_fee(&terms.fees, OrderSide::Buy, spot, premium_per_unit, units, fee_cap_pct_of_premium),
+        }
+    };
     let per_contract = premium_per_unit * multiplier;
     if !(per_contract > 0.0) || !(budget > 0.0) {
-        return 0.0;
+        return purchase(0.0);
     }
-    let lot = if lot > 0.0 { lot } else { 1.0 };
-    (budget / per_contract / lot).floor() * lot
+    let lot = if terms.lot > 0.0 { terms.lot } else { 1.0 };
+    let cost = |contracts: f64| {
+        let bought = purchase(contracts);
+        bought.premium + bought.fee
+    };
+    let most = crate::sizing::largest_within(budget, 0.0, budget / per_contract, cost);
+    // Onto the lot grid, with the 1e-9 carry the runner's lot flooring uses: a
+    // budget that buys a whole number of lots does not divide back into them
+    // exactly in binary. The cost has the last word on the carried lot.
+    let lots = (most / lot + 1e-9).floor();
+    let lots = if lots > 0.0 && cost(lots * lot) > budget { lots - 1.0 } else { lots };
+    purchase(lots * lot)
 }
 
 #[cfg(test)]
@@ -581,12 +634,56 @@ mod tests {
         assert_eq!(option_fee(&sell_only, OrderSide::Buy, 80_000.0, 500.0, 1.0, 12.5), 0.0);
     }
 
+    fn terms(premium_per_unit: f64, lot: f64, fees: Vec<FeeComponent>) -> PurchaseTerms {
+        PurchaseTerms { premium_per_unit, multiplier: 0.01, lot, spot: 80_000.0, fees, fee_cap_pct_of_premium: 12.5 }
+    }
+
     #[test]
     fn whole_contracts_only() {
         // 1,000 of budget at 30,000 per unit × 0.01 per contract = 3.33 → 3.
-        assert_eq!(contracts_for(1_000.0, 30_000.0, 0.01, 1.0), 3.0);
-        assert_eq!(contracts_for(100.0, 30_000.0, 0.01, 1.0), 0.0, "cannot afford one");
-        assert_eq!(contracts_for(1_000.0, 0.0, 0.01, 1.0), 0.0, "no price, no size");
+        let free = |premium| terms(premium, 1.0, Vec::new());
+        assert_eq!(affordable_purchase(1_000.0, &free(30_000.0)).contracts, 3.0);
+        assert_eq!(affordable_purchase(100.0, &free(30_000.0)).contracts, 0.0, "cannot afford one");
+        assert_eq!(affordable_purchase(1_000.0, &free(0.0)).contracts, 0.0, "no price, no size");
+        // A budget that is exactly three contracts buys three.
+        assert_eq!(affordable_purchase(900.0, &free(30_000.0)).contracts, 3.0);
+    }
+
+    /// The fee is paid out of the same budget as the premium: a budget that
+    /// is exactly three contracts' premium buys two once buying costs a fee.
+    /// Walked over premiums from deep in the money to far out of it (where
+    /// the fee's cap on the premium governs), lots, fee models and budgets:
+    /// what is bought always fits, and one more lot never would.
+    #[test]
+    fn the_premium_and_its_fee_fit_in_the_budget_together() {
+        let taker = vec![FeeComponent::flat_bps(3.0)];
+        assert_eq!(affordable_purchase(900.0, &terms(30_000.0, 1.0, taker.clone())).contracts, 2.0);
+
+        let per_order = FeeComponent {
+            basis: crate::fees::FeeBasis::Order { per_order: 1.5 },
+            side: crate::fees::FeeSide::Both, min_per_order: None, max_per_order: None, label: None,
+        };
+        let mut checked = 0;
+        for fees in [Vec::new(), taker, vec![FeeComponent::flat_bps(30.0)], vec![per_order]] {
+            for premium in [15.0, 400.0, 2_500.0, 30_000.0] {
+                for lot in [1.0, 0.1] {
+                    let at = terms(premium, lot, fees.clone());
+                    for budget in [5.0, 99.0, 1_000.0, 12_345.6, 250_000.0] {
+                        let bought = affordable_purchase(budget, &at);
+                        assert!(bought.premium + bought.fee <= budget,
+                                "{fees:?} at {premium}, lot {lot}: {bought:?} over {budget}");
+                        let more = {
+                            let contracts = bought.contracts + lot;
+                            let units = contracts * at.multiplier;
+                            units * premium + option_fee(&at.fees, OrderSide::Buy, at.spot, premium, units, 12.5)
+                        };
+                        assert!(more > budget, "{fees:?} at {premium}, lot {lot}: one more lot also fits {budget}");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 160);
     }
 
     #[test]

@@ -71,7 +71,7 @@ struct ConfigTests {
         ]
         config.alerts = [AlertRule(instId: "BTC-USDT", condition: .priceAbove(120_000), note: "moon")]
         config.trading.liveTradingUnlocked = false
-        try io.save(config)
+        try io.update { $0 = config }
 
         let loaded = io.load()
         #expect(loaded == config)

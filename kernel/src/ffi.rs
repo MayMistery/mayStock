@@ -231,6 +231,10 @@ pub unsafe extern "C" fn ms_strategy_decide(
     now_ms: i64,
     // Pre-trade limits as JSON; NULL uses the defaults.
     limits_json: *const c_char,
+    // The venue's fee model for the instrument as a JSON array of fee
+    // components, for a manifest that states no costs; NULL leaves the
+    // instrument's documented default.
+    fees_json: *const c_char,
     error_out: *mut *mut c_char,
 ) -> *mut c_char {
     guarded(error_out, ptr::null_mut(), || {
@@ -261,6 +265,11 @@ pub unsafe extern "C" fn ms_strategy_decide(
                     Some(text) if !text.trim().is_empty() => serde_json::from_str(text)
                         .map_err(|e| format!("风控限额解析失败：{e}"))?,
                     _ => crate::guard::OrderLimits::default(),
+                },
+                fees: match borrow_str(fees_json) {
+                    Some(text) if !text.trim().is_empty() => Some(serde_json::from_str(text)
+                        .map_err(|e| format!("费率模型解析失败：{e}"))?),
+                    _ => None,
                 },
             },
         )
@@ -450,7 +459,7 @@ mod tests {
         let mut error: *mut c_char = ptr::null_mut();
         let json = unsafe {
             ms_strategy_decide(handle, bars.as_ptr(), bars.len(), 0, 0, ptr::null(),
-                               10_000.0, 0.0, 10_000.0, -1.0, -1, false, 0.0, 0, ptr::null(), &mut error)
+                               10_000.0, 0.0, 10_000.0, -1.0, -1, false, 0.0, 0, ptr::null(), ptr::null(), &mut error)
         };
         assert!(error.is_null());
         let value: serde_json::Value = serde_json::from_str(&take_string(json)).unwrap();
@@ -466,7 +475,7 @@ mod tests {
         let mut error: *mut c_char = ptr::null_mut();
         let json =
             unsafe { ms_strategy_decide(handle, ptr::null(), 0, 0, 0, ptr::null(),
-                               10_000.0, 0.0, 10_000.0, -1.0, -1, false, 0.0, 0, ptr::null(), &mut error) };
+                               10_000.0, 0.0, 10_000.0, -1.0, -1, false, 0.0, 0, ptr::null(), ptr::null(), &mut error) };
         assert!(error.is_null());
         let value: serde_json::Value = serde_json::from_str(&take_string(json)).unwrap();
         assert_eq!(value["target"], 0);
@@ -508,6 +517,28 @@ mod tests {
         let json = unsafe { ms_option_select(empty.as_ptr(), &mut error) };
         assert!(error.is_null());
         assert_eq!(take_string(json), "null", "no candidate is an answer, not an error");
+    }
+
+    /// The runner's count of contracts is the backtest's: a budget of exactly
+    /// three contracts' premium buys two once the fee is paid out of it.
+    #[test]
+    fn an_option_purchase_round_trips_through_json() {
+        let request = CString::new(
+            r#"{"budget":900,"premiumPerUnit":30000,"multiplier":0.01,"lot":1,"spot":80000,
+                "fees":[{"basis":"notional","bps":3}],"feeCapPctOfPremium":12.5}"#,
+        )
+        .unwrap();
+        let mut error: *mut c_char = ptr::null_mut();
+        let json = unsafe { ms_option_purchase(request.as_ptr(), &mut error) };
+        assert!(error.is_null());
+        let value: serde_json::Value = serde_json::from_str(&take_string(json)).unwrap();
+        assert_eq!(value["contracts"], 2.0);
+        assert!(value["premium"].as_f64().unwrap() + value["fee"].as_f64().unwrap() <= 900.0);
+
+        let broken = CString::new(r#"{"budget":900}"#).unwrap();
+        let json = unsafe { ms_option_purchase(broken.as_ptr(), &mut error) };
+        assert!(json.is_null() && !error.is_null(), "incomplete terms are an error, not a count");
+        unsafe { ms_string_free(error) };
     }
 
     #[test]
@@ -751,6 +782,34 @@ pub unsafe extern "C" fn ms_compare_equity(
     })
 }
 
+/// How many contracts an option entry buys: the most whole contracts its
+/// premium budget pays for, the premium and the fee to buy them together — the
+/// rule the option backtest buys by (`options::affordable_purchase`), so the
+/// runner's count is the backtest's.
+///
+/// Request JSON carries `budget` and the [`crate::options::PurchaseTerms`]
+/// beside it; the result is a JSON [`crate::options::Purchase`].
+#[no_mangle]
+pub unsafe extern "C" fn ms_option_purchase(
+    request_json: *const c_char,
+    error_out: *mut *mut c_char,
+) -> *mut c_char {
+    #[derive(serde::Deserialize)]
+    struct Request {
+        budget: f64,
+        #[serde(flatten)]
+        terms: crate::options::PurchaseTerms,
+    }
+    guarded(error_out, ptr::null_mut(), || {
+        let text = borrow_str(request_json).ok_or("请求 JSON 为空")?;
+        let request: Request =
+            serde_json::from_str(text).map_err(|e| format!("期权买入数量请求解析失败：{e}"))?;
+        serde_json::to_string(&crate::options::affordable_purchase(request.budget, &request.terms))
+            .map(to_c_string)
+            .map_err(|e| e.to_string())
+    })
+}
+
 /// Pick the contract an option strategy would buy from a listed chain, by
 /// the same rule the backtester applies to its modelled chain.
 ///
@@ -792,6 +851,14 @@ pub unsafe extern "C" fn ms_option_select(
 /// (`{"reason", "byPolicy"}`): it does not. NULL with `error_out` set: the
 /// check itself failed, which the caller must not read as a pass. NULL
 /// `limits_json` means default limits.
+/// The part of an order that adds exposure, in coins — the guard's own
+/// definition (`guard::opening_base`): all of it from flat or when adding, the
+/// overshoot past flat when it reverses, nothing when it only reduces.
+#[no_mangle]
+pub extern "C" fn ms_opening_base(base_delta: f64, held_base: f64) -> f64 {
+    crate::guard::opening_base(base_delta, held_base)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn ms_check_order(
     base_delta: f64,

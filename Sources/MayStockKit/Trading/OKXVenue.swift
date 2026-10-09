@@ -205,6 +205,22 @@ public struct OKXVenue: ExchangeVenue {
         try await trade.feeRates(family: instType, instId: instId, groupId: groupId, mode: mode)
     }
 
+    /// OKX's own `account/max-size`, asked in the margin mode the order goes
+    /// out in, at the leverage its leg is held at. Measured on the demo
+    /// account (2026-10-09): for a perpetual it is the margin check's
+    /// boundary to the lot — margin at the buy price limit for a market buy,
+    /// at the mark for a sale, plus the taker fee, against what is free; for
+    /// spot it is the free quote over the last price. Every OKX order states
+    /// a mode, so an order without one is a mistake to say, not a default to
+    /// ask with.
+    public func maxOpeningSize(
+        instId: String, instType: InstrumentType, side: OrderSide, tradeMode: String?, mode: TradingMode
+    ) async throws -> Double? {
+        guard let tradeMode else { throw TradeError.refused("问可开上限要先定出这张单的 tdMode") }
+        let most = try await trade.maxOrderSize(family: instType, instId: instId, tradeMode: tradeMode, mode: mode)
+        return side == .buy ? most.maxBuy : most.maxSell
+    }
+
     public func warmTrading() async {
         if case .failure(let error) = await KernelTradeClient.warm() {
             Log.warn("trade: 预热交易连接失败：\(error)")

@@ -17,9 +17,9 @@
 //! as the close-doctor took four of them over the limit — `50011 Too Many
 //! Requests`.
 //!
-//! The two leverage routes were checked 2026-10-09 against OKX's own
-//! documentation — twenty per two seconds per user ID, each — and ccxt's
-//! table (cost 1).
+//! The two leverage routes and `max-size` were checked 2026-10-09 against
+//! OKX's own documentation — twenty per two seconds per user ID, each — and
+//! ccxt's table (cost 1).
 
 use std::time::Duration;
 
@@ -47,6 +47,7 @@ pub enum Route {
     Bills,
     TradeFee,
     LeverageInfo,
+    MaxSize,
 }
 
 /// At most `requests` in any `window`.
@@ -67,7 +68,7 @@ impl Limit {
 
 impl Route {
     /// Every route, for the checks that must hold of each one.
-    pub const ALL: [Route; 19] = [
+    pub const ALL: [Route; 20] = [
         Route::PlaceOrder,
         Route::PlaceAlgo,
         Route::CancelOrder,
@@ -87,6 +88,7 @@ impl Route {
         Route::Bills,
         Route::TradeFee,
         Route::LeverageInfo,
+        Route::MaxSize,
     ];
 
     pub fn path(self) -> &'static str {
@@ -109,6 +111,7 @@ impl Route {
             Route::Bills => "/api/v5/account/bills",
             Route::TradeFee => "/api/v5/account/trade-fee",
             Route::LeverageInfo => "/api/v5/account/leverage-info",
+            Route::MaxSize => "/api/v5/account/max-size",
         }
     }
 
@@ -135,7 +138,8 @@ impl Route {
             | Route::Fills
             | Route::Bills
             | Route::TradeFee
-            | Route::LeverageInfo => false,
+            | Route::LeverageInfo
+            | Route::MaxSize => false,
         }
     }
 
@@ -151,7 +155,8 @@ impl Route {
             | Route::AmendAlgos
             | Route::AlgoOrdersPending
             | Route::SetLeverage
-            | Route::LeverageInfo => Limit::per_two_seconds(20),
+            | Route::LeverageInfo
+            | Route::MaxSize => Limit::per_two_seconds(20),
             Route::Positions | Route::Balance | Route::Bills => Limit::per_two_seconds(10),
             Route::OrderPrecheck | Route::AccountConfig | Route::TradeFee => Limit::per_two_seconds(5),
             Route::AssetBalances => Limit::per_second(6),
@@ -222,6 +227,7 @@ mod tests {
                 Route::Bills => 16,
                 Route::TradeFee => 17,
                 Route::LeverageInfo => 18,
+                Route::MaxSize => 19,
             }
         }
         let mut seen = [false; Route::ALL.len()];

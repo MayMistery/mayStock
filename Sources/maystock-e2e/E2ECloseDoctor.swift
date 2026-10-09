@@ -32,7 +32,7 @@ extension E2EMain {
         var ok = true
         for mode in TradingMode.allCases {
             print("close ticket doctor — OKX \(mode.displayName)（不下单）")
-            ok = await signedPaths(trade: trade, mode: mode) && ok
+            ok = await signedPaths(trade: trade, venue: venue, mode: mode) && ok
             var requests: [CloseTicketRequest] = []
             do {
                 for position in try await venue.heldPositions(mode: mode) where position.quantity != 0 {
@@ -63,7 +63,7 @@ extension E2EMain {
     /// The kernel's signed reads, and — on the demo account — a signed POST
     /// that changes nothing.
     @MainActor
-    private static func signedPaths(trade: KernelTradeClient, mode: TradingMode) async -> Bool {
+    private static func signedPaths(trade: KernelTradeClient, venue: OKXVenue, mode: TradingMode) async -> Bool {
         var ok = true
         do {
             let listing = try await trade.workingOrders(mode: mode)
@@ -89,6 +89,30 @@ extension E2EMain {
             }
         } catch {
             fail("按 clOrdId 查单", String(describing: error))
+            ok = false
+        }
+        // What the runner fits an opening order to (`StrategyRunner.fitToVenue`),
+        // read the way it reads it: in the mode a strategy's perpetual opens
+        // in. Asking it reads the leg; nothing is set (no leverage to hold).
+        do {
+            let opening = try await venue.prepareLeg(LegPreparation(
+                instId: "BTC-USDT-SWAP", instType: .swap, posSide: nil,
+                accountLevel: (try? await venue.accountTradingConfig(mode: mode))?.accountLevel,
+                held: nil, lot: 0.01, intent: .open(leverage: nil)), mode: mode, liveUnlocked: false)
+            let buy = try await venue.maxOpeningSize(
+                instId: "BTC-USDT-SWAP", instType: .swap, side: .buy, tradeMode: opening.tradeMode, mode: mode)
+            let sell = try await venue.maxOpeningSize(
+                instId: "BTC-USDT-SWAP", instType: .swap, side: .sell, tradeMode: opening.tradeMode, mode: mode)
+            if let buy, let sell, buy.isFinite, sell.isFinite, buy >= 0, sell >= 0 {
+                pass("交易所可开上限（内核签名读取）",
+                     "BTC-USDT-SWAP \(opening.marginText ?? "—")最多开多 \(PriceFormatter.plain(buy)) 张、"
+                     + "开空 \(PriceFormatter.plain(sell)) 张")
+            } else {
+                fail("交易所可开上限", "答了 \(String(describing: buy)) / \(String(describing: sell))")
+                ok = false
+            }
+        } catch {
+            fail("交易所可开上限", String(describing: error))
             ok = false
         }
         guard mode == .demo else { return ok }

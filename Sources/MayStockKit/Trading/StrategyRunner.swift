@@ -1187,7 +1187,11 @@ public final class StrategyRunner {
                     // The kernel has no clock of its own, by design. Staleness
                     // is the one property it cannot judge without one.
                     now: Date(),
-                    limits: orderLimits(for: host)))
+                    limits: orderLimits(for: host),
+                    // The fee a backtest of this manifest charges, so an entry
+                    // is sized to fit its margin and its fee in the equity
+                    // exactly as it was simulated.
+                    fees: strategy.manifest.fallbackCosts(under: host.portfolio.feeSchedules)?.fees))
         } catch {
             update(strategy.id) {
                 $0.status = .failed
@@ -1493,6 +1497,70 @@ public final class StrategyRunner {
 
     // MARK: Order submission
 
+    /// How far an opening order is left short of the venue's bound. The bound
+    /// is read at the buy price limit as it stands, and the order is judged at
+    /// the limit as it stands when it arrives, two round trips later. Measured
+    /// on the OKX demo account (2026-10-09, ETH and BTC perpetuals, a sample
+    /// every half second for 90 s): the buy limit rose at most 0.014% within
+    /// one second and 0.023% within five. A tenth of a percent covers that
+    /// with room; a faster market than that gets a refusal, and the next bar
+    /// decides again.
+    static let venueBoundHeadroom = 0.001
+
+    /// How much of an order that adds exposure the venue's account can back
+    /// right now, and the note that says so when that is less than the
+    /// strategy sized. The strategy's own size when it fits, or when the venue
+    /// cannot say; nil when not even the smallest order fits, and nothing is
+    /// sent.
+    ///
+    /// A venue refuses an order its account cannot back and never shrinks
+    /// one. Measured on the OKX demo account (2026-10-09): margin plus the
+    /// taker fee over what is free is refused with 51008, exact to the cent,
+    /// and a market buy's margin is held at the buy price limit, about 1%
+    /// above the mark — so with an allocation that is the whole available
+    /// balance a full-size buy was refused although its margin and fee fit at
+    /// the mark. Fitting to the venue's own bound (`maxOpeningSize`) covers
+    /// that and everything else the account's free balance answers for: hand
+    /// trades, other strategies, the account's real fee tier.
+    private func fitToVenue(
+        _ size: Double, side: OrderSide, crossing: Bool, tradeMode: String?, meta: InstrumentMeta?,
+        strategy: CompiledStrategy, host: StrategyRunnerHost
+    ) async -> (size: Double, note: String?)? {
+        let market = strategy.market
+        let unit = market.instType.isDerivative ? "张" : market.instId.components(separatedBy: "-").first ?? ""
+        // One order that closes a net-mode position and opens the other side:
+        // the venue's bound has not been measured against such an order, so
+        // it is not fitted to it.
+        if crossing {
+            Log.warn("runner: \(strategy.id) \(market.instId) 这张单先平后开（净持仓模式），不按交易所可开上限缩量，由交易所裁定")
+            return (size, nil)
+        }
+        let most: Double?
+        do {
+            most = try await host.venue.maxOpeningSize(
+                instId: market.instId, instType: market.instType, side: side, tradeMode: tradeMode,
+                mode: host.portfolio.mode)
+        } catch {
+            Log.warn("runner: \(strategy.id) \(market.instId) 读不到交易所可开上限（\(error)），按定仓 \(size) \(unit) 下单，由交易所裁定")
+            return (size, nil)
+        }
+        guard let most else { return (size, nil) }
+        let room = most * (1 - Self.venueBoundHeadroom)
+        guard size > room else { return (size, nil) }
+        let fitted = meta?.flooredToLot(room) ?? room.rounded(.down)
+        let smallest = meta.map { Swift.max($0.minSize, $0.lotSize) } ?? 0
+        guard fitted > 0, fitted >= smallest else {
+            Log.warn("runner: \(strategy.id) \(market.instId) 定仓 \(size) \(unit)，交易所当前最多可开 \(most) \(unit)，低于最小下单量，未开仓")
+            update(strategy.id) {
+                $0.message = "交易所当前最多可开 \(PriceFormatter.plain(most)) \(unit)，低于最小下单量，未开仓"
+            }
+            return nil
+        }
+        let note = "交易所当前最多可开 \(PriceFormatter.plain(most)) \(unit)，按上限下 \(PriceFormatter.plain(fitted))（定仓 \(PriceFormatter.plain(size))）"
+        Log.warn("runner: \(strategy.id) \(market.instId) \(note)")
+        return (fitted, note)
+    }
+
     private func submit(
         baseDelta: Double, strategy: CompiledStrategy, host: StrategyRunnerHost, reason: String,
         stopPrice: Double? = nil, takeProfitPrice: Double? = nil
@@ -1550,9 +1618,12 @@ public final class StrategyRunner {
         // An order that shrinks a derivative position says so, and the
         // exchange then refuses to let it overshoot into the opposite side.
         let heldBase = host.ledger.position(for: strategy.id)?.baseQuantity ?? 0
+        // What the order adds, by the guard's own definition — nothing when it
+        // only moves the position towards flat, whatever the family.
+        let opens = KernelGuard.openingBase(baseDelta: baseDelta, heldBase: heldBase)
         let opposes = market.instType.isDerivative && abs(heldBase) > 1e-12
             && (baseDelta > 0) != (heldBase > 0)
-        let reduces = opposes && abs(baseDelta) <= abs(heldBase) + 1e-12
+        let reduces = opposes && opens == 0
 
         // A reversal is two trades, and on a hedge-mode account it has to be
         // sent as two orders.
@@ -1654,7 +1725,7 @@ public final class StrategyRunner {
             }
         }
 
-        let openingSize = openingDelta == baseDelta
+        var openingSize = openingDelta == baseDelta
             ? size
             : (meta?.exchangeSize(forBaseQuantity: abs(openingDelta))
                 ?? abs(openingDelta) / contractSize)
@@ -1662,22 +1733,38 @@ public final class StrategyRunner {
             update(strategy.id) { $0.message = "调整量低于交易所最小下单量，本次跳过" }
             return
         }
+        // What adds exposure, by the guard's own definition: after a split
+        // reversal the order left is the opening leg, from flat; otherwise
+        // whatever the order adds. A close or a trim — a spot sale of what is
+        // held among them — adds nothing.
+        let adds = openingDelta != baseDelta || opens > 0
 
         // A reduction states its position's own mode and is never held back
-        // by the leg; anything that opens or adds goes out only on a leg
-        // holding nothing but the strategies' own contracts, at the
-        // manifest's leverage. Selling a coin lowers what is held, as a
-        // reduction does.
-        let lowers = reduces || (!market.instType.isDerivative && openingDelta < 0)
+        // by the leg; anything that adds goes out only on a leg holding
+        // nothing but the strategies' own contracts, at the manifest's
+        // leverage. First, so the venue's bound below is asked at the
+        // leverage and in the mode the order is margined at.
         if readiness == nil {
             do {
-                readiness = try await ready(lowers ? .reduce : .open(leverage: leverage), on: posSide)
+                readiness = try await ready(adds ? .open(leverage: leverage) : .reduce, on: posSide)
             } catch {
-                holdBack(error, opening: !lowers, strategy: strategy)
+                holdBack(error, opening: adds, strategy: strategy)
                 return
             }
         }
         let tradeMode = readiness?.tradeMode
+
+        // What adds exposure is sent no larger than the account can back right
+        // now (`fitToVenue`); what does not goes whole.
+        var reason = reason
+        if adds {
+            let crossing = opposes && openingDelta == baseDelta
+            guard let fitted = await fitToVenue(
+                openingSize, side: openingDelta > 0 ? .buy : .sell, crossing: crossing, tradeMode: tradeMode,
+                meta: meta, strategy: strategy, host: host) else { return }
+            if let note = fitted.note { reason = "\(reason)；\(note)" }
+            openingSize = fitted.size
+        }
 
         func request(withProtection: Bool) -> OrderRequest {
             OrderRequest(
@@ -1702,7 +1789,7 @@ public final class StrategyRunner {
         // wire, and the number that made it wrong is never sent.
         Log.warn("""
             runner: 下单 \(strategy.id) \(market.instId) \
-            \(baseDelta > 0 ? "buy" : "sell") \(size) 张（面值 \(contractSize)，\
+            \(openingDelta > 0 ? "buy" : "sell") \(openingSize) 张（面值 \(contractSize)，\
             目标变动 \(baseDelta) 币，现持 \
             \(host.ledger.position(for: strategy.id)?.quantity ?? 0) 张，\
             \(readiness?.marginText ?? "无保证金模式")\
@@ -2067,27 +2154,47 @@ public final class StrategyRunner {
             return
         }
 
-        // The exchange quotes in the settlement coin per unit of underlying;
-        // the budget is in quote currency, so the ask converts at the same
-        // index the fill will be booked at.
-        let premiumQuotePerUnit = ask * quote.indexPrice
-        let perContract = premiumQuotePerUnit * contract.contractValue
+        // The order pays at most its limit, a little through the ask, and the
+        // exchange freezes the premium at that price — so the budget is held
+        // against it. Quotes are in the settlement coin per unit of
+        // underlying and the budget in quote currency, so the limit converts
+        // at the index the fill will be booked at.
+        let tick = contract.tickSize > 0 ? contract.tickSize : 0.0001
+        let limit = Self.snapToTick(ask * (1 + Self.optionPriceBuffer), tick: tick, roundingUp: true)
+        let perContract = limit * quote.indexPrice * contract.contractValue
         let lot = contract.lotSize > 0 ? contract.lotSize : 1
-        // Floored onto the lot grid with the same 1e-9 `snapToTick` and
-        // `exchangeSize` carry: a budget that buys a whole number of lots does
-        // not divide back into them exactly in binary, and flooring the raw
-        // ratio drops a lot the account could afford.
-        let contracts = perContract > 0
-            ? ((plan.premiumBudget / perContract / lot) + 1e-9).rounded(.down) * lot : 0
-        guard contracts >= Swift.max(contract.minSize, lot), contracts > 0 else {
+        guard let costs = strategy.manifest.effectiveCosts(under: host.portfolio.feeSchedules) else {
+            update(strategy.id) { $0.message = "没有 \(contract.instId) 的费率模型，算不出预算付得起几张，未开仓" }
+            Log.warn("runner: \(strategy.id) 没有 \(contract.instId) 的费率模型，未开仓")
+            return
+        }
+        // The premium and the fee to buy it both come out of the budget: the
+        // kernel's count, the one the option backtest buys by. Counted on the
+        // premium alone, a budget that was the whole capital bought contracts
+        // its fee then overdrew.
+        let bought: KernelOptionPurchase
+        do {
+            bought = try TradingKernel.optionPurchase(
+                budget: plan.premiumBudget,
+                terms: KernelOptionPurchaseTerms(
+                    premiumPerUnit: limit * quote.indexPrice, multiplier: contract.contractValue,
+                    lot: lot, spot: quote.indexPrice, fees: costs.fees,
+                    feeCapPctOfPremium: strategy.optionsSpec.feeCapPctOfPremium))
+        } catch {
             update(strategy.id) {
-                $0.message = "权利金预算 \(PriceFormatter.money(plan.premiumBudget)) 买不起一张 "
-                    + "\(contract.instId)（每张约 \(PriceFormatter.money(perContract))），未开仓"
+                $0.status = .failed
+                $0.message = "期权买入数量计算失败：\(error)"
             }
             return
         }
-        let tick = contract.tickSize > 0 ? contract.tickSize : 0.0001
-        let limit = Self.snapToTick(ask * (1 + Self.optionPriceBuffer), tick: tick, roundingUp: true)
+        let contracts = bought.contracts
+        guard contracts >= Swift.max(contract.minSize, lot), contracts > 0 else {
+            update(strategy.id) {
+                $0.message = "权利金预算 \(PriceFormatter.money(plan.premiumBudget)) 付不起一张 "
+                    + "\(contract.instId)（每张最多 \(PriceFormatter.money(perContract)) 加手续费），未开仓"
+            }
+            return
+        }
         let config = await accountTradingConfig(host: host)
         // The account decides how a bought option is booked, and the contract
         // must hold nothing the strategies did not buy.
@@ -2119,8 +2226,9 @@ public final class StrategyRunner {
             runner: 期权下单 \(strategy.id) 买入 \(contract.instId) \
             \(PriceFormatter.plain(contracts)) 张 @≤\(PriceFormatter.plain(limit)) \
             \(contract.settleCurrency)（卖一 \(PriceFormatter.plain(ask))，\
-            指数 \(PriceFormatter.plain(quote.indexPrice))，每张 \(PriceFormatter.money(perContract))，\
-            预算 \(PriceFormatter.money(plan.premiumBudget))，\(readiness.marginText ?? "无保证金模式")）理由：\(reason)
+            指数 \(PriceFormatter.plain(quote.indexPrice))，每张最多 \(PriceFormatter.money(perContract))，\
+            预算 \(PriceFormatter.money(plan.premiumBudget))，权利金 \(PriceFormatter.money(bought.premium)) \
+            + 手续费 \(PriceFormatter.money(bought.fee))，\(readiness.marginText ?? "无保证金模式")）理由：\(reason)
             """)
         switch await placeOrTrack(order, strategy: strategy, host: host, reason: reason) {
         case .rejected(let rejection):

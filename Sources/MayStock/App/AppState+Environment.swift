@@ -172,19 +172,13 @@ extension AppState {
 
     // MARK: Live unlock
 
+    /// Locking live must not leave strategies armed against a real account,
+    /// nor leave the app *on* that account, nor let a decision taken while it
+    /// was open go out after: the config's transition rules move the app to
+    /// demo and disarm, and `configDidChange` restarts the loop — for this
+    /// switch and for a hand edit of the file alike.
     func setLiveTradingUnlocked(_ unlocked: Bool) {
-        store.update { config in
-            config.trading.liveTradingUnlocked = unlocked
-            // Locking live must not leave strategies armed against a real
-            // account, nor leave the app *on* that account.
-            if !unlocked, config.strategy.mode == .live {
-                config.strategy.mode = .demo
-                for index in config.strategy.allocations.indices {
-                    config.strategy.allocations[index].running = false
-                }
-            }
-        }
-        if !unlocked { runners.forEach { $0.restart() } }
+        store.update { $0.trading.liveTradingUnlocked = unlocked }
         Log.warn("trading: live \(unlocked ? "unlocked" : "locked")")
     }
 
@@ -206,27 +200,14 @@ extension AppState {
 
     /// The state change itself. Every strategy is disarmed and the trading loop
     /// restarted across the boundary; positions are left alone, because
-    /// "stop trading" means stop deciding, not liquidate.
+    /// "stop trading" means stop deciding, not liquidate. Both follow from
+    /// the change — `AppConfig.enforceTransitionRules` and `accountDidChange`
+    /// — so a mode switched by a hand edit of the file crosses the same way.
     @discardableResult
     func switchMode(to mode: TradingMode) -> ModeSwitchBlock? {
         if mode == tradingMode { return .alreadyActive }
         if mode == .live && !liveTradingUnlocked { return .liveLocked }
-        // Cancel first, then change: see `StrategyRunner.restart`.
-        runners.forEach { $0.stop() }
-        let armed = store.config.strategy.allocations.filter(\.running).map(\.strategyId)
-        store.update { config in
-            config.strategy.mode = mode
-            for index in config.strategy.allocations.indices {
-                config.strategy.allocations[index].running = false
-            }
-        }
-        runners.forEach { $0.start() }
-        Log.warn("mode: switched to \(mode.rawValue); disarmed \(armed.isEmpty ? "nothing" : armed.joined(separator: ", "))")
-        for venue in Venue.allCases { books(for: venue).clearAccount() }
-        Task {
-            await refreshAccount()
-            for venue in Venue.allCases { await verifyConnection(mode, venue: venue) }
-        }
+        store.update { $0.strategy.mode = mode }
         return nil
     }
 
