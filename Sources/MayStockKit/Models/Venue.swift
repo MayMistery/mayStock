@@ -59,6 +59,22 @@ public enum Venue: String, Codable, Sendable, CaseIterable, Identifiable, Hashab
         instrumentTypes.contains(instType)
     }
 
+    /// The spelling this venue's instruments are kept under, from however
+    /// one arrived — typed in the watchlist, imported in a manifest. Upper
+    /// case everywhere; on Schwab a share class takes the slash Schwab itself
+    /// uses (`BRK/B`), whether it came as `BRK.B`, `BRK-B` or `brk/b`. Schwab
+    /// answers `BRK.B` with an error and Yahoo serves only `BRK-B`
+    /// (`schwabctl quotes` and Yahoo's chart endpoint, 2026-10-09), so one
+    /// spelling is kept and each source is asked in its own
+    /// (`YahooWire.yahooSymbol`).
+    public func canonicalInstId(_ raw: String) -> String {
+        let upper = raw.trimmingCharacters(in: .whitespaces).uppercased()
+        switch self {
+        case .okx: return upper
+        case .schwab: return ShareClass(upper).map { "\($0.root)/\($0.share)" } ?? upper
+        }
+    }
+
     /// The instrument family an id names on this venue.
     ///
     /// OKX encodes it in the id itself, and this is the only place allowed to
@@ -232,3 +248,20 @@ public enum Venue: String, Codable, Sendable, CaseIterable, Identifiable, Hashab
         }
     }
 }
+
+/// A US share class — a root of one to five letters and a one-letter class —
+/// however its separator is written: Schwab's slash, Yahoo's hyphen, the dot
+/// people type. Nil for anything else, including a pair like `BTC-USD`.
+struct ShareClass {
+    let root: String
+    let share: String
+
+    init?(_ symbol: String) {
+        let parts = symbol.split(omittingEmptySubsequences: false, whereSeparator: { "./-".contains($0) })
+        guard parts.count == 2, (1...5).contains(parts[0].count), parts[1].count == 1,
+              parts.allSatisfy({ $0.allSatisfy { $0.isASCII && $0.isLetter } }) else { return nil }
+        root = String(parts[0])
+        share = String(parts[1])
+    }
+}
+

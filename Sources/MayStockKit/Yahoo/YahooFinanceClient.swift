@@ -98,7 +98,7 @@ public struct YahooFinanceClient: MarketDataSource, Sendable {
             query["period1"] = String(Int(from.timeIntervalSince1970))
             query["period2"] = String(Int(to.timeIntervalSince1970))
         }
-        let data = try await data(base: baseURL, path: "v8/finance/chart/\(symbol)", query: query)
+        let data = try await data(base: baseURL, path: "v8/finance/chart/\(YahooWire.yahooSymbol(for: symbol))", query: query)
         switch try YahooWire.decodeChart(data) {
         case .success(let chart): return chart
         case .failure(let error): throw error
@@ -163,7 +163,7 @@ public struct YahooFinanceClient: MarketDataSource, Sendable {
         guard !trimmed.isEmpty else { return [] }
         let data = try await data(
             base: searchURL, path: "v1/finance/search",
-            query: ["q": trimmed, "quotesCount": "8", "newsCount": "0", "listsCount": "0"])
+            query: ["q": YahooWire.yahooSymbol(for: trimmed), "quotesCount": "8", "newsCount": "0", "listsCount": "0"])
         return try YahooWire.matches(from: data)
     }
 }
@@ -224,6 +224,17 @@ public struct YahooChart: Sendable, Equatable {
 /// the tests. Yahoo's numbers arrive as JSON numbers with nulls for bars that
 /// never printed, which is why every field on a bar is optional.
 public enum YahooWire {
+    /// Yahoo's spelling of an instrument the app keeps in Schwab's: a share
+    /// class is `BRK-B` there, `BRK/B` here (`Venue.canonicalInstId`).
+    public static func yahooSymbol(for instId: String) -> String {
+        ShareClass(instId.uppercased()).map { "\($0.root)-\($0.share)" } ?? instId
+    }
+
+    /// The app's spelling of a symbol Yahoo returned.
+    public static func instId(fromYahoo symbol: String) -> String {
+        Venue.schwab.canonicalInstId(symbol)
+    }
+
     struct Envelope: Decodable { let chart: ChartBlock }
     struct ChartBlock: Decodable {
         let result: [ResultBlock]?
@@ -309,7 +320,7 @@ public enum YahooWire {
             }
         }
         return .success(YahooChart(
-            symbol: meta.symbol,
+            symbol: instId(fromYahoo: meta.symbol),
             currency: meta.currency,
             exchangeCode: meta.exchangeName,
             exchangeName: meta.fullExchangeName,
@@ -436,7 +447,7 @@ public enum YahooWire {
                   let type = quote.quoteType, type == "EQUITY" || type == "ETF",
                   let exchange = quote.exchange, usExchanges.contains(exchange) else { return nil }
             return InstrumentMatch(
-                instId: symbol, name: quote.longname ?? quote.shortname ?? symbol,
+                instId: instId(fromYahoo: symbol), name: quote.longname ?? quote.shortname ?? symbol,
                 exchange: quote.exchDisp ?? exchange, instType: .stock)
         }
     }

@@ -91,6 +91,11 @@ private struct WatchlistColumn: View {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 5) {
                     Text(item.displayLabel).font(Theme.Text.bodyMedium)
+                    if let issue = session?.issue {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 9)).foregroundStyle(Theme.down)
+                            .help("读不到报价：\(issue)")
+                    }
                     if !item.enabled {
                         Badge(text: "已隐藏", tint: .secondary, size: .small)
                     } else if let phase = session?.marketPhase, phase != .regular {
@@ -158,7 +163,7 @@ private struct WatchlistColumn: View {
     /// never holds a symbol nothing can quote. The id is unique across venues:
     /// the hub keys sessions by id, and one name must mean one instrument.
     private func add() async {
-        let instId = newInstId.trimmingCharacters(in: .whitespaces).uppercased()
+        let instId = newVenue.canonicalInstId(newInstId)
         guard !instId.isEmpty else { return }
         if let existing = items.first(where: { $0.instId == instId }) {
             addError = existing.venue == newVenue ? "已在自选中" : "\(instId) 已作为\(existing.venue.displayName)标的在自选中"

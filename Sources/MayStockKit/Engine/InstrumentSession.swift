@@ -26,6 +26,9 @@ public final class InstrumentSession {
     public private(set) var meta: InstrumentMeta?
     public private(set) var connection: FeedState = .idle
     public private(set) var lastUpdate: Date?
+    /// Why this instrument cannot be read right now, as its feed says, while
+    /// the feed itself is up; nil when it reads.
+    public private(set) var issue: String?
 
     /// Direction of the most recent price change (+1 / -1 / 0), for tick pulses.
     public private(set) var lastTickDirection: Int = 0
@@ -87,6 +90,10 @@ public final class InstrumentSession {
 
     public func apply(connection new: FeedState) {
         connection = new
+    }
+
+    public func apply(issue new: String?) {
+        issue = new
     }
 
     public func seedSparkline(from seedCandles: [Candle]) {

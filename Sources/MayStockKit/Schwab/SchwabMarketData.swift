@@ -98,16 +98,21 @@ public actor SchwabRESTClient {
     }
 
     /// Symbols starting with the query, plus names containing it.
+    ///
+    /// Schwab answers "nothing matches" with an empty list, so every error is
+    /// a failure and is thrown. It used to be swallowed into "no results",
+    /// and that hid the one error the source falls back on: logged out, the
+    /// watchlist said a US symbol did not exist instead of asking Yahoo.
     public func search(_ query: String) async throws -> [InstrumentMatch] {
         let trimmed = query.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return [] }
         let upper = trimmed.uppercased()
         var matches: [InstrumentMatch] = []
-        let bySymbol = try? await get(SchwabAPI.instruments(NSRegularExpression.escapedPattern(for: upper) + ".*", projection: .symbolRegex))
-        if let bySymbol { matches += (try? SchwabWire.matches(from: bySymbol)) ?? [] }
+        let bySymbol = try await get(SchwabAPI.instruments(NSRegularExpression.escapedPattern(for: upper) + ".*", projection: .symbolRegex))
+        matches += try SchwabWire.matches(from: bySymbol)
         if matches.count < 8, trimmed.count >= 2 {
-            let byName = try? await get(SchwabAPI.instruments(trimmed, projection: .descriptionSearch))
-            if let byName { matches += (try? SchwabWire.matches(from: byName)) ?? [] }
+            let byName = try await get(SchwabAPI.instruments(trimmed, projection: .descriptionSearch))
+            matches += try SchwabWire.matches(from: byName)
         }
         var seen: Set<String> = []
         return matches.filter { seen.insert($0.instId).inserted }
@@ -336,13 +341,22 @@ public actor SchwabMarketFeed: MarketFeed {
     private var polls: [String: Poll] = [:]
     private var loop: Task<Void, Never>?
     private var state: FeedState = .idle
-    private var consecutiveFailures = 0
+    /// Passes in a row that read no symbol at all — the feed's own health.
+    /// One symbol failing while the others read is that symbol's problem
+    /// (`Poll.failures`), and used to reset this count for everyone.
+    private var failedPasses = 0
     private var source: Source?
+    /// A symbol was subscribed since the current pass took its list.
+    private var subscribedSincePass = false
 
     public static let tradingInterval: TimeInterval = 3
     public static let closedInterval: TimeInterval = 60
     static let candleRefresh: TimeInterval = 30
     static let degradeAfter = 3
+    /// A symbol that keeps failing is logged on its first failure and every
+    /// this-many after, so the log says it is still failing without a line
+    /// every three seconds.
+    static let relogEvery = 20
 
     public static let officialSourceName = "嘉信官方行情"
     public static let interimSourceName = "Yahoo Finance（嘉信未登录）"
@@ -352,6 +366,9 @@ public actor SchwabMarketFeed: MarketFeed {
     private struct Poll {
         var bar: BarInterval
         var lastCandleRefresh = Date.distantPast
+        /// Reads in a row this symbol failed, and the reason last shown.
+        var failures = 0
+        var issue: String?
     }
 
     public init(schwab: SchwabRESTClient, yahoo: YahooFinanceClient = YahooFinanceClient()) {
@@ -366,6 +383,7 @@ public actor SchwabMarketFeed: MarketFeed {
     public func subscribe(instId: String, bar: BarInterval) {
         guard polls[instId] == nil else { return }
         polls[instId] = Poll(bar: bar)
+        subscribedSincePass = true
         if state == .idle { setState(.connecting) }
         if loop == nil {
             loop = Task { [weak self] in
@@ -391,28 +409,39 @@ public actor SchwabMarketFeed: MarketFeed {
 
     // MARK: Polling
 
+    /// Read, then wait out the interval — unless a symbol is subscribed in
+    /// the meantime, which is read at once. The first subscription starts the
+    /// loop, and its first pass used to take only the symbols subscribed by
+    /// then: the rest of a watchlist waited a whole interval, a minute while
+    /// the market is closed (measured with `maystock-e2e markets`).
     private func run() async {
         while !Task.isCancelled, !polls.isEmpty {
             let interval = await readOnce()
-            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+            let wakeAt = Date().addingTimeInterval(interval)
+            while Date() < wakeAt, !subscribedSincePass, !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
         }
     }
 
     /// One pass over every subscription; returns how long to wait.
     private func readOnce() async -> TimeInterval {
         let now = Date()
+        subscribedSincePass = false
         let symbols = Array(polls.keys).sorted()
         guard !symbols.isEmpty else { return Self.closedInterval }
         var trading = false
+        var read = 0
         do {
             let tickers = try await schwab.quotes(symbols, now: now)
             announce(.schwab)
-            noteSuccess()
             for symbol in symbols {
                 guard let ticker = tickers[symbol] else {
-                    Log.warn("schwab feed: 报价里没有 \(symbol)")
+                    noteFailure(symbol, reason: "嘉信的报价里没有这个代码")
                     continue
                 }
+                noteRead(symbol)
+                read += 1
                 handler?(.ticker(ticker))
                 if ticker.phase?.isTrading ?? false { trading = true }
                 await refreshCandles(symbol: symbol, trading: ticker.phase?.isTrading ?? false, now: now) { bar in
@@ -430,7 +459,8 @@ public actor SchwabMarketFeed: MarketFeed {
                     guard let ticker = YahooWire.ticker(from: chart, now: now) else {
                         throw MarketDataError.decoding("\(symbol) 没有价格")
                     }
-                    noteSuccess()
+                    noteRead(symbol)
+                    read += 1
                     handler?(.ticker(ticker))
                     let symbolTrading = ticker.phase?.isTrading ?? false
                     if symbolTrading { trading = true }
@@ -443,13 +473,14 @@ public actor SchwabMarketFeed: MarketFeed {
                         }
                     }
                 } catch {
-                    noteFailure(symbol: symbol, error: error)
+                    noteFailure(symbol, reason: String(describing: error))
                 }
             }
         } catch {
-            noteFailure(symbol: symbols.joined(separator: ","), error: error)
+            notePass(read: 0, error: error)
             return 10
         }
+        notePass(read: read, error: nil)
         return trading ? Self.tradingInterval : Self.closedInterval
     }
 
@@ -478,17 +509,43 @@ public actor SchwabMarketFeed: MarketFeed {
         handler?(.source(name))
     }
 
-    private func noteSuccess() {
-        consecutiveFailures = 0
-        setState(.connected)
-    }
-
-    private func noteFailure(symbol: String, error: Error) {
-        consecutiveFailures += 1
-        if consecutiveFailures == Self.degradeAfter {
-            Log.warn("schwab feed: \(symbol) 连续 \(consecutiveFailures) 次读取失败，行情降级：\(error)")
+    /// The feed is up while any symbol reads; it degrades after passes in a
+    /// row that read none.
+    private func notePass(read: Int, error: Error?) {
+        if read > 0 {
+            failedPasses = 0
+            setState(.connected)
+            return
+        }
+        failedPasses += 1
+        if failedPasses == Self.degradeAfter {
+            Log.warn("schwab feed: 连续 \(failedPasses) 轮一个报价都没读到，行情降级：\(error.map { String(describing: $0) } ?? "每个代码都读取失败")")
             setState(.degraded)
         }
+    }
+
+    /// One symbol failed: said on its row (`.issue`), and in the log on the
+    /// first failure and every `relogEvery` after.
+    private func noteFailure(_ symbol: String, reason: String) {
+        guard var poll = polls[symbol] else { return }
+        poll.failures += 1
+        if poll.failures == 1 || poll.failures % Self.relogEvery == 0 {
+            Log.warn("schwab feed: \(symbol) 读不到报价\(poll.failures > 1 ? "（已连续 \(poll.failures) 次）" : "")：\(reason)")
+        }
+        if poll.issue != reason {
+            poll.issue = reason
+            handler?(.issue(instId: symbol, reason: reason))
+        }
+        polls[symbol] = poll
+    }
+
+    private func noteRead(_ symbol: String) {
+        guard var poll = polls[symbol], poll.failures > 0 else { return }
+        Log.warn("schwab feed: \(symbol) 恢复报价（此前连续 \(poll.failures) 次失败）")
+        poll.failures = 0
+        poll.issue = nil
+        polls[symbol] = poll
+        handler?(.issue(instId: symbol, reason: nil))
     }
 
     private func setState(_ new: FeedState) {

@@ -259,7 +259,9 @@ struct PanelRootView: View {
     private func footer(_ session: InstrumentSession) -> some View {
         HStack(spacing: 6) {
             Text("数据源 \(appState.hub.sourceName(for: session.venue))").lineLimit(1)
-            if let last = session.lastUpdate {
+            if let issue = session.issue {
+                Text("· ⚠ 读不到报价：\(issue)").lineLimit(1).foregroundStyle(Theme.down).help(issue)
+            } else if let last = session.lastUpdate {
                 Text("· 更新 \(last.formatted(date: .omitted, time: .standard))").numeric()
             }
             Spacer()

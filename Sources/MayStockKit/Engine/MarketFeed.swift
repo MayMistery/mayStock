@@ -16,6 +16,10 @@ public enum MarketFeedEvent: Sendable {
     /// Which backend the feed is reading from now — "嘉信官方行情" or the
     /// interim source — so the footer never labels Yahoo prices as Schwab's.
     case source(String)
+    /// One instrument cannot be read while the feed itself is up — why, or
+    /// nil once it reads again. Without it a row that stopped updating looked
+    /// exactly like a quiet market.
+    case issue(instId: String, reason: String?)
 }
 
 /// Live market data for one venue: subscriptions in, events out.

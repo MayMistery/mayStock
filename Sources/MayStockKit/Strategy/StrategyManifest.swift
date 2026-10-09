@@ -164,10 +164,12 @@ public struct StrategyMarket: Codable, Sendable, Equatable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        instId = try c.decode(String.self, forKey: .instId)
+        venue = try c.decodeIfPresent(Venue.self, forKey: .venue) ?? .okx
+        // An imported manifest is held to the venue's own spelling, like
+        // anything typed into the watchlist.
+        instId = venue.canonicalInstId(try c.decode(String.self, forKey: .instId))
         instType = try c.decodeIfPresent(InstrumentType.self, forKey: .instType) ?? .spot
         bar = try c.decodeIfPresent(BarInterval.self, forKey: .bar) ?? .h1
-        venue = try c.decodeIfPresent(Venue.self, forKey: .venue) ?? .okx
     }
 }
 

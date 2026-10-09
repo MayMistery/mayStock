@@ -99,6 +99,7 @@ cmd_test() {
 cmd_e2e() {
   cmd_build
   "$BUILD_DIR/maystock-e2e" doctor BTC-USDT
+  "$BUILD_DIR/maystock-e2e" markets 20
   "$BUILD_DIR/maystock-e2e" alert-sim
   "$BUILD_DIR/maystock-e2e" trade-doctor
   "$BUILD_DIR/maystock-e2e" strategy-doctor

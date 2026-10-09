@@ -250,7 +250,8 @@ final class StatusItemController: NSObject {
         StatusItemAlertStyle.updateLine(
             on: button, active: pending > 0,
             reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
-        button.toolTip = [StatusItemAlertStyle.toolTip(pending: pending), toolTip(ticker: ticker, connection: connection)]
+        button.toolTip = [StatusItemAlertStyle.toolTip(pending: pending), toolTip(ticker: ticker, connection: connection),
+                          session.issue.map { "⚠ 读不到报价：\($0)" }]
             .compactMap { $0 }.joined(separator: "\n")
     }
 

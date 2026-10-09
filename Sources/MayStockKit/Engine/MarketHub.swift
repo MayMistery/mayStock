@@ -242,6 +242,9 @@ public final class MarketHub {
             session.apply(book: book)
         case .source(let name):
             sourceNames[venue] = name
+        case .issue(let instId, let reason):
+            guard let session = sessions[instId], session.venue == venue else { return }
+            session.apply(issue: reason)
         }
     }
 }

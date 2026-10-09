@@ -16,6 +16,9 @@ import MayStockKit
 ///                                      account's exchange precheck; places nothing
 ///   maystock-e2e option-demo           buy and sell one option on the DEMO account,
 ///                                      through the runner's own order path
+///   maystock-e2e markets [sec] [sym…]  the watchlist's market data through the app's hub:
+///                                      quotes, sources, phases, every bar's backfill, and
+///                                      the US-equity fallback forced; read-only
 ///
 /// Exit code 0 = pass. Non-zero = failure (CI-friendly).
 @main
@@ -49,6 +52,10 @@ struct E2EMain {
             ok = await accountDoctor(seconds: args.count > 1 ? Int(args[1]) ?? 40 : 40)
         case "close-doctor":
             ok = await closeDoctor()
+        case "markets":
+            ok = await marketsDoctor(
+                seconds: args.count > 1 ? Int(args[1]) ?? 20 : 20,
+                symbols: Array(args.dropFirst(2)))
         default:
             print("unknown command: \(command)")
             ok = false
