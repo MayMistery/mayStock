@@ -3,8 +3,14 @@
 //! Execution model (see `docs/STRATEGY.md`):
 //! - signals are evaluated on the **close of bar i**, using data up to i only;
 //! - the resulting order fills at the **open of bar i+1**, plus slippage;
-//! - protective exits are checked against bar highs/lows, and when several
-//!   could have triggered inside one bar the **worst** one is assumed.
+//! - protective exits are checked against bar highs/lows. What the bar makes
+//!   certain is used — a level it opened past fills at the open, and adverse
+//!   levels are met nearest-first — and only what it leaves unknowable, a bar
+//!   that reaches both the stop and the target, is assumed against the
+//!   position (`protective_exit`);
+//! - every close is a fill (`ExitFill`): a market order pays slippage and the
+//!   fee schedule, and an isolated-margin liquidation takes the position's
+//!   margin — exactly, never more (`liquidation_fill`).
 //!
 //! Look-ahead bias is structurally impossible here: the evaluation window ends
 //! where the execution window begins.
@@ -267,14 +273,100 @@ fn unrealised(position: Option<&OpenPosition>, price: f64) -> f64 {
     }
 }
 
-/// Buying (entering long / exiting short) pays up; selling receives less.
+/// Buying pays up; selling receives less.
+pub(crate) fn market_price(reference: f64, buying: bool, slippage: f64) -> f64 {
+    reference * if buying { 1.0 + slippage } else { 1.0 - slippage }
+}
+
+/// Entering long or exiting short buys; the rest sells.
 fn fill_price(reference: f64, direction: Direction, is_exit: bool, slippage: f64) -> f64 {
     let buying = if is_exit {
         direction == Direction::Short
     } else {
         direction == Direction::Long
     };
-    reference * if buying { 1.0 + slippage } else { 1.0 - slippage }
+    market_price(reference, buying, slippage)
+}
+
+/// The order that closes a `direction` position.
+fn closing_side(direction: Direction) -> OrderSide {
+    if direction == Direction::Long { OrderSide::Sell } else { OrderSide::Buy }
+}
+
+/// One closing fill: the price the position left at and the fee the venue
+/// charged for it. Every close in the binary and continuous engines is built
+/// by `market` or `liquidation_fill`, so how a close fills has one answer.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExitFill {
+    pub price: f64,
+    pub fee: f64,
+}
+
+impl ExitFill {
+    /// A market order closing `quantity` of a `direction` position against
+    /// `reference`: slippage and the fee schedule, like every taker fill.
+    /// Stops, targets and trailing stops are conditional *market* orders live
+    /// (`trade::wire` sends them with an order price of −1), so they fill this
+    /// way too. They used to fill at the bare level — the only closes that
+    /// paid no slippage, flattering exactly the tight-stop strategies most
+    /// sensitive to cost.
+    pub(crate) fn market(costs: &Costs, direction: Direction, quantity: f64, reference: f64, slippage: f64) -> Self {
+        let price = fill_price(reference, direction, true, slippage);
+        Self { price, fee: costs.fee(closing_side(direction), quantity, quantity * price) }
+    }
+}
+
+/// How a liquidation fills, by margin regime.
+///
+/// **Isolated margin** backs a position with `notional / leverage`, and a
+/// liquidation takes all of it — never more. The exchange closes at the
+/// bankruptcy price: where the move, the funding settled against the margin
+/// and an ordinary closing fee together use the margin up exactly; whatever
+/// the market did past that, a gap included, is the insurance fund's. This is
+/// OKX's own booking of a liquidated isolated 5× BTC short (positions-history,
+/// 2025-05): price P&L −614.60 at the close price, funding +14.12, and a fee of
+/// 1.81 on the close at the same ≈0.05% the opening fill paid — so the close
+/// realised −602.29, the margin (0.0324 BTC × 92 945.9 / 5) to the cent, and
+/// the trade −603.79 with its opening fee. The level that *triggers* a
+/// liquidation (`liquidation_buffer`) only decides when; this decides what.
+///
+/// **Regulation T** has no such floor: the broker sells into the market, and a
+/// gap past the call is the customer's debt — an ordinary market close at the
+/// trigger, slippage and all. A fully paid position is never liquidated
+/// (its buffer is the whole price).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn liquidation_fill(
+    regime: MarginRegime,
+    direction: Direction,
+    quantity: f64,
+    basis: f64,
+    leverage: f64,
+    funding: f64,
+    trigger: f64,
+    slippage: f64,
+    costs: &Costs,
+) -> ExitFill {
+    match regime {
+        MarginRegime::Isolated => {
+            let margin = quantity * basis / leverage;
+            let side = closing_side(direction);
+            // The fee depends on the price and the price on the fee, but the
+            // fee moves only by its rate times the price change: a few rounds
+            // settle it far below a cent. The books balance exactly whatever
+            // the round count — the price is always solved from the fee.
+            let mut fill = ExitFill { price: trigger, fee: 0.0 };
+            for _ in 0..4 {
+                let fee = costs.fee(side, quantity, quantity * fill.price);
+                // gross − fee − funding = −margin
+                let gross = fee + funding - margin;
+                fill = ExitFill { price: basis + gross / (direction.sign() * quantity), fee };
+            }
+            fill
+        }
+        MarginRegime::RegT | MarginRegime::None => {
+            ExitFill::market(costs, direction, quantity, trigger, slippage)
+        }
+    }
 }
 
 // MARK: - Engine
@@ -375,14 +467,14 @@ pub fn run(
             let cooldown_reference = last_exit_index;
             if let Some(existing) = position {
                 if Some(existing.direction) != target {
-                    let fill = fill_price(candle.open, existing.direction, true, slippage);
+                    let fill = ExitFill::market(
+                        &costs, existing.direction, existing.quantity, candle.open, slippage);
                     close_position(
                         &mut position,
                         fill,
                         candle.ts_ms,
                         index,
                         ExitReason::Signal,
-                        &costs,
                         &mut equity,
                         &mut trades,
                     );
@@ -425,16 +517,28 @@ pub fn run(
         // --- 2. Protective exits, checked against this bar's range.
         if let Some(existing) = position {
             if let Some(exit) = protective_exit(strategy, &existing, &candle, leverage) {
-                if exit.reason == ExitReason::Liquidation {
+                let fill = if exit.reason == ExitReason::Liquidation {
                     liquidations += 1;
-                }
+                    liquidation_fill(
+                        manifest.market.inst_type.margin_regime(),
+                        existing.direction,
+                        existing.quantity,
+                        existing.entry_price,
+                        leverage,
+                        existing.funding,
+                        exit.price,
+                        slippage,
+                        &costs,
+                    )
+                } else {
+                    ExitFill::market(&costs, existing.direction, existing.quantity, exit.price, slippage)
+                };
                 close_position(
                     &mut position,
-                    exit.price,
+                    fill,
                     candle.ts_ms,
                     index,
                     exit.reason,
-                    &costs,
                     &mut equity,
                     &mut trades,
                 );
@@ -484,14 +588,14 @@ pub fn run(
                 && (day_start_equity - marked) / day_start_equity * 100.0 >= limit
             {
                 if let Some(existing) = position {
-                    let fill = fill_price(candle.close, existing.direction, true, slippage);
+                    let fill = ExitFill::market(
+                        &costs, existing.direction, existing.quantity, candle.close, slippage);
                     close_position(
                         &mut position,
                         fill,
                         candle.ts_ms,
                         index,
                         ExitReason::DailyLossHalt,
-                        &costs,
                         &mut equity,
                         &mut trades,
                     );
@@ -538,14 +642,13 @@ pub fn run(
     // Close anything still open at the last bar, so metrics see realised PnL.
     if let Some(existing) = position {
         let last = candles[candles.len() - 1];
-        let fill = fill_price(last.close, existing.direction, true, slippage);
+        let fill = ExitFill::market(&costs, existing.direction, existing.quantity, last.close, slippage);
         close_position(
             &mut position,
             fill,
             last.ts_ms,
             candles.len() - 1,
             ExitReason::EndOfData,
-            &costs,
             &mut equity,
             &mut trades,
         );
@@ -694,14 +797,12 @@ fn open_position(
     *position = Some(new);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn close_position(
     position: &mut Option<OpenPosition>,
-    price: f64,
+    fill: ExitFill,
     ts: i64,
     index: usize,
     reason: ExitReason,
-    costs: &Costs,
     equity: &mut f64,
     trades: &mut Vec<Trade>,
 ) {
@@ -709,9 +810,7 @@ fn close_position(
         return;
     };
 
-    let exit_notional = existing.quantity * price;
-    let side = if existing.direction == Direction::Long { OrderSide::Sell } else { OrderSide::Buy };
-    let exit_fee = costs.fee(side, existing.quantity, exit_notional);
+    let (price, exit_fee) = (fill.price, fill.fee);
     let gross = existing.direction.sign() * (price - existing.entry_price) * existing.quantity;
     let net = gross - exit_fee - existing.funding;
     *equity += net;
@@ -739,57 +838,72 @@ fn close_position(
     });
 }
 
-/// Pick the worst outcome among every protective level this bar could have
-/// touched. When both a stop and a target sit inside one candle there is no way
-/// to know which came first, so the simulation assumes the loss.
+/// Which protective level this bar fills, and the price it fills against.
+///
+/// What the bar makes certain is used; only what it leaves unknowable is
+/// assumed against the position.
+///
+/// - A level the bar **opened** past was crossed before anything else could
+///   trade, and fills at the open — a gap over the target takes the target,
+///   whatever the bar did afterwards. Opening past the liquidation level
+///   liquidates even with a stop nearer: the exchange's risk engine acts on
+///   the mark the moment it crosses, before a stop's market order can trade.
+/// - Otherwise adverse levels are met in order from the open, so the nearer
+///   one fires: a long's stop above its liquidation level closes it at the
+///   stop, not at the liquidation the stop prevented.
+/// - A bar that reaches both an adverse level and the target leaves the path
+///   inside it unknowable, and the adverse one is assumed.
+///
+/// These used to collapse into one rule — the worst price among every level
+/// the bar touched — which turned a gap through the target into a stop-out,
+/// and a stop above the liquidation level into a lost margin.
 fn protective_exit(
     strategy: &CompiledStrategy,
     position: &OpenPosition,
     candle: &Candle,
     leverage: f64,
 ) -> Option<PendingExit> {
-    let mut candidates: Vec<PendingExit> = Vec::new();
-    let is_long = position.direction == Direction::Long;
-
-    let mut consider = |level: Option<f64>, reason: ExitReason, favourable: bool| {
-        let Some(level) = level else { return };
-        // A long exits downward on a stop and upward on a target.
-        let downward = if is_long { !favourable } else { favourable };
-        if downward {
-            if candle.low <= level {
-                candidates.push(PendingExit {
-                    price: candle.open.min(level),
-                    reason,
-                });
-            }
-        } else if candle.high >= level {
-            candidates.push(PendingExit {
-                price: candle.open.max(level),
-                reason,
-            });
-        }
+    let sign = position.direction.sign();
+    // Whether `price` is at or past `level` against the position (below a
+    // long's level, above a short's), or in its favour.
+    let against = |price: f64, level: f64| sign * (level - price) >= 0.0;
+    let in_favour = |price: f64, level: f64| sign * (price - level) >= 0.0;
+    let stop_reason = if strategy.manifest.risk.trailing_stop_pct.is_some() {
+        ExitReason::TrailingStop
+    } else {
+        ExitReason::StopLoss
     };
+    let liquidation = if leverage > 1.0 { position.liquidation_price } else { None };
+    let adverse = [(liquidation, ExitReason::Liquidation), (position.stop_price, stop_reason)];
 
-    let is_trailing = strategy.manifest.risk.trailing_stop_pct.is_some();
-    consider(
-        position.stop_price,
-        if is_trailing {
-            ExitReason::TrailingStop
-        } else {
-            ExitReason::StopLoss
-        },
-        false,
-    );
-    consider(position.target_price, ExitReason::TakeProfit, true);
-    if leverage > 1.0 {
-        consider(position.liquidation_price, ExitReason::Liquidation, false);
+    // 1. Opened past a level: liquidation first, then the stop, then the target.
+    for (level, reason) in adverse {
+        if level.is_some_and(|level| against(candle.open, level)) {
+            return Some(PendingExit { price: candle.open, reason });
+        }
+    }
+    if position.target_price.is_some_and(|level| in_favour(candle.open, level)) {
+        return Some(PendingExit { price: candle.open, reason: ExitReason::TakeProfit });
     }
 
-    // "Worst" means lowest price for a long, highest for a short.
-    let sign = position.direction.sign();
-    candidates
+    // 2. Adverse levels reached inside the bar, the nearest to the open first.
+    let adverse_extreme = if sign > 0.0 { candle.low } else { candle.high };
+    let first_adverse = adverse
         .into_iter()
-        .reduce(|best, next| if sign * next.price < sign * best.price { next } else { best })
+        .filter_map(|(level, reason)| {
+            level.filter(|&level| against(adverse_extreme, level)).map(|price| PendingExit { price, reason })
+        })
+        .reduce(|met, next| if sign * next.price > sign * met.price { next } else { met });
+    if first_adverse.is_some() {
+        return first_adverse;
+    }
+
+    // 3. The target, reached inside the bar.
+    let favourable_extreme = if sign > 0.0 { candle.high } else { candle.low };
+    position
+        .target_price
+        .filter(|&level| in_favour(favourable_extreme, level))
+        .map(|price| PendingExit { price, reason: ExitReason::TakeProfit })
 }
 
 /// Map each funding settlement onto the bar whose interval contains it.
@@ -867,21 +981,59 @@ mod tests {
     use super::*;
     use crate::strategy::Manifest;
 
+    fn compile(json: &str) -> CompiledStrategy {
+        let manifest: Manifest = serde_json::from_str(json).unwrap();
+        CompiledStrategy::compile(manifest, &[]).unwrap()
+    }
+
     fn swap(leverage: f64) -> CompiledStrategy {
-        let json = format!(
+        compile(&format!(
             r#"{{"id":"b","name":"b","market":{{"instId":"BTC-USDT-SWAP","instType":"SWAP","bar":"1H"}},
                  "signals":{{"longEntry":"close > 0","longExit":"close < 0"}},
                  "sizing":{{"mode":"equityPct","value":100}},
                  "risk":{{"leverage":{leverage}}}}}"#
-        );
-        let manifest: Manifest = serde_json::from_str(&json).unwrap();
-        CompiledStrategy::compile(manifest, &[]).unwrap()
+        ))
+    }
+
+    /// Always long, at `leverage`, with `risk` added to the risk block.
+    fn always_long(inst_type: &str, leverage: f64, pct: f64, risk: &str) -> CompiledStrategy {
+        compile(&format!(
+            r#"{{"id":"l","name":"l","market":{{"instId":"X","instType":"{inst_type}","bar":"1H"}},
+                 "signals":{{"longEntry":"close > 0","longExit":"close < 0"}},
+                 "sizing":{{"mode":"equityPct","value":{pct}}},
+                 "risk":{{"leverage":{leverage}{risk}}}}}"#
+        ))
+    }
+
+    fn bar(i: i64, open: f64, high: f64, low: f64, close: f64) -> Candle {
+        Candle { ts_ms: i * 3_600_000, open, high, low, close, volume: 1.0, confirmed: 1 }
     }
 
     fn flat(count: i64) -> Vec<Candle> {
-        (0..count)
-            .map(|i| Candle { ts_ms: i * 3_600_000, open: 100.0, high: 100.5, low: 99.5, close: 100.0, volume: 1.0, confirmed: 1 })
-            .collect()
+        (0..count).map(|i| bar(i, 100.0, 100.5, 99.5, 100.0)).collect()
+    }
+
+    /// Flat at 100 for `before` bars, then `crash`, then flat at its close.
+    fn flat_then(before: i64, crash: (f64, f64, f64, f64), after: i64) -> Vec<Candle> {
+        let (open, high, low, close) = crash;
+        let mut bars: Vec<Candle> = (0..before).map(|i| bar(i, 100.0, 100.0, 100.0, 100.0)).collect();
+        bars.push(bar(before, open, high, low, close));
+        bars.extend((before + 1..before + 1 + after).map(|i| bar(i, close, close, close, close)));
+        bars
+    }
+
+    fn costs(fee_bps: f64, slippage_bps: f64) -> BacktestConfig {
+        BacktestConfig {
+            fees: Some(vec![FeeComponent::flat_bps(fee_bps)]),
+            slippage_bps: Some(slippage_bps),
+            ..BacktestConfig::default()
+        }
+    }
+
+    fn first(result: &BacktestResult, reason: ExitReason) -> Trade {
+        result.trades.iter().find(|t| t.exit_reason == reason).cloned().unwrap_or_else(|| {
+            panic!("no {reason:?} exit in {:?}", result.trades.iter().map(|t| t.exit_reason).collect::<Vec<_>>())
+        })
     }
 
     /// Walks every leverage a perpetual allows: a full-size entry is what
@@ -896,5 +1048,216 @@ mod tests {
             assert_eq!(result.guard_refusals, 0, "{leverage}x: {:?}", result.guard_refusal);
             assert!(!result.trades.is_empty(), "{leverage}x opened and closed nothing");
         }
+    }
+
+    /// An isolated liquidation takes the position's margin — to the cent, with
+    /// the funding it ran up and the closing fee inside it — and a bar that
+    /// gaps far past the level costs exactly the same. It used to fill at the
+    /// trigger level and charge the fee on top, so at 20× a liquidation lost
+    /// more than the margin the exchange can take.
+    #[test]
+    fn an_isolated_liquidation_loses_the_margin_and_never_more() {
+        let max = crate::strategy::InstrumentType::Swap.max_leverage();
+        for (leverage, crash) in [
+            (10.0, (100.0, 100.0, 85.0, 86.0)),  // reaches the level inside the bar
+            (10.0, (40.0, 40.0, 30.0, 35.0)),    // opens far past it
+            (20.0, (100.0, 100.0, 90.0, 92.0)),
+            (max, (100.0, 100.0, 97.0, 99.0)),
+        ] {
+            let mut config = costs(5.0, 3.0);
+            // One settlement while the position is open, so funding is part
+            // of what the margin has to cover.
+            config.funding_rates = vec![FundingRate { ts_ms: 3 * 3_600_000, rate: 0.0004 }];
+            let result = run(&always_long("SWAP", leverage, 50.0, ""), &flat_then(6, crash, 3), &config).unwrap();
+            let liquidated = first(&result, ExitReason::Liquidation);
+            let margin = liquidated.notional / leverage;
+            let entry_fee = liquidated.notional * 0.0005;
+            assert!((liquidated.net_pnl + margin + entry_fee).abs() < 1e-6,
+                    "{leverage}x {crash:?}: lost {} on a {margin} margin", -liquidated.net_pnl);
+            assert!(liquidated.funding > 0.0, "the settlement was charged");
+            // The record is consistent: the price it left at explains the
+            // gross, and the fees include an ordinary closing fee.
+            let gross = (liquidated.exit_price - liquidated.entry_price) * liquidated.quantity;
+            assert!((liquidated.gross_pnl - gross).abs() < 1e-6);
+            let exit_fee = liquidated.fees - entry_fee;
+            assert!((exit_fee - liquidated.quantity * liquidated.exit_price * 0.0005).abs() < 1e-6,
+                    "closing fee {exit_fee}");
+            assert_eq!(result.liquidations, 1);
+        }
+    }
+
+    /// Regulation T has no floor under the loss: the broker sells into the
+    /// market, so a gap past the call fills at the open, slippage and all.
+    #[test]
+    fn a_reg_t_call_is_a_market_close_at_the_open_it_gapped_to() {
+        let result = run(
+            &always_long("STOCK", 2.0, 50.0, ""),
+            &flat_then(6, (50.0, 50.0, 45.0, 48.0), 3),
+            &costs(0.0, 10.0),
+        ).unwrap();
+        let called = first(&result, ExitReason::Liquidation);
+        assert!((called.exit_price - 50.0 * (1.0 - 0.001)).abs() < 1e-9, "filled at {}", called.exit_price);
+    }
+
+    /// Protective fills are conditional market orders live, so they pay
+    /// slippage like every other taker fill. Large slippage, so the assertion
+    /// cannot pass by accident.
+    #[test]
+    fn a_stop_loss_fill_pays_slippage() {
+        let result = run(
+            &always_long("SPOT", 1.0, 100.0, r#","stopLossPct":2"#),
+            &flat_then(3, (100.0, 100.0, 95.0, 95.0), 0),
+            &costs(0.0, 100.0),
+        ).unwrap();
+        let stopped = first(&result, ExitReason::StopLoss);
+        let level = 100.0 * 1.01 * (1.0 - 0.02);
+        assert!((stopped.exit_price - level * (1.0 - 0.01)).abs() < 1e-9,
+                "stop filled at {} but the slipped level is {}", stopped.exit_price, level * 0.99);
+    }
+
+    /// A gap over the target took the target before anything else traded; a
+    /// low later in the bar cannot turn it into a stop-out.
+    #[test]
+    fn a_bar_that_opens_past_the_target_takes_the_target() {
+        let result = run(
+            &always_long("SPOT", 1.0, 100.0, r#","stopLossPct":2,"takeProfitPct":3"#),
+            &flat_then(3, (105.0, 106.0, 90.0, 95.0), 0),
+            &costs(0.0, 0.0),
+        ).unwrap();
+        let taken = first(&result, ExitReason::TakeProfit);
+        assert_eq!(taken.exit_price, 105.0);
+    }
+
+    /// Reaching both inside one bar leaves the order unknowable: the stop is
+    /// assumed.
+    #[test]
+    fn a_bar_that_reaches_both_the_stop_and_the_target_assumes_the_stop() {
+        let result = run(
+            &always_long("SPOT", 1.0, 100.0, r#","stopLossPct":2,"takeProfitPct":3"#),
+            &flat_then(3, (100.0, 104.0, 97.0, 100.0), 0),
+            &costs(0.0, 0.0),
+        ).unwrap();
+        let stopped = first(&result, ExitReason::StopLoss);
+        assert!((stopped.exit_price - 98.0).abs() < 1e-9);
+    }
+
+    /// Falling through a long's stop on the way to its liquidation level, the
+    /// stop fires first — the liquidation is what it prevented. Opening past
+    /// the liquidation level liquidates even with the stop nearer: the risk
+    /// engine acts on the mark before a stop's market order can trade.
+    #[test]
+    fn adverse_levels_fire_in_the_order_the_price_meets_them() {
+        let strategy = always_long("SWAP", 10.0, 50.0, r#","stopLossPct":5"#);
+        let inside = run(&strategy, &flat_then(3, (100.0, 100.0, 80.0, 85.0), 0), &costs(0.0, 0.0)).unwrap();
+        assert_eq!(first(&inside, ExitReason::StopLoss).exit_price, 95.0);
+        assert_eq!(inside.liquidations, 0);
+
+        let gapped = run(&strategy, &flat_then(3, (85.0, 86.0, 80.0, 85.0), 0), &costs(0.0, 0.0)).unwrap();
+        first(&gapped, ExitReason::Liquidation);
+    }
+
+    /// Every engine books exactly what it pays: final equity is the initial
+    /// capital plus the sum of the trades' net P&L, every trade's net is its
+    /// gross less its fees and funding, and the curve ends where the books do.
+    /// Run over every strategy the repository ships — whichever engine it
+    /// routes to — and over scenarios built to reach the rarer branches
+    /// (liquidations, trims, flips, funding both ways). The continuous engine
+    /// failed this by every funding bill it had reported and never paid.
+    #[test]
+    fn every_engine_books_exactly_what_it_pays() {
+        let mut cases: Vec<(String, CompiledStrategy, Vec<Candle>, BacktestConfig)> = Vec::new();
+        let candles = wandering(1_200);
+        let funding: Vec<FundingRate> = (0..150)
+            .map(|k| FundingRate { ts_ms: k * 8 * 3_600_000, rate: 0.0003 * ((k as f64) * 0.7).sin() })
+            .collect();
+
+        let library = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../Strategies");
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        for dir in [library.clone(), library.join("examples")] {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_some_and(|e| e == "json") {
+                    files.push(path);
+                }
+            }
+        }
+        assert!(files.len() >= 10, "the strategy library moved: {}", library.display());
+        for path in files {
+            let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            // Declared alternative series get a synthetic stand-in; a script
+            // strategy gets targets standing in for its script.
+            let series: Vec<String> = raw.get("data").and_then(|d| d.as_object())
+                .map(|d| d.keys().cloned().collect()).unwrap_or_default();
+            let manifest: Manifest = serde_json::from_value(raw.clone()).unwrap();
+            let strategy = CompiledStrategy::compile(manifest, &series).unwrap();
+            let mut config = BacktestConfig { funding_rates: funding.clone(), ..BacktestConfig::default() };
+            for name in &series {
+                config.external_series.insert(
+                    name.clone(),
+                    (0..candles.len()).map(|i| ((i as f64) * 0.05).sin() * 0.0004).collect(),
+                );
+            }
+            if raw.pointer("/engine/kind").and_then(|k| k.as_str()) == Some("script") {
+                config.script_targets = Some((0..candles.len()).map(|i| [1, 1, 0, -1][(i / 37) % 4]).collect());
+            }
+            cases.push((path.file_name().unwrap().to_string_lossy().into_owned(), strategy, candles.clone(), config));
+        }
+
+        let levered = |signals: &str, leverage: f64, risk: &str| compile(&format!(
+            r#"{{"id":"s","name":"s","market":{{"instId":"BTC-USDT-SWAP","instType":"SWAP","bar":"1H"}},
+                 "signals":{signals},"sizing":{{"mode":"equityPct","value":40}},
+                 "risk":{{"leverage":{leverage},"rebalanceThreshold":0.02,"maxExposure":1{risk}}}}}"#));
+        let funded = |fee: f64, slip: f64| BacktestConfig { funding_rates: funding.clone(), ..costs(fee, slip) };
+        let crossing = r#"{"longEntry":"close > sma(close, 20)","longExit":"close < sma(close, 20)",
+                           "shortEntry":"close < sma(close, 20)","shortExit":"close > sma(close, 20)"}"#;
+        cases.push(("binary 25x reversals and liquidations".into(),
+                    levered(crossing, 25.0, r#","stopLossPct":3,"takeProfitPct":4"#), candles.clone(), funded(5.0, 3.0)));
+        cases.push(("binary trailing stop".into(),
+                    levered(crossing, 3.0, r#","trailingStopPct":2,"maxDailyLossPct":4"#), candles.clone(), funded(5.0, 3.0)));
+        cases.push(("continuous flips at 8x".into(),
+                    levered(r#"{"exposure":"clamp((close - sma(close, 30)) / sma(close, 30) * 40, -1, 1)"}"#, 8.0, ""),
+                    candles.clone(), funded(5.0, 3.0)));
+        cases.push(("continuous liquidated at 20x".into(),
+                    levered(r#"{"exposure":"1"}"#, 20.0, ""), candles.clone(), funded(5.0, 3.0)));
+
+        let mut liquidated = 0;
+        for (name, strategy, bars, config) in &cases {
+            let result = run(strategy, bars, config).unwrap();
+            let booked: f64 = result.trades.iter().map(|t| t.net_pnl).sum();
+            let drift = result.final_equity - result.initial_capital - booked;
+            assert!(drift.abs() < 1e-6 * result.initial_capital,
+                    "{name}: final equity {} but the ledger books {} ({} trades)",
+                    result.final_equity, result.initial_capital + booked, result.trades.len());
+            for trade in &result.trades {
+                assert!((trade.gross_pnl - trade.fees - trade.funding - trade.net_pnl).abs() < 1e-6,
+                        "{name}: trade {} does not add up: {trade:?}", trade.id);
+            }
+            if let Some(last) = result.equity_curve.last() {
+                assert!((last.equity - result.final_equity).abs() < 1e-6, "{name}: the curve ends elsewhere");
+            }
+            liquidated += result.liquidations;
+        }
+        assert!(liquidated > 0, "the scenarios no longer reach a liquidation");
+    }
+
+    /// A random walk with regime shifts: enough to cross averages, trip stops
+    /// and, at high leverage, liquidate.
+    fn wandering(count: usize) -> Vec<Candle> {
+        let mut state = 7u64;
+        let mut next = || {
+            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut price = 30_000.0;
+        (0..count)
+            .map(|i| {
+                let drift = if i % 300 < 150 { 0.0008 } else { -0.0006 };
+                let open = price;
+                price *= 1.0 + drift + (next() - 0.5) * 0.03;
+                let high = open.max(price) * (1.0 + next() * 0.01);
+                let low = open.min(price) * (1.0 - next() * 0.01);
+                bar(i as i64, open, high, low, price)
+            })
+            .collect()
     }
 }

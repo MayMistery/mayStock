@@ -3,7 +3,8 @@
 # write Makefiles, so this script is the canonical entry point).
 #
 #   ./Scripts/make.sh build      release build (app + kit + e2e driver)
-#   ./Scripts/make.sh test       unit tests (swift-testing)
+#   ./Scripts/make.sh test       unit tests (swift-testing); extra arguments go
+#                                to `swift test`, e.g. `test --filter KernelGolden`
 #   ./Scripts/make.sh e2e        live end-to-end against OKX and the live layer's venues
 #   ./Scripts/make.sh verify     build + test + e2e
 #   ./Scripts/make.sh install    assemble /Applications/MayStock.app
@@ -92,7 +93,7 @@ cmd_test() {
   # bash 3.2 (the macOS default) treats an empty array as unset under `set -u`,
   # so expand it through the `+` form.
   swift test ${swift_testing_flags[@]+"${swift_testing_flags[@]}"} \
-    ${plugin_flags[@]+"${plugin_flags[@]}"}
+    ${plugin_flags[@]+"${plugin_flags[@]}"} "$@"
 }
 
 cmd_e2e() {
@@ -177,7 +178,8 @@ cmd_snapshot() {
 }
 
 case "${1:-verify}" in
-  build|test|e2e|verify|install|run|uninstall) "cmd_$1" ;;
+  test) shift; cmd_test "$@" ;;
+  build|e2e|verify|install|run|uninstall) "cmd_$1" ;;
   snapshot) cmd_snapshot "$@" ;;
   *) echo "usage: $0 {build|test|e2e|verify|install|run|uninstall|snapshot}"; exit 2 ;;
 esac

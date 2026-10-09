@@ -8,8 +8,9 @@
 //! which is what makes a turnover comparison meaningful.
 
 use super::{
-    bucket_funding, empty_result, liquidation_buffer, resolve_costs, resolve_maintenance,
-    BacktestConfig, BacktestResult, EquityPoint, ExitReason, Metrics, Trade,
+    bucket_funding, empty_result, liquidation_buffer, liquidation_fill, market_price, resolve_costs,
+    resolve_maintenance, BacktestConfig, BacktestResult, EquityPoint, ExitFill, ExitReason, Metrics,
+    Trade,
 };
 use crate::candle::Candle;
 use crate::decide::{realised_volatility, volatility_scale, Direction};
@@ -111,15 +112,13 @@ pub fn run(
             let delta = target - quantity;
             if delta.abs() > 1e-12 {
                 let buying = delta > 0.0;
-                let fill = candle.open * if buying { 1.0 + slippage } else { 1.0 - slippage };
-                let traded_notional = delta.abs() * fill;
+                let fill = market_price(candle.open, buying, slippage);
                 let fee = costs.fee(
                     if buying { OrderSide::Buy } else { OrderSide::Sell },
                     delta.abs(),
-                    traded_notional,
+                    delta.abs() * fill,
                 );
                 equity -= fee;
-                accrued_fees += fee;
 
                 if quantity == 0.0 {
                     // Opening a fresh position.
@@ -128,23 +127,40 @@ pub fn run(
                     entry_equity = equity + fee;
                     average_price = fill;
                     quantity = delta;
+                    accrued_fees += fee;
                 } else if (quantity > 0.0) == (delta > 0.0) {
                     // Adding: weighted-average the basis.
                     let total = quantity.abs() + delta.abs();
                     average_price =
                         (average_price * quantity.abs() + fill * delta.abs()) / total;
                     quantity += delta;
+                    accrued_fees += fee;
                 } else {
-                    // Reducing or flipping: realise on the overlap.
-                    let held_before = quantity.abs();
-                    let closing = held_before.min(delta.abs());
-                    let realised = (fill - average_price)
-                        * closing
-                        * if quantity > 0.0 { 1.0 } else { -1.0 };
-                    equity += realised;
-                    let remainder = delta.abs() - closing;
+                    // Reducing, closing or flipping: realise on the overlap.
                     let was_long = quantity > 0.0;
-                    quantity += delta;
+                    let held_before = quantity.abs();
+                    let after = quantity + delta;
+                    let closed_out = after.abs() < 1e-12;
+                    let flipped = !closed_out && (after > 0.0) != was_long;
+                    // Exactly the whole position when it closes out, so not a
+                    // rounding residue of its costs is left behind unbooked.
+                    let closing = if closed_out || flipped { held_before } else { delta.abs() };
+                    let share = closing / held_before;
+                    // One order can close one side and open the other. Its fee
+                    // is split by the quantity each part traded, so the trade
+                    // it closes is not charged for the position it opens.
+                    let opening_fee = if flipped { fee * after.abs() / delta.abs() } else { 0.0 };
+                    let realised = (fill - average_price) * closing * if was_long { 1.0 } else { -1.0 };
+                    let fees_share = accrued_fees * share + (fee - opening_fee);
+                    let funding_share = accrued_funding * share;
+                    // Funding accrues as a liability while the position is
+                    // open — the mark subtracts it — and is *paid* when its
+                    // share of the position is realised. It used to be
+                    // reported on the trade and never paid: the mark dropped
+                    // by the bill, the close reset the accrual, and equity
+                    // jumped back up, so final equity had paid no funding.
+                    equity += realised - funding_share;
+                    let net = realised - fees_share - funding_share;
 
                     // **Every** reduction is booked, not only the ones that
                     // close the position outright.
@@ -163,10 +179,6 @@ pub fn run(
                     // ledger, and the resample compounds it — so every
                     // trimming strategy was pinned near a 100% probability of
                     // loss regardless of what it actually did.
-                    let share = if held_before > 0.0 { closing / held_before } else { 0.0 };
-                    let fees_share = accrued_fees * share;
-                    let funding_share = accrued_funding * share;
-                    let net = realised - fees_share - funding_share;
                     trades.push(Trade {
                         id: trades.len() + 1,
                         direction: if was_long { Direction::Long } else { Direction::Short },
@@ -190,24 +202,26 @@ pub fn run(
                     });
                     // Only the closed share's costs are consumed; the rest
                     // stays with the position that is still open.
-                    accrued_fees -= fees_share;
+                    accrued_fees -= accrued_fees * share;
                     accrued_funding -= funding_share;
 
-                    if quantity.abs() < 1e-12 || remainder > 1e-12 {
-                        // Fully closed, or overshot into the opposite side.
-                        // Either way a new position starts here, so the clock
-                        // and the cost basis restart.
+                    if closed_out || flipped {
+                        // A new position starts here, if any: the clock, the
+                        // cost basis and the costs restart.
+                        quantity = if closed_out { 0.0 } else { after };
+                        average_price = if flipped { fill } else { 0.0 };
+                        accrued_fees = opening_fee;
+                        accrued_funding = 0.0;
                         entry_ts = candle.ts_ms;
                         entry_index = index;
-                        entry_equity = equity;
-                        average_price = if remainder > 1e-12 { fill } else { 0.0 };
-                        if quantity.abs() < 1e-12 {
-                            quantity = 0.0;
-                        }
+                        entry_equity = equity + opening_fee;
+                    } else {
+                        // A partial trim leaves entry_ts, entry_index and
+                        // average_price alone: what remains is the same
+                        // position, opened when it was opened, at the basis it
+                        // was opened at.
+                        quantity = after;
                     }
-                    // A partial trim leaves entry_ts, entry_index and
-                    // average_price alone: what remains is the same position,
-                    // opened when it was opened, at the basis it was opened at.
                 }
             }
         }
@@ -226,39 +240,36 @@ pub fn run(
 
         // --- 2b. Liquidation. A scaled position changes size every rebalance,
         //         so the level is recomputed from what is currently held rather
-        //         than fixed at entry.
+        //         than fixed at entry; what the liquidation then costs is the
+        //         binary engine's rule too (`liquidation_fill`).
         if quantity != 0.0 && leverage > 1.0 {
-            let buffer = liquidation_buffer(
-                manifest.market.inst_type.margin_regime(), maintenance, leverage);
-            let level = if quantity > 0.0 {
-                average_price * (1.0 - buffer)
-            } else {
-                average_price * (1.0 + buffer)
-            };
-            let breached = if quantity > 0.0 {
-                candle.low <= level
-            } else {
-                candle.high >= level
-            };
-            if breached {
-                // Everything is lost at the liquidation price, and the
-                // exchange does not ask whether the bar closed better.
-                let realised = (level - average_price)
-                    * quantity.abs()
-                    * if quantity > 0.0 { 1.0 } else { -1.0 };
-                equity += realised;
-                let net = realised - accrued_fees - accrued_funding;
+            let regime = manifest.market.inst_type.margin_regime();
+            let direction = if quantity > 0.0 { Direction::Long } else { Direction::Short };
+            let sign = direction.sign();
+            let level = average_price * (1.0 - sign * liquidation_buffer(regime, maintenance, leverage));
+            let adverse_extreme = if quantity > 0.0 { candle.low } else { candle.high };
+            if sign * (level - adverse_extreme) >= 0.0 {
+                // Opened past the level, or reached it inside the bar.
+                let trigger = if sign * (level - candle.open) >= 0.0 { candle.open } else { level };
+                let size = quantity.abs();
+                let fill = liquidation_fill(
+                    regime, direction, size, average_price, leverage, accrued_funding, trigger,
+                    slippage, &costs);
+                let gross = sign * (fill.price - average_price) * size;
+                equity += gross - fill.fee - accrued_funding;
+                let fees = accrued_fees + fill.fee;
+                let net = gross - fees - accrued_funding;
                 trades.push(Trade {
                     id: trades.len() + 1,
-                    direction: if quantity > 0.0 { Direction::Long } else { Direction::Short },
+                    direction,
                     entry_ts,
                     exit_ts: candle.ts_ms,
                     entry_price: average_price,
-                    exit_price: level,
-                    quantity: quantity.abs(),
-                    notional: quantity.abs() * average_price,
-                    gross_pnl: realised,
-                    fees: accrued_fees,
+                    exit_price: fill.price,
+                    quantity: size,
+                    notional: size * average_price,
+                    gross_pnl: gross,
+                    fees,
                     funding: accrued_funding,
                     net_pnl: net,
                     return_pct: if entry_equity > 0.0 { net / entry_equity * 100.0 } else { 0.0 },
@@ -344,33 +355,24 @@ pub fn run(
     // Close whatever is left so the metrics see realised P&L.
     if quantity != 0.0 {
         let last = candles[candles.len() - 1];
-        let buying = quantity < 0.0;
-        let fill = last.close * if buying { 1.0 + slippage } else { 1.0 - slippage };
-        let fee = costs.fee(
-            if buying { OrderSide::Buy } else { OrderSide::Sell },
-            quantity.abs(),
-            quantity.abs() * fill,
-        );
-        let realised =
-            (fill - average_price) * quantity.abs() * if quantity > 0.0 { 1.0 } else { -1.0 };
-        equity += realised - fee;
-        accrued_fees += fee;
-        let net = realised - accrued_fees - accrued_funding;
+        let direction = if quantity > 0.0 { Direction::Long } else { Direction::Short };
+        let size = quantity.abs();
+        let fill = ExitFill::market(&costs, direction, size, last.close, slippage);
+        let gross = direction.sign() * (fill.price - average_price) * size;
+        equity += gross - fill.fee - accrued_funding;
+        let fees = accrued_fees + fill.fee;
+        let net = gross - fees - accrued_funding;
         trades.push(Trade {
             id: trades.len() + 1,
-            direction: if quantity > 0.0 {
-                Direction::Long
-            } else {
-                Direction::Short
-            },
+            direction,
             entry_ts,
             exit_ts: last.ts_ms,
             entry_price: average_price,
-            exit_price: fill,
-            quantity: quantity.abs(),
-            notional: quantity.abs() * average_price,
-            gross_pnl: realised,
-            fees: accrued_fees,
+            exit_price: fill.price,
+            quantity: size,
+            notional: size * average_price,
+            gross_pnl: gross,
+            fees,
             funding: accrued_funding,
             net_pnl: net,
             return_pct: if entry_equity > 0.0 {

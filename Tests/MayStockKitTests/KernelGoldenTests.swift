@@ -12,7 +12,9 @@ import Testing
 /// of these numbers deliberately — which is exactly the review moment that
 /// silent numerical drift needs.
 ///
-/// Regenerate with: `MAYSTOCK_PRINT_GOLDENS=1 swift test --filter KernelGolden`
+/// Regenerate with: `MAYSTOCK_PRINT_GOLDENS=1 ./Scripts/make.sh test --filter KernelGolden`
+/// — it prints each run's fingerprint and how its trades ended, so a moved
+/// number comes with the exits that moved it.
 @Suite("Kernel golden")
 struct KernelGoldenTests {
 
@@ -107,43 +109,58 @@ struct KernelGoldenTests {
         }
     }
 
+    /// `exercises` is what the fixture exists to pin: every exit it names must
+    /// occur in the run. A fingerprint cannot move for a mechanism that never
+    /// fires — the trailing-stop golden spent a year with every trade ending
+    /// on its signal, pinning nothing about trailing stops.
     private func check(
         _ name: String, _ manifestJSON: String, bars: [Candle],
-        capital: Double = 30_000, expect expected: Golden
+        capital: Double = 30_000, exercises: Set<KernelExitReason> = [], expect expected: Golden
     ) throws {
         let strategy = try KernelStrategy(manifestJSON: manifestJSON)
         let result = try strategy.backtest(
             candles: bars, config: KernelBacktestConfig(initialCapital: capital))
         let actual = Golden(result)
         if ProcessInfo.processInfo.environment["MAYSTOCK_PRINT_GOLDENS"] != nil {
-            print("GOLDEN \(name) \(actual)")
+            let exits = Dictionary(grouping: result.trades, by: \.exitReason.rawValue)
+                .map { "\($0.key) \($0.value.count)" }.sorted().joined(separator: ", ")
+            print("GOLDEN \(name) \(actual) exits: \(exits)")
         }
+        let reached = Set(result.trades.map(\.exitReason))
+        #expect(exercises.isSubset(of: reached), "\(name) never reached \(exercises.subtracting(reached))")
         #expect(actual == expected, "\(name): got \(actual)")
     }
 
-    /// Frozen at the point the Swift engine was deleted, when the two agreed.
+    /// Frozen at the point the Swift engine was deleted, when the two agreed;
+    /// every deliberate move since is dated beside the value it changed.
     static let GOLDENS: [String: Golden] = [
         "movingAverageCrossover": Golden(
             trades: 20, finalEquity: 29551.924786, totalReturnPct: -1.493584,
             maxDrawdownPct: 14.485792, winRate: 40.0, feesPaid: 1173.391483),
+        // 2026-10-09: stops and targets fill as the market orders they are
+        // live (slippage), and a gap over the target takes the target.
         "stopsAndTargets": Golden(
-            trades: 128, finalEquity: 31741.262941, totalReturnPct: 5.80421,
-            maxDrawdownPct: 15.768024, winRate: 38.28125, feesPaid: 8109.603144),
+            trades: 128, finalEquity: 30910.150397, totalReturnPct: 3.033835,
+            maxDrawdownPct: 16.020657, winRate: 38.28125, feesPaid: 8002.975971),
+        // 2026-10-09: tightened from 4% to 1.5% — at 4% every trade ended on
+        // its signal and the golden pinned nothing about trailing stops.
         "trailingStop": Golden(
-            trades: 77, finalEquity: 26552.616469, totalReturnPct: -11.491278,
-            maxDrawdownPct: 25.463248, winRate: 32.467532, feesPaid: 4737.051611),
+            trades: 203, finalEquity: 10123.161502, totalReturnPct: -66.256128,
+            maxDrawdownPct: 66.621004, winRate: 26.108374, feesPaid: 7839.537098),
+        // 2026-10-09: the ATR stop pays slippage like any market order.
         "atrRiskSizing": Golden(
-            trades: 19, finalEquity: 33016.944843, totalReturnPct: 10.056483,
-            maxDrawdownPct: 5.851893, winRate: 42.105263, feesPaid: 424.889859),
+            trades: 19, finalEquity: 32983.613607, totalReturnPct: 9.945379,
+            maxDrawdownPct: 5.898383, winRate: 42.105263, feesPaid: 424.671903),
         "dailyLossBreaker": Golden(
             trades: 75, finalEquity: 39936.710149, totalReturnPct: 33.122367,
             maxDrawdownPct: 14.97631, winRate: 40.0, feesPaid: 5521.282679),
         "cooldownAndMinHold": Golden(
             trades: 43, finalEquity: 35091.205522, totalReturnPct: 16.970685,
             maxDrawdownPct: 12.86219, winRate: 46.511628, feesPaid: 2837.714358),
+        // 2026-10-09: stop tightened from 5% to 1.5%, which never fired.
         "shortsAndLeverage": Golden(
-            trades: 31, finalEquity: 47266.02858, totalReturnPct: 57.553429,
-            maxDrawdownPct: 47.016275, winRate: 48.387097, feesPaid: 2124.784382),
+            trades: 31, finalEquity: 38985.458429, totalReturnPct: 29.951528,
+            maxDrawdownPct: 48.917803, winRate: 38.709677, feesPaid: 2099.2669),
         "continuousExposure": Golden(
             trades: 19, finalEquity: 30060.098403, totalReturnPct: 0.200328,
             maxDrawdownPct: 5.124814, winRate: 26.315789, feesPaid: 419.367307),
@@ -164,14 +181,16 @@ struct KernelGoldenTests {
                 signals: #"{"longEntry": "close > sma(close, 20)", "longExit": "close < sma(close, 20)"}"#,
                 risk: #"{"stopLossPct":2,"takeProfitPct":3,"leverage":1}"#),
             bars: Self.candles(1_500, seed: 7),
+            exercises: [.stopLoss, .takeProfit],
             expect: Self.GOLDENS["stopsAndTargets"]!)
     }
     @Test func trailingStop() throws {
         try check("trailingStop",
             Self.manifest(
                 signals: #"{"longEntry": "close > sma(close, 30)", "longExit": "close < sma(close, 30)"}"#,
-                risk: #"{"trailingStopPct":4,"leverage":1}"#),
+                risk: #"{"trailingStopPct":1.5,"leverage":1}"#),
             bars: Self.candles(1_500, seed: 11),
+            exercises: [.trailingStop],
             expect: Self.GOLDENS["trailingStop"]!)
     }
     @Test func atrRiskSizing() throws {
@@ -184,6 +203,7 @@ struct KernelGoldenTests {
                 sizing: #"{"mode":"riskPerTrade","value":1}"#,
                 risk: #"{"atrStop":{"period":14,"mult":2.5},"leverage":1}"#),
             bars: Self.candles(1_800, seed: 3),
+            exercises: [.stopLoss],
             expect: Self.GOLDENS["atrRiskSizing"]!)
     }
     @Test func dailyLossBreaker() throws {
@@ -193,6 +213,7 @@ struct KernelGoldenTests {
                 signals: #"{"longEntry": "close > sma(close, 10)", "longExit": "close < sma(close, 10)"}"#,
                 risk: #"{"maxDailyLossPct":2,"leverage":1}"#),
             bars: Self.candles(2_000, seed: 5, bar: 900),
+            exercises: [.dailyLossHalt],
             expect: Self.GOLDENS["dailyLossBreaker"]!)
     }
     @Test func cooldownAndMinHold() throws {
@@ -213,9 +234,10 @@ struct KernelGoldenTests {
                  "shortEntry": "ema(close, fast) crosses_below ema(close, slow)",
                  "shortExit": "ema(close, fast) crosses_above ema(close, slow)"}
                 """,
-                risk: #"{"leverage":3,"stopLossPct":5}"#,
+                risk: #"{"leverage":3,"stopLossPct":1.5}"#,
                 costs: #"{"feeBps":5,"slippageBps":5}"#),
             bars: Self.candles(1_500, seed: 17),
+            exercises: [.stopLoss],
             expect: Self.GOLDENS["shortsAndLeverage"]!)
     }
     @Test func continuousExposure() throws {
