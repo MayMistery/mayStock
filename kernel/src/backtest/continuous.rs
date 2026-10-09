@@ -17,6 +17,7 @@ use crate::decide::{realised_volatility, volatility_scale, Direction};
 use crate::expr::eval::Evaluator;
 use crate::expr::ExprResult;
 use crate::fees::OrderSide;
+use crate::sizing::{exposure_of, Footing};
 use crate::strategy::{CompiledStrategy, InstrumentType, SizingMode};
 
 fn unrealised_for(quantity: f64, average_price: f64, price: f64, funding: f64) -> f64 {
@@ -45,6 +46,7 @@ pub fn run(
     let slippage = costs.slippage_bps / 10_000.0;
     let allows_short = manifest.market.inst_type.allows_short();
     let leverage = strategy.leverage();
+    let regime = manifest.market.inst_type.margin_regime();
     // The pre-trade check live applies to every rebalance (`decide_live`), so
     // the simulation never trades an order the runner would refuse.
     let limits = crate::guard::OrderLimits::default();
@@ -112,11 +114,20 @@ pub fn run(
 
         // --- 1. Execute the adjustment decided at the previous close.
         let halting = std::mem::take(&mut pending_halt);
-        if let Some(target) = pending_target_quantity.take() {
+        if let Some(decided) = pending_target_quantity.take() {
+            let buying = decided > quantity;
+            let fill = market_price(candle.open, buying, slippage);
+            // What the order adds is judged again where it fills, against the
+            // capital marked there: a gap since the decision moves both, and a
+            // position may not grow on a price its capital cannot back. Only
+            // what it adds can be cut; a close or a trim goes whole.
+            let at_fill = Footing {
+                costs: &costs, capital: equity + unrealised_for(quantity, average_price, fill, accrued_funding),
+                price: fill, leverage, regime, held_base: quantity, held_basis: average_price,
+            };
+            let target = at_fill.affordable(decided);
             let delta = target - quantity;
             if delta.abs() > 1e-12 {
-                let buying = delta > 0.0;
-                let fill = market_price(candle.open, buying, slippage);
                 let fee = costs.fee(
                     if buying { OrderSide::Buy } else { OrderSide::Sell },
                     delta.abs(),
@@ -253,7 +264,6 @@ pub fn run(
         //         than fixed at entry; what the liquidation then costs is the
         //         binary engine's rule too (`liquidation_fill`).
         if quantity != 0.0 && leverage > 1.0 {
-            let regime = manifest.market.inst_type.margin_regime();
             let direction = if quantity > 0.0 { Direction::Long } else { Direction::Short };
             let sign = direction.sign();
             let level = average_price * (1.0 - sign * liquidation_buffer(regime, maintenance, leverage));
@@ -337,17 +347,37 @@ pub fn run(
 
             let marked_equity = equity
                 + unrealised_for(quantity, average_price, candle.close, accrued_funding);
-            let price = candles[index + 1].open;
-            if marked_equity > 0.0 && price > 0.0 {
-                let target_quantity = marked_equity * effective * leverage / price;
-                let current_exposure = quantity * candle.close / marked_equity;
-                // Only trade when the drift is worth the fee.
-                if (effective - current_exposure).abs() >= threshold {
+            let close = candle.close;
+            if marked_equity > 0.0 && close > 0.0 {
+                // Sized as the runner sizes it (`decide_live`): at this close,
+                // against the capital marked at it, no further than that
+                // capital can commit to — the margin of the position after the
+                // order and the order's fee (`sizing::Footing`). It used to be
+                // sized at the next open against capital marked at this close;
+                // across a gap the two prices disagree, and an isolated
+                // position read its own loss as room to add.
+                let footing = Footing {
+                    costs: &costs, capital: marked_equity, price: close, leverage, regime,
+                    held_base: quantity, held_basis: average_price,
+                };
+                let current_exposure = exposure_of(quantity, marked_equity, close, leverage);
+                // Only trade when the drift is worth the fee. The ceiling only
+                // ever brings a target nearer what is held, so a drift too
+                // small to trade before it is too small after it, and the
+                // ceiling — a search — is only worked out for an order that may
+                // go: a position held at full size meets it on every bar.
+                let target_quantity = if (effective - current_exposure).abs() >= threshold {
+                    footing.exposure_target(effective)
+                } else {
+                    quantity
+                };
+                let target_exposure = exposure_of(target_quantity, marked_equity, close, leverage);
+                if (target_exposure - current_exposure).abs() >= threshold {
                     // What the runner would send (`guard::admit`): the order,
                     // the close alone when only a flip's opening half is
                     // refused, or nothing.
                     let admission = crate::guard::admit(
-                        target_quantity - quantity, quantity, price, marked_equity,
+                        target_quantity - quantity, quantity, close, marked_equity,
                         strategy.max_notional_multiple(), &limits);
                     if let Some(denied) = admission.denied {
                         refusals.note(denied);
@@ -486,6 +516,173 @@ mod tests {
         let result = run(&strategy("", 20.0), &bars, &BacktestConfig::default()).unwrap();
         assert_eq!(result.guard_refusals, 0, "{:?}", result.guard_refusal);
         assert!(result.final_equity != BacktestConfig::default().initial_capital, "the position was opened and paid its fees");
+    }
+
+    /// A position already at its target is left alone, at every leverage a
+    /// perpetual allows: the drift a rebalance is judged on is measured on
+    /// the same scale the target is sized on — and the live runner's. The
+    /// market wobbles too little to move even a 50× position's exposure by
+    /// the threshold (equity moves by leverage times the price).
+    #[test]
+    fn a_position_on_its_target_is_not_rebalanced_at_any_leverage() {
+        let bars: Vec<Candle> = (0..200)
+            .map(|i| {
+                let close = 100.0 * (1.0 + 0.000_2 * ((i as f64) * 0.7).sin());
+                Candle { ts_ms: i * 3_600_000, open: close, high: close * 1.001, low: close * 0.999,
+                         close, volume: 1.0, confirmed: 1 }
+            })
+            .collect();
+        let max = InstrumentType::Swap.max_leverage() as i64;
+        for leverage in 1..=max {
+            let json = format!(
+                r#"{{"id":"on","name":"on","market":{{"instId":"BTC-USDT-SWAP","instType":"SWAP","bar":"1H"}},
+                     "signals":{{"exposure":"1"}},"sizing":{{"mode":"equityPct","value":100}},
+                     "risk":{{"leverage":{leverage},"rebalanceThreshold":0.05}}}}"#);
+            let held = CompiledStrategy::compile(serde_json::from_str::<Manifest>(&json).unwrap(), &[]).unwrap();
+            let result = run(&held, &bars, &BacktestConfig::default()).unwrap();
+            assert_eq!(result.trades.len(), 1, "{leverage}x: {:?}",
+                       result.trades.iter().map(|t| t.exit_reason).collect::<Vec<_>>());
+        }
+    }
+
+    /// The binary engine's walk, for a scaled position: every family this
+    /// engine trades, at every whole leverage it allows, at full exposure
+    /// either way it can face, through the worst bar its margin defines — a gap
+    /// far past the liquidation level where the position is lent against, all
+    /// but the whole price where it is not. What the position committed was
+    /// its margin and its fee, so the run ends at or above zero, and a
+    /// liquidation takes what was committed: all of it, but for the slippage
+    /// between the close it was sized at and the open it filled at — which
+    /// leaves a short a little, and is cut from a long where it fills.
+    #[test]
+    fn a_full_exposure_position_never_commits_more_than_the_equity_behind_it() {
+        use crate::strategy::MarginRegime;
+        let config = BacktestConfig { fees: Some(vec![crate::fees::FeeComponent::flat_bps(5.0)]),
+                                      slippage_bps: Some(3.0), ..BacktestConfig::default() };
+        let mut walked = 0;
+        for family in InstrumentType::ALL.into_iter().filter(|f| !f.is_option()) {
+            let maintenance = family.default_maintenance_margin_rate().unwrap_or(0.0);
+            let mut leverage = 1.0;
+            while leverage <= family.max_leverage() {
+                let exposures: &[f64] = if family.allows_short() { &[1.0, -1.0] } else { &[1.0] };
+                for &exposure in exposures {
+                    let json = format!(
+                        r#"{{"id":"x","name":"x","market":{{"instId":"X","instType":{},"bar":"1H"}},
+                             "signals":{{"exposure":"{exposure}"}},"sizing":{{"mode":"equityPct","value":100}},
+                             "risk":{{"leverage":{leverage},"rebalanceThreshold":0.05}}}}"#,
+                        serde_json::to_value(family).unwrap());
+                    let strategy = CompiledStrategy::compile(serde_json::from_str::<Manifest>(&json).unwrap(), &[]).unwrap();
+                    let lends = leverage > 1.0 && family.margin_regime() != MarginRegime::None;
+                    let worst = if lends && family.margin_regime() == MarginRegime::Isolated {
+                        let buffer = liquidation_buffer(family.margin_regime(), maintenance, leverage);
+                        100.0 * (1.0 - exposure * buffer * 1.5)
+                    } else if lends {
+                        // A Reg T call is met inside its bar below.
+                        100.0 * (1.0 - exposure * liquidation_buffer(family.margin_regime(), maintenance, leverage))
+                    } else {
+                        100.0 * (1.0 - exposure * 0.99)
+                    };
+                    let mut bars: Vec<Candle> = (0..6)
+                        .map(|i| Candle { ts_ms: i * 3_600_000, open: 100.0, high: 100.0, low: 100.0, close: 100.0, volume: 1.0, confirmed: 1 })
+                        .collect();
+                    let (open, high, low) = if lends && family.margin_regime() == MarginRegime::RegT {
+                        (100.0, worst.max(100.0), worst.min(100.0))
+                    } else {
+                        (worst, worst, worst)
+                    };
+                    bars.push(Candle { ts_ms: 6 * 3_600_000, open, high, low, close: worst, volume: 1.0, confirmed: 1 });
+                    bars.extend((7..10).map(|i| Candle { ts_ms: i * 3_600_000, open: worst, high: worst, low: worst, close: worst, volume: 1.0, confirmed: 1 }));
+
+                    let result = run(&strategy, &bars, &config).unwrap();
+                    let label = format!("{family:?} {leverage}x exposure {exposure}");
+                    assert!(result.final_equity >= -1e-9 * config.initial_capital,
+                            "{label}: ends at {} after {:?}", result.final_equity,
+                            result.trades.iter().map(|t| t.exit_reason).collect::<Vec<_>>());
+                    if lends && family.margin_regime() == MarginRegime::Isolated {
+                        assert_eq!(result.liquidations, 1, "{label}");
+                        let slipped = config.initial_capital * 3.0 / 10_000.0;
+                        assert!(result.final_equity <= slipped * 1.01, "{label}: {}", result.final_equity);
+                    }
+                    walked += 1;
+                }
+                leverage += 1.0;
+            }
+        }
+        assert!(walked > 100, "walked {walked}");
+    }
+
+    /// A scaled position on isolated margin that rallies cannot add on the
+    /// rally: its profit is not cash, and a liquidation takes the margin at the
+    /// average price out of what was realised. At every leverage a perpetual
+    /// allows, a rally the rebalancer would follow and then a gap far past the
+    /// liquidation level end the run at or above zero. Counting the profit as
+    /// capital, a 10× run of 10 000 ended at −18 606.
+    #[test]
+    fn a_rally_is_not_capital_an_isolated_position_can_add_on() {
+        let max = InstrumentType::Swap.max_leverage() as i64;
+        let mut liquidated = 0;
+        for leverage in 2..=max {
+            let leverage = leverage as f64;
+            let json = format!(
+                r#"{{"id":"r","name":"r","market":{{"instId":"BTC-USDT-SWAP","instType":"SWAP","bar":"1H"}},
+                     "signals":{{"exposure":"1"}},"sizing":{{"mode":"equityPct","value":100}},
+                     "risk":{{"leverage":{leverage},"rebalanceThreshold":0.05}}}}"#);
+            let strategy = CompiledStrategy::compile(serde_json::from_str::<Manifest>(&json).unwrap(), &[]).unwrap();
+            // Each bar adds a fifth of the margin in profit, for sixty bars.
+            let mut price = 100.0;
+            let mut bars = Vec::new();
+            for i in 0..62i64 {
+                let open = price;
+                if i >= 2 {
+                    price *= 1.0 + 0.2 / leverage;
+                }
+                bars.push(Candle { ts_ms: i * 3_600_000, open, high: open.max(price), low: open.min(price),
+                                   close: price, volume: 1.0, confirmed: 1 });
+            }
+            let gap = price * 0.3;
+            bars.extend((62..66).map(|i| Candle { ts_ms: i * 3_600_000, open: gap, high: gap, low: gap,
+                                                  close: gap, volume: 1.0, confirmed: 1 }));
+            let result = run(&strategy, &bars, &BacktestConfig::default()).unwrap();
+            assert!(result.final_equity >= -1e-9 * result.initial_capital,
+                    "{leverage}x: ends at {} after {:?}", result.final_equity,
+                    result.trades.iter().map(|t| t.exit_reason).collect::<Vec<_>>());
+            liquidated += result.liquidations;
+        }
+        assert!(liquidated > 0, "the gap no longer reaches a liquidation");
+    }
+
+    /// Not a correctness test — a stopwatch for the ceiling's cost where it
+    /// bites hardest: a 10× position held at full exposure through 200 000
+    /// minute bars, which wants to add on nearly every one. Run explicitly:
+    /// `cargo test --release -- --ignored --nocapture full_exposure_throughput`
+    /// (2026-10-09: 9.4 ms a run; 111 ms when the ceiling was halved for on
+    /// every bar, 5.5 ms with no ceiling at all).
+    #[test]
+    #[ignore]
+    fn full_exposure_throughput() {
+        let json = r#"{"id":"s","name":"s","market":{"instId":"BTC-USDT-SWAP","instType":"SWAP","bar":"1m"},
+             "signals":{"exposure":"1"},"sizing":{"mode":"equityPct","value":100},
+             "risk":{"leverage":10,"rebalanceThreshold":0.05}}"#;
+        let strategy = CompiledStrategy::compile(serde_json::from_str::<Manifest>(json).unwrap(), &[]).unwrap();
+        let mut state = 7u64;
+        let mut price = 30_000.0;
+        let bars: Vec<Candle> = (0..200_000i64)
+            .map(|i| {
+                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                let open = price;
+                price *= 1.0 + ((state >> 11) as f64 / (1u64 << 53) as f64 - 0.5) * 0.0004;
+                Candle { ts_ms: i * 60_000, open, high: open.max(price), low: open.min(price), close: price,
+                         volume: 1.0, confirmed: 1 }
+            })
+            .collect();
+        let best = (0..5)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                run(&strategy, &bars, &BacktestConfig::default()).unwrap();
+                started.elapsed().as_secs_f64() * 1000.0
+            })
+            .fold(f64::MAX, f64::min);
+        println!("200 000 bars at full exposure, 10x: best of 5 = {best:.1} ms");
     }
 
     #[test]

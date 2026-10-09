@@ -94,7 +94,12 @@ struct BacktestEngineTests {
         let result = try engine.run(candles: candles)
 
         let trade = try #require(result.trades.first)
-        #expect(abs(trade.fees - 2) < 1e-6, "1,000 notional × 10bps, twice")
+        // The position and its opening fee together are the 1,000 of capital,
+        // so the notional is 1,000 / 1.001, charged 10 bps on the way in and
+        // again on the way out.
+        let notional = 1_000 / 1.001
+        #expect(abs(trade.quantity * trade.entryPrice - notional) < 1e-6)
+        #expect(abs(trade.fees - 2 * notional * 0.001) < 1e-6, "10 bps of the notional, twice")
         #expect(trade.netPnL < 0)
     }
 

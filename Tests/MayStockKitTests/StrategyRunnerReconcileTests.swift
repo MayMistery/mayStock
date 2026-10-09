@@ -1646,15 +1646,18 @@ struct OptionRunnerTests {
         #expect(order.posSide == nil)
         #expect(!order.reduceOnly)
         #expect(order.stopTriggerPrice == nil, "levels live on the premium, watched locally")
-        // 10% of 10,000 = 1,000 of premium; a contract costs 0.021 × 80,000 × 0.01 = 16.8.
-        #expect(order.size == 59, "floor(1000 / 16.8)")
+        // 10% of 10,000 = 1,000 for the premium and its fee together. A
+        // contract costs at most its limit, 0.0215 × 80,000 × 0.01 = 17.20,
+        // plus 3 bps of its 800 of notional, 0.24 — the kernel's count, the
+        // option backtest's.
+        #expect(order.size == 57, "floor(1000 / 17.44)")
         // The limit is the ask plus the buffer, rounded up to the tick.
         #expect(abs((order.limitPrice ?? 0) - 0.0215) < 1e-9)
 
         // The fill was booked in quote currency, per unit of underlying.
         let position = try #require(host.ledger.position(for: "opt"))
         #expect(position.instId == Self.call)
-        #expect(position.quantity == 59)
+        #expect(position.quantity == 57)
         #expect(position.contractSize == 0.01)
         #expect((position.averagePrice * 1e6).rounded() / 1e6 == 1_720, "0.0215 BTC/unit × 80,000")
         #expect(position.signalDirection == .long)
@@ -1684,7 +1687,7 @@ struct OptionRunnerTests {
         // Same bar, next tick: decided again and sent.
         await runner.tick()
         #expect(host.fake.placed.count == 2)
-        #expect(host.ledger.position(for: "opt")?.quantity == 59)
+        #expect(host.ledger.position(for: "opt")?.quantity == 57)
     }
 
     @Test("结果未确认的单被跟踪，不当成拒绝、也不盲目重发")
@@ -1706,12 +1709,12 @@ struct OptionRunnerTests {
         let host = try armedHost()
         let runner = runner(for: host)
         await runner.tick()
-        #expect(host.ledger.position(for: "opt")?.quantity == 59)
+        #expect(host.ledger.position(for: "opt")?.quantity == 57)
 
         host.runnableStrategies = [try strategy(signals: #"{"longEntry":"close > 1e12","longExit":"close > 0"}"#)]
         runner.reloadKernel()
         host.fake.positionsResult = .success([ExchangePosition(
-            instId: Self.call, posSide: .net, quantity: 59, averagePrice: 0.021,
+            instId: Self.call, posSide: .net, quantity: 57, averagePrice: 0.021,
             markPrice: 0.02, unrealisedPnL: 0, leverage: nil, liquidationPrice: nil)])
         // A new closed bar, so the bar-guard lets the runner act again.
         host.fake.candlesResult = recentCandles(201)
@@ -1722,7 +1725,7 @@ struct OptionRunnerTests {
         #expect(exit.side == .sell)
         #expect(exit.kind == .ioc)
         #expect(exit.reduceOnly)
-        #expect(exit.size == 59)
+        #expect(exit.size == 57)
         // The limit is the bid less the buffer, rounded down to the tick.
         #expect(abs((exit.limitPrice ?? 0) - 0.0196) < 1e-9)
         #expect(host.ledger.position(for: "opt")?.isFlat == true)
@@ -1734,7 +1737,7 @@ struct OptionRunnerTests {
         let runner = runner(for: host)
         await runner.tick()
         host.fake.positionsResult = .success([ExchangePosition(
-            instId: Self.call, posSide: .net, quantity: 59, averagePrice: 0.021,
+            instId: Self.call, posSide: .net, quantity: 57, averagePrice: 0.021,
             markPrice: 0.02, unrealisedPnL: 0, leverage: nil, liquidationPrice: nil)])
         // The mark, in quote currency per unit, at 40% of the premium paid.
         host.fake.valuationPrices[Self.call] = 0.0215 * 80_000 * 0.4
@@ -1786,9 +1789,9 @@ struct OptionRunnerTests {
         let message = try #require(runner.state(for: "opt").message)
         #expect(message.contains("结算币不足"))
         #expect(message.contains("BTC 可用 0"))
-        // 59 contracts × 0.01 × 0.0215 = 0.012685 BTC of premium, plus 3 bps
-        // of 0.59 BTC notional = 0.000177 in fee.
-        #expect(message.contains("需约 0.012862 BTC"), "\(message)")
+        // 57 contracts × 0.01 × 0.0215 = 0.012255 BTC of premium, plus 3 bps
+        // of 0.57 BTC notional = 0.000171 in fee.
+        #expect(message.contains("需约 0.012426 BTC"), "\(message)")
         #expect(message.contains("换入 BTC"))
         #expect(runner.state(for: "opt").status == .running, "funding is the account's state, not a fault")
     }
@@ -1828,16 +1831,16 @@ struct OptionRunnerTests {
         let message = try #require(runner.state(for: "opt").message)
         #expect(message.contains("未成交"), "\(message)")
         #expect(message.contains("已撤单"), "\(message)")
-        #expect(!message.hasSuffix("买入 59"), "\(message)")
+        #expect(!message.hasSuffix("买入 57"), "\(message)")
     }
 
     @Test("成交后状态写明成交数量和均价，部分成交说明其余已撤")
     func aFillIsReportedWithItsAverage() async throws {
         let host = try armedHost()
-        host.fake.orderStatusResult = .filled(filledSize: 59, averagePrice: 0.0212)
+        host.fake.orderStatusResult = .filled(filledSize: 57, averagePrice: 0.0212)
         let full = runner(for: host)
         await full.tick()
-        #expect(full.state(for: "opt").message?.contains("买入 59 已成交 @ 0.0212") == true,
+        #expect(full.state(for: "opt").message?.contains("买入 57 已成交 @ 0.0212") == true,
                 "\(full.state(for: "opt").message ?? "")")
 
         let partial = try armedHost()
@@ -1876,7 +1879,7 @@ struct OptionRunnerTests {
         let host = try armedHost()
         let runner = runner(for: host)
         await runner.tick()
-        #expect(host.ledger.position(for: "opt")?.quantity == 59)
+        #expect(host.ledger.position(for: "opt")?.quantity == 57)
 
         // Settled: the exchange reports nothing on the contract, and its mark
         // is the intrinsic value the settlement paid — above the 50% stop, so
@@ -1891,8 +1894,8 @@ struct OptionRunnerTests {
         #expect(host.ledger.fills.count == 2)
         #expect(host.fake.placed.count == 1, "settlement is booked, not traded")
         #expect(runner.state(for: "opt").message?.contains("到期结算") == true)
-        // Paid 1,720 per unit on 0.59 units, settled at 1,500: −129.8 realised.
-        #expect((position.realisedPnL * 1e6).rounded() / 1e6 == ((1_500 - 1_720) * 0.59 * 1e6).rounded() / 1e6)
+        // Paid 1,720 per unit on 0.57 units, settled at 1,500: −125.4 realised.
+        #expect((position.realisedPnL * 1e6).rounded() / 1e6 == ((1_500 - 1_720) * 0.57 * 1e6).rounded() / 1e6)
     }
 }
 
@@ -2017,6 +2020,54 @@ struct AccountScopedRunnerTests {
 
         #expect(runner.accountDrawdownPct == 80)
         #expect(runner.protectionTripped != nil)
+    }
+}
+
+// MARK: - Sizing against the venue's fee
+
+/// The live plan is sized against the fee the backtest charges — the venue's
+/// schedule, for a manifest that states none — so an entry's margin and its
+/// opening fee together are the strategy's capital. Were the schedule not
+/// handed over, the kernel would size against the instrument's documented
+/// default, which for an OKX perpetual is the default tier's rate as well; so
+/// the schedule here charges something else.
+@Suite("实盘按场所费率定仓")
+@MainActor
+struct LiveSizingFeeTests {
+    @Test("满仓开仓的保证金加手续费等于策略资金，费率取组合的费率表")
+    func aFullSizeEntryFitsItsFeeInTheCapital() async throws {
+        let json = """
+        {"schema":1,"id":"full","name":"full",
+         "market":{"instId":"BTC-USDT-SWAP","instType":"SWAP","bar":"1H"},
+         "signals":{"longEntry":"close > 0"},
+         "sizing":{"mode":"equityPct","value":100}}
+        """
+        let host = FakeHost()
+        host.runnableStrategies = [try JSONDecoder().decode(StrategyManifest.self, from: Data(json.utf8)).compile()]
+        host.portfolio.feeSchedules.okx.swapTakerOverrideBps = 25
+        host.portfolio.feeSchedules.okx.swapMakerOverrideBps = 25
+        // A million, so the fee moves the order by whole contracts.
+        host.portfolio.capital[.okx] = 2_000_000
+        host.portfolio.setCapital(1_000_000, for: "full", on: .okx)
+        host.portfolio.setRunning(true, for: "full")
+        host.fake.equity = 2_000_000
+        host.fake.price = 80_010
+        host.fake.candlesResult = (0..<200).map { index in
+            let ts = (Date().timeIntervalSince1970 / 3_600).rounded(.down) * 3_600
+                - Double(200 - index) * 3_600
+            return Candle(ts: Date(timeIntervalSince1970: ts), open: 80_000, high: 80_080,
+                          low: 79_920, close: 80_010, volume: 5, confirmed: true)
+        }
+        host.fake.positionsResult = .success([])
+        host.fake.accountConfig = AccountTradingConfig(positionMode: .longShort, accountLevel: 3)
+        await runner(for: host).tick()
+
+        let order = try #require(host.fake.placed.first)
+        // The capital over one plus 25 bps, at the decision bar's close, in
+        // contracts of 0.01 BTC, floored to the lot.
+        #expect(order.size == (1_000_000 / 1.0025 / 80_010 / 0.01).rounded(.down))
+        #expect(order.size != (1_000_000 / 1.0005 / 80_010 / 0.01).rounded(.down),
+                "the instrument's default fee would have sized it")
     }
 }
 

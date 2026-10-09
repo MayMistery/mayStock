@@ -372,16 +372,24 @@ fn open_position(
         refusals.note(denied);
         return;
     }
-    let contracts = options::contracts_for(budget, paid, spec.contract_multiplier, 1.0);
-    if contracts < 1.0 {
+    // The premium and its fee both come out of the budget.
+    let bought = options::affordable_purchase(budget, &options::PurchaseTerms {
+        premium_per_unit: paid,
+        multiplier: spec.contract_multiplier,
+        lot: 1.0,
+        spot,
+        fees: fees.to_vec(),
+        fee_cap_pct_of_premium: spec.fee_cap_pct_of_premium,
+    });
+    if !(bought.contracts > 0.0) {
         return;
     }
-    let units = contracts * spec.contract_multiplier;
-    let fee = options::option_fee(fees, OrderSide::Buy, spot, paid, units, spec.fee_cap_pct_of_premium);
+    let units = bought.contracts * spec.contract_multiplier;
+    let fee = bought.fee;
 
     let risk = &strategy.manifest.risk;
     let equity_at_entry = *cash;
-    *cash -= paid * units + fee;
+    *cash -= bought.premium + fee;
     *position = Some(OpenOption {
         kind,
         strike: contract.strike,
@@ -507,6 +515,44 @@ mod tests {
         }
         assert_eq!(result.liquidations, 0);
         assert!(!result.funding_unmodelled);
+    }
+
+    /// Walks every family this engine trades, at every leverage it allows
+    /// (an option's is the contract's own, 1×), on both views: the whole
+    /// capital spent on contracts that expire worthless leaves the cash at or
+    /// above zero, because the premium and its fee were bought out of the
+    /// budget together (`options::affordable_purchase`). Bought on the premium
+    /// alone, the fee — up to an eighth of a cheap contract's premium — took
+    /// the cash below zero on the first expiry.
+    #[test]
+    fn a_whole_budget_spent_on_premium_never_takes_the_cash_below_zero() {
+        let config = BacktestConfig::default();
+        let mut walked = 0;
+        for family in crate::strategy::InstrumentType::ALL.into_iter().filter(|f| f.is_option()) {
+            let mut leverage = 1.0;
+            while leverage <= family.max_leverage() {
+                // A call through a slide and a put through a rally, far out
+                // of the money and a day from expiry: each one dies worthless.
+                for (signals, per_bar) in [(ALWAYS_LONG, -0.003), (ALWAYS_SHORT, 0.003)] {
+                    let json = format!(
+                        r#"{{"id":"w","name":"w","market":{{"instId":"BTC-USDT","instType":{},"bar":"1H"}},
+                             "signals":{signals},"sizing":{{"mode":"equityPct","value":100}},
+                             "risk":{{"volLookbackBars":24,"leverage":{leverage}}},
+                             "options":{{"minDaysToExpiry":1,"moneynessPct":8}}}}"#,
+                        serde_json::to_value(family).unwrap());
+                    let strategy = CompiledStrategy::compile(serde_json::from_str::<Manifest>(&json).unwrap(), &[]).unwrap();
+                    let result = run(&strategy, &drifting(300, per_bar), &config).unwrap();
+                    assert!(result.trades.iter().any(|t| t.exit_reason == ExitReason::Expiry && t.exit_price == 0.0),
+                            "{signals}: nothing expired worthless — {:?}",
+                            result.trades.iter().map(|t| (t.exit_reason, t.exit_price)).collect::<Vec<_>>());
+                    assert!(result.final_equity >= -1e-9 * config.initial_capital,
+                            "{family:?} {signals}: the cash ended at {}", result.final_equity);
+                    walked += 1;
+                }
+                leverage += 1.0;
+            }
+        }
+        assert!(walked >= 2);
     }
 
     #[test]
