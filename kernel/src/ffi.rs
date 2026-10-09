@@ -783,6 +783,39 @@ pub unsafe extern "C" fn ms_option_select(
 ///
 /// The market, not just the bar: annualisation depends on how many of those
 /// bars the venue trades in a year, and only the market knows.
+/// Check one order against the pre-trade limits without a strategy handle —
+/// for an order no strategy computed (a confirmed `maystock://order` link), so
+/// the rule stays the one in `guard::check_order`. `max_multiple` is the most
+/// of its equity the order's sizing could legitimately reach.
+///
+/// NULL with `error_out` untouched: the order passes. A JSON `OrderDenied`
+/// (`{"reason", "byPolicy"}`): it does not. NULL with `error_out` set: the
+/// check itself failed, which the caller must not read as a pass. NULL
+/// `limits_json` means default limits.
+#[no_mangle]
+pub unsafe extern "C" fn ms_check_order(
+    base_delta: f64,
+    held_base: f64,
+    price: f64,
+    equity: f64,
+    max_multiple: f64,
+    limits_json: *const c_char,
+    error_out: *mut *mut c_char,
+) -> *mut c_char {
+    guarded(error_out, ptr::null_mut(), || {
+        let limits: crate::guard::OrderLimits = match borrow_str(limits_json) {
+            Some(text) if !text.trim().is_empty() => {
+                serde_json::from_str(text).map_err(|e| format!("风控限额解析失败：{e}"))?
+            }
+            _ => Default::default(),
+        };
+        match crate::guard::check_order(base_delta, held_base, price, equity, max_multiple, &limits) {
+            None => Ok(ptr::null_mut()),
+            Some(denied) => serde_json::to_string(&denied).map(to_c_string).map_err(|e| e.to_string()),
+        }
+    })
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn ms_metrics_compute(
     request_json: *const c_char,

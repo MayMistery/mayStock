@@ -221,7 +221,7 @@ struct AccountPage: View {
                     }
                 }
                 GridRow {
-                    settingLabel("单笔名义额上限", help: "任何一笔订单的名义额都不得超过此数。防的是定量 bug，不是策略参数。留空只保留权益比例上限。")
+                    settingLabel("单笔名义额上限", help: "策略下的单超过此数会被拒；经 maystock://order 链接下的单超过时在确认弹窗顶部警示，由确认的人决定。减仓不受限。防的是定量 bug，不是策略参数。留空则只剩内核按各策略杠杆推出的失控上限（定仓所能达到名义的 1.5 倍）。")
                     HStack(spacing: 4) {
                         CommitTextField(placeholder: "不限", value: portfolio.maxOrderNotional.map { PriceFormatter.plain($0) } ?? "", width: 80) { text in
                             let cleaned = text.trimmingCharacters(in: .whitespaces)

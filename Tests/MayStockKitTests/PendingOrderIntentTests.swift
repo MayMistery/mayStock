@@ -461,3 +461,39 @@ struct PendingOrderIntentTests {
         }
     }
 }
+
+/// A linked order is measured the way the guard measures a strategy's order,
+/// and checked by the kernel's own rule.
+@Suite("Linked order against the per-order cap")
+struct LinkedOrderCapTests {
+    private func intent(_ type: InstrumentType, side: OrderSide = .buy, size: Double) -> PendingOrderIntent {
+        PendingOrderIntent(instId: type == .swap ? "ETH-USDT-SWAP" : type == .option ? "ETH-USD-261009-2600-C" : "ETH-USDT",
+                           instType: type, side: side, kind: .limit, size: size, priceBasis: nil,
+                           mode: .demo, rationale: nil, nonce: "n")
+    }
+
+    @Test("永续按张数×面值×价格，现货按数量，期权按权利金折成标的；估不出就返回 nil，不拿 1 当面值")
+    func measuresLikeTheGuard() throws {
+        let swap = try #require(intent(.swap, size: 10).guardMeasure(limit: 2_500, mark: nil, contractValue: 0.1, indexPrice: nil))
+        #expect(swap.baseDelta == 1 && swap.price == 2_500)
+        let sell = try #require(intent(.spot, side: .sell, size: 2).guardMeasure(limit: nil, mark: 2_400, contractValue: nil, indexPrice: nil))
+        #expect(sell.baseDelta == -2 && sell.price == 2_400)
+        // 73 contracts × 0.1 ETH × 0.02 ETH premium = 0.146 ETH of premium, valued at the index.
+        let option = try #require(intent(.option, size: 73).guardMeasure(limit: 0.02, mark: nil, contractValue: 0.1, indexPrice: 2_500))
+        #expect(abs(option.baseDelta - 0.146) < 1e-12 && option.price == 2_500)
+        #expect(intent(.swap, size: 10).guardMeasure(limit: 2_500, mark: nil, contractValue: nil, indexPrice: nil) == nil)
+        #expect(intent(.spot, size: 1).guardMeasure(limit: nil, mark: nil, contractValue: nil, indexPrice: nil) == nil)
+    }
+
+    @Test("内核的规则：超过名义上限被标出，同一笔减仓不受限，限内放行")
+    func theKernelRuleDecides() {
+        let limits = KernelOrderLimits(maxOrderNotional: 10_000)
+        let over = KernelGuard.checkOrder(baseDelta: 5, heldBase: 0, price: 2_500, equity: 50_000, maxMultiple: 50, limits: limits)
+        #expect(over?.reason.contains("超过上限") == true)
+        #expect(KernelGuard.checkOrder(baseDelta: -5, heldBase: 8, price: 2_500, equity: 50_000, maxMultiple: 50, limits: limits) == nil,
+                "closing is never capped")
+        #expect(KernelGuard.checkOrder(baseDelta: 3, heldBase: 0, price: 2_500, equity: 50_000, maxMultiple: 50, limits: limits) == nil)
+        let broken = KernelGuard.checkOrder(baseDelta: .nan, heldBase: 0, price: 2_500, equity: 50_000, maxMultiple: 50, limits: limits)
+        #expect(broken != nil, "a broken calculation is refused, never passed")
+    }
+}

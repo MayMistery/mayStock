@@ -105,6 +105,15 @@ char *ms_backtest_run(const MSStrategy *handle,
  * freeParameterCount. Caller frees. */
 char *ms_metrics_compute(const char *request_json, char **error_out);
 
+/* One order against the pre-trade limits, without a strategy handle (an order
+ * no strategy computed — a confirmed maystock://order link). max_multiple is
+ * the most of its equity the order's sizing could reach. NULL with error_out
+ * untouched: passes. JSON {"reason","byPolicy"}: refused (caller frees). NULL
+ * with error_out set: the check failed — never a pass. NULL limits_json means
+ * default limits. */
+char *ms_check_order(double base_delta, double held_base, double price, double equity,
+                     double max_multiple, const char *limits_json, char **error_out);
+
 /* --- market calendar ------------------------------------------------- */
 
 /* Every conversion between bars and time goes through the market's calendar:

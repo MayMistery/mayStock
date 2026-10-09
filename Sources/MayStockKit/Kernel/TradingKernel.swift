@@ -588,3 +588,32 @@ extension KernelMetrics {
         return try! JSONDecoder().decode(KernelMetrics.self, from: Data(json.utf8))
     }
 }
+
+// MARK: - Order guard
+
+/// One order against the kernel's pre-trade limits, for an order no strategy
+/// computed — a confirmed `maystock://order` link. The rule is the one every
+/// strategy order goes through (`guard::check_order`); nothing here restates it.
+public enum KernelGuard {
+    /// Nil when the order passes. A check that could not run is reported as a
+    /// refusal, never as a pass.
+    public static func checkOrder(
+        baseDelta: Double, heldBase: Double, price: Double, equity: Double,
+        maxMultiple: Double, limits: KernelOrderLimits
+    ) -> KernelOrderDenied? {
+        guard let data = try? JSONEncoder().encode(limits), let json = String(data: data, encoding: .utf8) else {
+            return KernelOrderDenied(reason: "风控限额无法编码", byPolicy: false)
+        }
+        var error: UnsafeMutablePointer<CChar>?
+        let result = ms_check_order(baseDelta, heldBase, price, equity, maxMultiple, json, &error)
+        if let message = KernelStrategy.take(&error) {
+            if let result { ms_string_free(result) }
+            return KernelOrderDenied(reason: "风控检查失败：\(message)", byPolicy: false)
+        }
+        guard let result else { return nil }
+        defer { ms_string_free(result) }
+        let text = String(cString: result)
+        return (try? JSONDecoder().decode(KernelOrderDenied.self, from: Data(text.utf8)))
+            ?? KernelOrderDenied(reason: "风控结果无法读取：\(text)", byPolicy: false)
+    }
+}

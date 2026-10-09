@@ -238,6 +238,9 @@ extension AppState {
         let funding = Self.fundingOutcome(intent: intent, limit: limit, context: context)
 
         var message = Self.describe(intent, limit: limit)
+        if let capWarning = capWarning(intent, limit: limit, context: context) {
+            message = capWarning + "\n\n" + message
+        }
         if let fundingText = Self.describeFunding(funding, context: context) {
             message = fundingText + "\n\n" + "第 2 步 · " + message
         }
@@ -494,9 +497,10 @@ extension AppState {
                 Log.warn("order-intent: 无法取得 \(intent.instId) 的实时价格：\(reason)")
                 context.failure = reason
             }
-            if let meta = try? await orderVenue(for: intent.instId).instrumentMeta(instId: intent.instId, mode: intent.mode),
-               meta.tickSize > 0 {
-                context.tickSize = meta.tickSize
+            if let meta = try? await orderVenue(for: intent.instId).instrumentMeta(instId: intent.instId, mode: intent.mode) {
+                if meta.tickSize > 0 { context.tickSize = meta.tickSize }
+                // How much underlying a contract is: what a swap's notional is counted in.
+                context.contractValue = meta.contractValue
             }
         }
 
@@ -517,6 +521,31 @@ extension AppState {
         }
         context.feeModel = store.config.strategy.feeSchedules.okx.feeModel(for: .option)
         return context
+    }
+
+    /// The per-order cap every strategy order is refused at, checked here by
+    /// the same kernel rule (`KernelGuard`): over it, a linked order is warned
+    /// at the top of the confirmation and left to the person confirming (May,
+    /// 2026-10-09) — and an order that cannot be measured says so rather than
+    /// passing quietly. A reduction is never capped, as for the strategies.
+    private func capWarning(_ intent: PendingOrderIntent, limit: Double?, context: Context) -> String? {
+        guard let cap = store.config.strategy.maxOrderNotional, cap > 0, !intent.reduceOnly else { return nil }
+        guard let measure = intent.guardMeasure(
+            limit: limit, mark: context.mark, contractValue: context.contractValue, indexPrice: context.indexPrice)
+        else {
+            Log.warn("order-intent: \(intent.instId) 无法估出名义额，未能核对单笔上限 \(PriceFormatter.money(cap))")
+            return "⚠️ 无法核对单笔名义额上限 \(PriceFormatter.money(cap))：这笔单的名义额估不出来（缺价格或合约面值）。"
+        }
+        let held = books(for: venue(of: intent.instId)).contractPositions
+            .filter { $0.instId == intent.instId && (intent.posSide == nil || $0.posSide == intent.posSide) }
+            .reduce(0) { $0 + $1.quantity * (context.contractValue ?? 1) }
+        let equity = context.snapshot?.totalEquity ?? 0
+        guard let denied = KernelGuard.checkOrder(
+            baseDelta: measure.baseDelta, heldBase: held, price: measure.price, equity: equity,
+            maxMultiple: intent.instType.maxLeverage, limits: KernelOrderLimits(maxOrderNotional: cap))
+        else { return nil }
+        Log.warn("order-intent: \(intent.instId) \(denied.reason)；链接订单只警示，由确认的人决定")
+        return "⚠️ \(denied.reason.replacingOccurrences(of: "，已拒绝", with: ""))。策略下的单会在这里被拒；这笔由你决定。"
     }
 
     /// `BTC-USD-260919-80000-C` → `BTC-USD`.

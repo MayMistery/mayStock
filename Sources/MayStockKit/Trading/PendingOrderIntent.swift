@@ -400,6 +400,32 @@ public struct PendingOrderIntent: Sendable, Equatable, Codable {
         }
     }
 
+    /// The order as the pre-trade guard measures it — signed base units and
+    /// the price they are valued at — so a linked order meets the per-order
+    /// rule a strategy's order meets (`KernelGuard`). An option is measured by
+    /// its premium, as the underlying it would buy at the index: the runner's
+    /// measure of an option entry. Nil when the order cannot be valued — no
+    /// price, or a contract whose size is unknown; never valued at a guessed
+    /// contract size of one.
+    public func guardMeasure(
+        limit: Double?, mark: Double?, contractValue: Double?, indexPrice: Double?
+    ) -> (baseDelta: Double, price: Double)? {
+        let sign: Double = side == .buy ? 1 : -1
+        let price = limit ?? mark
+        switch instType {
+        case .spot, .stock:
+            guard let price, price > 0 else { return nil }
+            return (size * sign, price)
+        case .option:
+            guard let premium = price, premium > 0, let index = indexPrice, index > 0,
+                  let value = contractValue, value > 0 else { return nil }
+            return (size * value * premium * sign, index)
+        case .swap:
+            guard let price, price > 0, let value = contractValue, value > 0 else { return nil }
+            return (size * value * sign, price)
+        }
+    }
+
     // MARK: - Handing it to the exchange
 
     /// The exchange request this intent stands for. `tradeMode` comes from the
