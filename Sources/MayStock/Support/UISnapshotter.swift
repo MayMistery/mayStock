@@ -76,10 +76,12 @@ final class UISnapshotter {
         // overflows the window pushes the whole split view out of it and
         // squeezes wrapped text to one truncated line (the checkup, at about
         // 4,000 pt, captured with its header and toolbar missing; again at
-        // 4,800 pt once it gained the prediction-market card, and at 6,400 pt
+        // 4,800 pt once it gained the prediction-market card, at 6,400 pt
         // once that card listed the coming week's events and the risk card
-        // a section per leg).
-        let terminalWindow = OffscreenWindow(size: CGSize(width: 1_180, height: 9_600), chrome: true)
+        // a section per leg, and at 9,600 pt once a US share's review drew
+        // three rows of tiles for every option leg, 2026-10-09: the overflow
+        // captured the whole page black but for its coloured text).
+        let terminalWindow = OffscreenWindow(size: CGSize(width: 1_180, height: 14_400), chrome: true)
         terminalWindow.contentView = terminal
         terminalWindow.orderFrontRegardless()
         // The first draw of a freshly ordered window lags a beat behind its
@@ -94,6 +96,11 @@ final class UISnapshotter {
                 // sockets and REST reads take several seconds to fill, and a
                 // capture before then shows only "connecting".
                 try await Task.sleep(nanoseconds: 14_000_000_000)
+                if try ingestLiveFixture() {
+                    // What the documents change — the review, what the stream
+                    // watches, which expiries the chain reads — reconnects.
+                    try await Task.sleep(nanoseconds: 12_000_000_000)
+                }
             }
             Log.warn("snapshot: \(page.rawValue) fitting \(terminal.fittingSize) bounds \(terminal.bounds.size)")
             try capture(terminal, name: "terminal-\(page.rawValue)")
@@ -120,6 +127,19 @@ final class UISnapshotter {
         terminalWindow.orderOut(nil)
 
         try await renderCloseTickets()
+    }
+
+    /// Hand the live layer the recorded documents `--live-fixture` names;
+    /// false when there are none.
+    private func ingestLiveFixture() throws -> Bool {
+        guard let url = appState.options.liveFixture, let layer = appState.liveLayer else { return false }
+        struct Document: Decodable { let topic: String; let payload: String }
+        let documents = try JSONDecoder().decode([Document].self, from: Data(contentsOf: url))
+        for document in documents {
+            try layer.ingest(topic: document.topic, payload: document.payload)
+        }
+        Log.warn("snapshot: 体检页前交给实时层 \(documents.count) 份录制文档（\(url.lastPathComponent)）")
+        return true
     }
 
     /// The close ticket on whatever each account holds — a position, or the

@@ -31,16 +31,25 @@ final class IntelligenceCenter {
         var events: [IntelligenceEvent]
     }
 
+    /// What an archive written before the station read the display clock
+    /// still carries (`IntelligenceSettings.Retired`).
+    private struct RetiredArchive: Decodable {
+        var settings: IntelligenceSettings.Retired?
+    }
+
     init(directory: URL, snapshotMode: Bool) {
         self.directory = directory.appendingPathComponent("Intelligence")
         self.snapshotMode = snapshotMode
         let file = self.directory.appendingPathComponent("archive.json")
+        var retiredZone: String?
         if FileManager.default.fileExists(atPath: file.path) {
             do {
-                let archive = try IntelligenceJSON.decoder().decode(Archive.self, from: Data(contentsOf: file))
+                let data = try Data(contentsOf: file)
+                let archive = try IntelligenceJSON.decoder().decode(Archive.self, from: data)
                 settings = archive.settings; statuses = archive.statuses
                 reports = IntelligenceLibrary.canonicalReports(archive.reports)
                 events = archive.events
+                retiredZone = (try? IntelligenceJSON.decoder().decode(RetiredArchive.self, from: data))?.settings?.timezone
             } catch {
                 let backup = self.directory.appendingPathComponent("archive-unreadable-\(UUID().uuidString).json")
                 do {
@@ -52,15 +61,38 @@ final class IntelligenceCenter {
                 }
             }
         }
-        if TimeZone(identifier: settings.timezone) == nil { settings.timezone = "Asia/Taipei" }
         settings.dailyHour = min(23, max(0, settings.dailyHour))
         settings.horizonHours = min(120, max(1, settings.horizonHours))
+        if let retiredZone {
+            // Said once: the archive is written back without it.
+            Log.warn("intelligence: 情报站自己的时区「\(retiredZone)」已并入「显示时区」设置，日报按显示时区的 \(settings.dailyHour) 点")
+            persist()
+        }
+    }
+
+    /// The display zone changed: the daily report's next run is its hour
+    /// on the new clock. The others run by the interval, on no clock.
+    func displayZoneDidChange() {
+        statuses = rescheduled(statuses, settings: settings, kinds: [.daily])
+        persist()
+    }
+
+    private func rescheduled(_ statuses: [IntelligenceKind: IntelligenceJobStatus], settings: IntelligenceSettings,
+                             kinds: [IntelligenceKind] = IntelligenceKind.allCases) -> [IntelligenceKind: IntelligenceJobStatus] {
+        var next = statuses
+        for kind in kinds {
+            var status = next[kind] ?? IntelligenceJobStatus()
+            status.nextRunAt = IntelligenceSchedule.nextRun(kind: kind, now: Date(),
+                lastSuccess: status.lastSuccessAt, settings: settings, timezone: DisplayTime.identifier)
+            next[kind] = status
+        }
+        return next
     }
 
     /// Every screen reads one projection of the archive. Reading it never
     /// changes a report's timestamps or promotes a check into a new analysis.
     func library(now: Date) -> IntelligenceLibrary {
-        IntelligenceLibrary(reports: reports, events: events, now: now, timezone: settings.timezone)
+        IntelligenceLibrary(reports: reports, events: events, now: now, timezone: DisplayTime.identifier)
     }
 
     func start(watchlist: @escaping () -> [String], quote: @escaping (String) -> Ticker?,
@@ -87,24 +119,19 @@ final class IntelligenceCenter {
     }
 
     @discardableResult
-    func updateSettings(dailyHour: Int, timezone: String, horizonHours: Int, model: String, enabled: Bool) -> Bool {
-        guard (0...23).contains(dailyHour), TimeZone(identifier: timezone) != nil,
+    func updateSettings(dailyHour: Int, horizonHours: Int, model: String, enabled: Bool) -> Bool {
+        guard (0...23).contains(dailyHour),
               (1...120).contains(horizonHours), let selectedModel = IntelligenceSettings.normalizeModel(model) else {
-            error = "请填写有效模型名称、时区、0–23 点和 1–120 小时预测周期。"
+            error = "请填写有效模型名称、0–23 点和 1–120 小时预测周期。"
             return false
         }
         var nextSettings = settings
-        nextSettings.dailyHour = dailyHour; nextSettings.timezone = timezone
+        nextSettings.dailyHour = dailyHour
         nextSettings.horizonHours = horizonHours; nextSettings.model = selectedModel
         nextSettings.enabled = enabled
         var nextStatuses = statuses
-        if dailyHour != settings.dailyHour || timezone != settings.timezone || horizonHours != settings.horizonHours {
-            for kind in IntelligenceKind.allCases {
-                var status = nextStatuses[kind] ?? IntelligenceJobStatus()
-                status.nextRunAt = IntelligenceSchedule.nextRun(kind: kind, now: Date(),
-                    lastSuccess: status.lastSuccessAt, settings: nextSettings)
-                nextStatuses[kind] = status
-            }
+        if dailyHour != settings.dailyHour || horizonHours != settings.horizonHours {
+            nextStatuses = rescheduled(statuses, settings: nextSettings)
         }
         do {
             if !snapshotMode {
@@ -128,7 +155,7 @@ final class IntelligenceCenter {
         for kind in order {
             let status = statuses[kind] ?? IntelligenceJobStatus()
             let next = status.nextRunAt ?? IntelligenceSchedule.nextRun(kind: kind, now: now,
-                lastSuccess: status.lastSuccessAt, settings: settings)
+                lastSuccess: status.lastSuccessAt, settings: settings, timezone: DisplayTime.identifier)
             if next <= now { refresh(kind); return }
         }
     }
@@ -164,7 +191,7 @@ final class IntelligenceCenter {
                     }
                 }
                 let request = IntelligenceRequest(kind: kind, now: Date(), settings: capturedSettings,
-                    watchlist: instruments, quotes: quotes,
+                    timezone: DisplayTime.identifier, watchlist: instruments, quotes: quotes,
                     knownEvents: self.events.filter { $0.status == .occurred }.map(IntelligenceKnownEvent.init),
                     venues: self.venues())
                 let report = try await bridge.generate(request)
@@ -206,9 +233,9 @@ final class IntelligenceCenter {
         }
         var merged = Dictionary(events.map { ($0.id, $0) }, uniquingKeysWith: { _, newer in newer })
         for event in report.events { merged[event.id] = event }
-        let dates = IntelligenceSchedule.days(now: now, timezone: settings.timezone)
+        let dates = IntelligenceSchedule.days(now: now, timezone: request.timezone)
         let lower = dates.first ?? now.addingTimeInterval(-7 * 86_400)
-        let upper = IntelligenceSchedule.calendar(timezone: settings.timezone)
+        let upper = IntelligenceSchedule.calendar(timezone: request.timezone)
             .date(byAdding: .day, value: 1, to: dates.last ?? now) ?? now.addingTimeInterval(31 * 86_400)
         let nextEvents = merged.values.filter { $0.occurredAt >= lower && $0.occurredAt < upper }
             .sorted { $0.occurredAt < $1.occurredAt }
@@ -216,7 +243,7 @@ final class IntelligenceCenter {
         status.lastSuccessAt = now; status.error = nil
         status.coverageComplete = report.coverageComplete
         status.nextRunAt = IntelligenceSchedule.nextRun(kind: report.kind, now: now,
-            lastSuccess: report.kind == .daily ? now : request.now, settings: settings)
+            lastSuccess: report.kind == .daily ? now : request.now, settings: settings, timezone: DisplayTime.identifier)
         if report.kind == .flash && report.events.isEmpty {
             status.note = (report.coverageComplete == false
                 ? "来源覆盖不完整；已读取资料中未核验到窗口内新事件，本次静默。"

@@ -600,7 +600,7 @@ public enum PortfolioReview {
                     severity: .info,
                     title: "账单窗口盖不住持仓历史",
                     detail: "\(instId) 有 \(missing.count)/\(ours.count) 笔成交不在交易所账单窗口内"
-                        + "（账单最早回溯到 \(Self.stamp(total.earliestBillAt))），"
+                        + "（账单最早回溯到 \(Self.clock(total.earliestBillAt))），"
                         + "差额无法归因，本轮不比。",
                     remedy: "要长期可核对，就把账单落到本地留存"))
                 continue
@@ -625,13 +625,6 @@ public enum PortfolioReview {
                     + "修完用重放成交的方式把账改回来，不要直接改总数"))
         }
         return findings
-    }
-
-    private static func stamp(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "MM-dd HH:mm"
-        formatter.timeZone = TimeZone(identifier: "Asia/Shanghai")
-        return formatter.string(from: date)
     }
 
     // MARK: Activity
@@ -885,17 +878,11 @@ public enum PortfolioReview {
     // MARK: Formatting
 
     static func clock(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.timeZone = EquityWindow.timeZone
-        formatter.dateFormat = "MM-dd HH:mm"
-        return formatter.string(from: date)
+        DisplayTime.string(date, "MM-dd HH:mm")
     }
 
     static func day(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.timeZone = EquityWindow.timeZone
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.string(from: date)
+        DisplayTime.string(date, "yyyy-MM-dd")
     }
 }
 

@@ -26,6 +26,7 @@ pub mod backtest;
 pub mod calendar;
 pub mod candle;
 pub mod decide;
+pub mod display;
 pub mod expr;
 pub mod fees;
 pub mod ffi;
@@ -44,6 +45,7 @@ pub mod series;
 pub mod sizing;
 pub mod strategy;
 pub mod trade;
+pub mod us_options;
 
 pub use calendar::MarketCalendar;
 pub use candle::Candle;

@@ -433,6 +433,11 @@ public struct ExchangePosition: Sendable, Equatable, Identifiable {
     /// Why the venue's pushed figures stand, when a fresher mark was there
     /// to value at and could not be used.
     public let valuationNote: String?
+    /// What the venue values the position at, in dollars, where it states
+    /// that outright (Schwab's `marketValue`; negative for a short). For an
+    /// option this — the premium on the books — is the price risk, not the
+    /// notional of the underlying it controls.
+    public let marketValueUsd: Double?
 
     public var id: String { instId + posSide.rawValue }
 
@@ -443,8 +448,9 @@ public struct ExchangePosition: Sendable, Equatable, Identifiable {
         margin: Double? = nil, maintenanceMargin: Double? = nil, marginRatio: Double? = nil,
         settlementCurrency: String? = nil, usdRate: Double? = nil, marginMode: MarginMode? = nil,
         unrealisedRatio: Double? = nil, markAt: Date? = nil, isValuedLive: Bool = false,
-        valuationNote: String? = nil
+        valuationNote: String? = nil, marketValueUsd: Double? = nil
     ) {
+        self.marketValueUsd = marketValueUsd
         self.unrealisedRatio = unrealisedRatio
         self.markAt = markAt
         self.isValuedLive = isValuedLive
@@ -476,7 +482,7 @@ public struct ExchangePosition: Sendable, Equatable, Identifiable {
             margin: margin, maintenanceMargin: maintenanceMargin, marginRatio: marginRatio,
             settlementCurrency: settlementCurrency, usdRate: usdRate, marginMode: marginMode,
             unrealisedRatio: unrealisedRatio, markAt: date, isValuedLive: isValuedLive,
-            valuationNote: valuationNote)
+            valuationNote: valuationNote, marketValueUsd: marketValueUsd)
     }
 
     /// `unrealisedPnL` in dollars, or nil when the venue gave nothing to
@@ -508,6 +514,7 @@ public struct ExchangePosition: Sendable, Equatable, Identifiable {
         case "SWAP": return "永续"
         case "FUTURES": return "交割"
         case "OPTION": return "期权"
+        case "STOCK": return "股票"
         case "MARGIN": return "杠杆"
         case "SPOT": return "现货"
         default: return instType.isEmpty ? "—" : instType

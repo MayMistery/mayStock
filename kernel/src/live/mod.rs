@@ -40,6 +40,8 @@ mod polymarket;
 mod reactions;
 mod rest;
 mod schwab;
+pub mod schwab_account;
+mod schwab_chain;
 mod socket;
 mod state;
 
@@ -98,6 +100,37 @@ pub struct LiveConfig {
     /// nothing gets the whole layer, as it always has.
     #[serde(default = "yes")]
     pub analytics: bool,
+    /// Which market `inst_id` is in: an OKX perpetual (`crypto`), or a US
+    /// share whose listed options Schwab carries (`usEquity`, `inst_id` its
+    /// ticker).
+    #[serde(default)]
+    pub review_market: Market,
+    /// The zone every time the layer writes into its texts is read in, and
+    /// its name (`display`).
+    #[serde(default)]
+    pub display_zone: crate::display::DisplayZone,
+}
+
+/// The markets the checkup reviews, each with its own sources: a coin's
+/// perpetual on OKX with the coin's four option venues, or a US share with
+/// its listed options read from Schwab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, serde::Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum Market {
+    #[default]
+    Crypto,
+    UsEquity,
+}
+
+impl Market {
+    pub const ALL: [Market; 2] = [Market::Crypto, Market::UsEquity];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Market::Crypto => "crypto",
+            Market::UsEquity => "usEquity",
+        }
+    }
 }
 
 fn yes() -> bool {
@@ -145,11 +178,13 @@ pub enum Feed {
     Clock,
     Yahoo,
     Polymarket,
+    /// The US underlying under review's option chain, read from Schwab.
+    SchwabChain,
 }
 
 impl Feed {
     /// Every feed, for anything that has to cover them all.
-    pub const ALL: [Feed; 17] = [
+    pub const ALL: [Feed; 18] = [
         Feed::OkxPublic,
         Feed::OkxPrivate,
         Feed::OkxOrders,
@@ -167,6 +202,7 @@ impl Feed {
         Feed::Clock,
         Feed::Yahoo,
         Feed::Polymarket,
+        Feed::SchwabChain,
     ];
 
     pub fn id(self) -> &'static str {
@@ -188,6 +224,7 @@ impl Feed {
             Feed::Clock => "clock",
             Feed::Yahoo => "yahoo",
             Feed::Polymarket => "polymarket",
+            Feed::SchwabChain => "schwab.chain",
         }
     }
 
@@ -210,6 +247,7 @@ impl Feed {
             Feed::Clock => "时钟校准",
             Feed::Yahoo => "Yahoo 分钟线（回落）",
             Feed::Polymarket => "Polymarket 预测市场",
+            Feed::SchwabChain => "嘉信期权链",
         }
     }
 
@@ -223,7 +261,7 @@ impl Feed {
             | Feed::OkxHistory | Feed::Clock => Some("OKX"),
             Feed::Deribit => Some("Deribit"),
             Feed::BinanceStream | Feed::BinanceHistory | Feed::BinanceOpenInterest => Some("Binance"),
-            Feed::Schwab => Some("嘉信"),
+            Feed::Schwab | Feed::SchwabChain => Some("嘉信"),
             Feed::Yahoo => Some("Yahoo"),
             Feed::Polymarket => Some("Polymarket"),
             Feed::OptionBook => None,
@@ -279,6 +317,22 @@ impl Feed {
             // One request per topic, all at once; the prices are context
             // for the page, not a timing signal, so a minute is plenty.
             Feed::Polymarket => Duration::from_secs(60),
+            // A window of the chain is 1–6 MB (2026-10-09); the held
+            // contracts' own quotes stream, so the smile and the open
+            // interest are read on a slower clock than the quotes.
+            Feed::SchwabChain => Duration::from_secs(30),
+        }
+    }
+
+    /// The market whose review this feed serves; None for one every review
+    /// reads (the account, the macro tape, the clock).
+    pub fn market(self) -> Option<Market> {
+        match self {
+            Feed::OkxPublic | Feed::Deribit | Feed::BinanceStream | Feed::OptionBook | Feed::OkxHistory | Feed::BinanceHistory
+            | Feed::BinanceOpenInterest => Some(Market::Crypto),
+            Feed::SchwabChain => Some(Market::UsEquity),
+            Feed::OkxPrivate | Feed::OkxOrders | Feed::OkxOrderEvents | Feed::OkxMarks | Feed::OkxTransfers | Feed::OkxBook
+            | Feed::Schwab | Feed::Clock | Feed::Yahoo | Feed::Polymarket => None,
         }
     }
 
@@ -313,13 +367,42 @@ pub enum Renewal {
     /// socket is down (`ms_live_rest_fallback_ms`, which the app's loop
     /// sleeps by).
     RestFallback,
+    /// The app's read of an account it polls (Schwab's): every ten seconds
+    /// while it holds anything priced, every minute while it holds cash
+    /// alone (`AccountReading.pollInterval`, which reads these).
+    PolledPriced,
+    PolledCash,
+    /// The app's slower refresh of what a polled account is holding open —
+    /// its working orders (`AppState.accountRefreshInterval`).
+    AccountRefresh,
 }
 
 impl Renewal {
     /// Every renewal that is not a feed's frames, for anything that has to
     /// cover them all alongside `Feed::ALL`.
-    pub const OWN_CLOCKS: [Renewal; 5] =
-        [Renewal::OkxMark, Renewal::OkxFunding, Renewal::OkxOpenInterest, Renewal::Bucket, Renewal::RestFallback];
+    pub const OWN_CLOCKS: [Renewal; 8] = [
+        Renewal::OkxMark,
+        Renewal::OkxFunding,
+        Renewal::OkxOpenInterest,
+        Renewal::Bucket,
+        Renewal::RestFallback,
+        Renewal::PolledPriced,
+        Renewal::PolledCash,
+        Renewal::AccountRefresh,
+    ];
+
+    /// The app's own clocks, by the name it asks for them under
+    /// (`ms_live_renewal_ms`), so a loop the app runs sleeps by the interval
+    /// the kernel ages its readings by.
+    pub fn app_clock(name: &str) -> Option<Renewal> {
+        match name {
+            "restFallback" => Some(Renewal::RestFallback),
+            "polledPriced" => Some(Renewal::PolledPriced),
+            "polledCash" => Some(Renewal::PolledCash),
+            "accountRefresh" => Some(Renewal::AccountRefresh),
+            _ => None,
+        }
+    }
 
     pub fn interval(self) -> Duration {
         match self {
@@ -329,6 +412,9 @@ impl Renewal {
             Renewal::OkxOpenInterest => Duration::from_secs(16),
             Renewal::Bucket => Duration::from_secs(300),
             Renewal::RestFallback => Duration::from_secs(10),
+            Renewal::PolledPriced => Duration::from_secs(10),
+            Renewal::PolledCash => Duration::from_secs(60),
+            Renewal::AccountRefresh => Duration::from_secs(300),
         }
     }
 
@@ -486,6 +572,15 @@ struct Tasks {
     instrument: Vec<AbortHandle>,
     base: Vec<AbortHandle>,
     fixed: Vec<AbortHandle>,
+    /// Schwab's quote stream: the macro tape, and the US review's share and
+    /// contracts — restarted whenever what the state wants watched differs
+    /// from `watching`, what the running stream was started with.
+    schwab: Vec<AbortHandle>,
+    watching: Option<schwab::Watch>,
+    /// A US review's option chain, and the underlying and held expiries the
+    /// running poller reads — restarted the same way.
+    chain: Vec<AbortHandle>,
+    chain_scope: Option<(String, Vec<chrono::NaiveDate>)>,
     // The account: always.
     account: Vec<AbortHandle>,
     /// The held instruments' marks and terms, restarted when what is held
@@ -509,6 +604,17 @@ impl Tasks {
         Self::abort(&mut self.instrument);
         Self::abort(&mut self.base);
         Self::abort(&mut self.fixed);
+        Self::abort(&mut self.schwab);
+        self.watching = None;
+        self.abort_review();
+    }
+
+    /// What reads the instrument under review, whichever market it is in.
+    fn abort_review(&mut self) {
+        Self::abort(&mut self.instrument);
+        Self::abort(&mut self.base);
+        Self::abort(&mut self.chain);
+        self.chain_scope = None;
     }
     fn abort_all(&mut self) {
         self.abort_analytics();
@@ -575,6 +681,8 @@ async fn supervise(
                             (true, true) if next.schwabctl_path != previous.schwabctl_path => {
                                 Tasks::abort(&mut tasks.fixed);
                                 spawn_analytics_fixed(&mut tasks, &updates_tx, http.clone(), &next, &state);
+                                spawn_schwab(&mut tasks, &updates_tx, http.clone(), &state);
+                                spawn_review(&mut tasks, &updates_tx, http.clone(), &state);
                             }
                             _ => {}
                         }
@@ -653,6 +761,9 @@ pub(crate) enum Effect {
     BalanceMoved,
     /// An order push said something changed: read the orders now.
     OrdersChanged,
+    /// The review moved to another market, or to another US underlying:
+    /// restart what reads the review.
+    ReviewChanged,
 }
 
 fn follow(
@@ -681,13 +792,26 @@ fn follow(
     if !state.config.analytics {
         return;
     }
-    if effects.contains(&Effect::BaseChanged) {
-        Tasks::abort(&mut tasks.base);
-        spawn_base(tasks, updates, http.clone(), state);
+    if effects.contains(&Effect::ReviewChanged) {
+        spawn_review(tasks, updates, http.clone(), state);
+    } else {
+        if effects.contains(&Effect::BaseChanged) {
+            Tasks::abort(&mut tasks.base);
+            spawn_base(tasks, updates, http.clone(), state);
+        }
+        if effects.contains(&Effect::InstrumentChanged) || effects.contains(&Effect::BaseChanged) {
+            Tasks::abort(&mut tasks.instrument);
+            spawn_instrument(tasks, updates, http.clone(), state);
+        }
     }
-    if effects.contains(&Effect::InstrumentChanged) || effects.contains(&Effect::BaseChanged) {
-        Tasks::abort(&mut tasks.instrument);
-        spawn_instrument(tasks, updates, http, state);
+    // What is watched and which expiries the chain covers follow from what
+    // is held and reviewed; whatever changed them, the running tasks are
+    // brought in line here, once.
+    if tasks.watching.as_ref() != Some(&state.schwab_watch()) {
+        spawn_schwab(tasks, updates, http.clone(), state);
+    }
+    if state.market == Market::UsEquity && tasks.chain_scope != state.chain_scope() {
+        spawn_review(tasks, updates, http, state);
     }
 }
 
@@ -703,22 +827,63 @@ fn spawn_clock(tasks: &mut Tasks, updates: &mpsc::Sender<Update>, http: Option<r
 fn spawn_analytics(tasks: &mut Tasks, updates: &mpsc::Sender<Update>, http: Option<reqwest::Client>, config: &LiveConfig, state: &State) {
     tasks.abort_analytics();
     spawn_analytics_fixed(tasks, updates, http.clone(), config, state);
-    spawn_base(tasks, updates, http.clone(), state);
-    spawn_instrument(tasks, updates, http, state);
+    spawn_schwab(tasks, updates, http.clone(), state);
+    spawn_review(tasks, updates, http, state);
 }
 
 fn spawn_analytics_fixed(tasks: &mut Tasks, updates: &mpsc::Sender<Update>, http: Option<reqwest::Client>, config: &LiveConfig, state: &State) {
     let Some(http) = http else { return };
     tasks.fixed.push(tokio::spawn(rest::polymarket(http.clone(), updates.clone())).abort_handle());
     match config.schwabctl_path.as_deref().filter(|p| !p.is_empty()) {
-        Some(path) => {
-            let dialect = schwab::Dialect::new(path.to_string(), http.clone());
-            tasks.fixed.push(tokio::spawn(socket::run(dialect, updates.clone())).abort_handle());
+        Some(_) => {
             let live = state.schwab_live_flag();
             tasks.fixed.push(tokio::spawn(rest::yahoo_when_schwab_is_down(http, updates.clone(), live)).abort_handle());
         }
         None => {
             tasks.fixed.push(tokio::spawn(rest::yahoo(http, updates.clone(), "未配置 schwabctl")).abort_handle());
+        }
+    }
+}
+
+/// Schwab's quote stream, carrying the tape and whatever the review
+/// watches. One connection a user (Schwab's rule), so a change of what it
+/// watches reconnects it.
+fn spawn_schwab(tasks: &mut Tasks, updates: &mpsc::Sender<Update>, http: Option<reqwest::Client>, state: &State) {
+    Tasks::abort(&mut tasks.schwab);
+    let watch = state.schwab_watch();
+    tasks.watching = Some(watch.clone());
+    let (Some(http), Some(path)) = (http, state.config.schwabctl_path.as_deref().filter(|p| !p.is_empty())) else { return };
+    let dialect = schwab::Dialect::new(path.to_string(), http, watch);
+    tasks.schwab.push(tokio::spawn(socket::run(dialect, updates.clone())).abort_handle());
+}
+
+/// What reads the instrument under review: a coin's option venues and its
+/// perpetual's sockets, or a US share's option chain.
+fn spawn_review(tasks: &mut Tasks, updates: &mpsc::Sender<Update>, http: Option<reqwest::Client>, state: &State) {
+    tasks.abort_review();
+    match state.market {
+        Market::Crypto => {
+            spawn_base(tasks, updates, http.clone(), state);
+            spawn_instrument(tasks, updates, http, state);
+        }
+        Market::UsEquity => {
+            tasks.chain_scope = state.chain_scope();
+            let (Some(http), Some((symbol, held))) = (http, state.chain_scope()) else { return };
+            match state.config.schwabctl_path.as_deref().filter(|p| !p.is_empty()) {
+                Some(path) => {
+                    let poll = schwab_chain::poll(http, updates.clone(), path.to_string(), symbol, held);
+                    tasks.chain.push(tokio::spawn(poll).abort_handle());
+                }
+                None => {
+                    let updates = updates.clone();
+                    tasks.chain.push(
+                        tokio::spawn(async move {
+                            socket::health(&updates, Feed::SchwabChain, FeedState::Off("未配置 schwabctl，读不到美股期权链".into())).await;
+                        })
+                        .abort_handle(),
+                    );
+                }
+            }
         }
     }
 }

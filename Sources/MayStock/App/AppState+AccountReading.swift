@@ -7,6 +7,83 @@ import MayStockKit
 /// describe the same figure two ways.
 extension AppState {
 
+    /// What the live layer is told about a venue's account.
+    enum LiveAccountHandoff {
+        /// A reading, which carries its own document.
+        case reading(AccountReading)
+        /// The latest read failed: the last reading stays, labelled.
+        case failed(String)
+        /// Nothing read before may be shown — a logout, a switch of account.
+        case cleared(String?)
+    }
+
+    /// Hand a venue's account reading to the live layer, for a venue the
+    /// layer does not read itself (`Venue.liveAccountTopic`): the same
+    /// reading every other screen shows, so the checkup's figures are this
+    /// one reading's rather than a second read on a clock of its own.
+    func handAccountToLiveLayer(_ venue: Venue, _ handoff: LiveAccountHandoff) {
+        guard let liveLayer, let topic = venue.liveAccountTopic else { return }
+        let payload: String
+        switch handoff {
+        case .reading(let reading):
+            guard let document = reading.liveDocument else {
+                Log.warn("live: \(venue.displayName)的账户读数没有带给实时层的文档，体检里不会更新")
+                return
+            }
+            payload = document.payload
+        case .failed(let why):
+            payload = Self.json(["error": why])
+        case .cleared(let reason):
+            payload = Self.json(["cleared": reason ?? "账户读数已清空"])
+        }
+        do {
+            try liveLayer.ingest(topic: topic, payload: payload)
+        } catch {
+            Log.warn("live: 把\(venue.displayName)账户读数交给实时层失败：\(error)")
+        }
+    }
+
+    /// What the live layer is told about a venue's working orders.
+    enum LiveOrdersHandoff {
+        case read([ExchangeOpenOrder])
+        case failed(String)
+    }
+
+    /// Hand the working orders just read to the live layer, for a venue
+    /// whose orders it does not read itself: the checkup lists a holding's
+    /// stops from the same listing the overview shows.
+    func handOrdersToLiveLayer(_ venue: Venue, _ handoff: LiveOrdersHandoff) {
+        guard let liveLayer, let topic = venue.liveOrdersTopic else { return }
+        let payload: String
+        switch handoff {
+        case .read(let orders):
+            let rows: [[String: Any]] = orders.map { order in
+                var row: [String: Any] = [
+                    "id": order.id, "instId": order.instId, "ordType": order.ordType, "side": order.side.rawValue,
+                    "filledSize": order.filledSize, "state": order.state, "reduceOnly": order.reduceOnly,
+                ]
+                if let price = order.price { row["price"] = price }
+                if let stop = order.stopTriggerPrice ?? order.triggerPrice { row["stopPrice"] = stop }
+                if let size = order.size { row["size"] = size }
+                return row
+            }
+            let object: [String: Any] = ["orders": rows]
+            payload = (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]))
+                .map { String(decoding: $0, as: UTF8.self) } ?? "{}"
+        case .failed(let why):
+            payload = Self.json(["error": why])
+        }
+        do {
+            try liveLayer.ingest(topic: topic, payload: payload)
+        } catch {
+            Log.warn("live: 把\(venue.displayName)挂单交给实时层失败：\(error)")
+        }
+    }
+
+    private static func json(_ object: [String: String]) -> String {
+        (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])).map { String(decoding: $0, as: UTF8.self) } ?? "{}"
+    }
+
     /// Past this, a venue's equity reads amber: the age its reading carries
     /// (`VenueBooks.equityStaleAfter`) — a few intervals of whatever renews
     /// it, the marks' stream, the REST fallback or the poll, by the one rule

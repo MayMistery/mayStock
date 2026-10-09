@@ -376,8 +376,7 @@ private struct InstrumentDetail: View {
             case .candles:
                 let display = session.displayCandles
                 let isStale = session.isBackfilling && !display.candles.isEmpty
-                CandleChartView(candles: display.candles, bar: display.bar, decimals: decimals,
-                                timeZone: venue.tradesContinuously ? .current : venue.timeZone)
+                CandleChartView(candles: display.candles, bar: display.bar, decimals: decimals, venue: venue)
                     .opacity(isStale ? 0.45 : 1)
                 if isStale { ChartLoadingBadge(text: "加载 \(session.bar.rawValue)…") }
             case .depth:
@@ -416,7 +415,7 @@ private struct InstrumentDetail: View {
                              caption: "价差 " + PriceFormatter.price(ask - bid, decimals: decimals))
                 }
                 StatTile(label: "时段", value: session.marketPhase?.displayName ?? "—",
-                         caption: "纽约 09:30–16:00")
+                         caption: USSessionHours.displayedHours(\.regular))
             }
         }
     }

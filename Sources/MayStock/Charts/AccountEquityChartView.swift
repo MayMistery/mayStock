@@ -119,7 +119,7 @@ struct AccountEquityChartView: View {
         let change = point.equity - domain.reference
         let pct = domain.reference > 0 ? change / domain.reference * 100 : 0
         var items: [ChartLegendItem] = [
-            ChartLegendItem(key: "t", value: ChartFormatters.string(point.ts, "MM-dd HH:mm"),
+            ChartLegendItem(key: "t", value: DisplayTime.string(point.ts, "MM-dd HH:mm"),
                             tint: .secondary, priority: 5),
             ChartLegendItem(key: "e", label: "权益", value: PriceFormatter.money(point.equity), priority: 10),
             .trend("d", label: window.label, value: PriceFormatter.signedMoney(change, decimals: 0),
@@ -148,12 +148,12 @@ struct AccountEquityChartView: View {
                              at: CGPoint(x: geometry.plotWidth + 5, y: y), anchor: .leading)
         }
         let format = ChartMath.timeAxisFormat(span: domain.span)
-        for tick in ChartMath.timeTicks(from: domain.start, to: domain.end, maxLabels: 6) {
+        for tick in ChartMath.timeTicks(from: domain.start, to: domain.end, maxLabels: 6, timeZone: DisplayTime.zone) {
             let x = domain.x(tick)
             guard x > 14, x < geometry.plotWidth - 14 else { continue }
             context.strokeLine(from: CGPoint(x: x, y: geometry.top), to: CGPoint(x: x, y: geometry.bottom),
                                color: ChartStyle.grid)
-            context.drawText(ChartFormatters.string(tick, format), font: ChartStyle.axisFont,
+            context.drawText(DisplayTime.string(tick, format), font: ChartStyle.axisFont,
                              color: ChartStyle.axisLabel,
                              at: CGPoint(x: x, y: geometry.axisBaseline), anchor: .bottom)
         }
@@ -209,7 +209,7 @@ struct AccountEquityChartView: View {
             context.fill(Path(ellipseIn: CGRect(x: x - 3, y: y - 3, width: 6, height: 6)), with: .color(color))
             context.drawPriceTag(PriceFormatter.money(sample.equity, decimals: 0), y: y, geometry: geometry,
                                  fill: ChartStyle.tagFill, text: ChartStyle.tagText)
-            context.drawTimeTag(ChartFormatters.string(sample.ts, "MM-dd HH:mm"), x: x, geometry: geometry,
+            context.drawTimeTag(DisplayTime.string(sample.ts, "MM-dd HH:mm"), x: x, geometry: geometry,
                                 fill: ChartStyle.tagFill, text: ChartStyle.tagText)
         }
     }

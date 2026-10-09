@@ -27,46 +27,18 @@ enum ChartStyle {
     static let plotTopInset: CGFloat = 7
 }
 
-/// Pre-built, locale-stable date formatters. Charts redraw on every tick, so
-/// they must never allocate a `DateFormatter` inside the draw path.
+/// Chart time labels. A label in the display zone comes from `DisplayTime`,
+/// whose formatters are built once per zone: charts redraw on every tick and
+/// must not allocate a formatter per label. A bar named for a venue's day
+/// (`ChartMath.labelZone`) on another clock builds one per call — a handful
+/// of labels a frame, and only on day bars.
 enum ChartFormatters {
-    static let formats = [
-        "HH:mm:ss", "HH:mm", "MM-dd", "MM-dd HH:mm", "MM-dd HH:mm:ss", "yyyy-MM", "yyyy",
-    ]
-
-    private static let cache: [String: DateFormatter] = {
-        var built: [String: DateFormatter] = [:]
-        for format in formats {
-            let formatter = DateFormatter()
-            formatter.locale = Locale(identifier: "en_US_POSIX")
-            formatter.dateFormat = format
-            built[format] = formatter
-        }
-        return built
-    }()
-
-    private static let fallback: DateFormatter = {
+    static func string(_ date: Date, _ format: String, zone: TimeZone) -> String {
+        if zone == DisplayTime.zone { return DisplayTime.string(date, format) }
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "HH:mm"
-        return formatter
-    }()
-
-    static func string(_ date: Date, _ format: String) -> String {
-        (cache[format] ?? fallback).string(from: date)
-    }
-
-    /// The same, in another clock. A stock chart labels New York time: its
-    /// session runs 09:30–16:00 there, and a label in the viewer's zone would
-    /// put the open at an hour that means nothing on the tape. Formatters
-    /// for other zones are built per call — only the axis and the crosshair
-    /// ask, a handful of labels per frame.
-    static func string(_ date: Date, _ format: String, timeZone: TimeZone) -> String {
-        guard timeZone != .current else { return string(date, format) }
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = timeZone
-        formatter.dateFormat = formats.contains(format) ? format : "HH:mm"
+        formatter.timeZone = zone
+        formatter.dateFormat = format
         return formatter.string(from: date)
     }
 }

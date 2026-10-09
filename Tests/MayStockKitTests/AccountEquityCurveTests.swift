@@ -228,7 +228,7 @@ struct TrailingReturnTests {
     /// Formats an instant in the book's own zone, for readable assertions.
     private func singapore(_ date: Date, _ format: String = "yyyy-MM-dd HH:mm") -> String {
         let formatter = DateFormatter()
-        formatter.timeZone = EquityWindow.timeZone
+        formatter.timeZone = Venue.okx.dayZone
         // Pinned, or the weekday reads back in whatever language the machine
         // running the tests happens to be set to.
         formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -253,6 +253,18 @@ struct TrailingReturnTests {
         // And on the Monday itself the week starts that morning, not a week back.
         let monday = at(-2 * 24 * 60)        // same clock time, two days earlier
         #expect(singapore(EquityWindow.day7.anchor(now: monday)) == "2023-11-13 00:00")
+    }
+
+    /// The tooltip writes where a window starts on the display clock — the
+    /// default, Singapore: no test changes the process's display zone — and,
+    /// where the venue's day turns over at another hour, which midnight it is.
+    @Test("窗口说明按显示时区写起点；嘉信的一天另注纽约 0 点")
+    func theWindowLabelWritesItsStartOnTheDisplayClock() {
+        let now = at(0)   // 2023-11-15 06:13 Singapore; New York on standard time
+        #expect(EquityWindow.day1.longLabel(for: .okx, now: now) == "今日（新加坡时间 11-15 00:00 起）")
+        #expect(EquityWindow.day1.longLabel(for: .schwab, now: now) == "今日（新加坡时间 11-14 13:00 起，即纽约时间 0 点）")
+        #expect(EquityWindow.day7.longLabel(for: .schwab, now: now) == "本周（新加坡时间 11-13 13:00 起，即纽约时间周一 0 点）")
+        #expect(EquityWindow.hour1.longLabel(for: .schwab, now: now) == "最近 1 小时（滚动）")
     }
 
     @Test("开机一秒后三个窗口都有值，而不是空")

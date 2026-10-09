@@ -28,10 +28,10 @@ struct KernelTradingTests {
             reduceOnly: true, cancelWithPosition: false, clientId: "ms2", kind: .chase(maxChaseRatio: 0.002))),
         .placeAlgo(TradeAlgoSpec(
             instId: "ETH-USDT-SWAP", instType: .swap, side: .buy, posSide: .short, size: 10, tradeMode: "cross",
-            reduceOnly: true, cancelWithPosition: true, kind: .protection(takeProfit: 2500, stopLoss: 2900))),
+            reduceOnly: true, cancelWithPosition: true, kind: .protection(takeProfit: 2500, stopLoss: 2900, trigger: .last))),
         .placeAlgo(TradeAlgoSpec(
             instId: "ETH-USDT", instType: .spot, side: .sell, posSide: nil, size: 0.04, tradeMode: "cash",
-            reduceOnly: false, cancelWithPosition: false, kind: .protection(takeProfit: nil, stopLoss: 2500))),
+            reduceOnly: false, cancelWithPosition: false, kind: .protection(takeProfit: nil, stopLoss: 2500, trigger: .last))),
         .cancel(instId: "ETH-USDT-SWAP", orderId: "123"),
         .cancelAlgo(instId: "ETH-USDT-SWAP", algoId: "9"),
         .amendStop(instId: "ETH-USDT-SWAP", algoId: "9", stop: 2610.5),

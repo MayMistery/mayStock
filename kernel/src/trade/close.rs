@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use super::margin::{self, MarginError};
 use super::reads::{FeeRates, WorkingOrder};
 use super::terms::{self, Terms};
-use super::wire::{self, Action, AlgoKind, AlgoSpec, Family, OrderKind, OrderSpec, PosSide, Side, WireRequest};
+use super::wire::{self, Action, AlgoKind, AlgoSpec, Family, OrderKind, OrderSpec, PosSide, Side, Trigger, WireRequest};
 use crate::live::book::{Px, Spec, PUBLISHED_DEPTH};
 
 pub use super::terms::Money;
@@ -108,6 +108,30 @@ pub struct Capabilities {
     pub price_sources: Vec<SourceKind>,
     /// Levels of the book the venue shows; 1 is the touch alone.
     pub book_depth: usize,
+    /// What a stop on this family watches.
+    pub stop_basis: StopBasis,
+}
+
+/// What a stop watches, as a venue offers it for a family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StopBasis {
+    /// The last trade.
+    Last,
+    /// The side the close fills into: the bid for a sale, the ask for a
+    /// buy-back. Where trades are sparse — a listed option can go an hour
+    /// without one — a stop on the last trade waits for a print that may come
+    /// long after the quote has gone through it.
+    ExitSide,
+}
+
+impl StopBasis {
+    fn trigger(self, side: Side) -> Trigger {
+        match self {
+            StopBasis::Last => Trigger::Last,
+            StopBasis::ExitSide => Trigger::exit_side(side),
+        }
+    }
 }
 
 impl Capabilities {
@@ -121,6 +145,7 @@ impl Capabilities {
             limit_kinds: Vec::new(),
             price_sources: Vec::new(),
             book_depth: 0,
+            stop_basis: StopBasis::Last,
         }
     }
 
@@ -159,6 +184,7 @@ pub fn capabilities(venue: Venue, family: Family) -> Capabilities {
             limit_kinds: okx_limits,
             price_sources: ALL_SOURCES.to_vec(),
             book_depth: PUBLISHED_DEPTH,
+            stop_basis: StopBasis::Last,
         },
         (Venue::Okx, Family::Spot) => Capabilities {
             market: Availability::yes(),
@@ -169,6 +195,7 @@ pub fn capabilities(venue: Venue, family: Family) -> Capabilities {
             limit_kinds: okx_limits,
             price_sources: ALL_SOURCES.to_vec(),
             book_depth: PUBLISHED_DEPTH,
+            stop_basis: StopBasis::Last,
         },
         (Venue::Okx, Family::Option) => {
             let no_algo = "OKX 期权没有策略委托簿，止盈止损和追逐限价都挂不了";
@@ -181,6 +208,7 @@ pub fn capabilities(venue: Venue, family: Family) -> Capabilities {
                 limit_kinds: okx_limits,
                 price_sources: ALL_SOURCES.to_vec(),
                 book_depth: PUBLISHED_DEPTH,
+                stop_basis: StopBasis::Last,
             }
         }
         (Venue::Okx, Family::Stock) => Capabilities::none("OKX 不交易股票"),
@@ -193,8 +221,20 @@ pub fn capabilities(venue: Venue, family: Family) -> Capabilities {
             limit_kinds: vec![OrderKind::Limit],
             price_sources: ALL_SOURCES.to_vec(),
             book_depth: 1,
+            stop_basis: StopBasis::Last,
         },
-        (Venue::Schwab, _) => Capabilities::none("嘉信只交易股票"),
+        (Venue::Schwab, Family::Option) => Capabilities {
+            market: Availability::no("期权盘口薄，市价单会按对手任意报价成交；请用限价"),
+            limit: Availability::yes(),
+            chase: Availability::no("嘉信没有追逐限价单"),
+            take_profit: Availability::no("嘉信通道只挂止损单；要在目标价卖出请用限价"),
+            stop_loss: Availability::yes(),
+            limit_kinds: vec![OrderKind::Limit],
+            price_sources: ALL_SOURCES.to_vec(),
+            book_depth: 1,
+            stop_basis: StopBasis::ExitSide,
+        },
+        (Venue::Schwab, Family::Swap | Family::Spot) => Capabilities::none("嘉信只交易股票和期权"),
     }
 }
 
@@ -490,8 +530,15 @@ impl Market {
         }
     }
 
-    fn tick(&self) -> f64 {
-        self.terms.as_ref().map_or(0.0, |t| t.tick)
+    /// Snap `price` to the step that applies where it lands, towards the
+    /// holder when `up` for a sale. A price snapped across a band edge is
+    /// snapped again on the band it landed in: 2.999 on a penny option goes
+    /// to 3.00, which is a nickel.
+    fn snap(&self, price: f64, up: bool) -> f64 {
+        let Some(terms) = self.terms.as_ref() else { return price };
+        let first = snap(price, terms.tick_at(price), up);
+        let landed = terms.tick_at(first);
+        if (landed - terms.tick_at(price)).abs() > 1e-12 { snap(first, landed, up) } else { first }
     }
 
     fn format(&self, price: f64) -> String {
@@ -638,7 +685,8 @@ pub enum CloseError {
     ChaseOutOfRange(f64),
     NoProtectionLeg,
     LegUnavailable(String),
-    NoReferencePrice,
+    /// What the triggers watch has no price to check them against.
+    NoReferencePrice(&'static str),
     TakeProfitWrongSide { price: String, reference: String, is_long: bool },
     StopLossWrongSide { price: String, reference: String, is_long: bool },
     StopLossBeyondLiquidation { price: String, liquidation: String, is_long: bool },
@@ -670,11 +718,11 @@ impl std::fmt::Display for CloseError {
             }
             CloseError::NoProtectionLeg => write!(f, "止盈价和止损价至少填一个"),
             CloseError::LegUnavailable(reason) => write!(f, "{reason}"),
-            CloseError::NoReferencePrice => write!(f, "读不到最新成交价，无法核对止盈止损在现价的哪一边"),
+            CloseError::NoReferencePrice(watched) => write!(f, "读不到{watched}，无法核对止盈止损在现价的哪一边"),
             CloseError::TakeProfitWrongSide { price, reference, is_long } => write!(
-                f, "止盈价 {price} 要{}最新价 {reference}，否则一挂上就触发", if *is_long { "高于" } else { "低于" }),
+                f, "止盈价 {price} 要{}现价 {reference}，否则一挂上就触发", if *is_long { "高于" } else { "低于" }),
             CloseError::StopLossWrongSide { price, reference, is_long } => write!(
-                f, "止损价 {price} 要{}最新价 {reference}，否则一挂上就触发", if *is_long { "低于" } else { "高于" }),
+                f, "止损价 {price} 要{}现价 {reference}，否则一挂上就触发", if *is_long { "低于" } else { "高于" }),
             CloseError::StopLossBeyondLiquidation { price, liquidation, is_long } => write!(
                 f, "止损价 {price} 在强平价 {liquidation} {}，仓位会先被强平，这张止损永远等不到触发", if *is_long { "之下" } else { "之上" }),
             CloseError::Wire(why) => write!(f, "{why}"),
@@ -818,14 +866,20 @@ pub fn plan(input: &PlanInput, book: &BookView) -> Result<ClosePlan, CloseError>
             if stop_loss.is_some() && !capabilities.stop_loss.available {
                 return Err(CloseError::LegUnavailable(format!("止损不可用：{}", capabilities.stop_loss.reason.clone().unwrap_or_default())));
             }
-            // Triggers fire on the last trade.
-            let reference = market.last.or(market.mid()).ok_or(CloseError::NoReferencePrice)?;
+            // Triggers fire on what this family's stops watch: the last trade,
+            // or the side of the book the close fills into.
+            let trigger = capabilities.stop_basis.trigger(side);
+            let reference = match trigger {
+                Trigger::Last => market.last.or(market.mid()),
+                Trigger::Bid => market.bids.first().map(|l| l.px),
+                Trigger::Ask => market.asks.first().map(|l| l.px),
+            }
+            .ok_or(CloseError::NoReferencePrice(trigger.name()))?;
             let is_long = holding.is_long;
-            let tick = market.tick();
             // Each trigger snapped towards its own side of the market, so
             // snapping never moves one across the price.
-            let target = take_profit.map(|p| snap(p, tick, is_long));
-            let stop = stop_loss.map(|p| snap(p, tick, !is_long));
+            let target = take_profit.map(|p| market.snap(p, is_long));
+            let stop = stop_loss.map(|p| market.snap(p, !is_long));
             if let Some(target) = target {
                 if if is_long { target <= reference } else { target >= reference } {
                     return Err(CloseError::TakeProfitWrongSide { price: market.format(target), reference: market.format(reference), is_long });
@@ -859,7 +913,8 @@ pub fn plan(input: &PlanInput, book: &BookView) -> Result<ClosePlan, CloseError>
             }
             let tied = holding.family == Family::Swap && input.account.as_ref().is_some_and(Account::stops_follow_position);
             lines.push(format!(
-                "按最新成交价触发（现 {}），触发后市价成交。{}",
+                "按{}触发（现 {}），触发后市价成交。{}",
+                trigger.name(),
                 market.format(reference),
                 if target.is_some() && stop.is_some() { "两边互斥：一边触发，另一边自动撤销。" } else { "" }));
             if tied {
@@ -886,7 +941,7 @@ pub fn plan(input: &PlanInput, book: &BookView) -> Result<ClosePlan, CloseError>
                 reduce_only,
                 cancel_with_position: tied,
                 client_id: input.client_id.clone(),
-                kind: AlgoKind::Protection { take_profit: target, stop_loss: stop },
+                kind: AlgoKind::Protection { take_profit: target, stop_loss: stop, trigger },
             };
             (Action::PlaceAlgo { algo }, how)
         }
@@ -997,10 +1052,17 @@ pub fn plan(input: &PlanInput, book: &BookView) -> Result<ClosePlan, CloseError>
         remainder,
         price: resolved,
         estimate,
-        review: Review { headline: format!("{} {} {size_text} · {how}", holding.action_label(), holding.inst_id), lines, warnings },
+        review: Review { headline: format!("{} {} {size_text} · {how}", holding.action_label(), display_name(&holding.inst_id)), lines, warnings },
         book_seq: market.seq,
         book_exchange_ms: market.exchange_ms,
     })
+}
+
+/// How a holding is named to a person: a US option by its contract
+/// (`MU 2026-11-20 1040 C`) rather than its padded OCC symbol, anything
+/// else by its id.
+fn display_name(inst_id: &str) -> String {
+    crate::us_options::UsOption::parse(inst_id).map(|c| c.label()).unwrap_or_else(|_| inst_id.to_string())
 }
 
 /// A book older than this is flagged in the confirmation.
@@ -1094,13 +1156,13 @@ fn resolve_price(source: &PriceSource, side: Side, market: &Market, capabilities
     let price = match source {
         PriceSource::Counterparty { level: n } => level(market.opposite(side), *n)?,
         PriceSource::Queue { level: n } => level(market.same(side), *n)?,
-        PriceSource::Mid => snap(market.mid().ok_or_else(|| CloseError::NoPrice("盘口缺一边，没有中间价".into()))?, market.tick(), towards_holder),
+        PriceSource::Mid => market.snap(market.mid().ok_or_else(|| CloseError::NoPrice("盘口缺一边，没有中间价".into()))?, towards_holder),
         PriceSource::Last => market.last.ok_or_else(|| CloseError::NoPrice("还没有最新成交价".into()))?,
         PriceSource::Fixed { price } => {
             if !(*price > 0.0) || !price.is_finite() {
                 return Err(CloseError::NoPrice("填一个大于 0 的限价".into()));
             }
-            snap(*price, market.tick(), towards_holder)
+            market.snap(*price, towards_holder)
         }
     };
     if !(price > 0.0) {
@@ -1639,6 +1701,88 @@ mod tests {
         assert!(matches!(super::plan(&deeper, &quote), Err(CloseError::NoLevel { .. })), "one level is all a quote has");
         request.ticket.limit_kind = OrderKind::Ioc;
         assert!(matches!(super::plan(&request, &quote), Err(CloseError::LimitKindUnavailable(_))));
+    }
+
+    /// A Schwab option closes by limit and by a stop on the side it exits
+    /// into, in whole contracts, priced on its class's steps — and never by
+    /// market order.
+    #[test]
+    fn schwab_closes_an_option_on_its_own_steps_and_quote() {
+        let symbol = "MU    261120C01040000";
+        let long = Holding {
+            inst_id: symbol.into(), family: Family::Option, is_long: true, quantity: 3.0, unit: "张".into(),
+            pos_side: None, margin_mode: None, average_price: Some(2.80), liquidation_price: None,
+        };
+        let mut quote = book(&[("3.10", "0")], &[("2.95", "0")], crate::us_options::option_spec("MU", true, 100.0));
+        quote.last = Some(Stamped { px: "3.40".into(), ms: 1_000 });
+        quote.sizes_known = false;
+        let request = |ticket: Ticket, holding: &Holding| {
+            let mut r = input(holding.clone(), ticket);
+            r.venue = Venue::Schwab;
+            r.fees = None;
+            r
+        };
+        // A typed price above $3 snaps to a nickel, towards the holder.
+        let fixed = plan(&request(limit(PriceSource::Fixed { price: 3.02 }, OrderKind::Limit, SizeRequest::All), &long), &quote).unwrap();
+        assert_eq!(fixed.price.as_ref().map(|p| p.value), Some(3.05));
+        // Under $3 it is a cent; the mid of 2.95/3.10 is 3.025, a nickel band.
+        let below = plan(&request(limit(PriceSource::Fixed { price: 2.913 }, OrderKind::Limit, SizeRequest::All), &long), &quote).unwrap();
+        assert_eq!(below.price.as_ref().map(|p| p.value), Some(2.92));
+        let mid = plan(&request(limit(PriceSource::Mid, OrderKind::Limit, SizeRequest::All), &long), &quote).unwrap();
+        assert_eq!(mid.price.as_ref().map(|p| p.value), Some(3.05));
+        assert!(mid.wire.is_none(), "Schwab's body is the app's to spell");
+        let pnl = fixed.estimate.pnl.clone().unwrap();
+        assert!((pnl.amount - (3.05 - 2.80) * 100.0 * 3.0).abs() < 1e-9 && pnl.ccy == "USD", "{pnl:?}");
+        let Action::Place { order } = &fixed.action else { panic!("{:?}", fixed.action) };
+        assert_eq!((order.inst_type, order.side, order.reduce_only, order.size), (Family::Option, Side::Sell, true, 3.0));
+        // No market order on a thin book.
+        let mut market = limit(PriceSource::Mid, OrderKind::Limit, SizeRequest::All);
+        market.method = Method::Market;
+        assert!(matches!(plan(&request(market, &long), &quote), Err(CloseError::Unavailable(Method::Market, _))));
+        // The stop watches the bid for a sale, whatever the last trade says:
+        // 3.40 printed, but 3.00 is above the 2.95 bid and would fire at once.
+        let mut stop = limit(PriceSource::Mid, OrderKind::Limit, SizeRequest::All);
+        stop.method = Method::Protect;
+        stop.stop_loss = Some(3.0);
+        assert!(matches!(plan(&request(stop.clone(), &long), &quote), Err(CloseError::StopLossWrongSide { .. })));
+        stop.stop_loss = Some(2.503);
+        let protect = plan(&request(stop.clone(), &long), &quote).unwrap();
+        let Action::PlaceAlgo { algo } = &protect.action else { panic!() };
+        assert_eq!(algo.kind, AlgoKind::Protection { take_profit: None, stop_loss: Some(2.50), trigger: Trigger::Bid });
+        assert!(protect.review.lines.iter().any(|l| l.starts_with("按买一触发（现 2.95）")), "{:?}", protect.review.lines);
+        assert!(protect.review.headline.contains("MU 2026-11-20 1040 C"), "named by its contract: {}", protect.review.headline);
+        // A short is bought back on the ask.
+        let short = Holding { is_long: false, ..long.clone() };
+        stop.stop_loss = Some(3.5);
+        let protect = plan(&request(stop.clone(), &short), &quote).unwrap();
+        let Action::PlaceAlgo { algo } = &protect.action else { panic!() };
+        assert_eq!(algo.kind, AlgoKind::Protection { take_profit: None, stop_loss: Some(3.5), trigger: Trigger::Ask });
+        stop.take_profit = Some(2.0);
+        assert!(matches!(plan(&request(stop, &short), &quote), Err(CloseError::LegUnavailable(_))), "Schwab's channel carries stops only");
+        // OKX cannot be asked to watch a quote.
+        let mut okx = long_swap(1.0);
+        okx.inst_id = "ETH-USDT-SWAP".into();
+        let algo = AlgoSpec {
+            inst_id: okx.inst_id.clone(), inst_type: Family::Swap, side: Side::Sell, pos_side: Some(PosSide::Long), size: 1.0,
+            trade_mode: Some("isolated".into()), reduce_only: true, cancel_with_position: false, client_id: None,
+            kind: AlgoKind::Protection { take_profit: None, stop_loss: Some(2500.0), trigger: Trigger::Bid },
+        };
+        assert!(wire::build(&Action::PlaceAlgo { algo }).is_err());
+    }
+
+    /// Every family a venue offers a stop for says what that stop watches,
+    /// and only a venue that can be asked to watch a quote is declared so.
+    #[test]
+    fn every_stop_declares_what_it_watches() {
+        for venue in [Venue::Okx, Venue::Schwab] {
+            for family in [Family::Spot, Family::Swap, Family::Option, Family::Stock] {
+                let offered = capabilities(venue, family);
+                if offered.stop_basis == StopBasis::ExitSide {
+                    assert_eq!(venue, Venue::Schwab, "{family:?}: OKX's triggers are the last trade (`wire::build`)");
+                    assert!(offered.stop_loss.available, "{venue:?} {family:?}");
+                }
+            }
+        }
     }
 
     #[test]

@@ -1048,6 +1048,8 @@ public final class StrategyRunner {
         // The exchange's own family word first; the id's shape when the
         // venue did not say.
         if position.isOption || host.venue.venue.instrumentType(of: position.instId) == .option {
+            // The venue's own dollar valuation, where it states one.
+            if let value = position.marketValueUsd { return abs(value) }
             guard let meta = try? await host.venue.instrumentMeta(instId: position.instId, mode: mode),
                   let contractValue = meta.contractValue,
                   let premium = try? await host.venue.valuationPrice(instId: position.instId, mode: mode)

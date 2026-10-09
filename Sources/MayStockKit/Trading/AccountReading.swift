@@ -45,11 +45,27 @@ public struct AccountReading: Sendable, Equatable {
     /// clock. Each position carries the time of its own mark (`markAt`).
     public let positionsAt: Date?
     public let source: Source
+    /// This reading as the live layer takes it, for a venue whose account the
+    /// layer does not read itself: handed to `LiveKernel.ingest`, so the
+    /// checkup reads this reading rather than one of its own.
+    public let liveDocument: LiveDocument?
+
+    /// A topic and payload for `LiveKernel.ingest`.
+    public struct LiveDocument: Sendable, Equatable {
+        public let topic: String
+        public let payload: String
+
+        public init(topic: String, payload: String) {
+            self.topic = topic
+            self.payload = payload
+        }
+    }
 
     public init(
         snapshot: AccountSnapshot, equityAt: Date, positions: [ExchangePosition]?,
         shareHoldings: [ExchangePosition] = [],
-        positionsError: String? = nil, positionsAt: Date?, source: Source
+        positionsError: String? = nil, positionsAt: Date?, source: Source,
+        liveDocument: LiveDocument? = nil
     ) {
         self.snapshot = snapshot
         self.equityAt = equityAt
@@ -58,6 +74,14 @@ public struct AccountReading: Sendable, Equatable {
         self.positionsError = positionsError
         self.positionsAt = positionsAt
         self.source = source
+        self.liveDocument = liveDocument
+    }
+
+    /// The same reading, carrying `liveDocument`.
+    public func handing(liveDocument: LiveDocument?) -> AccountReading {
+        AccountReading(
+            snapshot: snapshot, equityAt: equityAt, positions: positions, shareHoldings: shareHoldings,
+            positionsError: positionsError, positionsAt: positionsAt, source: source, liveDocument: liveDocument)
     }
 
     /// Why there is no reading to give.
@@ -90,8 +114,10 @@ public struct AccountReading: Sendable, Equatable {
         holdsPriced(quoteCurrency: quoteCurrency) ? Self.pricedPollInterval : Self.cashPollInterval
     }
 
-    public static let pricedPollInterval: TimeInterval = 10
-    public static let cashPollInterval: TimeInterval = 60
+    /// The kernel's declaration (`Renewal::PolledPriced` / `PolledCash`),
+    /// which also ages what the live layer is handed from these readings.
+    public static let pricedPollInterval = LiveKernel.AppClock.polledPriced.interval
+    public static let cashPollInterval = LiveKernel.AppClock.polledCash.interval
 
     /// Read the account one part after another — the snapshot, then the
     /// contracts, then the shares: `ExchangeVenue.accountReading`'s default.

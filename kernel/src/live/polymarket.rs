@@ -299,6 +299,16 @@ pub fn deadline_day(end_ms: i64) -> Option<String> {
     new_york_day(end_ms).map(|day| day.format("%Y-%m-%d").to_string())
 }
 
+/// The instant a deadline runs out: the end of the New York day it names.
+/// "By September 30" is over at midnight ET, whichever way gamma wrote it —
+/// the instant the app writes in the display zone, where it may well be
+/// the next day.
+pub fn deadline_ends_ms(end_ms: i64) -> Option<i64> {
+    use chrono::TimeZone;
+    let next = new_york_day(end_ms)?.succ_opt()?.and_hms_opt(0, 0, 0)?;
+    chrono_tz::America::New_York.from_local_datetime(&next).earliest().map(|t| t.timestamp_millis())
+}
+
 fn new_york_day(ms: i64) -> Option<NaiveDate> {
     use chrono::TimeZone;
     let utc = chrono::DateTime::from_timestamp_millis(ms)?;
@@ -357,6 +367,18 @@ mod tests {
         assert!((market.probability.unwrap() - 0.0005).abs() < 1e-12);
         assert_eq!((market.bid, market.ask), (None, Some(0.001)), "the empty side is reported empty");
         assert_eq!(market.label, "");
+    }
+
+    #[test]
+    fn a_deadline_runs_out_at_new_york_midnight_whichever_way_gamma_writes_it() {
+        let ends = |text: &str| deadline_ends_ms(chrono::DateTime::parse_from_rfc3339(text).unwrap().timestamp_millis()).unwrap();
+        let midnight = chrono::DateTime::parse_from_rfc3339("2026-10-01T00:00:00-04:00").unwrap().timestamp_millis();
+        assert_eq!(ends("2026-09-30T23:59:00Z"), midnight);
+        assert_eq!(ends("2026-10-01T03:59:00Z"), midnight);
+        // After New York falls back, midnight is 05:00 UTC.
+        let winter = chrono::DateTime::parse_from_rfc3339("2026-12-01T00:00:00-05:00").unwrap().timestamp_millis();
+        assert_eq!(ends("2026-11-30T23:59:00Z"), winter);
+        assert_eq!(deadline_ends_ms(i64::MAX), None, "an instant past chrono's range is none, not a panic");
     }
 
     #[test]

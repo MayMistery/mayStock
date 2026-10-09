@@ -78,7 +78,7 @@
 **关键决策**
 
 1. **Kit 与 App 分层**：MayStockKit 不依赖 AppKit，可在 Linux/CI 编译测试 —— E2E 驱动 `maystock-e2e` 直接复用同一套引擎，「测试的就是线上跑的代码」。
-2. **行情按交易所走端口**：`MarketHub` 每家交易所各持一个 `MarketFeed`（实时推送）和一个 `MarketDataSource`（历史、元数据、搜索），按自选项的 `venue` 路由，自己不认识任何一家的协议。OKX 是两条共享的 WebSocket（public 与 business 各一条，订阅表由 feed 维护，重连后自动重放）；美股是轮询嘉信的 `/marketdata/v1/quotes`（所有自选一次批量，交易时段每 3 秒、休市每 60 秒），`schwabctl` 没登录时同一个 feed 自动改读 Yahoo Finance 的图表接口，并以 `MarketFeedEvent.source` 报出当前来源——页脚与账户页显示的是 feed 说的名字，不是 venue 的设计名。`Ticker` 只有一种形状，涨跌的基准和会话阶段随行情走，界面从上面读标签，不写死「24h」。有休市的市场按昨收；不休市的市场按设置（`general.changeBasis`）：默认北京时间 00:00，与 OKX App 的涨跌幅同一个起点，也可选 UTC 00:00 或滚动 24 小时。OKX 每个 ticker 都带这三个参考价（`open24h` / `sodUtc8` / `sodUtc0`），`MarketHub` 在任何地方读到之前统一换算（`Ticker.rebased`），菜单栏、面板、行情页、告警读的是同一个涨跌。
+2. **行情按交易所走端口**：`MarketHub` 每家交易所各持一个 `MarketFeed`（实时推送）和一个 `MarketDataSource`（历史、元数据、搜索），按自选项的 `venue` 路由，自己不认识任何一家的协议。OKX 是两条共享的 WebSocket（public 与 business 各一条，订阅表由 feed 维护，重连后自动重放）；美股是轮询嘉信的 `/marketdata/v1/quotes`（所有自选一次批量，交易时段每 3 秒、休市每 60 秒），`schwabctl` 没登录时同一个 feed 自动改读 Yahoo Finance 的图表接口，并以 `MarketFeedEvent.source` 报出当前来源——页脚与账户页显示的是 feed 说的名字，不是 venue 的设计名。`Ticker` 只有一种形状，涨跌的基准和会话阶段随行情走，界面从上面读标签，不写死「24h」。有休市的市场按昨收；不休市的市场按设置（`general.changeBasis`）：默认 UTC+8 00:00（`sodUtc8`，标作「新加坡时间 0 点」），与 OKX App 的涨跌幅同一个起点，也可选 UTC 00:00 或滚动 24 小时。OKX 每个 ticker 都带这三个参考价（`open24h` / `sodUtc8` / `sodUtc0`），`MarketHub` 在任何地方读到之前统一换算（`Ticker.rebased`），菜单栏、面板、行情页、告警读的是同一个涨跌。
 3. **数据正确性**：K 线以 `ts` 为主键 replace-or-append；未确认 K 线（confirm=0）实时刷新；REST 回填与 WS 增量在同一 actor 内合并，无竞态。
 4. **密钥不归 App 保管，发单只有一条封闭的路**：OKX 的 API Key 存在官方 `okx` CLI 的 `~/.okx/config.toml` 里，App 不另存；自 2026-09-25（May 拍板「内核直接签名下单」）起，OKX 订单由 Rust 内核读取所选 profile 的密钥直接签名 REST 请求——只在签名那一刻读、不写日志，能发的只有 `trade::wire::Action` 列出的动作，实盘锁在内核里先于读密钥检查（见 `docs/KERNEL.md` §1.0.1）；只有账单流水仍经 CLI。嘉信的 App Key/Secret 与 OAuth refresh token 由自研的 `schwabctl`（`schwabctl/`，Rust，与内核同一套工具链，随 App 装进 `MayStock.app/Contents/MacOS/`）存在钥匙串里，App 只通过 `schwabctl token` 拿 30 分钟有效的 access token 读行情，订单一律经 `schwabctl place --live` 发出——没有 `--live` 它拒绝发单，因为嘉信的 paperMoney 不对 API 开放、没有可兜底的模拟盘。MayStock 不存储任何私钥。默认 demo（模拟盘），实盘需在「账户与连接」页显式解锁，切换前先验证每家交易所的目标账户并确认，每个策略在实盘启动时再单独确认。
    模拟盘与实盘是**两个账户、两套密钥**（OKX 对另一环境的 Key 一律回 "APIKey does not match current environment"），所以配置里每个环境各有一个 profile（`trading.demoProfile` / `trading.liveProfile`），`TradeBridge` 按调用的 mode 选 profile；App 只读 `config.toml` 的 profile 名与 `demo` 标记，从不读密钥。嘉信的「模拟盘」是本地影子账户（`ShadowBook`）：按实时行情在常规交易时段撮合，盘口加滑点假设、扣嘉信的费用组件、按 Reg T 两倍购买力拒单，落盘在 `shadow-schwab.json`，账本读它和读交易所一模一样。
@@ -139,6 +139,7 @@ Yahoo 这边（`Sources/MayStockKit/Yahoo/`，没有 key 时的过渡源）：
 - K 线：阳线空心可选/实心默认，MA20 橙色 1.2pt，最新价虚线 + 右侧价签胶囊
 - 深度图：买绿卖红 25% 面积 + 1.5pt 描边，中价竖线，hover 读数（价格/累计量）
 - 动效：面板 fade+2pt 位移 160ms ease-out；价格变动 120ms 色彩脉冲
+- 时间：所有显示的时刻按「显示时区」写（设置 › 时间，默认新加坡），只经 `DisplayTime`；交易所自己的日（美股纽约、OKX UTC+8）只决定规则和日线以上 K 线的命名，见 KERNEL.md 1.0.4
 
 ## 6. 测试策略（端到端）
 

@@ -254,7 +254,7 @@ public enum FundingCoverage {
         let uncovered = earliest.timeIntervalSince(first)
         guard uncovered > 8 * 3_600 else { return nil }
         let span = last.timeIntervalSince(first)
-        return "资金费率记录只从 \(earliest.formatted(.iso8601.year().month().day())) 起（OKX 只提供约三个月），"
+        return "资金费率记录只从 \(DisplayTime.string(earliest, "yyyy-MM-dd")) 起（OKX 只提供约三个月），"
             + "此前 \(Int(uncovered / 86_400)) 天（回测区间的 \(Int((uncovered / span * 100).rounded()))%）"
             + "的持仓没有计资金费，永续成本被低估。"
     }

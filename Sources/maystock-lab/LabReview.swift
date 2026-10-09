@@ -360,16 +360,10 @@ extension LabMain {
     }
 
     private static func stamp(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.timeZone = EquityWindow.timeZone
-        formatter.dateFormat = "yyyy-MM-dd HH:mm"
-        return formatter.string(from: date)
+        DisplayTime.string(date, "yyyy-MM-dd HH:mm")
     }
 
     private static func dayStamp(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.timeZone = EquityWindow.timeZone
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.string(from: date)
+        DisplayTime.string(date, "yyyy-MM-dd")
     }
 }

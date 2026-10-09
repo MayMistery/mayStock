@@ -86,8 +86,9 @@ representing it as a fresh event. An hourly/daily report with analysis retains i
 conclusion even when events is empty. Legacy reports may omit analysis and legacy
 predictions may omit findingIds. The model must provide both in new outputs.
 
-Swift owns persistence, retries and scheduling. Daily is 08:00 Asia/Taipei by
-default; hourly covers the latest 60 minutes and flash the latest 30 minutes.
+Swift owns persistence, retries and scheduling. Daily is 08:00 on the app's
+display clock by default (`general.displayTimeZone`, Asia/Singapore unless set;
+the request's `timezone` is that zone); hourly covers the latest 60 minutes and flash the latest 30 minutes.
 No catch-up flash outside its current rolling occurrence window. Flash with no
 new verified event is a successful silent check, with no report/notification,
 including a partial check; its incomplete coverage remains visible in job status.

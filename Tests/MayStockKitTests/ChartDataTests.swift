@@ -144,7 +144,7 @@ struct ChartMathTests {
 
     @Test func timeTicksStayWithinTheRequestedLabelBudget() {
         for span in [300.0, 900, 3_600, 14_400, 86_400] {
-            let ticks = ChartMath.timeTicks(from: t0, to: t0.addingTimeInterval(span), maxLabels: 5)
+            let ticks = ChartMath.timeTicks(from: t0, to: t0.addingTimeInterval(span), maxLabels: 5, timeZone: DisplayTime.zone)
             #expect(ticks.count <= 5, "span \(span) produced \(ticks.count) labels")
             #expect(!ticks.isEmpty, "span \(span) produced no labels")
         }

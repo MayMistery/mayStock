@@ -228,6 +228,48 @@ impl MarketCalendar {
 /// earlier, and so on — that fall after `from_ms`, the earlier of the two.
 /// Unsigned from the start: the distance between them is the span, and a
 /// count taken from it has no sign to lose.
+/// The New York calendar date an instant falls on.
+pub fn us_date(ts_ms: i64) -> NaiveDate {
+    us::local(ts_ms).date()
+}
+
+/// The US session in progress at `ts_ms`, or the next one to open: its
+/// open and close. `None` only past the end of chrono's calendar.
+pub fn us_session_at_or_after(ts_ms: i64) -> Option<(i64, i64)> {
+    let mut day = us_date(ts_ms);
+    // A trading day is never more than a long weekend away; the bound only
+    // keeps a date at the edge of chrono's range from looping.
+    for _ in 0..14 {
+        if let Some((open, close)) = us::session(day) {
+            if ts_ms < close {
+                return Some((open, close));
+            }
+        }
+        day = day.succ_opt()?;
+    }
+    None
+}
+
+/// The close of the US session on `date` — 16:00, 13:00 on an early close —
+/// or, when the market is shut that day, of the last session before it. A
+/// listed option stops trading at this instant: a contract whose stated
+/// expiry falls on Good Friday trades out on the Thursday.
+pub fn us_close_on_or_before(date: NaiveDate) -> i64 {
+    let mut day = date;
+    // A trading day is never more than a long weekend away; the bound only
+    // keeps a date at the edge of chrono's range from looping.
+    for _ in 0..14 {
+        if let Some((_, close)) = us::session(day) {
+            return close;
+        }
+        match day.pred_opt() {
+            Some(previous) => day = previous,
+            None => break,
+        }
+    }
+    us::to_ms(date.and_hms_opt(16, 0, 0).unwrap_or_default())
+}
+
 fn opens_back_from(from_ms: i64, to_ms: i64, bar_ms: i64) -> usize {
     to_ms.abs_diff(from_ms).div_ceil(bar_ms.unsigned_abs()) as usize
 }

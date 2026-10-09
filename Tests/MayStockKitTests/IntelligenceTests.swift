@@ -36,28 +36,32 @@ struct IntelligenceTests {
         #expect(zip(days, days.dropFirst()).contains { $1.timeIntervalSince($0) == 23 * 3_600 })
     }
 
-    @Test func dailyUsesSelectedZoneAndBootstraps() {
-        let now = date("2026-09-08T00:05:00Z") // 08:05 Taipei
+    @Test func dailyRunsAtItsHourOnTheDisplayClockAndBootstraps() {
+        let now = date("2026-09-08T00:05:00Z") // 08:05 Singapore
         let settings = IntelligenceSettings()
-        #expect(IntelligenceSchedule.nextRun(kind: .daily, now: now, lastSuccess: nil, settings: settings) == now)
+        let zone = "Asia/Singapore"
+        #expect(IntelligenceSchedule.nextRun(kind: .daily, now: now, lastSuccess: nil, settings: settings, timezone: zone) == now)
         #expect(IntelligenceSchedule.nextRun(kind: .daily, now: now,
-            lastSuccess: date("2026-09-07T00:01:00Z"), settings: settings) == date("2026-09-08T00:00:00Z"))
+            lastSuccess: date("2026-09-07T00:01:00Z"), settings: settings, timezone: zone) == date("2026-09-08T00:00:00Z"))
         #expect(IntelligenceSchedule.nextRun(kind: .daily, now: now,
-            lastSuccess: now, settings: settings) == date("2026-09-09T00:00:00Z"))
+            lastSuccess: now, settings: settings, timezone: zone) == date("2026-09-09T00:00:00Z"))
         #expect(IntelligenceSchedule.nextRun(kind: .daily, now: now,
-            lastSuccess: date("2026-09-07T23:59:00Z"), settings: settings) == date("2026-09-08T00:00:00Z"))
+            lastSuccess: date("2026-09-07T23:59:00Z"), settings: settings, timezone: zone) == date("2026-09-08T00:00:00Z"))
+        // The same hour on New York's clock is 12 hours later in September.
+        #expect(IntelligenceSchedule.nextRun(kind: .daily, now: now,
+            lastSuccess: now, settings: settings, timezone: "America/New_York") == date("2026-09-08T12:00:00Z"))
     }
 
     @Test func intradayCadenceSurvivesRestartAndDoesNotStretchWindows() {
         let old = date("2026-09-08T00:00:00Z")
         let now = old.addingTimeInterval(5 * 3_600)
         let settings = IntelligenceSettings()
-        #expect(IntelligenceSchedule.nextRun(kind: .flash, now: now, lastSuccess: old, settings: settings)
+        #expect(IntelligenceSchedule.nextRun(kind: .flash, now: now, lastSuccess: old, settings: settings, timezone: "UTC")
                 == old.addingTimeInterval(1_800))
-        #expect(IntelligenceSchedule.nextRun(kind: .hourly, now: now, lastSuccess: old, settings: settings)
+        #expect(IntelligenceSchedule.nextRun(kind: .hourly, now: now, lastSuccess: old, settings: settings, timezone: "UTC")
                 == old.addingTimeInterval(3_600))
         // Request.now is always now, not the missed scheduled time.
-        let request = IntelligenceRequest(kind: .flash, now: now, settings: settings,
+        let request = IntelligenceRequest(kind: .flash, now: now, settings: settings, timezone: "Asia/Singapore",
             watchlist: ["BTC-USDT", "ETH-USDT"], quotes: [], knownEvents: [])
         #expect(request.now == now)
         #expect(request.watchlist.count == 2)

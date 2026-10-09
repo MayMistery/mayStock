@@ -39,7 +39,10 @@ extension AppState {
         }
     }
 
-    /// `maystock://checkup` or `maystock://checkup?instId=ETH-USDT-SWAP`.
+    /// `maystock://checkup`, `maystock://checkup?instId=ETH-USDT-SWAP`, or a
+    /// US share with its options: `maystock://checkup?instId=MU&market=usEquity`
+    /// (an id OKX could not spell — no `-` — is read as one without the
+    /// `market`).
     ///
     /// Naming no instrument is the useful case: the page follows whatever is
     /// actually held, which is the question someone opening it is asking.
@@ -50,13 +53,15 @@ extension AppState {
         let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
         let requested = items.first { $0.name == "instId" }?.value?
             .trimmingCharacters(in: .whitespaces)
-        let unknown = Set(items.map(\.name)).subtracting(["instId"])
+        let named = items.first { $0.name == "market" }?.value
+        let unknown = Set(items.map(\.name)).subtracting(["instId", "market"])
         if !unknown.isEmpty {
             Log.warn("deep-link: checkup 忽略未知参数 \(unknown.sorted().joined(separator: "、"))")
         }
         if let requested, !requested.isEmpty {
-            Log.warn("deep-link: 打开体检页，指定 \(requested)")
-            pendingCheckupInstId = requested
+            let request = Self.checkupRequest(instId: requested, market: named)
+            Log.warn("deep-link: 打开体检页，指定 \(request.instId)（\(request.market)）")
+            pendingCheckupInstId = request
         } else {
             Log.warn("deep-link: 打开体检页，跟随持仓")
             pendingCheckupInstId = nil
@@ -66,11 +71,31 @@ extension AppState {
 }
 
 extension AppState {
+    /// What the checkup is asked to review, by id and, where named, market.
+    /// An id OKX could not spell — no `-` — is a US share's ticker.
+    static func checkupRequest(instId: String, market named: String?) -> CheckupRequest {
+        let markets = [LiveSnapshot.Reviewable.crypto, LiveSnapshot.Reviewable.usEquity]
+        let market = named.flatMap { markets.contains($0) ? $0 : nil }
+            ?? (instId.contains("-") ? LiveSnapshot.Reviewable.crypto : LiveSnapshot.Reviewable.usEquity)
+        if let named, !markets.contains(named) {
+            Log.warn("checkup: market「\(named)」不认识，按 \(market) 读")
+        }
+        return CheckupRequest(
+            instId: market == LiveSnapshot.Reviewable.usEquity ? Venue.schwab.canonicalInstId(instId) : instId,
+            market: market)
+    }
+
     /// An instrument a deep link asked the checkup page to show, consumed and
     /// cleared by the page when it opens. Nil means "follow the position".
     ///
     /// A stored request rather than a direct call because the page may not
     /// exist yet when the link arrives — the window is created lazily, and its
     /// view has no state to write to until SwiftUI builds it.
-    var requestedCheckupInstId: String? { pendingCheckupInstId }
+    var requestedCheckupInstId: CheckupRequest? { pendingCheckupInstId }
+}
+
+/// An instrument a deep link asked the checkup to review, and its market.
+struct CheckupRequest: Equatable {
+    let instId: String
+    let market: String
 }

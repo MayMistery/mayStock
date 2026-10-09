@@ -15,6 +15,8 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
     public let generatedMs: Int64
     public let clock: Clock?
     public let instrument: Instrument
+    /// Everything the page can put under review, held first.
+    public let reviewable: [Reviewable]
     public let feeds: [Feed]
     /// Several operators unreachable at once: this machine's network, not
     /// theirs. Nil while it is not the case.
@@ -44,6 +46,24 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
         public let instId: String
         public let base: String
         public let mode: String
+        /// `crypto` (an OKX perpetual) or `usEquity` (a US share and its
+        /// listed options, read from Schwab).
+        public let market: String
+        /// The review follows what is held rather than a choice.
+        public let followsHeld: Bool
+        public var isUSEquity: Bool { market == Reviewable.usEquity }
+    }
+
+    /// Something the page can put under review.
+    public struct Reviewable: Decodable, Sendable, Equatable, Identifiable, Hashable {
+        public static let crypto = "crypto"
+        public static let usEquity = "usEquity"
+        public let market: String
+        public let instId: String
+        /// `ETH-USDT-SWAP`, or `MU · 2 张期权 · 30 股`.
+        public let label: String
+        public let held: Bool
+        public var id: String { market + "|" + instId }
     }
 
     public struct Feed: Decodable, Sendable, Equatable, Identifiable {
@@ -129,6 +149,11 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
         /// The stops feed's stale age, for `stopsMs`.
         public let stopsStaleAfterMs: Double
         public let stopsError: String?
+        /// `okx` or `schwab`: whose account the legs are on.
+        public let venue: String
+        /// What the exposure is measured in and leaves out, where that is not
+        /// the plain notional (a share's options, by delta).
+        public let exposureNote: String?
 
         /// Positions were actually read — the only state in which "flat" is a
         /// claim this screen may make.
@@ -140,7 +165,8 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
     public struct Mark: Decodable, Sendable, Equatable {
         public let price: Double
         public let ms: Int64?
-        /// `okx.mark-price` (the live stream) or `position` (the last push).
+        /// `okx.mark-price` (the live stream), `position` (the last push),
+        /// `schwab.stream` or `schwab.chain` (a US share's quote).
         public let source: String
         /// The stale age of whatever renews the mark.
         public let staleAfterMs: Double?
@@ -150,6 +176,17 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
         /// The venue's id for this leg.
         public let key: String
         public let instId: String
+        /// `okx` or `schwab`: where the leg is held, and closed.
+        public let venue: String
+        /// `SWAP`, `OPTION`, `STOCK`…; nil for one no rule reads.
+        public let family: String?
+        /// An option leg's contract, quote, greeks and odds.
+        public let option: OptionLeg?
+        /// The venue's own figures, where it states them apart from the live
+        /// valuation (Schwab's market value and open profit).
+        public let venueFigures: VenueFigures?
+        /// What about the leg's figures is not as read.
+        public let note: String?
         public let posSide: String
         /// `cross` or `isolated`: whether this leg's liquidation price is its own.
         public let marginMode: String?
@@ -179,6 +216,86 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
         public let updatedMs: Int64?
         public var id: String { key }
         public var isIsolated: Bool { marginMode == "isolated" }
+        public var isShares: Bool { family == "STOCK" }
+    }
+
+    /// One held option: its contract, quote, greeks and odds.
+    public struct OptionLeg: Decodable, Sendable, Equatable {
+        /// `MU 2026-11-20 1040 C`.
+        public let label: String
+        public let underlying: String
+        public let call: Bool
+        public let strike: Double
+        public let expiryMs: Int64
+        public let expiryDay: String
+        public let daysLeft: Double
+        public let multiplier: Double
+        /// What one contract delivers when it is not `multiplier` shares.
+        public let nonstandard: String?
+        public let quote: OptionQuote?
+        /// A share, Schwab's model; `iv` in percent.
+        public let iv: Double?
+        public let delta: Double?
+        public let gamma: Double?
+        public let theta: Double?
+        public let vega: Double?
+        /// `stream` or `chain`.
+        public let greeksSource: String?
+        /// A share.
+        public let intrinsic: Double?
+        public let extrinsic: Double?
+        public let breakeven: Double
+        /// Risk-neutral, at expiry.
+        public let pItm: Double?
+        public let pProfit: Double?
+        /// A written contract touching its strike before expiry.
+        public let pTouchStrike: Double?
+        public let oddsBasis: OddsBasis?
+        /// The position's, signed.
+        public let positionDelta: Double?
+        public let dollarDelta: Double?
+        public let positionGamma: Double?
+        public let thetaPerDay: Double?
+        public let vegaPerPoint: Double?
+        /// Dollars paid (positive) or received (negative).
+        public let cost: Double
+        /// Dollars at the mark, negative for a liability.
+        public let value: Double?
+        /// Nil when the loss has no ceiling.
+        public let maxLoss: Double?
+        public let maxLossText: String
+        public let assignment: String?
+    }
+
+    public struct OptionQuote: Decodable, Sendable, Equatable {
+        public let bid: Double?
+        public let ask: Double?
+        public let last: Double?
+        /// What the leg is valued at.
+        public let mark: Double
+        public let ms: Int64?
+        public let staleAfterMs: Double
+        /// `schwab.stream` or `schwab.chain`.
+        public let source: String
+        public let volume: Double?
+        public let openInterest: Double?
+    }
+
+    public struct OddsBasis: Decodable, Sendable, Equatable {
+        /// Read off the contract's own expiry's smile.
+        public let exact: Bool
+        public let expiryMs: Int64
+        public let farExpiryMs: Int64?
+        public let placement: String?
+    }
+
+    public struct VenueFigures: Decodable, Sendable, Equatable {
+        public let marketValue: Double
+        public let openProfitLoss: Double?
+        public let dayProfitLoss: Double?
+        public let maintenanceRequirement: Double?
+        public let readMs: Int64
+        public let staleAfterMs: Double
     }
 
     public struct Protective: Decodable, Sendable, Equatable, Identifiable {
@@ -283,6 +400,12 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
         public let bookMs: Int64?
         /// The option book feed's stale age, for `bookMs`.
         public let bookStaleAfterMs: Double
+        /// The feed the book is read through.
+        public let bookFeed: String
+        /// What open interest is counted in on the page — the coin, or
+        /// listed contracts — and how many of `oiBase`'s units make one.
+        public let oiUnit: String
+        public let oiPerUnit: Double
         public let venues: [VenueCoverage]
         public let expiries: [ExpiryRow]
         public let nearExpiryMs: Int64?
@@ -349,10 +472,16 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
 
     public struct Probability: Decodable, Sendable, Equatable {
         public let smileVenue: String
+        /// The feed the smiles come from.
+        public let smileFeed: String
         public let surfaceMs: Int64?
         public let surfaceStaleAfterMs: Double
+        /// When the underlying the table is laid on was quoted, and where from.
         public let indexMs: Int64?
         public let indexStaleAfterMs: Double
+        public let spotSource: String?
+        /// What about these smiles is not the plain reading.
+        public let notes: [String]
         public let spot: Double?
         /// The divisor in force: the one asked for, or 1 when the kernel
         /// does not offer that one.
@@ -498,12 +627,13 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
         public let extrapolated: Bool
     }
 
-    /// One event of mutually exclusive outcomes (with its `deadline`), or
+    /// One event of mutually exclusive outcomes (with its deadline), or
     /// one question across its deadlines (each cell has one).
     public struct PredictionLine: Decodable, Sendable, Equatable {
         public let title: String
-        /// `YYYY-MM-DD`, a New York day.
-        public let deadline: String?
+        /// When the event runs out: the end of the New York day it resolves
+        /// on, to be written in the display zone.
+        public let deadlineEndsMs: Int64?
         public let volume24h: Double
         public let liquidity: Double
         public let cells: [PredictionCell]
@@ -511,8 +641,12 @@ public struct LiveSnapshot: Decodable, Sendable, Equatable {
 
     public struct PredictionCell: Decodable, Sendable, Equatable {
         public let label: String
-        /// `YYYY-MM-DD`, a New York day, for a deadline cell.
+        /// `YYYY-MM-DD`, the New York day a deadline cell is named for —
+        /// "on October 8", "by October 9".
         public let deadline: String?
+        /// When that day runs out: the instant "by October 9" is over, to be
+        /// written in the display zone.
+        public let deadlineEndsMs: Int64?
         /// Settles within the coming week.
         public let upcoming: Bool
         /// ETH if this outcome happens, one per the topic's reaction window.

@@ -250,10 +250,17 @@ struct LaunchOptions: Sendable {
     var dataDirectory: URL = ConfigIO.defaultDirectory()
     var snapshotDirectory: URL? = nil
     var openIntelligence = false
+    /// Snapshot only: what the checkup reviews, as `maystock://checkup?instId=`
+    /// would name it, instead of following what is held.
+    var checkupInstId: String? = nil
+    /// Snapshot only: recorded live-layer documents (`[{"topic","payload"}]`)
+    /// handed to the live layer just before the checkup is drawn — to draw a
+    /// situation the account is not in, from documents recorded off the venue.
+    var liveFixture: URL? = nil
 
     var isSnapshot: Bool { snapshotDirectory != nil }
 
-    /// `MayStock [--data-dir <dir>] [--snapshot <out-dir>]`
+    /// `MayStock [--data-dir <dir>] [--snapshot <out-dir> [--checkup <instId>] [--live-fixture <file>]]`
     static func parse(_ arguments: [String]) -> LaunchOptions {
         var options = LaunchOptions()
         var iterator = arguments.dropFirst().makeIterator()
@@ -265,6 +272,10 @@ struct LaunchOptions: Sendable {
                 if let value = iterator.next() { options.snapshotDirectory = URL(fileURLWithPath: value) }
             case "--intelligence":
                 options.openIntelligence = true
+            case "--checkup":
+                options.checkupInstId = iterator.next()
+            case "--live-fixture":
+                if let value = iterator.next() { options.liveFixture = URL(fileURLWithPath: value) }
             default:
                 break
             }
@@ -347,7 +358,9 @@ final class AppState {
     /// stream — is re-read on this clock as well as on demand: positions
     /// opened by hand, stops firing and bills settling all happen on the
     /// exchange with no word to this app.
-    static let accountRefreshInterval: TimeInterval = 300
+    /// The kernel's declaration (`Renewal::AccountRefresh`), which also ages
+    /// the working orders the live layer is handed from these refreshes.
+    static let accountRefreshInterval = LiveKernel.AppClock.accountRefresh.interval
     @ObservationIgnored private var accountRefreshLoop: Task<Void, Never>?
     @ObservationIgnored private var polledAccountLoop: Task<Void, Never>?
     @ObservationIgnored private var lastLoggedAccountError: [Venue: String] = [:]
@@ -357,7 +370,7 @@ final class AppState {
     @ObservationIgnored private var backtestTasks: [String: Task<Void, Never>] = [:]
     /// Set by a deep link, read once by the checkup page. See
     /// `AppState.requestedCheckupInstId`.
-    @ObservationIgnored var pendingCheckupInstId: String?
+    @ObservationIgnored var pendingCheckupInstId: CheckupRequest?
     /// The holding the close ticket is open on, presented as a sheet on the
     /// terminal window. See `openCloseTicket`.
     var closeTicketRequest: CloseTicketRequest?
@@ -389,10 +402,19 @@ final class AppState {
         // A render pass must not put a second set of items in the menu bar.
         statusItems = options.isSnapshot ? nil : StatusItemManager(appState: self)
         for venue in Venue.allCases {
-            venueBooks[venue] = VenueBooks(venue: venue, dataDirectory: options.dataDirectory, app: self)
+            let books = VenueBooks(venue: venue, dataDirectory: options.dataDirectory, app: self)
+            // Whatever clears a venue's figures from the screens clears them
+            // from the checkup too.
+            books.onCleared = { [weak self] reason in self?.handAccountToLiveLayer(venue, .cleared(reason)) }
+            venueBooks[venue] = books
         }
 
+        if options.isSnapshot, let instId = options.checkupInstId {
+            pendingCheckupInstId = Self.checkupRequest(instId: instId, market: nil)
+        }
         wire()
+        // Before anything writes a time: the live layer's first texts too.
+        applyDisplayZone()
         startLiveLayer()
         reloadStrategies()
         applyConfig()
@@ -482,6 +504,7 @@ final class AppState {
 
     /// Push the current config into hub / status bar / alert engine.
     func applyConfig() {
+        applyDisplayZone()
         syncLiveLayer()
         hub.setChangeBasis(store.config.general.changeBasis)
         hub.setWatchlist(store.config.watchlist)
@@ -490,6 +513,18 @@ final class AppState {
             alerts.setRules(store.config.alerts)
         }
         LaunchAtLogin.set(enabled: store.config.general.launchAtLogin)
+    }
+
+    /// Read every time in the zone the settings name, from here on. The
+    /// live layer takes it up on the sync that follows; the intelligence
+    /// station's daily report moves to that hour on the new clock.
+    private func applyDisplayZone() {
+        let before = DisplayTime.zone
+        DisplayTime.adopt(store.config.general)
+        if DisplayTime.zone != before {
+            Log.warn("display: 时间改按 \(DisplayTime.identifier)（\(DisplayTime.name)）显示")
+            intelligence.displayZoneDidChange()
+        }
     }
 
     /// Everything a config change sets off, keyed on the change rather than
@@ -531,15 +566,17 @@ final class AppState {
 
     // MARK: The live layer
 
-    /// The account the live layer reads, from the settings: the active mode
-    /// and its profile. The checkup page's part of the config (instrument,
-    /// grid, analytics) is the page's own.
+    /// The settings' part of the live layer's config: the account it reads
+    /// — the active mode and its profile — and the zone its texts write
+    /// times in. The checkup page's part (instrument, grid, analytics) is
+    /// the page's own.
     private func liveAccountConfig(_ config: inout LiveKernel.Config) {
         let mode = tradingMode
         config.mode = mode.isDemo ? "demo" : "live"
         config.okxProfile = tradeBridge.profile(for: mode)
         config.okxConfigPath = OKXProfileCatalog.defaultFileURL().path
         config.schwabctlPath = schwabBridge.resolveCLIPath()
+        config.displayZone = .current
     }
 
     private func startLiveLayer() {
@@ -1015,10 +1052,12 @@ final class AppState {
             }
             books.openOrdersError = nil
             books.ordersAt = Date()
+            handOrdersToLiveLayer(venue, .read(books.openOrders))
         } catch {
             books.openOrders = []
             books.openOrdersNote = nil
             books.openOrdersError = String(describing: error)
+            handOrdersToLiveLayer(venue, .failed(String(describing: error)))
         } }
         // What the venue has filled lately, whoever placed it. Its own block,
         // for the same reason the order book has one: a refused fill read must
@@ -1080,9 +1119,12 @@ final class AppState {
         }
         let heldBefore = books.heldCounts
         do {
-            books.adopt(try await exchangeVenue(for: venue).accountReading(mode: tradingMode, source: source))
+            let reading = try await exchangeVenue(for: venue).accountReading(mode: tradingMode, source: source)
+            books.adopt(reading)
+            handAccountToLiveLayer(venue, .reading(reading))
         } catch {
             books.accountError = String(describing: error)
+            handAccountToLiveLayer(venue, .failed(String(describing: error)))
         }
         await readTransfers(venue, holdingsMoved: books.heldCounts != heldBefore)
     }

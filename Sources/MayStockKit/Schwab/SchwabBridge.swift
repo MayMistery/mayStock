@@ -76,7 +76,12 @@ public struct SchwabBridge: Sendable {
     }
 
     public func account() async throws -> SchwabAccount {
-        try SchwabWire.account(from: try await run(["account"]))
+        try SchwabWire.account(from: try await accountDocument())
+    }
+
+    /// The account exactly as `schwabctl account` prints it.
+    public func accountDocument() async throws -> Data {
+        try await run(["account"])
     }
 
     public func orders(from: Date, to: Date) async throws -> [SchwabOrder] {

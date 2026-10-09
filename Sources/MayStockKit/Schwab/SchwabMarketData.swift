@@ -77,6 +77,18 @@ public actor SchwabRESTClient {
         return try SchwabWire.tickers(from: data, hours: hours, now: now)
     }
 
+    /// One option's quote, and the terms its quote states: the underlying,
+    /// whether its class quotes in pennies, its multiplier.
+    public func optionQuote(_ symbol: String, now: Date = Date()) async throws -> (ticker: Ticker, terms: SchwabOptionQuoteTerms) {
+        let hours = try? await sessionHours(on: now)
+        let data = try await get(SchwabAPI.quotes(symbols: [symbol]))
+        guard let ticker = try SchwabWire.tickers(from: data, hours: hours, now: now)[symbol],
+              let terms = SchwabWire.optionQuoteTerms(from: data, symbol: symbol) else {
+            throw SchwabAPIError.decoding("嘉信没有给出期权 \(symbol.trimmingCharacters(in: .whitespaces)) 的报价")
+        }
+        return (ticker, terms)
+    }
+
     /// Candles in `[start, end]`, oldest first. Regular session only, which
     /// is what the kernel calendar counts.
     public func candles(symbol: String, bar: BarInterval, start: Date, end: Date, now: Date = Date()) async throws -> [Candle] {
@@ -277,6 +289,13 @@ public struct SchwabMarketDataSource: MarketDataSource {
             await notice.degraded(error)
             return try await yahoo.instrumentMeta(instId: instId)
         }
+    }
+
+    /// An option's quote straight from Schwab. Never from Yahoo: Yahoo
+    /// spells contracts its own way, and a quote for an order on a contract
+    /// has to be the venue's.
+    public func optionQuote(symbol: String) async throws -> (ticker: Ticker, terms: SchwabOptionQuoteTerms) {
+        try await schwab.optionQuote(symbol)
     }
 
     public static func equityMeta(_ instId: String) -> InstrumentMeta {

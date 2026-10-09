@@ -29,17 +29,28 @@ pub enum OptionVenue {
     Okx,
     Bybit,
     Binance,
+    /// A US listing's chain, read from Schwab: OCC clears every exchange's
+    /// contracts, so this one book is the whole market's.
+    Schwab,
 }
 
 impl OptionVenue {
-    pub const ALL: [OptionVenue; 4] = [OptionVenue::Deribit, OptionVenue::Okx, OptionVenue::Bybit, OptionVenue::Binance];
-
     pub fn label(self) -> &'static str {
         match self {
             OptionVenue::Deribit => "Deribit",
             OptionVenue::Okx => "OKX",
             OptionVenue::Bybit => "Bybit",
             OptionVenue::Binance => "Binance",
+            OptionVenue::Schwab => "嘉信（全美合并）",
+        }
+    }
+
+    /// The venues whose books together are a market's options. Every
+    /// venue is one market's (`every_option_venue_is_one_markets`).
+    pub fn of(market: super::Market) -> &'static [OptionVenue] {
+        match market {
+            super::Market::Crypto => &[OptionVenue::Deribit, OptionVenue::Okx, OptionVenue::Bybit, OptionVenue::Binance],
+            super::Market::UsEquity => &[OptionVenue::Schwab],
         }
     }
 }
@@ -133,6 +144,8 @@ pub enum RestUpdate {
     Transfers(Result<TransferListing, String>, i64, Delivery),
     /// A held instrument's specification, read from the public listing.
     Spec { inst_id: String, result: Result<Spec, String> },
+    /// A US underlying's option chain, and when it was read (local).
+    Chain { symbol: String, result: Result<super::schwab_chain::Chain, String>, ms: i64 },
 }
 
 impl RestUpdate {
@@ -153,6 +166,7 @@ impl RestUpdate {
             RestUpdate::Prediction { .. } => Some(Feed::Polymarket),
             RestUpdate::Transfers(..) => Some(Feed::OkxTransfers),
             RestUpdate::Spec { .. } => None,
+            RestUpdate::Chain { .. } => Some(Feed::SchwabChain),
         }
     }
 
@@ -168,6 +182,7 @@ impl RestUpdate {
             RestUpdate::Prediction { result, .. } => result.is_ok(),
             RestUpdate::Transfers(result, ..) => result.is_ok(),
             RestUpdate::Spec { result, .. } => result.is_ok(),
+            RestUpdate::Chain { result, .. } => result.is_ok(),
         }
     }
 }
@@ -626,6 +641,25 @@ pub(crate) fn yahoo_quote(id: &'static str, body: &str) -> Result<MacroQuote, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every venue; a variant missing here fails to compile.
+    fn every_venue() -> Vec<OptionVenue> {
+        let all = vec![OptionVenue::Deribit, OptionVenue::Okx, OptionVenue::Bybit, OptionVenue::Binance, OptionVenue::Schwab];
+        for venue in &all {
+            match venue {
+                OptionVenue::Deribit | OptionVenue::Okx | OptionVenue::Bybit | OptionVenue::Binance | OptionVenue::Schwab => {}
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn every_option_venue_is_one_markets() {
+        for venue in every_venue() {
+            let owners = super::super::Market::ALL.iter().filter(|m| OptionVenue::of(**m).contains(&venue)).count();
+            assert_eq!(owners, 1, "{venue:?}");
+        }
+    }
 
     #[test]
     fn okx_counts_both_families_in_coin_and_keeps_their_mark_currencies_apart() {

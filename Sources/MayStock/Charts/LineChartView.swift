@@ -78,7 +78,9 @@ struct LineChartView: View {
         /// Left edge of real data, when the window reaches further back than
         /// the history we hold.
         let coverageStart: Date
-        let timeZone: TimeZone
+        /// The venue's day, which groups a multi-day axis into sessions; the
+        /// labels themselves are in the display zone.
+        let dayZone: TimeZone
 
         init?(points: [SparkPoint], window: LineWindow, venue: Venue, size: CGSize) {
             let geometry = PlotGeometry(size: size)
@@ -107,7 +109,7 @@ struct LineChartView: View {
             self.end = end
             self.collapsesGaps = collapsesGaps
             self.coverageStart = inWindow[0].ts
-            self.timeZone = collapsesGaps ? venue.timeZone : .current
+            self.dayZone = venue.dayZone
 
             if collapsesGaps {
                 // Trading time: each step is the real interval, except across
@@ -192,12 +194,12 @@ struct LineChartView: View {
         /// drawn where nothing traded.
         var timeTicks: [(x: CGFloat, date: Date, major: Bool)] {
             if !collapsesGaps {
-                return ChartMath.timeTicks(from: start, to: end, maxLabels: 5)
+                return ChartMath.timeTicks(from: start, to: end, maxLabels: 5, timeZone: DisplayTime.zone)
                     .map { (x($0), $0, false) }
             }
             var ticks: [(x: CGFloat, date: Date, major: Bool)] = []
             var calendar = Calendar(identifier: .gregorian)
-            calendar.timeZone = timeZone
+            calendar.timeZone = dayZone
             let multiDay = !calendar.isDate(series[0].ts, inSameDayAs: series[series.count - 1].ts)
             if multiDay {
                 // One tick per session, at its first sample.
@@ -231,7 +233,7 @@ struct LineChartView: View {
         if let probe {
             let delta = domain.open > 0 ? (probe.price - domain.open) / domain.open * 100 : 0
             return [
-                ChartLegendItem(key: "t", value: ChartFormatters.string(probe.ts, hoverFormat(domain), timeZone: domain.timeZone),
+                ChartLegendItem(key: "t", value: DisplayTime.string(probe.ts, hoverFormat(domain)),
                                 tint: .secondary, priority: 8),
                 ChartLegendItem(key: "p", value: PriceFormatter.price(probe.price, decimals: decimals),
                                 priority: 10),
@@ -317,7 +319,7 @@ struct LineChartView: View {
             context.strokeLine(from: CGPoint(x: x, y: geometry.top),
                                to: CGPoint(x: x, y: geometry.bottom),
                                color: ChartStyle.grid)
-            context.drawText(ChartFormatters.string(tick.date, tick.major ? "MM-dd" : format, timeZone: domain.timeZone),
+            context.drawText(DisplayTime.string(tick.date, tick.major ? "MM-dd" : format),
                              font: ChartStyle.axisFont,
                              color: tick.major ? .secondary : ChartStyle.axisLabel,
                              at: CGPoint(x: x, y: geometry.axisBaseline), anchor: .bottom)
@@ -396,7 +398,7 @@ struct LineChartView: View {
         context.drawPriceTag(PriceFormatter.price(sample.price, decimals: decimals),
                              y: y, geometry: geometry, fill: ChartStyle.tagFill,
                              text: ChartStyle.tagText)
-        context.drawTimeTag(ChartFormatters.string(sample.ts, hoverFormat(domain), timeZone: domain.timeZone),
+        context.drawTimeTag(DisplayTime.string(sample.ts, hoverFormat(domain)),
                             x: x, geometry: geometry, fill: ChartStyle.tagFill,
                             text: ChartStyle.tagText)
     }

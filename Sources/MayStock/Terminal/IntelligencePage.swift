@@ -12,7 +12,7 @@ struct IntelligencePage: View {
     @State private var selectedReport: IntelligenceReport?
 
     private var center: IntelligenceCenter { appState.intelligence }
-    private var calendar: Calendar { IntelligenceCalendar.calendar(timezone: center.settings.timezone) }
+    private var calendar: Calendar { IntelligenceCalendar.calendar(timezone: DisplayTime.identifier) }
     private var watchlist: [String] { Array(Set(appState.store.config.watchlist.map(\.instId))).sorted() }
 
     var body: some View {
@@ -29,7 +29,7 @@ struct IntelligencePage: View {
                     }
                     .pickerStyle(.segmented).labelsHidden().frame(width: 240)
                     Spacer()
-                    Text(center.settings.timezone).font(Theme.Text.caption).foregroundStyle(.secondary)
+                    Text(DisplayTime.name).font(Theme.Text.caption).foregroundStyle(.secondary)
                 }
                 .padding(.horizontal, Theme.pagePadding).padding(.vertical, 16)
                 Divider()
@@ -54,7 +54,7 @@ struct IntelligencePage: View {
             IntelligenceSettingsSheet(center: center)
         }
         .sheet(item: $selectedReport) { report in
-            IntelligenceReportReader(report: report, timezone: center.settings.timezone)
+            IntelligenceReportReader(report: report)
         }
     }
 
@@ -195,7 +195,7 @@ struct IntelligencePage: View {
                 Card(title: "研究分析", subtitle: "\(report.findings.count) 个章节 · 点击标题展开正文与来源") {
                     VStack(alignment: .leading, spacing: 0) {
                         ForEach(Array(report.findings.enumerated()), id: \.element.id) { index, finding in
-                            IntelligenceFindingDisclosure(finding: finding, timezone: center.settings.timezone,
+                            IntelligenceFindingDisclosure(finding: finding,
                                                           number: index + 1)
                                 .padding(.vertical, 8)
                             if finding.id != report.findings.last?.id { Divider() }
@@ -271,7 +271,7 @@ struct IntelligencePage: View {
                 VStack(alignment: .leading, spacing: 6) {
                     ForEach(watchlist, id: \.self) { instId in
                         if let context = library.currentPrediction(for: instId) {
-                            IntelligencePredictionView(context: context, now: now, timezone: center.settings.timezone)
+                            IntelligencePredictionView(context: context, now: now)
                         } else {
                             HStack {
                                 Text(instId).font(Theme.Text.bodyMedium)
@@ -299,7 +299,7 @@ struct IntelligencePage: View {
             Card(title: "最近快讯") {
                 VStack(alignment: .leading, spacing: 10) {
                     ForEach(library.recentFlashes) { event in
-                        IntelligenceEventDisclosure(event: event, timezone: center.settings.timezone)
+                        IntelligenceEventDisclosure(event: event)
                     }
                 }
             }
@@ -317,8 +317,8 @@ struct IntelligencePage: View {
     }
 
     private func calendarCard(library: IntelligenceLibrary, now: Date) -> some View {
-        let days = IntelligenceCalendar.days(around: now, timezone: center.settings.timezone)
-        let leading = days.first.map { IntelligenceCalendar.leadingDays(for: $0, timezone: center.settings.timezone) } ?? 0
+        let days = IntelligenceCalendar.days(around: now, timezone: DisplayTime.identifier)
+        let leading = days.first.map { IntelligenceCalendar.leadingDays(for: $0, timezone: DisplayTime.identifier) } ?? 0
         return Card(title: "事件日历", subtitle: calendarRange(days)) {
             Button("今天") { selectedDay = now }.controlSize(.small)
         } content: {
@@ -393,7 +393,7 @@ struct IntelligencePage: View {
             } else {
                 VStack(alignment: .leading, spacing: 12) {
                     ForEach(confirmed) { event in
-                        IntelligenceEventDisclosure(event: event, timezone: center.settings.timezone)
+                        IntelligenceEventDisclosure(event: event)
                         if event.id != confirmed.last?.id { Divider() }
                     }
                     if !pending.isEmpty {
@@ -402,7 +402,7 @@ struct IntelligencePage: View {
                         Text("以下按归档日期展示，实际发生日期仍待核实。")
                             .font(Theme.Text.caption).foregroundStyle(.secondary)
                         ForEach(pending) { event in
-                            IntelligenceEventDisclosure(event: event, timezone: center.settings.timezone)
+                            IntelligenceEventDisclosure(event: event)
                         }
                     }
                 }
@@ -425,7 +425,7 @@ struct IntelligencePage: View {
                      stamp(day.date, format: "M月d日 EEEE")) {
                     VStack(alignment: .leading, spacing: 12) {
                         ForEach(day.editions) { edition in
-                            IntelligenceHistoryEditionRow(edition: edition, timezone: center.settings.timezone,
+                            IntelligenceHistoryEditionRow(edition: edition,
                                                           openReport: { selectedReport = $0 })
                             if edition.id != day.editions.last?.id { Divider() }
                         }
@@ -446,7 +446,7 @@ struct IntelligencePage: View {
     }
 
     private func stamp(_ date: Date, format: String = "MM/dd HH:mm") -> String {
-        intelligenceStamp(date, timezone: center.settings.timezone, format: format)
+        intelligenceStamp(date, format: format)
     }
 
     private func calendarRange(_ days: [Date]) -> String {
@@ -477,12 +477,11 @@ private struct IntelligenceSummaryView: View {
 
 private struct IntelligenceFindingDisclosure: View {
     let finding: IntelligenceFinding
-    let timezone: String
     var number: Int? = nil
 
     var body: some View {
         DisclosureGroup {
-            IntelligenceFindingView(finding: finding, timezone: timezone, showHeading: false)
+            IntelligenceFindingView(finding: finding, showHeading: false)
                 .padding(.top, 8)
         } label: {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -501,11 +500,10 @@ private struct IntelligenceFindingDisclosure: View {
 
 private struct IntelligenceEventDisclosure: View {
     let event: IntelligenceEvent
-    let timezone: String
 
     var body: some View {
         DisclosureGroup {
-            IntelligenceEventView(event: event, timezone: timezone, showHeading: false).padding(.top, 7)
+            IntelligenceEventView(event: event, showHeading: false).padding(.top, 7)
         } label: {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(event.title).font(Theme.Text.bodyMedium).fixedSize(horizontal: false, vertical: true)
@@ -514,7 +512,7 @@ private struct IntelligenceEventDisclosure: View {
                 if event.timePrecision == .unknown || event.status == .unverified {
                     Badge(text: "待核实", tint: .secondary, size: .small)
                 }
-                Text(intelligenceStamp(event.occurredAt, timezone: timezone,
+                Text(intelligenceStamp(event.occurredAt,
                                        format: event.timePrecision == .minute ? "MM/dd HH:mm" : "MM/dd"))
                     .font(Theme.Text.caption).foregroundStyle(.secondary).numeric()
             }
@@ -524,7 +522,6 @@ private struct IntelligenceEventDisclosure: View {
 
 private struct IntelligenceHistoryEditionRow: View {
     let edition: IntelligenceEdition
-    let timezone: String
     let openReport: (IntelligenceReport) -> Void
 
     var body: some View {
@@ -554,7 +551,7 @@ private struct IntelligenceHistoryEditionRow: View {
                         Text(report.kind == .daily ? "当日简报" : report.kind == .hourly ? "市场分析" : "快讯")
                             .font(Theme.Text.bodyMedium)
                         if isPrevious { Badge(text: "较早版本", tint: .secondary, size: .small) }
-                        Text(intelligenceStamp(report.generatedAt, timezone: timezone, format: "HH:mm"))
+                        Text(intelligenceStamp(report.generatedAt, format: "HH:mm"))
                             .font(Theme.Text.caption).foregroundStyle(.secondary).numeric()
                     }
                     Text(report.title).font(Theme.Text.secondary).foregroundStyle(.secondary)
@@ -573,7 +570,6 @@ private struct IntelligenceHistoryEditionRow: View {
 
 private struct IntelligenceAnalysisView: View {
     let report: IntelligenceReport
-    let timezone: String
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -582,7 +578,7 @@ private struct IntelligenceAnalysisView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             ForEach(report.findings) { finding in
-                IntelligenceFindingView(finding: finding, timezone: timezone)
+                IntelligenceFindingView(finding: finding)
             }
             if !report.coverage.isEmpty {
                 Text("检索覆盖：" + report.coverage).font(Theme.Text.secondary).foregroundStyle(.secondary)
@@ -595,7 +591,6 @@ private struct IntelligenceAnalysisView: View {
 
 private struct IntelligenceFindingView: View {
     let finding: IntelligenceFinding
-    let timezone: String
     var showHeading = true
 
     var body: some View {
@@ -613,7 +608,7 @@ private struct IntelligenceFindingView: View {
             }
             Text(finding.body).font(Theme.Text.body).lineSpacing(4).textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
-            IntelligenceSourcesView(sources: finding.sources, timezone: timezone)
+            IntelligenceSourcesView(sources: finding.sources)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -621,7 +616,6 @@ private struct IntelligenceFindingView: View {
 
 private struct IntelligenceEventView: View {
     let event: IntelligenceEvent
-    let timezone: String
     var showHeading = true
 
     var body: some View {
@@ -648,31 +642,30 @@ private struct IntelligenceEventView: View {
                 Text("市场影响：" + event.impact).font(Theme.Text.secondary).foregroundStyle(.secondary)
                     .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
             }
-            IntelligenceSourcesView(sources: event.sources, timezone: timezone)
+            IntelligenceSourcesView(sources: event.sources)
         }
     }
 
     private var occurrenceText: String {
         let prefix = event.status == .scheduled ? "计划 " : "发生 "
         switch event.timePrecision {
-        case .minute: return prefix + intelligenceStamp(event.occurredAt, timezone: timezone) + " " + timezone
+        case .minute: return prefix + intelligenceStamp(event.occurredAt) + " " + DisplayTime.name
         case .day:
-            return "来源日期 " + intelligenceStamp(event.occurredAt, timezone: timezone, format: "yyyy/MM/dd") +
-                "（时分未核实） · " + timezone
+            return "来源日期 " + intelligenceStamp(event.occurredAt, format: "yyyy/MM/dd") +
+                "（时分未核实） · " + DisplayTime.name
         case .unknown:
             return (event.status == .scheduled ? "计划时间待核实" : "发生时间待核实") + " · 归档 " +
-                intelligenceStamp(event.occurredAt, timezone: timezone, format: "MM/dd")
+                intelligenceStamp(event.occurredAt, format: "MM/dd")
         }
     }
 
     private var publicationText: String {
-        event.publishedAt.map { "报道发布 " + intelligenceStamp($0, timezone: timezone) } ?? "报道发布时间未提供"
+        event.publishedAt.map { "报道发布 " + intelligenceStamp($0) } ?? "报道发布时间未提供"
     }
 }
 
 private struct IntelligenceSourcesView: View {
     let sources: [IntelligenceSource]
-    let timezone: String
 
     var body: some View {
         DisclosureGroup("来源与原始证据（\(sources.count)）") {
@@ -687,7 +680,7 @@ private struct IntelligenceSourcesView: View {
                         } else {
                             Text(source.title).foregroundStyle(.secondary)
                         }
-                        Text(source.publisher + " · 检索于 " + intelligenceStamp(source.retrievedAt, timezone: timezone))
+                        Text(source.publisher + " · 检索于 " + intelligenceStamp(source.retrievedAt))
                             .font(Theme.Text.caption).foregroundStyle(.secondary)
                         if !source.evidence.isEmpty {
                             Text(source.evidence).foregroundStyle(.secondary).textSelection(.enabled)
@@ -706,7 +699,6 @@ private struct IntelligenceSourcesView: View {
 private struct IntelligencePredictionView: View {
     let context: IntelligencePredictionContext
     let now: Date
-    let timezone: String
     var historical = false
 
     private var prediction: IntelligencePrediction { context.prediction }
@@ -715,8 +707,8 @@ private struct IntelligencePredictionView: View {
     var body: some View {
         DisclosureGroup {
             VStack(alignment: .leading, spacing: 7) {
-                Text("生成 " + intelligenceStamp(prediction.generatedAt, timezone: timezone) + " · 有效至 " +
-                     intelligenceStamp(prediction.expiresAt, timezone: timezone) + " " + timezone)
+                Text("生成 " + intelligenceStamp(prediction.generatedAt) + " · 有效至 " +
+                     intelligenceStamp(prediction.expiresAt) + " " + DisplayTime.name)
                     .font(Theme.Text.caption).foregroundStyle(.secondary)
                 if let price = prediction.referencePrice {
                     Text("参考价格 " + PriceFormatter.auto(price)).font(Theme.Text.secondary).numeric()
@@ -732,7 +724,7 @@ private struct IntelligencePredictionView: View {
                 if !context.findings.isEmpty {
                     Text("研判依据").font(Theme.Text.captionMedium).foregroundStyle(.secondary)
                     ForEach(context.findings) { finding in
-                        IntelligenceFindingDisclosure(finding: finding, timezone: timezone)
+                        IntelligenceFindingDisclosure(finding: finding)
                             .padding(.vertical, 4)
                     }
                 }
@@ -741,7 +733,7 @@ private struct IntelligencePredictionView: View {
                     ForEach(context.events) { event in
                         VStack(alignment: .leading, spacing: 4) {
                             Text(event.title).font(Theme.Text.secondary)
-                            IntelligenceSourcesView(sources: event.sources, timezone: timezone)
+                            IntelligenceSourcesView(sources: event.sources)
                         }
                     }
                 }
@@ -759,12 +751,12 @@ private struct IntelligencePredictionView: View {
                 if expired {
                     Badge(text: "已过期", tint: .secondary, size: .small)
                 } else {
-                    Text("至 " + intelligenceStamp(prediction.expiresAt, timezone: timezone, format: "HH:mm"))
+                    Text("至 " + intelligenceStamp(prediction.expiresAt, format: "HH:mm"))
                         .font(Theme.Text.caption).foregroundStyle(.secondary).numeric()
                 }
             }
-            .help("生成 " + intelligenceStamp(prediction.generatedAt, timezone: timezone) + " · 有效至 " +
-                  intelligenceStamp(prediction.expiresAt, timezone: timezone) + " " + timezone)
+            .help("生成 " + intelligenceStamp(prediction.generatedAt) + " · 有效至 " +
+                  intelligenceStamp(prediction.expiresAt) + " " + DisplayTime.name)
         }
         .rowStyle(padding: 9)
     }
@@ -777,7 +769,6 @@ private struct IntelligencePredictionView: View {
 
 private struct IntelligenceReportReader: View {
     let report: IntelligenceReport
-    let timezone: String
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -787,7 +778,7 @@ private struct IntelligenceReportReader: View {
                     VStack(alignment: .leading, spacing: 7) {
                         HStack(spacing: 7) {
                             Badge(text: "历史报告", tint: .secondary, size: .small)
-                            Text(intelligenceStamp(report.generatedAt, timezone: timezone) + " · " + timezone)
+                            Text(intelligenceStamp(report.generatedAt) + " · " + DisplayTime.name)
                                 .font(Theme.Text.caption).foregroundStyle(.secondary).textSelection(.enabled)
                             if report.coverageComplete == nil {
                                 Badge(text: "旧版记录 · 覆盖未知", tint: .secondary, size: .small)
@@ -805,21 +796,21 @@ private struct IntelligenceReportReader: View {
                 Divider()
                 ScrollView {
                     VStack(alignment: .leading, spacing: Theme.sectionSpacing) {
-                        Text("资料窗口 " + intelligenceStamp(report.windowStart, timezone: timezone) + " — " +
-                             intelligenceStamp(report.windowEnd, timezone: timezone) + " " + timezone)
+                        Text("资料窗口 " + intelligenceStamp(report.windowStart) + " — " +
+                             intelligenceStamp(report.windowEnd) + " " + DisplayTime.name)
                             .font(Theme.Text.caption).foregroundStyle(.secondary).textSelection(.enabled)
                         if let model = report.model {
                             Text("生成模型：" + model)
                                 .font(Theme.Text.caption).foregroundStyle(.secondary).textSelection(.enabled)
                         }
-                        IntelligenceAnalysisView(report: report, timezone: timezone)
+                        IntelligenceAnalysisView(report: report)
                         if !report.predictions.isEmpty {
                             Card(title: "当时的标的判断", subtitle: "仅反映本报告生成时的研究，过期判断不代表当前方向") {
                                 VStack(alignment: .leading, spacing: 6) {
                                     ForEach(report.predictions) { prediction in
                                         IntelligencePredictionView(
                                             context: IntelligencePredictionContext(prediction: prediction, report: report),
-                                            now: context.date, timezone: timezone, historical: true)
+                                            now: context.date, historical: true)
                                     }
                                 }
                             }
@@ -828,7 +819,7 @@ private struct IntelligenceReportReader: View {
                             Card(title: "本报告收录的事件") {
                                 VStack(alignment: .leading, spacing: 12) {
                                     ForEach(report.events) { event in
-                                        IntelligenceEventDisclosure(event: event, timezone: timezone)
+                                        IntelligenceEventDisclosure(event: event)
                                         if event.id != report.events.last?.id { Divider() }
                                     }
                                 }
@@ -847,7 +838,6 @@ private struct IntelligenceSettingsSheet: View {
     let center: IntelligenceCenter
     @Environment(\.dismiss) private var dismiss
     @State private var dailyHour = 8
-    @State private var timezone = "Asia/Taipei"
     @State private var horizonHours = 1
     @State private var enabled = true
     @State private var model = IntelligenceSettings.defaultModel
@@ -865,7 +855,7 @@ private struct IntelligenceSettingsSheet: View {
                 Picker("日报时间", selection: $dailyHour) {
                     ForEach(0..<24, id: \.self) { Text(String(format: "%02d:00", $0)).tag($0) }
                 }
-                TextField("时区", text: $timezone).textFieldStyle(.roundedBorder)
+                LabeledContent("时区", value: "\(DisplayTime.name)（跟随设置 › 通用 › 显示时区）")
                 Stepper("预测期限：\(horizonHours) 小时", value: $horizonHours, in: 1...120)
             }
             .font(Theme.Text.body)
@@ -877,10 +867,6 @@ private struct IntelligenceSettingsSheet: View {
                 if center.isRunning { Text("当前研究会继续使用启动时的模型。") }
             }
             .font(Theme.Text.secondary).foregroundStyle(.secondary)
-            if TimeZone(identifier: timezone) == nil {
-                Text("请输入有效 IANA 时区，例如 Asia/Taipei 或 America/New_York。")
-                    .font(Theme.Text.caption).foregroundStyle(Theme.warning)
-            }
             if IntelligenceSettings.normalizeModel(model) == nil {
                 Text("请输入 1–200 位模型名称，可包含字母、数字、下划线、点、冒号、斜线、短横线和方括号。")
                     .font(Theme.Text.caption).foregroundStyle(Theme.warning)
@@ -892,7 +878,7 @@ private struct IntelligenceSettingsSheet: View {
                 Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
                 Spacer()
                 Button("保存") {
-                    if center.updateSettings(dailyHour: dailyHour, timezone: timezone, horizonHours: horizonHours,
+                    if center.updateSettings(dailyHour: dailyHour, horizonHours: horizonHours,
                                              model: model, enabled: enabled) {
                         dismiss()
                     } else {
@@ -900,13 +886,12 @@ private struct IntelligenceSettingsSheet: View {
                     }
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(TimeZone(identifier: timezone) == nil || IntelligenceSettings.normalizeModel(model) == nil)
+                .disabled(IntelligenceSettings.normalizeModel(model) == nil)
             }
         }
         .padding(24).frame(width: 560)
         .onAppear {
             dailyHour = center.settings.dailyHour
-            timezone = center.settings.timezone
             horizonHours = center.settings.horizonHours
             enabled = center.settings.enabled
             model = center.settings.model
@@ -914,12 +899,8 @@ private struct IntelligenceSettingsSheet: View {
     }
 }
 
-private func intelligenceStamp(_ date: Date, timezone: String, format: String = "yyyy/MM/dd HH:mm") -> String {
-    let formatter = DateFormatter()
-    formatter.locale = Locale(identifier: "zh_Hans_CN")
-    formatter.timeZone = TimeZone(identifier: timezone) ?? TimeZone(secondsFromGMT: 0)
-    formatter.dateFormat = format
-    return formatter.string(from: date)
+private func intelligenceStamp(_ date: Date, format: String = "yyyy/MM/dd HH:mm") -> String {
+    DisplayTime.string(date, format)
 }
 
 private func importanceColor(_ importance: IntelligenceImportance) -> Color {

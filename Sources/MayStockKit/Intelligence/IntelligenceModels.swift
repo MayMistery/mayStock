@@ -210,16 +210,16 @@ public struct IntelligenceSettings: Codable, Equatable, Sendable {
     public static let defaultModel = "model_hub/es1_orange_o50[1m]"
 
     public var enabled: Bool
+    /// The hour the daily report runs, on the display clock (`DisplayTime`):
+    /// the station keeps no zone of its own.
     public var dailyHour: Int
-    public var timezone: String
     public var horizonHours: Int
     public var model: String
 
-    public init(enabled: Bool = true, dailyHour: Int = 8, timezone: String = "Asia/Taipei",
+    public init(enabled: Bool = true, dailyHour: Int = 8,
                 horizonHours: Int = 1, model: String = IntelligenceSettings.defaultModel) {
         self.enabled = enabled
         self.dailyHour = dailyHour
-        self.timezone = timezone
         self.horizonHours = horizonHours
         self.model = model
     }
@@ -234,13 +234,19 @@ public struct IntelligenceSettings: Codable, Equatable, Sendable {
         return model
     }
 
-    private enum CodingKeys: String, CodingKey { case enabled, dailyHour, timezone, horizonHours, model }
+    private enum CodingKeys: String, CodingKey { case enabled, dailyHour, horizonHours, model }
+
+    /// The station's own zone, before it read the display clock — still in
+    /// an archive written before 2026-10-09; the center says it is retired
+    /// and writes the archive without it.
+    public struct Retired: Decodable {
+        public let timezone: String?
+    }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
         dailyHour = try c.decodeIfPresent(Int.self, forKey: .dailyHour) ?? 8
-        timezone = try c.decodeIfPresent(String.self, forKey: .timezone) ?? "Asia/Taipei"
         horizonHours = try c.decodeIfPresent(Int.self, forKey: .horizonHours) ?? 1
         model = try c.decodeIfPresent(String.self, forKey: .model) ?? Self.defaultModel
     }

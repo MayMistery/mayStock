@@ -254,10 +254,10 @@ struct CloseTicketModelTests {
     func sharesOnAStockVenue() async throws {
         let shares = ExchangePosition(
             instId: "MU", posSide: .net, quantity: 30, averagePrice: 100, markPrice: 120,
-            unrealisedPnL: 600, leverage: nil, liquidationPrice: nil, instType: "EQUITY")
+            unrealisedPnL: 600, leverage: nil, liquidationPrice: nil, instType: InstrumentType.stock.rawValue)
         let venue = QuoteVenue(shares: [shares])
         let model = await Self.opened(venue, CloseTicketRequest(
-            venue: .schwab, mode: .live, instId: "MU", instType: .stock, filedAs: "EQUITY",
+            venue: .schwab, mode: .live, instId: "MU", instType: .stock, filedAs: InstrumentType.stock.rawValue,
             holding: .position(isLong: true)))
         defer { model.close() }
         #expect(model.holding?.family == .stock)
@@ -357,7 +357,7 @@ final class QuoteVenue: ExchangeVenue, @unchecked Sendable {
             instId: instId, last: 120.05, bid: 120.00, ask: 120.10, reference: 119, open: nil,
             high: 121, low: 118, volume: 1_000, basis: .previousClose, phase: nil, ts: Date())
         return StaticBook(BookDocument.quote(
-            instId: instId, spec: .shares(SchwabMarketDataSource.equityMeta(instId)), ticker: ticker, error: nil,
+            instId: instId, spec: try .us(.stock), ticker: ticker, error: nil,
             interval: .seconds(1)))
     }
 }

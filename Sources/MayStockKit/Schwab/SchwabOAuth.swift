@@ -269,9 +269,6 @@ public struct SchwabCredentialStatus: Codable, Sendable, Equatable {
     }
 
     static func stamp(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "zh_CN")
-        formatter.dateFormat = "MM-dd HH:mm"
-        return formatter.string(from: date)
+        DisplayTime.string(date, "MM-dd HH:mm")
     }
 }

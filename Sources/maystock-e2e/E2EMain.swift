@@ -9,6 +9,12 @@ import MayStockKit
 ///   maystock-e2e trade-doctor          okx CLI detection + public call
 ///   maystock-e2e strategy-doctor       compile presets + real multi-window backtest
 ///   maystock-e2e live [sec]            the kernel's live layer against the real venues
+///   maystock-e2e live-us <sym> [sec] [contract…] [--fixture=<file>]
+///                                      the checkup of a US share against Schwab: its chain
+///                                      fitted, each named contract streamed and held field by
+///                                      field to Schwab's REST quote, its close rehearsed to the
+///                                      request body; places nothing. --fixture writes the
+///                                      reading for `MayStock --snapshot --live-fixture`
 ///   maystock-e2e account [sec]         the live account document against REST reads of the
 ///                                      same account: valuation, orders, transfers; read-only
 ///   maystock-e2e close-doctor          the close ticket on every real holding: the kernel's
@@ -33,6 +39,8 @@ struct E2EMain {
         // sharing a file with them was cut mid-character (measured: a split
         // UTF-8 sequence at every 8 KB boundary of `close-doctor > f 2>&1`).
         setvbuf(stdout, nil, _IOLBF, 0)
+        // Times print on the clock the app's settings name.
+        DisplayTime.adopt(ConfigIO(directory: ConfigIO.defaultDirectory()).load().general)
         let args = Array(CommandLine.arguments.dropFirst())
         let command = args.first ?? "doctor"
         let ok: Bool
@@ -54,6 +62,13 @@ struct E2EMain {
             ok = await strategyDoctor(instId: args.count > 1 ? args[1] : nil)
         case "live":
             ok = await liveDoctor(seconds: args.count > 1 ? Int(args[1]) ?? 30 : 30)
+        case "live-us":
+            let rest = Array(args.dropFirst(3))
+            let fixture = rest.first { $0.hasPrefix("--fixture=") }.map { URL(fileURLWithPath: String($0.dropFirst("--fixture=".count))) }
+            ok = await liveUSDoctor(
+                symbol: args.count > 1 ? args[1].uppercased() : "MU",
+                seconds: args.count > 2 ? Int(args[2]) ?? 40 : 40,
+                contracts: rest.filter { !$0.hasPrefix("--fixture=") }, fixture: fixture)
         case "account":
             ok = await accountDoctor(seconds: args.count > 1 ? Int(args[1]) ?? 40 : 40)
         case "close-doctor":

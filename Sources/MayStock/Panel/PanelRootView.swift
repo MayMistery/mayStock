@@ -132,8 +132,7 @@ struct PanelRootView: View {
             case .candles:
                 let display = session.displayCandles
                 let isStale = session.isBackfilling && !display.candles.isEmpty
-                CandleChartView(candles: display.candles, bar: display.bar, decimals: decimals,
-                                timeZone: venue.tradesContinuously ? .current : venue.timeZone)
+                CandleChartView(candles: display.candles, bar: display.bar, decimals: decimals, venue: venue)
                     .opacity(isStale ? 0.45 : 1)
                 if isStale {
                     // Keep the outgoing interval on screen while the new one
@@ -271,7 +270,7 @@ struct PanelRootView: View {
             if let issue = session.issue {
                 Text("· ⚠ 读不到报价：\(issue)").lineLimit(1).foregroundStyle(Theme.down).help(issue)
             } else if let last = session.lastUpdate {
-                Text("· 更新 \(last.formatted(date: .omitted, time: .standard))").numeric()
+                Text("· 更新 \(Format.clock(last))").numeric()
             }
             Spacer()
             Button {
@@ -311,9 +310,9 @@ struct MarketPhaseBadge: View {
 
     private var help: String {
         switch phase {
-        case .regular: return "常规交易时段（纽约 09:30–16:00）"
-        case .preMarket: return "盘前交易（纽约 04:00–09:30），成交稀薄"
-        case .afterHours: return "盘后交易（纽约 16:00–20:00），成交稀薄"
+        case .regular: return "常规交易时段（\(USSessionHours.displayedHours(\.regular))）"
+        case .preMarket: return "盘前交易（\(USSessionHours.displayedHours(\.preMarket))），成交稀薄"
+        case .afterHours: return "盘后交易（\(USSessionHours.displayedHours(\.postMarket))），成交稀薄"
         case .closed: return "休市，显示的是最近一次成交"
         }
     }

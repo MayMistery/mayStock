@@ -284,11 +284,24 @@ public struct SchwabVenue: ExchangeVenue {
         return tagged
     }
 
+    /// Shares and options, each from the one account document. The shadow
+    /// book holds shares only.
     public func positions(mode: TradingMode, instType: InstrumentType) async throws -> [ExchangePosition] {
-        guard instType == .stock else { return [] }
+        switch (mode, instType) {
+        case (.demo, .stock): return await shadow.positions()
+        case (.live, .stock): return try await bridge.account().shareHoldings
+        case (.live, .option): return try await bridge.account().contractPositions
+        default: return []
+        }
+    }
+
+    /// Everything held, from one read of the account.
+    public func heldPositions(mode: TradingMode) async throws -> [ExchangePosition] {
         switch mode {
         case .demo: return await shadow.positions()
-        case .live: return try await bridge.account().exchangePositions
+        case .live:
+            let account = try await bridge.account()
+            return account.contractPositions + account.shareHoldings
         }
     }
 
@@ -316,14 +329,51 @@ public struct SchwabVenue: ExchangeVenue {
     public func accountReading(mode: TradingMode, source: AccountReading.Source) async throws -> AccountReading {
         switch mode {
         case .demo:
-            return try await AccountReading.piecewise(from: self, mode: mode, source: source)
+            let reading = try await AccountReading.piecewise(from: self, mode: mode, source: source)
+            return reading.handing(liveDocument: Self.shadowDocument(reading))
         case .live:
             let account = try await bridge.account()
             let at = Date()
             return AccountReading(
-                snapshot: account.snapshot, equityAt: at, positions: [],
-                shareHoldings: account.exchangePositions, positionsAt: at, source: source)
+                snapshot: account.snapshot, equityAt: at, positions: account.contractPositions,
+                shareHoldings: account.shareHoldings, positionsAt: at, source: source,
+                liveDocument: AccountReading.LiveDocument(topic: Self.accountTopic, payload: Self.envelope(
+                    source: "schwab", account: account.document)))
         }
+    }
+
+    /// The live layer's topics for this venue's account reading and its
+    /// working orders.
+    public static let accountTopic = "schwab.account"
+    public static let ordersTopic = "schwab.orders"
+
+    /// The reading as the live layer takes it: whose book it is, and the
+    /// kernel's account document.
+    static func envelope(source: String, account: String) -> String {
+        "{\"source\":\"\(source)\",\"account\":\(account)}"
+    }
+
+    /// The shadow book, written as the kernel's account document — shares
+    /// only, since the shadow book trades nothing else — so the checkup reads
+    /// the demo account the way it reads the live one.
+    static func shadowDocument(_ reading: AccountReading) -> AccountReading.LiveDocument? {
+        let holdings: [[String: Any]] = reading.shareHoldings.map { position in
+            var row: [String: Any] = [
+                "symbol": position.instId, "assetType": "EQUITY", "family": InstrumentType.stock.rawValue,
+                "quantity": position.quantity, "averagePrice": position.averagePrice,
+                "marketValue": position.notionalUsd ?? 0, "openProfitLoss": position.unrealisedPnL,
+            ]
+            if position.notionalUsd == nil { row["note"] = "影子账户还没有这只股票的报价，市值暂按 0" }
+            return row
+        }
+        let cash = reading.snapshot.balances.first { $0.ccy == Venue.schwab.quoteCurrency }?.total ?? 0
+        let account: [String: Any] = [
+            "accountNumber": "shadow", "type": "SHADOW", "cash": cash,
+            "equity": reading.snapshot.totalEquity as Any, "positions": holdings, "unrecognised": [String](),
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: account, options: [.sortedKeys]) else { return nil }
+        return AccountReading.LiveDocument(
+            topic: accountTopic, payload: envelope(source: "shadow", account: String(decoding: data, as: UTF8.self)))
     }
 
     // MARK: Open orders
@@ -355,7 +405,7 @@ public struct SchwabVenue: ExchangeVenue {
                     price: order.price, triggerPrice: order.stopPrice, stopTriggerPrice: order.stopPrice,
                     takeProfitTriggerPrice: nil, size: order.quantity, closeFraction: nil,
                     filledSize: order.filledQuantity, state: order.status.lowercased(),
-                    reduceOnly: order.instruction == "SELL" || order.instruction == "BUY_TO_COVER",
+                    reduceOnly: order.closes,
                     clOrdId: tag, createdAt: order.enteredTime))
             }
             return out
@@ -405,28 +455,104 @@ public struct SchwabVenue: ExchangeVenue {
         instId: String, instType: InstrumentType, posSide: PositionSide?, tradeMode: String?,
         size: Double, stopPrice: Double, mode: TradingMode, liveUnlocked: Bool
     ) async throws {
-        switch mode {
-        case .demo:
+        try await placeStop(
+            instId: instId, family: instType, size: size, stopPrice: stopPrice, trigger: .last,
+            mode: mode, liveUnlocked: liveUnlocked)
+    }
+
+    /// A stop that closes what is held: shares, or an option's contracts,
+    /// watching what the kernel's plan named (`TradeAlgoSpec.Trigger`).
+    private func placeStop(
+        instId: String, family: InstrumentType, size: Double, stopPrice: Double, trigger: TradeAlgoSpec.Trigger,
+        mode: TradingMode, liveUnlocked: Bool
+    ) async throws {
+        switch (mode, family) {
+        case (.demo, .stock):
             let held = await shadow.positions().first { $0.instId == instId }?.quantity ?? 0
             await shadow.placeProtective(instId: instId, side: held >= 0 ? .sell : .buy, size: size, stopPrice: stopPrice)
-        case .live:
+        case (.live, .stock):
             let held = try await bridge.account().held(instId)
             let spec = SchwabOrderSpec(
                 symbol: instId, instruction: SchwabOrderSpec.closingInstruction(forLong: held >= 0),
-                quantity: size, orderType: "STOP", stopPrice: stopPrice, duration: "GOOD_TILL_CANCEL")
+                quantity: size, orderType: "STOP", stopPrice: stopPrice,
+                stopType: SchwabOrderSpec.stopType(trigger), duration: "GOOD_TILL_CANCEL")
             _ = try await bridge.place(spec, liveUnlocked: liveUnlocked)
+        case (.live, .option):
+            let held = try await bridge.account().held(instId)
+            let spec = try Self.optionStop(instId, size: size, stopPrice: stopPrice, trigger: trigger, held: held)
+            _ = try await bridge.place(spec, liveUnlocked: liveUnlocked)
+        case (.demo, .option):
+            throw TradeError.refused("嘉信影子账户只撮合股票，没有期权")
+        default:
+            throw TradeError.unsupportedInstrument(family)
         }
+    }
+
+    /// Refuses unless an order for `size` contracts of `symbol` only
+    /// closes what is `held`: something is held, and no more than that is
+    /// asked for. Schwab would refuse a close larger than the position
+    /// anyway; saying so here says it in words.
+    static func checkClosable(_ symbol: String, size: Double, held: Double) throws {
+        let name = symbol.trimmingCharacters(in: .whitespaces)
+        guard held != 0 else { throw TradeError.refused("账户上已经没有 \(name) 的持仓") }
+        guard size <= abs(held) + 1e-9 else {
+            throw TradeError.refused("要平 \(PriceFormatter.plain(size)) 张，账户上只有 \(PriceFormatter.plain(abs(held))) 张 \(name)")
+        }
+    }
+
+    /// A stop that closes `size` of an option held `held` (signed), on what
+    /// the plan said it watches. The one spelling the order path sends and
+    /// the doctor reviews.
+    public static func optionStop(
+        _ symbol: String, size: Double, stopPrice: Double, trigger: TradeAlgoSpec.Trigger, held: Double
+    ) throws -> SchwabOrderSpec {
+        try checkClosable(symbol, size: size, held: held)
+        return SchwabOrderSpec(
+            symbol: symbol, assetType: "OPTION",
+            instruction: SchwabOrderSpec.optionClosingInstruction(forLong: held > 0),
+            quantity: size, orderType: "STOP", stopPrice: stopPrice,
+            stopType: SchwabOrderSpec.stopType(trigger), duration: "GOOD_TILL_CANCEL")
+    }
+
+    /// A limit close of an option held `held` (signed): `SELL_TO_CLOSE` a
+    /// long, `BUY_TO_CLOSE` a short — never one that opens. The kernel's
+    /// declaration offers nothing else for a Schwab option (no market order
+    /// on a thin book), so anything else is refused by name.
+    public static func optionClose(_ spec: TradeOrderSpec, held: Double) throws -> SchwabOrderSpec {
+        guard spec.instType == .option else { throw TradeError.unsupportedInstrument(spec.instType) }
+        guard spec.reduceOnly else { throw TradeError.refused("嘉信期权单只用来平仓") }
+        guard spec.kind == .limit, let price = spec.price else {
+            throw TradeError.refused("嘉信期权只下限价单，不下\(spec.kind.displayName)单")
+        }
+        try checkClosable(spec.instId, size: spec.size, held: held)
+        guard (held > 0) == (spec.side == .sell) else {
+            throw TradeError.refused("账户上的 \(spec.instId.trimmingCharacters(in: .whitespaces)) 是\(held > 0 ? "多" : "空")头，这张单会开反向仓")
+        }
+        return SchwabOrderSpec(
+            symbol: spec.instId, assetType: "OPTION",
+            instruction: SchwabOrderSpec.optionClosingInstruction(forLong: held > 0),
+            quantity: spec.size, orderType: "LIMIT", price: price, duration: "DAY")
     }
 
     // MARK: Closing by hand
 
     /// Schwab's channel carries a quote, not depth: a one-level book, read
-    /// every second while the ticket is open.
+    /// every second while the ticket is open. The terms are the kernel's
+    /// declaration for a US share or option — an option's from what its own
+    /// quote says of its class and multiplier.
     public func closeBook(instId: String, instType: InstrumentType, mode: TradingMode) async throws -> any CloseBookFeed {
-        guard instType == .stock else { throw TradeError.unsupportedInstrument(instType) }
-        let meta = try await data.instrumentMeta(instId: instId) ?? SchwabMarketDataSource.equityMeta(instId)
         let data = self.data
-        return QuoteBook(instId: instId, spec: .shares(meta)) { try await data.ticker(instId: instId) }
+        switch instType {
+        case .stock:
+            return QuoteBook(instId: instId, spec: try .us(.stock)) { try await data.ticker(instId: instId) }
+        case .option:
+            let terms = try await data.optionQuote(symbol: instId).terms
+            let spec = try BookDocument.Spec.us(
+                .option(underlying: terms.underlying, penny: terms.penny, multiplier: terms.multiplier))
+            return QuoteBook(instId: instId, spec: spec) { try await data.optionQuote(symbol: instId).ticker }
+        default:
+            throw TradeError.unsupportedInstrument(instType)
+        }
     }
 
     /// The actions a close plan can produce for shares — a market or limit
@@ -435,6 +561,8 @@ public struct SchwabVenue: ExchangeVenue {
     /// for Schwab offers nothing else, so reaching this is a routing bug.
     public func execute(_ action: TradeAction, mode: TradingMode, liveUnlocked: Bool) async throws -> String {
         switch action {
+        case .place(let spec) where spec.instType == .option:
+            return try await closeOption(spec, mode: mode, liveUnlocked: liveUnlocked)
         case .place(let spec):
             guard spec.instType == .stock else { throw TradeError.unsupportedInstrument(spec.instType) }
             let kind: OrderKind
@@ -449,14 +577,15 @@ public struct SchwabVenue: ExchangeVenue {
                 sizeUnit: .base, limitPrice: spec.price, reduceOnly: spec.reduceOnly, clOrdId: spec.clientId)
             return try await place(order, mode: mode, liveUnlocked: liveUnlocked).ordId
         case .placeAlgo(let algo):
-            guard case .protection(nil, let stop?) = algo.kind else {
+            guard case .protection(nil, let stop?, let trigger) = algo.kind else {
                 throw TradeError.refused("嘉信通道只挂止损单")
             }
+            guard liveUnlocked || mode == .demo else { throw TradeError.liveTradingLocked }
             // Schwab returns a stop's id in a header this channel does not
             // surface; the ticket re-reads the working orders to show it.
-            try await placeProtectiveOrder(
-                instId: algo.instId, instType: algo.instType, posSide: nil, tradeMode: nil,
-                size: algo.size, stopPrice: stop, mode: mode, liveUnlocked: liveUnlocked)
+            try await placeStop(
+                instId: algo.instId, family: algo.instType, size: algo.size, stopPrice: stop, trigger: trigger,
+                mode: mode, liveUnlocked: liveUnlocked)
             return ""
         case .cancel(_, let id), .cancelAlgo(_, let id):
             try await cancel(id: id, mode: mode, liveUnlocked: liveUnlocked)
@@ -464,6 +593,17 @@ public struct SchwabVenue: ExchangeVenue {
         case .amendStop, .precheck, .setLeverage:
             throw TradeError.refused("嘉信通道没有这个操作")
         }
+    }
+
+    /// Close an option's contracts by limit (`optionClose`), against what
+    /// the account holds now.
+    private func closeOption(_ spec: TradeOrderSpec, mode: TradingMode, liveUnlocked: Bool) async throws -> String {
+        guard mode == .live else { throw TradeError.refused("嘉信影子账户只撮合股票，没有期权") }
+        guard liveUnlocked else { throw TradeError.liveTradingLocked }
+        let order = try Self.optionClose(spec, held: try await bridge.account().held(spec.instId))
+        let id = try await bridge.place(order, liveUnlocked: liveUnlocked)
+        if let tag = spec.clientId { await tags.record(clOrdId: tag, orderId: id, instId: spec.instId) }
+        return id
     }
 
     public func workingOrders(

@@ -18,10 +18,28 @@ use serde::{Deserialize, Serialize};
 use super::wire::Family;
 use crate::live::book::{Px, Spec};
 
+/// From this price up, prices move in steps of `tick`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TickBand {
+    pub from: f64,
+    pub tick: f64,
+}
+
+/// The step that applies at `price`: the band with the highest start at or
+/// below it; `fallback` when there are no bands.
+pub fn tick_at(bands: &[TickBand], price: f64, fallback: f64) -> f64 {
+    bands.iter().filter(|b| b.from <= price + 1e-12).max_by(|a, b| a.from.total_cmp(&b.from)).map_or(fallback, |b| b.tick)
+}
+
 /// Contract terms as numbers.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Terms {
+    /// The step at every price, or — where `tick_bands` is not empty — the
+    /// step of the first band.
     pub tick: f64,
+    /// Where the step changes with the price; empty when `tick` holds
+    /// throughout.
+    pub tick_bands: Vec<TickBand>,
     pub lot: f64,
     pub min: f64,
     pub price_decimals: usize,
@@ -48,11 +66,20 @@ impl Terms {
     pub fn read(spec: &Spec) -> Result<Terms, String> {
         let ct_val = Px::parse(&spec.ct_val).map(Px::as_f64).filter(|v| *v > 0.0);
         let ct_mult = Px::parse(&spec.ct_mult).map(Px::as_f64).filter(|v| *v > 0.0).unwrap_or(1.0);
+        let mut tick_bands = Vec::with_capacity(spec.tick_bands.len());
+        for band in &spec.tick_bands {
+            let from = Px::parse(&band.from).map(Px::as_f64).filter(|v| *v >= 0.0);
+            let from = from.ok_or_else(|| format!("合约规格的价位分段起点不合法：{:?}", band.from))?;
+            tick_bands.push(TickBand { from, tick: positive(&band.tick_sz, "tickBands.tickSz")? });
+        }
+        tick_bands.sort_by(|a, b| a.from.total_cmp(&b.from));
+        let price_decimals = spec.tick_bands.iter().map(|b| decimals(&b.tick_sz)).chain([decimals(&spec.tick_sz)]).max().unwrap_or(0);
         Ok(Terms {
             tick: positive(&spec.tick_sz, "tickSz")?,
+            tick_bands,
             lot: positive(&spec.lot_sz, "lotSz")?,
             min: positive(&spec.min_sz, "minSz")?,
-            price_decimals: decimals(&spec.tick_sz),
+            price_decimals,
             contract_value: ct_val.map_or(1.0, |v| v * ct_mult),
             ct_type: spec.ct_type.clone(),
             ct_val_ccy: spec.ct_val_ccy.clone(),
@@ -60,6 +87,11 @@ impl Terms {
             quote_ccy: spec.quote_ccy.clone(),
             inst_type: spec.inst_type.clone(),
         })
+    }
+
+    /// The step a price of `price` has to keep to.
+    pub fn tick_at(&self, price: f64) -> f64 {
+        tick_at(&self.tick_bands, price, self.tick)
     }
 }
 

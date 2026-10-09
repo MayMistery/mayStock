@@ -31,6 +31,7 @@ struct CheckupPage: View {
                     title: "体检",
                     subtitle: "持仓风险、价格区间概率、期权引力、永续结构、宏观、预测市场——实时推送，只读，不下单"
                 ) {
+                    if let model { ReviewPicker(model: model) }
                     ModeBadge(mode: appState.tradingMode)
                 }
                 content
@@ -48,7 +49,8 @@ struct CheckupPage: View {
                 let requested = appState.requestedCheckupInstId
                 let created = CheckupModel(
                     kernel: kernel,
-                    instId: requested ?? Self.fallbackInstId,
+                    instId: requested?.instId ?? Self.fallbackInstId,
+                    reviewMarket: requested?.market ?? LiveSnapshot.Reviewable.crypto,
                     followsHeldPosition: requested == nil,
                     gridDivisor: gridDivisor)
                 appState.pendingCheckupInstId = nil
@@ -130,14 +132,11 @@ enum CheckupText {
         value > 0 ? Theme.up : (value < 0 ? Theme.down : .primary)
     }
 
-    private static let expiryFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "MM-dd HH:mm"
-        return formatter
-    }()
-
+    /// An expiry as the instant it settles, on the display clock: a coin's
+    /// at 08:00 UTC, a US option at its New York session's close — the
+    /// 20NOV contract reads "11-21 05:00" in Singapore.
     static func expiry(_ ms: Int64) -> String {
-        expiryFormatter.string(from: Date(timeIntervalSince1970: Double(ms) / 1000))
+        DisplayTime.string(Date(timeIntervalSince1970: Double(ms) / 1000), "MM-dd HH:mm")
     }
 
     static func hours(_ hours: Double) -> String {
@@ -166,7 +165,50 @@ enum CheckupText {
         switch source {
         case "okx.private": return "账户推送"
         case "rest": return "REST 读取（推送不可用）"
+        case "schwab": return "嘉信账户（App 定时读取，与其他页面同一份）"
+        case "shadow": return "嘉信影子账户（模拟盘）"
         default: return "未读到"
+        }
+    }
+
+    /// The option book the gravity card reads: `4 家合并`, or the one venue
+    /// whose book is the whole market's (`嘉信（全美合并）`).
+    static func bookName(_ gravity: LiveSnapshot.Gravity?) -> String {
+        guard let venues = gravity?.venues, !venues.isEmpty else { return "期权簿" }
+        return venues.count == 1 ? venues[0].venue : "\(venues.count) 家合并"
+    }
+
+    /// `11-20 1040C`: an option leg, short enough for a button.
+    static func contract(_ option: LiveSnapshot.OptionLeg) -> String {
+        "\(expiryDay(option.expiryDay)) \(PriceFormatter.plain(option.strike))\(option.call ? "C" : "P")"
+    }
+
+    /// `2026-11-20` → `11-20`.
+    static func expiryDay(_ day: String) -> String {
+        day.count == 10 ? String(day.dropFirst(5)) : day
+    }
+
+    /// Dollars, signed where a gain or a cost: Schwab's figures and a US
+    /// leg's are all dollars.
+    static func usd(_ amount: Double) -> String {
+        money(amount, "USD")
+    }
+
+    static func signedUsd(_ amount: Double) -> String {
+        PriceFormatter.signedMoney(amount) + " USD"
+    }
+
+    /// Which smile a leg's odds were read from.
+    static func oddsBasis(_ basis: LiveSnapshot.OddsBasis?) -> String {
+        guard let basis else { return "期权链还没拟合出曲面，算不出概率。" }
+        if basis.exact { return "按这份合约自己的到期（\(expiry(basis.expiryMs))）那条曲线读。" }
+        switch basis.placement {
+        case "between":
+            return "这个到期没有拟合出曲线，按 \(expiry(basis.expiryMs)) 与 \(basis.farExpiryMs.map(expiry) ?? "—") 两个到期在总方差上插值。"
+        case "before-first":
+            return "早于最近一个有曲线的到期，沿用 \(expiry(basis.expiryMs)) 的曲线。"
+        default:
+            return "晚于最远一个有曲线的到期，沿用 \(expiry(basis.expiryMs)) 的曲线（外推）。"
         }
     }
 
@@ -211,6 +253,12 @@ enum CheckupText {
 
     /// A leg's heading: side, size, and whether its liquidation is its own.
     static func legTitle(_ position: LiveSnapshot.Position) -> String {
+        if let option = position.option {
+            return "\(position.isShort ? "卖出" : "买入") \(PriceFormatter.plain(abs(position.contracts))) 张 \(option.label)"
+        }
+        if position.isShares {
+            return "\(position.isShort ? "做空" : "持有") \(PriceFormatter.plain(abs(position.contracts))) 股 \(position.instId)"
+        }
         let side = position.isShort ? "空头腿" : "多头腿"
         let mode = position.marginMode == "isolated" ? "逐仓" : (position.marginMode == "cross" ? "全仓" : nil)
         return ([side, "\(PriceFormatter.plain(abs(position.contracts))) 张", mode].compactMap { $0 }).joined(separator: " · ")
@@ -347,6 +395,35 @@ private struct FeedsCard: View {
     }
 }
 
+// MARK: - Review
+
+/// What the page reviews: whatever is held, followed, or one of the held
+/// instruments chosen by hand — an OKX perpetual or a US share with its
+/// options. Its own view, so a tick elsewhere does not redraw the menu.
+private struct ReviewPicker: View {
+    let model: CheckupModel
+
+    var body: some View {
+        if let instrument = model.instrument, !model.reviewable.isEmpty {
+            let current = model.reviewable.first { $0.market == instrument.market && $0.instId == instrument.instId }
+            Menu {
+                Button((instrument.followsHeld ? "✓ " : "") + "跟随持仓") { model.review(nil) }
+                Divider()
+                ForEach(model.reviewable) { item in
+                    let chosen = !instrument.followsHeld && item.id == current?.id
+                    Button((chosen ? "✓ " : "") + item.label + (item.held ? "" : "（未持有）")) { model.review(item) }
+                }
+            } label: {
+                Text("体检对象：\(current?.label ?? instrument.instId)\(instrument.followsHeld ? "（跟随持仓）" : "")")
+                    .font(Theme.Text.caption)
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("持有的 OKX 永续和嘉信美股（含期权）都可以体检；跟随持仓时优先 OKX 永续，没有就看嘉信上持有最多的标的")
+        }
+    }
+}
+
 // MARK: - Risk
 
 private struct RiskCard: View {
@@ -356,32 +433,33 @@ private struct RiskCard: View {
     var body: some View {
         if let risk = model.risk {
             let offset = model.clock?.offsetMs ?? 0
-            Card(
-                title: "持仓风险",
-                subtitle: risk.positions.isEmpty
-                    ? (risk.wasRead ? "无持仓" : nil)
-                    : risk.instId + (risk.isHedged ? " · 多空双向" : "")
-            ) {
+            let venue: Venue = risk.venue == "schwab" ? .schwab : .okx
+            Card(title: "持仓风险", subtitle: subtitle(risk, venue: venue)) {
                 HStack(spacing: 6) {
                     Text(CheckupText.source(risk.source)).font(Theme.Text.caption).foregroundStyle(.secondary)
                     if let ms = risk.positionsMs { AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: risk.positionsStaleAfterMs ?? 0) }
                     // One ticket per leg: closing a long/short account's short
-                    // must not open on its long.
+                    // must not open on its long, and each option is its own
+                    // contract.
                     ForEach(risk.positions) { position in
                         CloseHoldingButton(
                             appState: appState,
-                            request: appState.closeTicket(instId: position.instId, isLong: !position.isShort, on: .okx),
-                            title: risk.positions.count > 1
-                                ? "\(position.isShort ? "平空" : "平多") / 止盈止损" : "平仓 / 止盈止损")
+                            request: appState.closeTicket(instId: position.instId, isLong: !position.isShort, on: venue),
+                            title: closeTitle(position, risk: risk))
                     }
                 }
             } content: {
                 VStack(alignment: .leading, spacing: 10) {
-                    if let fallbackError = appState.accountFeed?.fallbackError {
+                    if venue == .okx, let fallbackError = appState.accountFeed?.fallbackError {
                         InlineNotice(kind: .warning, message: "账户推送不可用，REST 读取也失败了：\(fallbackError)")
                     }
+                    // OKX's note names the source, which the header already says;
+                    // Schwab's says the latest read failed.
+                    if venue == .schwab, let note = risk.note, risk.wasRead {
+                        InlineNotice(kind: .warning, message: note)
+                    }
                     if !risk.positions.isEmpty {
-                        instrumentTiles(risk, offset: offset)
+                        if venue == .schwab { usTiles(risk, offset: offset) } else { instrumentTiles(risk, offset: offset) }
                         if risk.isHedged, let notice = CheckupText.nakedLegs(risk.positions) {
                             InlineNotice(kind: .warning, title: "两条腿各自逐仓", message: notice)
                         }
@@ -390,8 +468,11 @@ private struct RiskCard: View {
                         }
                         unattached(risk, offset: offset)
                     } else if risk.wasRead {
-                        EmptyState(icon: "checkmark.shield", title: "当前没有持仓",
-                                   message: "开仓后这里显示强平距离、敞口与强平概率。")
+                        EmptyState(icon: "checkmark.shield",
+                                   title: venue == .schwab ? "嘉信账户里没有 \(risk.instId) 的持仓" : "当前没有持仓",
+                                   message: venue == .schwab
+                                       ? "持有这只股票或它的期权后，这里显示每条腿的报价、希腊值、盈亏平衡和到期概率。"
+                                       : "开仓后这里显示强平距离、敞口与强平概率。")
                     } else {
                         // Distinct from flat: nothing was read, so nothing may be claimed.
                         InlineNotice(
@@ -401,6 +482,21 @@ private struct RiskCard: View {
                 }
             }
         }
+    }
+
+    private func subtitle(_ risk: LiveSnapshot.Risk, venue: Venue) -> String? {
+        if risk.positions.isEmpty { return risk.wasRead ? "无持仓" : nil }
+        if venue == .schwab { return "\(risk.instId) · 美股（嘉信）" }
+        return risk.instId + (risk.isHedged ? " · 多空双向" : "")
+    }
+
+    private func closeTitle(_ position: LiveSnapshot.Position, risk: LiveSnapshot.Risk) -> String {
+        let single = risk.positions.count == 1
+        if let option = position.option {
+            return single ? "平仓 / 止损" : "平 \(CheckupText.contract(option))"
+        }
+        if position.isShares { return single ? "平仓 / 止损" : "平股票" }
+        return single ? "平仓 / 止盈止损" : "\(position.isShort ? "平空" : "平多") / 止盈止损"
     }
 
     /// What the instrument as a whole risks: every leg netted for price,
@@ -441,7 +537,46 @@ private struct RiskCard: View {
         }
     }
 
-    /// One leg: its own liquidation, odds and protection.
+    /// A US underlying as a whole: its shares and options folded into the
+    /// shares they move like (delta), in dollars — Schwab's unit.
+    @ViewBuilder
+    private func usTiles(_ risk: LiveSnapshot.Risk, offset: Double) -> some View {
+        HStack(spacing: 8) {
+            StatTile(
+                label: "实际杠杆（按 Delta）",
+                value: risk.exposure.map { String(format: "%.2fx", $0.effectiveLeverage) } ?? "—",
+                caption: risk.exposure.map { "权益 \(CheckupText.usd($0.equity))" },
+                help: "每条腿按 Delta 折成股数，乘以标的价得到美元敞口，再除以嘉信账户的清算价值")
+            if let exposure = risk.exposure {
+                StatTile(
+                    label: "Delta 敞口",
+                    value: (exposure.netNotional >= 0 ? "净多 " : "净空 ") + CheckupText.usd(abs(exposure.netNotional)),
+                    caption: "多 \(CheckupText.usd(exposure.longNotional)) · 空 \(CheckupText.usd(exposure.shortNotional))")
+                StatTile(
+                    label: "标的每涨 1%", value: CheckupText.signedUsd(exposure.pnlPerOnePercentRise),
+                    tint: CheckupText.pnlTint(exposure.pnlPerOnePercentRise),
+                    caption: String(format: "权益的 %.2f%%", exposure.onePercentAsEquityPct))
+                StatTile(
+                    label: "维持保证金", value: CheckupText.usd(exposure.margin),
+                    caption: String(format: "权益的 %.1f%%", exposure.marginAsEquityPct),
+                    help: "嘉信给每条腿的维持保证金要求之和；买入的期权和全额股票为 0")
+            }
+            StatTile(
+                label: "标的价", value: risk.mark.map { CheckupText.price($0.price) } ?? "—",
+                caption: model.spot?.source)
+        }
+        if let mark = risk.mark, let ms = mark.ms {
+            HStack(spacing: 6) {
+                Text("标的价").font(Theme.Text.caption).foregroundStyle(.secondary)
+                AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: mark.staleAfterMs ?? 0)
+            }
+        }
+        if let note = risk.exposureNote {
+            Text(note).font(Theme.Text.caption).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// One leg, by what it is: an option, shares, or a perpetual.
     @ViewBuilder
     private func leg(_ position: LiveSnapshot.Position, risk: LiveSnapshot.Risk, offset: Double) -> some View {
         if risk.positions.count > 1 {
@@ -450,6 +585,138 @@ private struct RiskCard: View {
                 .font(Theme.Text.captionMedium)
                 .foregroundStyle(position.isShort ? Theme.down : Theme.up)
         }
+        if let option = position.option {
+            optionLeg(position, option, offset: offset)
+        } else if position.isShares {
+            shareLeg(position)
+        } else {
+            perpetualLeg(position, risk: risk)
+        }
+        if let note = position.note {
+            InlineNotice(kind: .info, message: note)
+        }
+        protective(position, risk: risk, offset: offset)
+    }
+
+    /// A held option: its contract and quote, its profit, where it breaks
+    /// even and how likely that is, what it can lose, and its greeks.
+    @ViewBuilder
+    private func optionLeg(_ position: LiveSnapshot.Position, _ option: LiveSnapshot.OptionLeg, offset: Double) -> some View {
+        let quote = option.quote
+        let spot = model.risk?.mark?.price
+        HStack(spacing: 8) {
+            StatTile(
+                label: "合约",
+                value: "\(position.isShort ? "卖" : "买")\(option.call ? "看涨" : "看跌") \(PriceFormatter.plain(option.strike))",
+                caption: "\(CheckupText.expiry(option.expiryMs)) 到期 · 剩 \(CheckupText.hours(option.daysLeft * 24)) · \(PriceFormatter.plain(abs(position.contracts))) 张",
+                help: "\(option.label)，每张 \(PriceFormatter.plain(option.multiplier)) 股")
+            StatTile(
+                label: "期权价",
+                value: quote.map { CheckupText.price($0.mark) } ?? "—",
+                caption: quote.map { q in
+                    [q.bid.map { "买 \(CheckupText.price($0))" }, q.ask.map { "卖 \(CheckupText.price($0))" },
+                     option.extrinsic.map { "时间价值 \(CheckupText.price($0))" }].compactMap { $0 }.joined(separator: " · ")
+                },
+                help: "按买卖中间价估值（没有双边报价时按最新成交）。来源：\(quote?.source == "schwab.stream" ? "嘉信逐笔推送" : "嘉信期权链")"
+                    + (quote?.openInterest.map { "；持仓 \(PriceFormatter.plain($0)) 张" } ?? "")
+                    + (quote?.volume.map { "，今日成交 \(PriceFormatter.plain($0)) 张" } ?? ""))
+            StatTile(
+                label: "浮动盈亏", value: position.unrealisedPnl.map(CheckupText.signedUsd) ?? "—",
+                tint: CheckupText.pnlTint(position.unrealisedPnl ?? 0),
+                caption: ["均价 \(position.averagePrice.map(CheckupText.price) ?? "—")",
+                          position.venueFigures?.openProfitLoss.map { "嘉信口径 \(CheckupText.signedUsd($0))" }]
+                    .compactMap { $0 }.joined(separator: " · "),
+                help: position.remarked
+                    ? "（期权价 − 均价）× 张数 × \(PriceFormatter.plain(option.multiplier))，与平仓面板同一个公式；嘉信口径是它最近一次账户读数里的数"
+                    : "嘉信账户读数里的数（还没有这张合约的报价）")
+            StatTile(
+                label: "盈亏平衡", value: CheckupText.price(option.breakeven),
+                caption: spot.map { String(format: "距标的 %+.2f%%", (option.breakeven / $0 - 1) * 100) },
+                help: "到期时标的要在这个价\(option.call ? "之上" : "之下")，这条腿才不亏（按均价）")
+        }
+        if let quote, let ms = quote.ms {
+            HStack(spacing: 6) {
+                Text("期权报价").font(Theme.Text.caption).foregroundStyle(.secondary)
+                AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: quote.staleAfterMs)
+            }
+        }
+        if let nonstandard = option.nonstandard {
+            InlineNotice(kind: .warning, message: "非标准合约：每张交割 \(nonstandard)。行权价对应的不是标的本身，按标的算的到期概率和希腊值会出错，这里不给。")
+        } else {
+            HStack(spacing: 8) {
+                StatTile(
+                    label: "到期价内", value: option.pItm.map(CheckupText.percent) ?? "—",
+                    caption: "结算\(option.call ? "高于" : "低于") \(PriceFormatter.plain(option.strike))")
+                StatTile(
+                    label: "到期盈利", value: option.pProfit.map(CheckupText.percent) ?? "—",
+                    tint: (option.pProfit ?? 1) < 0.3 ? Theme.warning : .primary,
+                    caption: "结算\((option.call != position.isShort) ? "高于" : "低于") \(CheckupText.price(option.breakeven))")
+                if position.isShort {
+                    StatTile(
+                        label: "到期前触及行权价", value: option.pTouchStrike.map(CheckupText.percent) ?? "—",
+                        tint: (option.pTouchStrike ?? 0) > 0.3 ? Theme.down : .primary,
+                        caption: "碰到就可能被行权",
+                        help: "期间任意时刻碰到行权价的风险中性概率（put–call 对称静态复制），比到期价内更早发生")
+                }
+                StatTile(
+                    label: "最大亏损", value: option.maxLoss.map(CheckupText.usd) ?? "无上限",
+                    tint: option.maxLoss == nil ? Theme.down : .primary,
+                    caption: option.maxLossText)
+            }
+            Text("风险中性概率：" + CheckupText.oddsBasis(option.oddsBasis))
+                .font(Theme.Text.caption).foregroundStyle(.tertiary)
+            HStack(spacing: 8) {
+                StatTile(
+                    label: "Delta", value: option.positionDelta.map { String(format: "%+.1f 股", $0) } ?? "—",
+                    caption: [option.delta.map { String(format: "每股 %.3f", $0) }, option.dollarDelta.map { "≈ \(CheckupText.signedUsd($0))" }]
+                        .compactMap { $0 }.joined(separator: " · "),
+                    help: "这条腿像多少股标的一样涨跌（正为看多）")
+                StatTile(
+                    label: "Theta（每天）", value: option.thetaPerDay.map(CheckupText.signedUsd) ?? "—",
+                    tint: CheckupText.pnlTint(option.thetaPerDay ?? 0),
+                    caption: option.theta.map { String(format: "每股 %.3f", $0) },
+                    help: "其他不变时，过一天这条腿的价值变化")
+                StatTile(
+                    label: "Vega（每 1 个波动率点）", value: option.vegaPerPoint.map(CheckupText.signedUsd) ?? "—",
+                    caption: option.iv.map { String(format: "IV %.1f%%", $0) })
+                StatTile(
+                    label: "Gamma", value: option.positionGamma.map { String(format: "%+.2f 股/美元", $0) } ?? "—",
+                    caption: option.gamma.map { String(format: "每股 %.4f", $0) },
+                    help: "标的每涨 1 美元，Delta 变多少股")
+            }
+            if let source = option.greeksSource {
+                Text("希腊值、IV 是嘉信的模型\(source == "stream" ? "（逐笔推送）" : "（期权链）")；概率是用期权链报价重新拟合的曲面。")
+                    .font(Theme.Text.caption).foregroundStyle(.tertiary)
+            }
+        }
+        if let assignment = option.assignment {
+            InlineNotice(kind: .warning, message: assignment)
+        }
+    }
+
+    /// Shares of the underlying.
+    @ViewBuilder
+    private func shareLeg(_ position: LiveSnapshot.Position) -> some View {
+        HStack(spacing: 8) {
+            StatTile(
+                label: "方向 / 股数", value: "\(position.isShort ? "空" : "多") \(PriceFormatter.plain(abs(position.contracts)))",
+                caption: position.notionalUsd.map { "市值 \(CheckupText.usd($0))" })
+            StatTile(
+                label: "浮动盈亏", value: position.unrealisedPnl.map(CheckupText.signedUsd) ?? "—",
+                tint: CheckupText.pnlTint(position.unrealisedPnl ?? 0),
+                caption: ["均价 \(position.averagePrice.map(CheckupText.price) ?? "—")",
+                          position.venueFigures?.openProfitLoss.map { "嘉信口径 \(CheckupText.signedUsd($0))" }]
+                    .compactMap { $0 }.joined(separator: " · "),
+                help: position.remarked ? "按上方实时标的价计算；嘉信口径是它最近一次账户读数里的数" : "嘉信账户读数里的数")
+            StatTile(
+                label: "维持保证金", value: position.margin.map(CheckupText.usd) ?? "—",
+                caption: "嘉信的要求")
+        }
+    }
+
+    /// A perpetual leg: its liquidation, odds and margin.
+    @ViewBuilder
+    private func perpetualLeg(_ position: LiveSnapshot.Position, risk: LiveSnapshot.Risk) -> some View {
         HStack(spacing: 8) {
             StatTile(
                 label: "方向 / 张数",
@@ -502,24 +769,30 @@ private struct RiskCard: View {
                     .font(Theme.Text.caption).foregroundStyle(.tertiary)
             }
         }
-        protective(position, risk: risk, offset: offset)
     }
 
     @ViewBuilder
     private func protective(_ position: LiveSnapshot.Position, risk: LiveSnapshot.Risk, offset: Double) -> some View {
+        let schwab = risk.venue == "schwab"
+        let name = risk.positions.count > 1
+            ? (position.option.map { CheckupText.contract($0) } ?? (position.isShares ? "股票" : (position.isShort ? "空头腿" : "多头腿")))
+            : "仓位"
         if risk.stopsMs == nil {
             // Not read yet (or never readable) is not "none".
-            InlineNotice(kind: .info, message: risk.stopsError.map { "条件单读取失败：\($0)" } ?? "正在读取条件单…")
+            InlineNotice(kind: .info, message: risk.stopsError.map { "\(schwab ? "挂单" : "条件单")读取失败：\($0)" }
+                ?? (schwab ? "正在读取嘉信挂单…" : "正在读取条件单…"))
         } else if position.protective.isEmpty {
-            InlineNotice(kind: .warning, message: "\(risk.positions.count > 1 ? (position.isShort ? "空头腿" : "多头腿") : "仓位")没有止盈止损单——在交易所侧没有自动保护。")
+            InlineNotice(kind: .warning, message: schwab
+                ? "\(name)在嘉信没有平仓挂单（止损或限价）——没有自动保护。" + (position.option != nil && !position.isShort ? "买入的期权最多亏掉权利金。" : "")
+                : "\(name)没有止盈止损单——在交易所侧没有自动保护。")
         } else {
             HStack(spacing: 6) {
-                Text("止盈止损").font(Theme.Text.captionMedium).foregroundStyle(.secondary)
+                Text(schwab ? "平仓挂单" : "止盈止损").font(Theme.Text.captionMedium).foregroundStyle(.secondary)
                 if let ms = risk.stopsMs { AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: risk.stopsStaleAfterMs) }
             }
             DataGrid(
                 columns: [.init(title: "类型"), .init(title: "止损触发", alignment: .trailing),
-                          .init(title: "止盈触发", alignment: .trailing), .init(title: "数量", alignment: .trailing)],
+                          .init(title: schwab ? "平仓限价" : "止盈触发", alignment: .trailing), .init(title: "数量", alignment: .trailing)],
                 rows: position.protective
             ) { order in
                 GridText(order.kind)
@@ -528,7 +801,7 @@ private struct RiskCard: View {
                 GridText(CheckupText.orderSize(order), alignment: .trailing)
             }
             if let error = risk.stopsError {
-                InlineNotice(kind: .warning, message: "最近一次条件单读取失败，下面是上一次成功读到的：\(error)")
+                InlineNotice(kind: .warning, message: "最近一次\(schwab ? "挂单" : "条件单")读取失败，下面是上一次成功读到的：\(error)")
             }
         }
     }
@@ -538,15 +811,16 @@ private struct RiskCard: View {
     @ViewBuilder
     private func unattached(_ risk: LiveSnapshot.Risk, offset: Double) -> some View {
         if !risk.unattachedOrders.isEmpty {
+            let schwab = risk.venue == "schwab"
             Divider()
             HStack(spacing: 6) {
-                Text("不平任何持仓的条件单（\(risk.unattachedOrders.count) 张）")
+                Text("不平任何持仓的\(schwab ? "挂单" : "条件单")（\(risk.unattachedOrders.count) 张）")
                     .font(Theme.Text.captionMedium).foregroundStyle(.secondary)
                 if let ms = risk.stopsMs { AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: risk.stopsStaleAfterMs) }
             }
             DataGrid(
                 columns: [.init(title: "类型"), .init(title: "方向"), .init(title: "止损触发", alignment: .trailing),
-                          .init(title: "止盈触发", alignment: .trailing), .init(title: "数量", alignment: .trailing)],
+                          .init(title: schwab ? "限价" : "止盈触发", alignment: .trailing), .init(title: "数量", alignment: .trailing)],
                 rows: risk.unattachedOrders
             ) { order in
                 GridText(order.kind)
@@ -555,7 +829,7 @@ private struct RiskCard: View {
                 GridText(order.takeProfitPrice.map { CheckupText.price($0) } ?? "—", alignment: .trailing)
                 GridText(CheckupText.orderSize(order), alignment: .trailing)
             }
-            Text("这些单子触发后是开仓或加仓，不会减少上面任何一条腿——它们不算保护。")
+            Text("这些单子成交后是开仓或加仓，不会减少上面任何一条腿——它们不算保护。")
                 .font(Theme.Text.caption).foregroundStyle(.tertiary)
         }
     }
@@ -579,22 +853,26 @@ private struct ProbabilityCard: View {
             let offset = model.clock?.offsetMs ?? 0
             Card(
                 title: "价格区间概率",
-                subtitle: "期权市场给出的结算价分布（\(probability.smileVenue) 波动率曲面 + OKX 指数实时平移）"
+                subtitle: "期权市场给出的结算价分布（\(probability.smileVenue)波动率曲面 + \(probability.spotSource ?? "标的价")实时平移）"
             ) {
                 HStack(spacing: 6) {
                     Text("曲面").font(Theme.Text.caption).foregroundStyle(.secondary)
                     if let ms = probability.surfaceMs { AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: probability.surfaceStaleAfterMs) }
-                    Text("指数").font(Theme.Text.caption).foregroundStyle(.secondary)
+                    Text("标的").font(Theme.Text.caption).foregroundStyle(.secondary)
                     if let ms = probability.indexMs { AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: probability.indexStaleAfterMs) }
                 }
             } content: {
                 VStack(alignment: .leading, spacing: 10) {
                     if !probability.gridChoices.isEmpty { widthPicker(probability) }
                     if probability.columns.isEmpty {
-                        Text(model.feeds.first { $0.id == "deribit" }?.isLive == true ? "等待期权曲面与指数…" : "Deribit 曲面推送不在线，算不出概率")
+                        let feed = model.feeds.first { $0.id == probability.smileFeed }
+                        Text(feed?.isLive == true ? "等待期权曲面与标的价…" : "\(feed?.label ?? probability.smileVenue)不在线，算不出概率\(feed?.detail.map { "：\($0)" } ?? "")")
                             .font(Theme.Text.secondary).foregroundStyle(.secondary)
                     } else {
                         table(probability)
+                    }
+                    ForEach(probability.notes, id: \.self) { note in
+                        InlineNotice(kind: .info, message: note)
                     }
                 }
             }
@@ -659,7 +937,7 @@ private struct ProbabilityCard: View {
             .font(Theme.Text.caption).foregroundStyle(.tertiary)
         InlineNotice(
             kind: .info,
-            message: "风险中性概率：含风险溢价，通常高估下跌尾部。◆ 是该到期四家合并的 max pain 所在区间。列是持仓占全市场 2% 以上的到期日。")
+            message: "风险中性概率：含风险溢价，通常高估下跌尾部。◆ 是该到期\(CheckupText.bookName(model.gravity))的 max pain 所在区间。列是持仓占全市场 2% 以上的到期日\(model.risk?.positions.contains { $0.option != nil } == true ? "，以及所持合约自己的到期" : "")。")
         if columns.contains(where: { $0.curve == "SSVI" }) {
             InlineNotice(kind: .info, message: "标 SSVI 的到期：五参数 SVI 拟合出的分布不合法（尾部为负或越过 1），改用定理保证无套利的 SSVI。")
         }
@@ -680,7 +958,7 @@ private struct GravityCard: View {
     var body: some View {
         if let gravity = model.gravity {
             let offset = model.clock?.offsetMs ?? 0
-            Card(title: "期权引力（四家合并）", subtitle: venueLine(gravity)) {
+            Card(title: "期权引力（\(CheckupText.bookName(gravity))）", subtitle: venueLine(gravity)) {
                 if let ms = gravity.bookMs { AgeLabel(ms: ms, offsetMs: offset, staleAfterMs: gravity.bookStaleAfterMs) }
             } content: {
                 VStack(alignment: .leading, spacing: 10) {
@@ -702,12 +980,12 @@ private struct GravityCard: View {
                 .init(title: "距现价", alignment: .trailing),
                 .init(title: "到位概率", alignment: .trailing),
                 .init(title: "1σ", alignment: .trailing),
-                .init(title: "持仓", alignment: .trailing),
+                .init(title: "持仓（\(gravity.oiUnit)）", alignment: .trailing),
                 .init(title: "名义", alignment: .trailing),
                 .init(title: "真实市值", alignment: .trailing),
             ],
             rows: gravity.expiries,
-            emptyText: model.feeds.first { $0.id == "options.book" }?.detail.map { "⚠️ \($0)" } ?? "读取四家期权持仓中…"
+            emptyText: model.feeds.first { $0.id == gravity.bookFeed }?.detail.map { "⚠️ \($0)" } ?? "读取\(CheckupText.bookName(gravity))期权持仓中…"
         ) { row in
             GridText(CheckupText.expiry(row.expiryMs))
             GridText(CheckupText.hours(row.hours), alignment: .trailing)
@@ -718,7 +996,7 @@ private struct GravityCard: View {
                      tint: (row.maxPain?.distancePct ?? 0) < 0 ? Theme.down : Theme.up, alignment: .trailing)
             GridText(row.pBeyondMaxPain.map { CheckupText.percent($0) } ?? "—", alignment: .trailing)
             GridText(row.oneSigma.map { String(format: "±%.0f", $0) } ?? "—", alignment: .trailing)
-            GridText(String(format: "%.0fk", row.oiBase / 1000), alignment: .trailing)
+            GridText(PriceFormatter.compact(row.oiBase / gravity.oiPerUnit), alignment: .trailing)
             GridText(String(format: "%.0fM", row.notionalUsd / 1_000_000), alignment: .trailing)
             GridText(row.marketValueUsd.map { String(format: "%.1fM", $0 / 1_000_000) } ?? "—",
                      tint: .secondary, alignment: .trailing)
@@ -753,7 +1031,7 @@ private struct GravityCard: View {
     private func nearStrikes(_ gravity: LiveSnapshot.Gravity) -> some View {
         if !gravity.nearStrikes.isEmpty, let near = gravity.nearExpiryMs {
             let spot = model.spot?.value ?? 0
-            Text("\(CheckupText.expiry(near)) 现价 ±6% 内持仓最大的 \(gravity.nearStrikes.count) 个行权价（\(model.instrument?.base ?? "")，四家合并）")
+            Text("\(CheckupText.expiry(near)) 现价 ±6% 内持仓最大的 \(gravity.nearStrikes.count) 个行权价（\(model.instrument?.base ?? "")，\(CheckupText.bookName(gravity))，单位 \(gravity.oiUnit)）")
                 .font(Theme.Text.captionMedium).foregroundStyle(.secondary)
             DataGrid(
                 columns: [.init(title: "行权价"), .init(title: "call", alignment: .trailing),
@@ -762,9 +1040,9 @@ private struct GravityCard: View {
             ) { row in
                 GridText(PriceFormatter.plain(row.strike),
                          tint: spot > 0 && abs(row.strike - spot) / spot < 0.004 ? Theme.warning : .primary)
-                GridText(PriceFormatter.plain(row.callOi), alignment: .trailing)
-                GridText(PriceFormatter.plain(row.putOi), alignment: .trailing)
-                GridText(String(format: "%+.0f", row.net), tint: row.net > 0 ? Theme.up : Theme.down, alignment: .trailing)
+                GridText(PriceFormatter.plain(row.callOi / gravity.oiPerUnit), alignment: .trailing)
+                GridText(PriceFormatter.plain(row.putOi / gravity.oiPerUnit), alignment: .trailing)
+                GridText(String(format: "%+.0f", row.net / gravity.oiPerUnit), tint: row.net > 0 ? Theme.up : Theme.down, alignment: .trailing)
             }
         }
     }
@@ -793,6 +1071,8 @@ private struct StructureCard: View {
 
     var body: some View {
         let venues = model.structure
+        // A share has no perpetual positioning: the kernel sends none.
+        if !venues.isEmpty {
         Card(title: "永续结构", subtitle: "谁在付钱、谁在撤退——OKX 是你的仓位所在，Binance 是最大的场") {
             EmptyView()
         } content: {
@@ -810,6 +1090,7 @@ private struct StructureCard: View {
                     InlineNotice(kind: .warning, message: "\(venue) 5 分钟历史读取失败：\(error)")
                 }
             }
+        }
         }
     }
 
@@ -985,7 +1266,7 @@ private struct PredictionCard: View {
     /// deadlines is titled with the topic itself, already in the header.
     private func summary(_ line: LiveSnapshot.PredictionLine, of topic: LiveSnapshot.PredictionTopic) -> String {
         let title = line.title == topic.label ? "" : "\(line.title)  "
-        let when = line.deadline.map { "\(Self.day($0)) 结算 · " } ?? ""
+        let when = line.deadlineEndsMs.map { "\(Self.moment($0)) 前结算 · " } ?? ""
         return "\(title)\(when)24h 成交 $\(PriceFormatter.compact(line.volume24h)) · 挂单深度 $\(PriceFormatter.compact(line.liquidity))"
     }
 
@@ -1060,23 +1341,24 @@ private struct PredictionCard: View {
         }
     }
 
-    /// `10/9 前` for a deadline, `10/8 当天` for a day's question, the
-    /// outcome's own name otherwise; a deadline inside the coming week says so.
+    /// `10/10 12:00 前` for a deadline — the instant it runs out, on the
+    /// display clock — `10/8 当天` for a day's question, which is named for
+    /// its New York day, the outcome's own name otherwise; a deadline inside
+    /// the coming week adds its weekday.
     private static func rowLabel(_ cell: LiveSnapshot.PredictionCell, layout: String, title: String) -> String {
-        guard let deadline = cell.deadline else { return cell.label.isEmpty ? title : cell.label }
-        let label = "\(day(deadline)) \(layout == "daily" ? "当天" : "前")"
-        return cell.upcoming && layout == "deadlines" ? label + " · \(weekday(deadline))" : label
+        if layout == "daily", let day = cell.deadline { return "\(Self.day(day)) 当天" }
+        guard let ends = cell.deadlineEndsMs else { return cell.label.isEmpty ? title : cell.label }
+        let label = "\(moment(ends)) 前"
+        return cell.upcoming ? label + " · " + DisplayTime.string(date(ends), "EEE") : label
     }
 
-    /// `2026-10-09` → `周五`: the coming week is read by weekday.
-    private static func weekday(_ iso: String) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "zh_CN")
-        formatter.timeZone = TimeZone(identifier: "America/New_York")
-        formatter.dateFormat = "yyyy-MM-dd"
-        guard let date = formatter.date(from: iso) else { return "" }
-        formatter.dateFormat = "EEE"
-        return formatter.string(from: date)
+    /// `10/10 12:00`, on the display clock.
+    private static func moment(_ ms: Int64) -> String {
+        DisplayTime.string(date(ms), "M/d HH:mm")
+    }
+
+    private static func date(_ ms: Int64) -> Date {
+        Date(timeIntervalSince1970: Double(ms) / 1000)
     }
 
     /// A price in cents, the way Polymarket quotes it.

@@ -467,16 +467,16 @@ enum Format {
     }
 
     static func clock(_ date: Date?) -> String {
-        date?.formatted(date: .omitted, time: .standard) ?? "—"
+        date.map { DisplayTime.string($0, "HH:mm:ss") } ?? "—"
     }
 
     static func shortDate(_ date: Date?) -> String {
-        date?.formatted(date: .abbreviated, time: .shortened) ?? "—"
+        date.map { DisplayTime.string($0, "yyyy-MM-dd HH:mm") } ?? "—"
     }
 
     /// `09-07 21:58` — the width a table column can afford.
     static func stamp(_ date: Date) -> String {
-        ChartFormatters.string(date, "MM-dd HH:mm")
+        DisplayTime.string(date, "MM-dd HH:mm")
     }
 
     static func relative(_ date: Date?, now: Date = Date()) -> String {

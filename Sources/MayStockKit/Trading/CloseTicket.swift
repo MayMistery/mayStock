@@ -107,7 +107,9 @@ extension Venue {
             default: return nil
             }
         case .schwab:
-            return SchwabAPI.equityAssetTypes.contains(instType.uppercased()) ? .stock : nil
+            // Schwab's holdings are filed by the kernel's reading of its
+            // asset types (`live::schwab_account::FAMILIES`): the family name.
+            return InstrumentType(rawValue: instType.uppercased()).flatMap { accountFamilies.contains($0) ? $0 : nil }
         }
     }
 }

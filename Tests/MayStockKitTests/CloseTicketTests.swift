@@ -13,7 +13,8 @@ struct CloseTicketTests {
 
     /// A book around 2,653 on the instrument's own tick, as the kernel
     /// publishes one.
-    static func book(for family: InstrumentType, sizesKnown: Bool = true) -> Data {
+    static func book(for family: InstrumentType, venue: Venue = .okx, sizesKnown: Bool = true) -> Data {
+        if venue == .schwab, family == .option { return schwabOptionBook() }
         let spec: BookDocument.Spec
         switch family {
         case .swap:
@@ -26,7 +27,7 @@ struct CloseTicketTests {
             spec = .init(instType: "OPTION", tickSz: "0.0001", lotSz: "1", minSz: "1", ctVal: "1", ctMult: "0.1",
                          ctType: "inverse", ctValCcy: "ETH", settleCcy: "ETH", groupId: "1")
         case .stock:
-            spec = .shares(SchwabMarketDataSource.equityMeta("MU"))
+            spec = try! .us(.stock)
         }
         let prices: (asks: [String], bids: [String]) = family == .option
             ? (["0.0510", "0.0520", "0.0550", "0.0600"], ["0.0500", "0.0490", "0.0450", "0.0400"])
@@ -42,7 +43,26 @@ struct CloseTicketTests {
         return (try? JSONEncoder().encode(document)) ?? Data()
     }
 
-    static func holding(_ family: InstrumentType, isLong: Bool = true) -> CloseHolding {
+    /// A Schwab option's one-level quote, in dollars a share, on the
+    /// kernel's spec for a penny class.
+    static func schwabOptionBook() -> Data {
+        let spec = try! BookDocument.Spec.us(.option(underlying: "MU", penny: true, multiplier: 100))
+        var document = BookDocument(
+            instId: schwabOption, state: "live", detail: nil,
+            asks: [BookDocument.Level(px: "3.10", sz: "0", orders: 0)], bids: [BookDocument.Level(px: "2.95", sz: "0", orders: 0)],
+            receivedMs: Int64(Date().timeIntervalSince1970 * 1_000), exchangeMs: nil, staleAfterMs: nil,
+            last: BookDocument.Stamped(px: "3.00", ms: 1), spec: spec, sizesKnown: false)
+        document.seqId = 7
+        return (try? JSONEncoder().encode(document)) ?? Data()
+    }
+
+    static let schwabOption = "MU    261120C01040000"
+
+    static func holding(_ family: InstrumentType, venue: Venue = .okx, isLong: Bool = true) -> CloseHolding {
+        if venue == .schwab, family == .option {
+            return CloseHolding(instId: schwabOption, family: .option, isLong: isLong, quantity: 3, unit: "张",
+                                posSide: nil, marginMode: nil, averagePrice: 2.80, liquidationPrice: nil)
+        }
         switch family {
         case .swap:
             return CloseHolding(instId: "ETH-USDT-SWAP", family: .swap, isLong: isLong, quantity: 50, unit: "张",
@@ -63,14 +83,25 @@ struct CloseTicketTests {
         _ venue: Venue, _ family: InstrumentType, ticket: CloseTicketInput, isLong: Bool = true
     ) -> ClosePlanInput {
         ClosePlanInput(
-            venue: venue, mode: .demo, holding: holding(family, isLong: isLong), ticket: ticket,
+            venue: venue, mode: .demo, holding: holding(family, venue: venue, isLong: isLong), ticket: ticket,
             account: AccountTradingConfig(positionMode: .longShort, accountLevel: 2),
             fees: FeeRates(maker: 0.0002, taker: 0.0005), working: [], workingUnread: nil,
             clientId: OrderTag.make(strategyId: CloseTicketModel.manualTag))
     }
 
+    /// Prices on the scale of the book a venue's family is quoted in: a
+    /// typed limit, and levels either side of it for a target and a stop.
+    static func levels(_ venue: Venue, _ family: InstrumentType) -> (fixed: Double, target: Double, stop: Double) {
+        switch (venue, family) {
+        case (.schwab, .option): return (3.02, 3.60, 2.50)
+        case (_, .option): return (0.0555, 0.07, 0.03)
+        default: return (2660.004, 2800, 2500)
+        }
+    }
+
     /// Every ticket worth asking a venue for, given what it declares.
-    static func tickets(for capabilities: CloseCapabilities, family: InstrumentType) -> [CloseTicketInput] {
+    static func tickets(for capabilities: CloseCapabilities, venue: Venue = .okx, family: InstrumentType) -> [CloseTicketInput] {
+        let levels = levels(venue, family)
         var tickets: [CloseTicketInput] = []
         for method in CloseMethod.allCases where capabilities.availability(of: method).available {
             switch method {
@@ -82,7 +113,7 @@ struct CloseTicketTests {
                     case .queue: prices = (1...min(capabilities.bookDepth, 4)).map { .queue(level: $0) }
                     case .mid: prices = [.mid]
                     case .last: prices = [.last]
-                    case .fixed: prices = [.fixed(family == .option ? 0.0555 : 2660.004)]
+                    case .fixed: prices = [.fixed(levels.fixed)]
                     }
                     for price in prices {
                         for kind in capabilities.limitKinds {
@@ -95,8 +126,8 @@ struct CloseTicketTests {
             case .protect:
                 tickets.append(CloseTicketInput(
                     method: .protect, size: .all,
-                    takeProfit: capabilities.takeProfit.available ? 2800 : nil,
-                    stopLoss: capabilities.stopLoss.available ? 2500 : nil))
+                    takeProfit: capabilities.takeProfit.available ? levels.target : nil,
+                    stopLoss: capabilities.stopLoss.available ? levels.stop : nil))
             }
         }
         return tickets
@@ -108,7 +139,7 @@ struct CloseTicketTests {
             for family in InstrumentType.allCases {
                 let capabilities = KernelClose.capabilities(venue: venue, family: family)
                 let offered = CloseMethod.allCases.filter { capabilities.availability(of: $0).available }
-                #expect(offered.isEmpty != venue.trades(family), "\(venue) \(family): offers \(offered)")
+                #expect(offered.isEmpty != venue.accountFamilies.contains(family), "\(venue) \(family): offers \(offered)")
                 for method in CloseMethod.allCases where !capabilities.availability(of: method).available {
                     #expect(capabilities.availability(of: method).reason?.isEmpty == false, "\(venue) \(family) \(method) says why")
                 }
@@ -124,10 +155,10 @@ struct CloseTicketTests {
     @Test("everything a venue offers plans, and the reviewed request is exactly what send builds")
     func everyOfferedTicketPlans() throws {
         for venue in Venue.allCases {
-            for family in InstrumentType.allCases where venue.trades(family) {
+            for family in venue.accountFamilies {
                 let capabilities = KernelClose.capabilities(venue: venue, family: family)
-                let book = Self.book(for: family, sizesKnown: venue == .okx)
-                let tickets = Self.tickets(for: capabilities, family: family)
+                let book = Self.book(for: family, venue: venue, sizesKnown: venue == .okx)
+                let tickets = Self.tickets(for: capabilities, venue: venue, family: family)
                 #expect(!tickets.isEmpty, "\(venue) \(family)")
                 for ticket in tickets {
                     let plan: ClosePlan
@@ -162,12 +193,13 @@ struct CloseTicketTests {
     @Test("what a venue refuses is refused with the reason it declared")
     func refusalsCarryTheDeclaredReason() {
         for venue in Venue.allCases {
-            for family in InstrumentType.allCases where venue.trades(family) {
+            for family in venue.accountFamilies {
                 let capabilities = KernelClose.capabilities(venue: venue, family: family)
+                let levels = Self.levels(venue, family)
                 for method in CloseMethod.allCases where !capabilities.availability(of: method).available {
-                    let ticket = CloseTicketInput(method: method, size: .all, takeProfit: 2800, stopLoss: 2500)
+                    let ticket = CloseTicketInput(method: method, size: .all, takeProfit: levels.target, stopLoss: levels.stop)
                     guard case .failure(let refusal) = KernelClose.plan(
-                        Self.input(venue, family, ticket: ticket), book: Self.book(for: family)) else {
+                        Self.input(venue, family, ticket: ticket), book: Self.book(for: family, venue: venue)) else {
                         Issue.record("\(venue) \(family) \(method) planned although declared unavailable")
                         continue
                     }
@@ -193,7 +225,7 @@ struct CloseTicketTests {
     }
 
     @Test("a family the app does not trade gets nothing, and says so")
-    func unsupportedFamilyIsNamed() {
+    func unsupportedFamilyIsNamed() throws {
         for venue in Venue.allCases {
             let capabilities = CloseCapabilities.unsupportedFamily("FUTURES", venue: venue)
             for method in CloseMethod.allCases {
@@ -204,7 +236,17 @@ struct CloseTicketTests {
         #expect(Venue.okx.family(ofPositionFiledAs: "FUTURES") == nil)
         #expect(Venue.okx.instrumentType(of: "BTC-USD-250926") == .spot, "why the id is not trusted")
         #expect(Venue.okx.family(ofPositionFiledAs: "SWAP") == .swap)
-        #expect(Venue.schwab.family(ofPositionFiledAs: "EQUITY") == .stock)
+        // Schwab's holdings are filed by the kernel's reading of its asset
+        // types; every type it reads is a family the account is declared to
+        // hold, and nothing else is.
+        #expect(Venue.schwab.family(ofPositionFiledAs: "STOCK") == .stock)
+        #expect(Venue.schwab.family(ofPositionFiledAs: "OPTION") == .option)
+        #expect(Venue.schwab.family(ofPositionFiledAs: "SWAP") == nil)
+        for assetType in ["EQUITY", "ETF", "COLLECTIVE_INVESTMENT", "OPTION"] {
+            let family = try #require(SchwabAPI.family(ofAssetType: assetType), "\(assetType)")
+            #expect(Venue.schwab.accountFamilies.contains(family), "\(assetType)")
+        }
+        #expect(SchwabAPI.family(ofAssetType: "FIXED_INCOME") == nil)
     }
 
     @Test("a coin's ticket sells into its USDT market; the quote coin has none")

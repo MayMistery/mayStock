@@ -1389,12 +1389,23 @@ pub extern "C" fn ms_live_stale_after_intervals() -> u32 {
     crate::live::STALE_AFTER
 }
 
-/// How often the app reads the account over REST while the private
-/// socket is down, in milliseconds — the interval the kernel ages those
-/// readings by (`Renewal::RestFallback`), so the loop and the ages agree.
+/// How often the app runs one of its own clocks, in milliseconds — the
+/// interval the kernel ages that clock's readings by (`Renewal::app_clock`),
+/// so the loop and the ages agree: `restFallback` (the account over REST
+/// while the private socket is down), `polledPriced` / `polledCash` (a
+/// polled account holding something priced, or cash alone),
+/// `accountRefresh` (a polled account's working orders). 0 for a name the
+/// kernel does not declare.
 #[no_mangle]
-pub extern "C" fn ms_live_rest_fallback_ms() -> u64 {
-    crate::live::Renewal::RestFallback.interval().as_millis() as u64
+pub unsafe extern "C" fn ms_live_renewal_ms(name: *const c_char) -> u64 {
+    borrow_str(name).and_then(crate::live::Renewal::app_clock).map_or(0, |r| r.interval().as_millis() as u64)
+}
+
+/// The zone a fresh install writes times in (`display::DEFAULT_ZONE`), an
+/// IANA identifier. Caller frees.
+#[no_mangle]
+pub extern "C" fn ms_display_zone_default() -> *mut c_char {
+    to_c_string(crate::display::DEFAULT_ZONE.to_string())
 }
 
 /// Stop the live layer and release the handle. Null is a no-op.
@@ -1444,6 +1455,81 @@ pub unsafe extern "C" fn ms_okx_account_document(kind: *const c_char, json: *con
             other => return Err(format!("未知的账户文档类型：{other}")),
         };
         Ok(to_c_string(out.to_string()))
+    })
+}
+
+// MARK: - Schwab account documents
+
+/// Read Schwab's account document — `schwabctl account` — into the shape
+/// every reader takes (`live::schwab_account::SchwabAccount`): cash, the
+/// liquidation value, every share and option holding, and the holdings of
+/// any other family by name. The one reader: the app's account reading and
+/// the live layer's checkup both come here. Caller frees.
+#[no_mangle]
+pub unsafe extern "C" fn ms_schwab_account_document(json: *const c_char, error_out: *mut *mut c_char) -> *mut c_char {
+    guarded(error_out, ptr::null_mut(), || {
+        let text = borrow_str(json).ok_or("账户文档不是 UTF-8")?;
+        let account = crate::live::schwab_account::read(text)?;
+        serde_json::to_string(&account).map(to_c_string).map_err(|e| e.to_string())
+    })
+}
+
+/// The family the app reads one of Schwab's asset types as
+/// (`live::schwab_account::FAMILIES`): `STOCK`, `OPTION`, or null for one it
+/// does not read. Caller frees.
+#[no_mangle]
+pub unsafe extern "C" fn ms_schwab_family(asset_type: *const c_char) -> *mut c_char {
+    guarded(ptr::null_mut(), ptr::null_mut(), || {
+        let family = borrow_str(asset_type).and_then(crate::live::schwab_account::family_of);
+        Ok(match family.and_then(|f| serde_json::to_value(f).ok()).and_then(|v| v.as_str().map(str::to_string)) {
+            Some(name) => to_c_string(name),
+            None => ptr::null_mut(),
+        })
+    })
+}
+
+/// A US option's OCC symbol read (`us_options::UsOption`):
+/// `{"underlying","call","strike","expiryDay","expiryMs"}`, or null when the
+/// symbol is not an option's. Caller frees.
+#[no_mangle]
+pub unsafe extern "C" fn ms_us_option(symbol: *const c_char) -> *mut c_char {
+    guarded(ptr::null_mut(), ptr::null_mut(), || {
+        let Some(contract) = borrow_str(symbol).and_then(|s| crate::us_options::UsOption::parse(s).ok()) else {
+            return Ok(ptr::null_mut());
+        };
+        let value = serde_json::json!({
+            "underlying": contract.underlying, "call": contract.call, "strike": contract.strike,
+            "expiryDay": contract.expiry_day(), "expiryMs": contract.expiry_ms(),
+        });
+        Ok(to_c_string(value.to_string()))
+    })
+}
+
+/// The book spec a US share or option is ordered on (`us_options`):
+/// `{"kind":"stock"}` or `{"kind":"option","underlying":"MU","penny":true,"multiplier":100}`.
+/// Caller frees.
+#[no_mangle]
+pub unsafe extern "C" fn ms_us_book_spec(request_json: *const c_char, error_out: *mut *mut c_char) -> *mut c_char {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", tag = "kind")]
+    enum Request {
+        Stock,
+        #[serde(rename_all = "camelCase")]
+        Option { underlying: String, penny: bool, multiplier: f64 },
+    }
+    guarded(error_out, ptr::null_mut(), || {
+        let text = borrow_str(request_json).ok_or("请求不是 UTF-8")?;
+        let request: Request = serde_json::from_str(text).map_err(|e| format!("规格请求读不懂：{e}"))?;
+        let spec = match request {
+            Request::Stock => crate::us_options::share_spec(),
+            Request::Option { underlying, penny, multiplier } => {
+                if !(multiplier > 0.0) || !multiplier.is_finite() {
+                    return Err(format!("合约乘数 {multiplier} 不合法"));
+                }
+                crate::us_options::option_spec(&underlying, penny, multiplier)
+            }
+        };
+        serde_json::to_string(&spec).map(to_c_string).map_err(|e| e.to_string())
     })
 }
 

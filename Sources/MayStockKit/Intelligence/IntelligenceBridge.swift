@@ -35,10 +35,12 @@ public struct IntelligenceRequest: Codable, Sendable {
     public var quotes: [IntelligenceQuote]
     public var knownEvents: [IntelligenceKnownEvent]
 
-    public init(kind: IntelligenceKind, now: Date, settings: IntelligenceSettings,
+    /// `timezone` is the display zone: the helper writes its days and times
+    /// on the clock May reads the station by.
+    public init(kind: IntelligenceKind, now: Date, settings: IntelligenceSettings, timezone: String,
                 watchlist: [String], quotes: [IntelligenceQuote], knownEvents: [IntelligenceKnownEvent],
                 venues: [String: String]? = nil) {
-        self.kind = kind; self.now = now; timezone = settings.timezone
+        self.kind = kind; self.now = now; self.timezone = timezone
         horizonHours = settings.horizonHours; self.watchlist = watchlist
         model = settings.model
         self.quotes = quotes; self.knownEvents = knownEvents

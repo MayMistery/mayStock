@@ -56,7 +56,7 @@ public enum ChartMath {
     /// 10:00 / 10:15 / 10:30 rather than 10:03 / 10:18 / 10:33.
     public static func timeTicks(
         from start: Date, to end: Date,
-        maxLabels: Int = 5, timeZone: TimeZone = .current
+        maxLabels: Int = 5, timeZone: TimeZone
     ) -> [Date] {
         guard end > start else { return [] }
         let step = niceTimeStep(span: end.timeIntervalSince(start), maxLabels: maxLabels)
@@ -71,6 +71,15 @@ public enum ChartMath {
             local += step
         }
         return ticks
+    }
+
+    /// The clock bars are placed and labelled on. A bar of a day or longer
+    /// is named for the venue's day (`Venue.dayZone`) — OKX's 1D bar opens
+    /// at 00:00 UTC+8, a US session's day is New York's — and read on
+    /// another clock it would carry the day before. A bar inside a day is
+    /// an instant, written in the display zone like every other time.
+    public static func labelZone(barSeconds: TimeInterval, venue: Venue) -> TimeZone {
+        barSeconds >= 86_400 ? venue.dayZone : DisplayTime.zone
     }
 
     /// Label format for a time-positioned axis spanning `span`.
@@ -158,7 +167,7 @@ public enum ChartMath {
     /// axis instead of labels at whatever index happened to divide evenly.
     public static func axisTicks(
         timestamps: [Date], maxLabels: Int = 5,
-        barSeconds: TimeInterval = 0, timeZone: TimeZone = .current
+        barSeconds: TimeInterval = 0, timeZone: TimeZone
     ) -> [AxisTick] {
         guard timestamps.count > 1, maxLabels > 1 else { return [] }
         var calendar = Calendar(identifier: .gregorian)

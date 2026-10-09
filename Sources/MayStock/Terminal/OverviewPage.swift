@@ -375,7 +375,7 @@ struct OverviewPage: View {
                 caption += " · 已扣划转"
             }
         }
-        return StatTile(label: (window.longLabel(for: venue).components(separatedBy: "（").first ?? window.label) + " · 盈亏",
+        return StatTile(label: window.label + " · 盈亏",
                         value: Format.signedMoney(change?.changeQuote, decimals: 0),
                         tint: tint,
                         caption: caption,

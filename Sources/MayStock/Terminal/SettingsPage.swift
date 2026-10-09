@@ -7,6 +7,7 @@ struct SettingsPage: View {
     let appState: AppState
 
     private var general: GeneralPrefs { appState.store.config.general }
+    @State private var otherZone = ""
 
     var body: some View {
         PageScroll {
@@ -45,6 +46,44 @@ struct SettingsPage: View {
                             }
                             .labelsHidden().frame(width: 140)
                         }
+                    }
+                }
+
+                Card(title: "时间", subtitle: "App 里显示的每个时刻都按这个时区写；交易所按自己时钟定的规则（美股的交易日是纽约的，OKX 的日线从 UTC+8 0 点开始）不变，只换算成这里的时间") {
+                    Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+                        GridRow {
+                            label("显示时区")
+                            Picker("", selection: Binding(
+                                get: { general.displayTimeZone },
+                                set: { value in appState.store.update { $0.general.displayTimeZone = value } })) {
+                                ForEach(zoneChoices, id: \.self) { identifier in
+                                    Text(zoneTitle(identifier)).tag(identifier)
+                                }
+                            }
+                            .labelsHidden().frame(width: 260)
+                        }
+                        GridRow {
+                            label("其他时区")
+                            HStack(spacing: 8) {
+                                TextField("IANA 标识，如 Europe/Berlin", text: $otherZone)
+                                    .textFieldStyle(.roundedBorder).frame(width: 200)
+                                    .onSubmit(useOtherZone)
+                                Button("使用", action: useOtherZone)
+                                    .controlSize(.small)
+                                    .disabled(!DisplayTime.isKnown(otherZone))
+                            }
+                        }
+                    }
+                    if !DisplayTime.isKnown(general.displayTimeZone) {
+                        Text("配置里的时区「\(general.displayTimeZone)」系统不认识，现在按\(DisplayTime.name)显示")
+                            .font(Theme.Text.caption).foregroundStyle(Theme.warning)
+                    } else if !otherZone.isEmpty, !DisplayTime.isKnown(otherZone) {
+                        Text("「\(otherZone)」不是系统认识的 IANA 时区")
+                            .font(Theme.Text.caption).foregroundStyle(Theme.warning)
+                    }
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        Text("现在 \(DisplayTime.string(context.date, "MM-dd HH:mm:ss")) \(DisplayTime.name)")
+                            .font(Theme.Text.caption).foregroundStyle(.tertiary).numeric()
                     }
                 }
 
@@ -98,6 +137,25 @@ struct SettingsPage: View {
             }
             .padding(Theme.pagePadding)
         }
+    }
+
+    /// The offered zones, and the configured one when it is not among them.
+    private var zoneChoices: [String] {
+        DisplayTime.choices.contains(general.displayTimeZone)
+            ? DisplayTime.choices : DisplayTime.choices + [general.displayTimeZone]
+    }
+
+    /// `新加坡时间 · Asia/Singapore`.
+    private func zoneTitle(_ identifier: String) -> String {
+        guard let zone = TimeZone(identifier: identifier) else { return "\(identifier)（系统不认识）" }
+        return "\(DisplayTime.name(of: zone)) · \(identifier)"
+    }
+
+    private func useOtherZone() {
+        guard DisplayTime.isKnown(otherZone) else { return }
+        let identifier = otherZone
+        appState.store.update { $0.general.displayTimeZone = identifier }
+        otherZone = ""
     }
 
     private func label(_ text: String) -> some View {

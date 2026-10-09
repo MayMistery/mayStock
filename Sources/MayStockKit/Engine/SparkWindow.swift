@@ -26,7 +26,7 @@ public enum SparkWindow: Equatable, Sendable {
             // the bell that is the session just finished, which is the one a
             // closed market should still show.
             guard let anchor = spark.last?.ts ?? Optional(now) else { return [] }
-            let start = Self.dayStart(of: anchor, in: venue.timeZone)
+            let start = Self.dayStart(of: anchor, in: venue.dayZone)
             return spark.window(seconds: now.timeIntervalSince(start), now: now)
         }
     }

@@ -1,4 +1,5 @@
 import Foundation
+import CMayStockKernel
 
 // MARK: - Session hours
 
@@ -45,7 +46,7 @@ public struct USSessionHours: Sendable, Equatable, Codable {
     /// post, New York — on a day the calendar trades. An early close is not
     /// known here; that is why the endpoint is asked first.
     public static func standard(on date: Date, open: Bool) -> USSessionHours {
-        let zone = Venue.schwab.timeZone
+        let zone = Venue.schwab.dayZone
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = zone
         let start = calendar.startOfDay(for: date)
@@ -59,6 +60,15 @@ public struct USSessionHours: Sendable, Equatable, Codable {
             preMarket: [DateInterval(start: at(4, 0), end: at(9, 30))],
             regular: [DateInterval(start: at(9, 30), end: at(16, 0))],
             postMarket: [DateInterval(start: at(16, 0), end: at(20, 0))])
+    }
+
+    /// One part of an ordinary day — `\.regular`, `\.preMarket`,
+    /// `\.postMarket` — as May reads it: `新加坡时间 21:30–04:00`. The hours
+    /// are New York's; where they fall in the display zone moves with New
+    /// York's daylight saving, so it is read for `date`.
+    public static func displayedHours(_ part: KeyPath<USSessionHours, [DateInterval]>, on date: Date = Date()) -> String {
+        guard let window = standard(on: date, open: true)[keyPath: part].first else { return "" }
+        return "\(DisplayTime.name) \(DisplayTime.span(window))"
     }
 }
 
@@ -74,32 +84,89 @@ public struct SchwabAccountRef: Sendable, Equatable, Codable {
     }
 }
 
-public struct SchwabPosition: Sendable, Equatable {
+/// One holding as the kernel reads Schwab's account document: shares, or
+/// contracts of one option (`live::schwab_account`).
+public struct SchwabPosition: Sendable, Equatable, Decodable {
+    /// As Schwab spells it — the OCC symbol, padding kept, for an option.
     public let symbol: String
+    /// Schwab's own word for the family.
     public let assetType: String
-    /// Long minus short, in shares.
+    /// What the kernel reads `assetType` as: `.stock` or `.option`.
+    public let family: InstrumentType
+    /// Long minus short: shares, or contracts.
     public let quantity: Double
+    /// A share's price, or an option's premium a share.
     public let averagePrice: Double
+    /// Schwab's valuation in dollars; negative for a short.
     public let marketValue: Double
     public let dayProfitLoss: Double?
+    /// Schwab's own open profit on the holding.
+    public let openProfitLoss: Double?
+    public let maintenanceRequirement: Double?
+    public let option: SchwabOptionTerms?
+    /// What about this row is not as Schwab wrote it, in words.
+    public let note: String?
 
-    public init(symbol: String, assetType: String, quantity: Double, averagePrice: Double, marketValue: Double, dayProfitLoss: Double?) {
-        self.symbol = symbol
-        self.assetType = assetType
-        self.quantity = quantity
-        self.averagePrice = averagePrice
-        self.marketValue = marketValue
-        self.dayProfitLoss = dayProfitLoss
+    public var isEquity: Bool { family == .stock }
+
+    /// The holding as every position listing shows it. An option's mark is
+    /// Schwab's own valuation a share; its profit is Schwab's open profit.
+    public var exchangePosition: ExchangePosition {
+        let multiplier = option?.multiplier ?? 1
+        let units = abs(quantity) * multiplier
+        return ExchangePosition(
+            instId: symbol, posSide: .net, quantity: quantity, averagePrice: averagePrice,
+            markPrice: units > 0 ? abs(marketValue) / units : nil,
+            unrealisedPnL: openProfitLoss ?? (marketValue - averagePrice * quantity * multiplier),
+            leverage: nil, liquidationPrice: nil,
+            // A share's notional is its value; an option's is the
+            // underlying's, which this document does not price.
+            notionalUsd: isEquity ? marketValue : nil,
+            instType: family.rawValue, maintenanceMargin: maintenanceRequirement,
+            valuationNote: note, marketValueUsd: marketValue)
     }
-
-    public var isEquity: Bool { SchwabAPI.equityAssetTypes.contains(assetType) }
 }
 
-/// One account as the trader endpoint reports it, reduced to what the book
-/// needs. `untracked` names holdings of families this app does not trade,
-/// so a bond or an option on the account is reported rather than folded
-/// into a share count or dropped.
-public struct SchwabAccount: Sendable, Equatable {
+/// What an option holding is a contract on, as the kernel reads its symbol.
+public struct SchwabOptionTerms: Sendable, Equatable, Decodable {
+    public let underlying: String
+    public let call: Bool
+    public let strike: Double
+    /// `2026-11-20`.
+    public let expiryDay: String
+    /// When it stops trading, epoch milliseconds.
+    public let expiryMs: Int64
+    /// Shares one contract delivers.
+    public let multiplier: Double
+    public let description: String?
+    /// What one contract delivers when that is not `multiplier` shares of
+    /// the underlying — an adjusted contract (`33 ETHA`); nil when standard.
+    public let nonstandard: String?
+
+    /// `MU 2026-11-20 1040 C`.
+    public var label: String {
+        "\(underlying) \(expiryDay) \(PriceFormatter.plain(strike)) \(call ? "C" : "P")"
+    }
+}
+
+/// What an option's quote says about ordering on it.
+public struct SchwabOptionQuoteTerms: Sendable, Equatable {
+    public let underlying: String
+    /// In the Penny Interval Program: cents below $3.
+    public let penny: Bool
+    public let multiplier: Double
+
+    public init(underlying: String, penny: Bool, multiplier: Double) {
+        self.underlying = underlying
+        self.penny = penny
+        self.multiplier = multiplier
+    }
+}
+
+/// One account as the kernel reads Schwab's document. `unrecognised` names
+/// the holdings of any family it does not read — a bond, a fund — so they
+/// are reported rather than folded into a count or dropped.
+public struct SchwabAccount: Sendable, Equatable, Decodable {
     public let accountNumber: String
     public let type: String
     public let cash: Double
@@ -109,28 +176,34 @@ public struct SchwabAccount: Sendable, Equatable {
     public let buyingPower: Double?
     public let maintenanceRequirement: Double?
     public let positions: [SchwabPosition]
-    public let untracked: [String]
+    public let unrecognised: [String]
+    /// The kernel's reading itself, as JSON: what the live layer is handed,
+    /// so the checkup reads this reading rather than one of its own.
+    public private(set) var document: String = ""
 
-    public init(
-        accountNumber: String, type: String, cash: Double, equity: Double?, availableFunds: Double?,
-        buyingPower: Double?, maintenanceRequirement: Double?, positions: [SchwabPosition], untracked: [String]
-    ) {
-        self.accountNumber = accountNumber
-        self.type = type
-        self.cash = cash
-        self.equity = equity
-        self.availableFunds = availableFunds
-        self.buyingPower = buyingPower
-        self.maintenanceRequirement = maintenanceRequirement
-        self.positions = positions
-        self.untracked = untracked
+    private enum CodingKeys: String, CodingKey {
+        case accountNumber, type, cash, equity, availableFunds, buyingPower, maintenanceRequirement, positions, unrecognised
+    }
+
+    /// Schwab's document (`schwabctl account`), read by the kernel.
+    public static func read(_ data: Data) throws -> SchwabAccount {
+        let text = String(decoding: data, as: UTF8.self)
+        let reading: String
+        do {
+            reading = try callReturningString { error in ms_schwab_account_document(text, error) }
+        } catch {
+            throw SchwabAPIError.decoding("嘉信账户文档读不懂：\(error)")
+        }
+        var account = try JSONDecoder().decode(SchwabAccount.self, from: Data(reading.utf8))
+        account.document = reading
+        return account
     }
 
     public var isMargin: Bool { type.uppercased() == "MARGIN" }
 
     /// The book's shape: dollars, then one line per stock held, in shares —
     /// a short as a negative count. Same shape OKX spot takes, so the runner
-    /// values both the same way.
+    /// values both the same way. Options are contracts, not balances.
     public var balances: [AccountBalance] {
         var out = [AccountBalance(
             ccy: Venue.schwab.quoteCurrency, available: availableFunds ?? cash, total: cash, valuationUsd: cash)]
@@ -142,16 +215,14 @@ public struct SchwabAccount: Sendable, Equatable {
         return out
     }
 
-    public var exchangePositions: [ExchangePosition] {
-        positions.filter { $0.isEquity && $0.quantity != 0 }.map { position in
-            let mark = position.quantity != 0 ? position.marketValue / position.quantity : nil
-            return ExchangePosition(
-                instId: position.symbol, posSide: .net, quantity: position.quantity,
-                averagePrice: position.averagePrice, markPrice: mark,
-                unrealisedPnL: position.marketValue - position.averagePrice * position.quantity,
-                leverage: nil, liquidationPrice: nil,
-                notionalUsd: position.marketValue, instType: position.assetType)
-        }
+    /// Contract positions — options — as every position listing shows them.
+    public var contractPositions: [ExchangePosition] {
+        positions.filter { !$0.isEquity && $0.quantity != 0 }.map(\.exchangePosition)
+    }
+
+    /// Shares, valued through the balances.
+    public var shareHoldings: [ExchangePosition] {
+        positions.filter { $0.isEquity && $0.quantity != 0 }.map(\.exchangePosition)
     }
 
     public var snapshot: AccountSnapshot {
@@ -162,9 +233,9 @@ public struct SchwabAccount: Sendable, Equatable {
             equityCurrency: "USD")
     }
 
-    /// Shares held in `symbol`, signed.
+    /// What is held of `symbol`, signed: shares, or an option's contracts.
     public func held(_ symbol: String) -> Double {
-        positions.filter { $0.symbol == symbol && $0.isEquity }.reduce(0) { $0 + $1.quantity }
+        positions.filter { $0.symbol == symbol }.reduce(0) { $0 + $1.quantity }
     }
 }
 
@@ -242,7 +313,10 @@ public struct SchwabOrder: Sendable, Equatable, Identifiable {
     public var isWorking: Bool { Self.workingStatuses.contains(status) }
     /// A stop of either kind: what the runner reads as a protective order.
     public var isStop: Bool { orderType.hasPrefix("STOP") }
-    public var isSell: Bool { instruction == "SELL" || instruction == "SELL_SHORT" }
+    /// Every sell Schwab spells: `SELL`, `SELL_SHORT`, `SELL_TO_OPEN`, `SELL_TO_CLOSE`.
+    public var isSell: Bool { instruction?.hasPrefix("SELL") ?? false }
+    /// Reduces what is held rather than adding to it.
+    public var closes: Bool { instruction.map(SchwabOrderSpec.closingInstructions.contains) ?? false }
 
     public var averageFillPrice: Double? {
         let filled = executions.reduce(0.0) { $0 + $1.quantity }
@@ -275,11 +349,16 @@ public struct SchwabOrder: Sendable, Equatable, Identifiable {
 /// An order as Schwab wants it spelled, built from the app's request.
 public struct SchwabOrderSpec: Sendable, Equatable {
     public var symbol: String
+    /// `EQUITY` or `OPTION`: the order leg's instrument type.
+    public var assetType: String
     public var instruction: String
     public var quantity: Double
     public var orderType: String
     public var price: Double?
     public var stopPrice: Double?
+    /// What a stop watches (`BID`, `ASK`, `LAST`…); nil leaves Schwab's
+    /// standard, the last trade on a share.
+    public var stopType: String?
     public var duration: String
     public var session: String
     /// Legs released together when this one fills — the stop and the take
@@ -287,19 +366,40 @@ public struct SchwabOrderSpec: Sendable, Equatable {
     public var children: [SchwabOrderSpec]
 
     public init(
-        symbol: String, instruction: String, quantity: Double, orderType: String,
-        price: Double? = nil, stopPrice: Double? = nil,
+        symbol: String, assetType: String = "EQUITY", instruction: String, quantity: Double, orderType: String,
+        price: Double? = nil, stopPrice: Double? = nil, stopType: String? = nil,
         duration: String = "DAY", session: String = "NORMAL", children: [SchwabOrderSpec] = []
     ) {
         self.symbol = symbol
+        self.assetType = assetType
         self.instruction = instruction
         self.quantity = quantity
         self.orderType = orderType
         self.price = price
         self.stopPrice = stopPrice
+        self.stopType = stopType
         self.duration = duration
         self.session = session
         self.children = children
+    }
+
+    /// The instructions that reduce a holding: a share's two and an
+    /// option's two.
+    public static let closingInstructions: Set<String> = ["SELL", "BUY_TO_COVER", "SELL_TO_CLOSE", "BUY_TO_CLOSE"]
+
+    /// An option's closing instruction for a holding of `direction`.
+    public static func optionClosingInstruction(forLong: Bool) -> String {
+        forLong ? "SELL_TO_CLOSE" : "BUY_TO_CLOSE"
+    }
+
+    /// Schwab's word for what a stop watches.
+    public static func stopType(_ trigger: TradeAlgoSpec.Trigger) -> String? {
+        switch trigger {
+        // Schwab's standard: the last trade on a share.
+        case .last: return nil
+        case .bid: return "BID"
+        case .ask: return "ASK"
+        }
     }
 
     /// Which of Schwab's four instructions a side means, given what the
@@ -326,11 +426,12 @@ public struct SchwabOrderSpec: Sendable, Equatable {
             "orderLegCollection": [[
                 "instruction": instruction,
                 "quantity": quantity,
-                "instrument": ["symbol": symbol, "assetType": "EQUITY"],
+                "instrument": ["symbol": symbol, "assetType": assetType],
             ] as [String: Any]],
         ]
         if let price { out["price"] = Self.priceString(price) }
         if let stopPrice { out["stopPrice"] = Self.priceString(stopPrice) }
+        if let stopType { out["stopType"] = stopType }
         if !children.isEmpty {
             if children.count == 1 {
                 out["childOrderStrategies"] = [children[0].body]
@@ -399,6 +500,20 @@ public enum SchwabWire {
         return out
     }
 
+    /// What an option's quote says about the contract an order is placed
+    /// on: `reference.underlying`, `isPennyPilot`, `multiplier`. Nil for a
+    /// symbol the document does not quote as an option.
+    public static func optionQuoteTerms(from data: Data, symbol: String) -> SchwabOptionQuoteTerms? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let entry = object[symbol] as? [String: Any],
+              (entry["assetMainType"] as? String) == "OPTION",
+              let reference = entry["reference"] as? [String: Any],
+              let underlying = reference["underlying"] as? String else { return nil }
+        return SchwabOptionQuoteTerms(
+            underlying: underlying, penny: (reference["isPennyPilot"] as? Bool) ?? false,
+            multiplier: number(reference, "multiplier") ?? 100)
+    }
+
     // MARK: Price history
 
     /// Candles oldest first. Hourly bars are assembled from the half-hour
@@ -430,7 +545,7 @@ public enum SchwabWire {
     /// the open (extended hours, if ever requested) keep their own hour.
     public static func aggregateHourly(_ halves: [Candle]) -> [Candle] {
         var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = Venue.schwab.timeZone
+        calendar.timeZone = Venue.schwab.dayZone
         var grouped: [Date: [Candle]] = [:]
         for half in halves {
             let dayStart = calendar.startOfDay(for: half.ts)
@@ -496,7 +611,7 @@ public enum SchwabWire {
         return rows.compactMap { row in
             guard let symbol = row["symbol"] as? String, !symbol.isEmpty,
                   let assetType = row["assetType"] as? String,
-                  SchwabAPI.equityAssetTypes.contains(assetType) else { return nil }
+                  SchwabAPI.family(ofAssetType: assetType) == .stock else { return nil }
             return InstrumentMatch(
                 instId: symbol, name: (row["description"] as? String) ?? symbol,
                 exchange: (row["exchange"] as? String) ?? "US", instType: .stock)
@@ -515,52 +630,10 @@ public enum SchwabWire {
         }
     }
 
-    /// One account — the object `GET /accounts/{hash}` returns, or the first
-    /// element of the array `GET /accounts` returns.
+    /// One account — what `schwabctl account` prints — read by the kernel,
+    /// the one reader of these fields (`SchwabAccount.read`).
     public static func account(from data: Data) throws -> SchwabAccount {
-        guard let object = try? JSONSerialization.jsonObject(with: data) else {
-            throw SchwabAPIError.decoding("account 不是 JSON")
-        }
-        let wrapper: [String: Any]
-        if let single = object as? [String: Any] {
-            wrapper = single
-        } else if let list = object as? [[String: Any]], let first = list.first {
-            wrapper = first
-        } else {
-            throw SchwabAPIError.decoding("account 为空")
-        }
-        guard let account = wrapper["securitiesAccount"] as? [String: Any] else {
-            throw SchwabAPIError.decoding("account 没有 securitiesAccount")
-        }
-        let balances = (account["currentBalances"] as? [String: Any]) ?? [:]
-        let aggregated = (wrapper["aggregatedBalance"] as? [String: Any]) ?? [:]
-        var positions: [SchwabPosition] = []
-        var untracked: [String] = []
-        for row in (account["positions"] as? [[String: Any]]) ?? [] {
-            let instrument = (row["instrument"] as? [String: Any]) ?? [:]
-            let symbol = (instrument["symbol"] as? String) ?? "?"
-            let assetType = (instrument["assetType"] as? String) ?? "?"
-            let long = number(row, "longQuantity") ?? 0
-            let short = number(row, "shortQuantity") ?? 0
-            guard SchwabAPI.equityAssetTypes.contains(assetType) else {
-                untracked.append("\(symbol)（\(assetType)）")
-                continue
-            }
-            positions.append(SchwabPosition(
-                symbol: symbol, assetType: assetType, quantity: long - short,
-                averagePrice: number(row, "averagePrice") ?? 0,
-                marketValue: number(row, "marketValue") ?? 0,
-                dayProfitLoss: number(row, "currentDayProfitLoss")))
-        }
-        return SchwabAccount(
-            accountNumber: (account["accountNumber"] as? String) ?? "",
-            type: (account["type"] as? String) ?? "",
-            cash: number(balances, "cashBalance") ?? 0,
-            equity: number(balances, "liquidationValue") ?? number(aggregated, "liquidationValue"),
-            availableFunds: number(balances, "availableFunds") ?? number(balances, "cashAvailableForTrading"),
-            buyingPower: number(balances, "buyingPower"),
-            maintenanceRequirement: number(balances, "maintenanceRequirement"),
-            positions: positions, untracked: untracked)
+        try SchwabAccount.read(data)
     }
 
     // MARK: Orders
@@ -653,9 +726,11 @@ public enum SchwabWire {
             let time = (row["time"] as? String).flatMap(date(_:)) ?? (row["tradeDate"] as? String).flatMap(date(_:)) ?? Date()
             let items = (row["transferItems"] as? [[String: Any]]) ?? []
             let fees = items.filter { $0["feeType"] != nil }.reduce(0.0) { $0 + abs(number($1, "cost") ?? number($1, "amount") ?? 0) }
+            // Shares and options alike: an option traded by hand is a trade
+            // the account made (`amount` in contracts, `price` a share).
             let trades = items.filter { item in
                 let instrument = (item["instrument"] as? [String: Any]) ?? [:]
-                return item["feeType"] == nil && SchwabAPI.equityAssetTypes.contains((instrument["assetType"] as? String) ?? "")
+                return item["feeType"] == nil && SchwabAPI.family(ofAssetType: (instrument["assetType"] as? String) ?? "") != nil
             }
             for (index, item) in trades.enumerated() {
                 let instrument = (item["instrument"] as? [String: Any]) ?? [:]
@@ -731,6 +806,9 @@ public enum SchwabWire {
     private static let dateFormatters: [DateFormatter] = ["yyyy-MM-dd'T'HH:mm:ssZ", "yyyy-MM-dd'T'HH:mm:ss.SSSZ", "yyyy-MM-dd'T'HH:mm:ssXXX", "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"].map { pattern in
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
+        // Every pattern reads the offset off the text; the zone is only
+        // what a text without one would be taken in, and there is none.
+        formatter.timeZone = TimeZone(identifier: "UTC")
         formatter.dateFormat = pattern
         return formatter
     }

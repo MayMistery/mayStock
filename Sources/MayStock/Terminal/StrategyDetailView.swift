@@ -109,7 +109,7 @@ struct StrategyDetailView: View {
 
                 if let result = report.result(for: selection.backtestWindow) {
                     Card(title: "净值曲线 · \(selection.backtestWindow.displayName)",
-                         subtitle: "\(result.start.formatted(date: .numeric, time: .shortened)) → \(result.end.formatted(date: .numeric, time: .shortened)) · \(result.barCount) 根 \(result.bar.rawValue) · 起始 \(PriceFormatter.money(result.initialCapital, decimals: 0)) \(venue.quoteCurrency)") {
+                         subtitle: "\(Format.shortDate(result.start)) → \(Format.shortDate(result.end)) · \(result.barCount) 根 \(result.bar.rawValue) · 起始 \(PriceFormatter.money(result.initialCapital, decimals: 0)) \(venue.quoteCurrency)") {
                         HStack(spacing: 8) {
                             legendSwatch(Theme.trend(result.metrics.totalReturnPct >= 0), "策略")
                             legendSwatch(.secondary.opacity(0.45), "买入持有", dashed: true)
@@ -433,7 +433,7 @@ struct StrategyDetailView: View {
         let state = runtime
         if let message = state.message { return "\(state.status.displayName) · \(message)" }
         if let bar = state.lastBarTime {
-            return "\(state.status.displayName) · 最新 K 线 " + bar.formatted(date: .omitted, time: .shortened)
+            return "\(state.status.displayName) · 最新 K 线 " + Format.stamp(bar)
         }
         return state.status.displayName
     }

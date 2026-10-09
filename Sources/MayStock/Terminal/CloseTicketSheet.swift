@@ -632,10 +632,12 @@ private struct ProtectFields: View {
                     if let reference {
                         ForEach(Self.steps, id: \.self) { step in
                             Button("\(direction > 0 ? "+" : "−")\(PriceFormatter.plain(step))%") {
-                                let tick = model.book?.spec?.tick ?? 0
+                                // Written to the instrument's decimals; the plan
+                                // snaps it to the step that applies at that
+                                // price, and the review shows where it landed.
                                 let raw = reference * (1 + direction * step / 100)
-                                let snapped = tick > 0 ? (raw / tick).rounded() * tick : raw
-                                text.wrappedValue = PriceFormatter.wire(snapped)
+                                let decimals = model.book?.spec?.priceDecimals
+                                text.wrappedValue = decimals.map { PriceFormatter.decimals(raw, $0) } ?? PriceFormatter.wire(raw)
                             }
                             .controlSize(.small)
                         }

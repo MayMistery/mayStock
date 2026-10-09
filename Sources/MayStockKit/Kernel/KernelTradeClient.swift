@@ -100,14 +100,20 @@ public struct TradeOrderSpec: Codable, Sendable, Equatable {
 
 /// An order the exchange works after it is placed (`trade::wire::AlgoSpec`).
 public struct TradeAlgoSpec: Codable, Sendable, Equatable {
+    /// The price a stop or a target watches (`trade::wire::Trigger`): the
+    /// last trade, or the side of the book a close fills into.
+    public enum Trigger: String, Codable, Sendable, Equatable {
+        case last, bid, ask
+    }
+
     public enum Kind: Codable, Sendable, Equatable {
         /// Post-only at the best price, re-priced every second, cancelled
         /// once the book has run `maxChaseRatio` (0.002 = 0.2%).
         case chase(maxChaseRatio: Double)
-        /// Filled at market once the last trade crosses a trigger.
-        case protection(takeProfit: Double?, stopLoss: Double?)
+        /// Filled at market once `trigger` crosses a level.
+        case protection(takeProfit: Double?, stopLoss: Double?, trigger: Trigger)
 
-        private enum CodingKeys: String, CodingKey { case type, maxChaseRatio, takeProfit, stopLoss }
+        private enum CodingKeys: String, CodingKey { case type, maxChaseRatio, takeProfit, stopLoss, trigger }
 
         public init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -117,7 +123,8 @@ public struct TradeAlgoSpec: Codable, Sendable, Equatable {
             case "protection":
                 self = .protection(
                     takeProfit: try c.decodeIfPresent(Double.self, forKey: .takeProfit),
-                    stopLoss: try c.decodeIfPresent(Double.self, forKey: .stopLoss))
+                    stopLoss: try c.decodeIfPresent(Double.self, forKey: .stopLoss),
+                    trigger: try c.decodeIfPresent(Trigger.self, forKey: .trigger) ?? .last)
             case let other:
                 throw DecodingError.dataCorruptedError(forKey: .type, in: c, debugDescription: "未知的策略委托类型 \(other)")
             }
@@ -129,10 +136,11 @@ public struct TradeAlgoSpec: Codable, Sendable, Equatable {
             case .chase(let ratio):
                 try c.encode("chase", forKey: .type)
                 try c.encode(ratio, forKey: .maxChaseRatio)
-            case .protection(let takeProfit, let stopLoss):
+            case .protection(let takeProfit, let stopLoss, let trigger):
                 try c.encode("protection", forKey: .type)
                 try c.encodeIfPresent(takeProfit, forKey: .takeProfit)
                 try c.encodeIfPresent(stopLoss, forKey: .stopLoss)
+                try c.encode(trigger, forKey: .trigger)
             }
         }
     }

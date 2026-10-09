@@ -108,6 +108,8 @@ final class VenueBooks {
     /// One connection verdict per environment.
     var connections: [TradingMode: VenueConnectionStatus] = [:]
 
+    /// Told whenever the account's figures are forgotten, and why.
+    @ObservationIgnored var onCleared: ((String?) -> Void)?
     @ObservationIgnored private(set) var runner: StrategyRunner!
     @ObservationIgnored private(set) var host: VenueRunnerHost!
     @ObservationIgnored private let dataDirectory: URL
@@ -186,6 +188,7 @@ final class VenueBooks {
         transfers = nil
         transfersError = nil
         accountError = reason
+        onCleared?(reason)
     }
 
     /// The current reading, as the trading loop takes it.

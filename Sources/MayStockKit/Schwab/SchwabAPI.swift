@@ -1,4 +1,5 @@
 import Foundation
+import CMayStockKernel
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
@@ -24,10 +25,15 @@ public enum SchwabAPI {
     /// — so this is what `schwabctl login` listens on.
     public static let defaultCallback = "https://127.0.0.1:8182"
 
-    /// Every family the venue's positions endpoint can report that this app
-    /// treats as a stock. Anything else — an option, a bond, a mutual fund —
-    /// is reported back as untracked rather than folded into a share count.
-    public static let equityAssetTypes: Set<String> = ["EQUITY", "ETF", "COLLECTIVE_INVESTMENT"]
+    /// The family the app reads one of Schwab's asset types as — `EQUITY`,
+    /// `ETF` and `COLLECTIVE_INVESTMENT` are shares, `OPTION` an option —
+    /// declared once in the kernel (`live::schwab_account::FAMILIES`). Nil
+    /// for a family the app does not read (a bond, a fund).
+    public static func family(ofAssetType assetType: String) -> InstrumentType? {
+        guard let pointer = ms_schwab_family(assetType) else { return nil }
+        defer { ms_string_free(pointer) }
+        return InstrumentType(rawValue: String(cString: pointer))
+    }
 
     // MARK: Market data
 
@@ -176,7 +182,7 @@ public enum SchwabAPI {
     private static let dayFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = Venue.schwab.timeZone
+        formatter.timeZone = Venue.schwab.dayZone
         formatter.dateFormat = "yyyy-MM-dd"
         return formatter
     }()

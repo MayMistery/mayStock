@@ -589,16 +589,41 @@ pub fn parity_forward(strike: f64, call_in_coin: f64, put_in_coin: f64) -> Optio
     forward.is_finite().then_some(forward)
 }
 
+/// The forward implied by one strike's call and put on a venue that quotes
+/// them in dollars (a US listing): `C − P = D·(F − K)`, so
+/// `F = K + (C − P)·growth` with `growth = 1/D`, the money-market growth to
+/// expiry. Exact for European options; a listed equity option is American,
+/// and near the money — where this is read — the early-exercise premium is
+/// a cent or two of the pair.
+pub fn parity_forward_in_dollars(strike: f64, call: f64, put: f64, growth: f64) -> Option<f64> {
+    if !(strike > 0.0) || call < 0.0 || put < 0.0 || !(growth > 0.0) {
+        return None;
+    }
+    let forward = strike + (call - put) * growth;
+    (forward > 0.0 && forward.is_finite()).then_some(forward)
+}
+
 /// Median of the parity forwards at the `count` strikes nearest `reference`.
 /// Several strikes rather than one, because a single pair of marks can be a
 /// tick off; the median ignores one bad pair without averaging it in.
 pub fn parity_forward_near(pairs: &[(f64, f64, f64)], reference: f64, count: usize) -> Option<f64> {
+    median_forward_near(pairs, reference, count, |k, c, p| parity_forward(k, c, p))
+}
+
+/// The same, for pairs quoted in dollars (`parity_forward_in_dollars`).
+pub fn parity_forward_near_in_dollars(pairs: &[(f64, f64, f64)], reference: f64, count: usize, growth: f64) -> Option<f64> {
+    median_forward_near(pairs, reference, count, |k, c, p| parity_forward_in_dollars(k, c, p, growth))
+}
+
+fn median_forward_near(
+    pairs: &[(f64, f64, f64)], reference: f64, count: usize, forward: impl Fn(f64, f64, f64) -> Option<f64>,
+) -> Option<f64> {
     let mut ordered: Vec<&(f64, f64, f64)> = pairs.iter().collect();
     ordered.sort_by(|a, b| (a.0 - reference).abs().total_cmp(&(b.0 - reference).abs()));
     let mut estimates: Vec<f64> = ordered
         .into_iter()
         .take(count.max(1))
-        .filter_map(|(k, c, p)| parity_forward(*k, *c, *p))
+        .filter_map(|(k, c, p)| forward(*k, *c, *p))
         .collect();
     if estimates.is_empty() {
         return None;
@@ -610,6 +635,42 @@ pub fn parity_forward_near(pairs: &[(f64, f64, f64)], reference: f64, count: usi
     } else {
         (estimates[mid - 1] + estimates[mid]) / 2.0
     })
+}
+
+/// The volatility at which an option on `forward` is worth `price`, the
+/// undiscounted premium a unit (Black-76 with the forward as the
+/// underlying). None for a price outside what any volatility gives: at or
+/// below the intrinsic value, or at or above the most an option can be worth.
+pub fn implied_vol(kind: OptionKind, forward: f64, strike: f64, years: f64, price: f64) -> Option<f64> {
+    if !(forward > 0.0) || !(strike > 0.0) || !(years > 0.0) || !price.is_finite() {
+        return None;
+    }
+    let floor = match kind {
+        OptionKind::Call => (forward - strike).max(0.0),
+        OptionKind::Put => (strike - forward).max(0.0),
+    };
+    let ceiling = match kind {
+        OptionKind::Call => forward,
+        OptionKind::Put => strike,
+    };
+    if !(price > floor + 1e-12) || !(price < ceiling) {
+        return None;
+    }
+    // The premium rises with volatility everywhere, so bisection always
+    // closes on the one answer; 80 halvings of [1e-4, 20] leave nothing.
+    let (mut low, mut high) = (1e-4, 20.0);
+    if black_scholes(kind, forward, strike, years, high) < price {
+        return None;
+    }
+    for _ in 0..80 {
+        let middle = 0.5 * (low + high);
+        if black_scholes(kind, forward, strike, years, middle) < price {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    Some(0.5 * (low + high))
 }
 
 /// A round step close to `fraction` of spot: 1, 2, 2.5 or 5 times a power of
@@ -657,6 +718,27 @@ pub fn price_edges(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dollar_quoted_pair_gives_its_forward_and_a_price_its_vol() {
+        // Priced at forward 1040 on a 45% smile, with 0.3% of carry.
+        let (forward, years, growth) = (1040.0, 42.0 / 365.0, 1.003);
+        let call = black_scholes(OptionKind::Call, forward, 1000.0, years, 0.45) / growth;
+        let put = black_scholes(OptionKind::Put, forward, 1000.0, years, 0.45) / growth;
+        let read = parity_forward_in_dollars(1000.0, call, put, growth).unwrap();
+        assert!((read - forward).abs() < 1e-9, "{read}");
+        let pairs = vec![(1000.0, call, put), (1040.0, call, put + 50.0), (1100.0, call, put)];
+        assert!(parity_forward_near_in_dollars(&pairs, 1040.0, 3, growth).is_some());
+        for (kind, strike) in [(OptionKind::Call, 1100.0), (OptionKind::Put, 950.0), (OptionKind::Call, 900.0)] {
+            let price = black_scholes(kind, forward, strike, years, 0.45);
+            let vol = implied_vol(kind, forward, strike, years, price).unwrap();
+            assert!((vol - 0.45).abs() < 1e-9, "{kind:?} {strike}: {vol}");
+        }
+        assert_eq!(implied_vol(OptionKind::Call, forward, 900.0, years, 140.0), None, "at intrinsic no vol prices it");
+        assert_eq!(implied_vol(OptionKind::Put, forward, 950.0, years, 0.0), None);
+        assert_eq!(implied_vol(OptionKind::Call, forward, 1100.0, years, forward), None, "worth the whole forward");
+        assert_eq!(parity_forward_in_dollars(1000.0, 10.0, 2000.0, 1.0), None, "a forward below zero is no forward");
+    }
 
     fn flat(forward: f64, iv: f64) -> Smile {
         let points: Vec<SmilePoint> = [0.6, 0.8, 1.0, 1.25, 1.6].iter().map(|m| SmilePoint { strike: forward * m, iv }).collect();

@@ -160,12 +160,22 @@ public struct BookDocument: Codable, Sendable, Equatable {
         public var quoteCcy: String
         public var groupId: String
         public var state: String
+        /// Where the step changes with the price — a US share under a dollar,
+        /// a US option from $3. Nil when `tickSz` holds at every price.
+        public var tickBands: [TickBand]?
+
+        /// From `from` up, prices move in steps of `tickSz`.
+        public struct TickBand: Codable, Sendable, Equatable {
+            public var from: String
+            public var tickSz: String
+        }
 
         public init(
             instType: String, tickSz: String, lotSz: String, minSz: String, ctVal: String = "", ctMult: String = "",
             ctType: String = "", ctValCcy: String = "", settleCcy: String = "", baseCcy: String = "",
-            quoteCcy: String = "", groupId: String = "", state: String = "live"
+            quoteCcy: String = "", groupId: String = "", state: String = "live", tickBands: [TickBand]? = nil
         ) {
+            self.tickBands = tickBands
             self.instType = instType
             self.tickSz = tickSz
             self.lotSz = lotSz
@@ -181,10 +191,24 @@ public struct BookDocument: Codable, Sendable, Equatable {
             self.state = state
         }
 
-        /// Shares: a cent and one share.
-        public static func shares(_ meta: InstrumentMeta) -> Spec {
-            Spec(instType: InstrumentType.stock.rawValue, tickSz: PriceFormatter.wire(meta.tickSize),
-                 lotSz: PriceFormatter.wire(meta.lotSize), minSz: PriceFormatter.wire(meta.minSize), quoteCcy: "USD")
+        /// A US share or option as an order is placed on it, as the kernel
+        /// declares it (`us_options`): its lot, its multiplier, its steps.
+        public static func us(_ kind: USInstrument) throws -> Spec {
+            let request: [String: Any]
+            switch kind {
+            case .stock:
+                request = ["kind": "stock"]
+            case .option(let underlying, let penny, let multiplier):
+                request = ["kind": "option", "underlying": underlying, "penny": penny, "multiplier": multiplier]
+            }
+            let json = String(decoding: try JSONSerialization.data(withJSONObject: request), as: UTF8.self)
+            let text = try callReturningString { error in ms_us_book_spec(json, error) }
+            return try JSONDecoder().decode(Spec.self, from: Data(text.utf8))
+        }
+
+        public enum USInstrument: Sendable, Equatable {
+            case stock
+            case option(underlying: String, penny: Bool, multiplier: Double)
         }
 
         public var tick: Double { Double(tickSz) ?? 0 }
@@ -196,10 +220,14 @@ public struct BookDocument: Codable, Sendable, Equatable {
             let multiplier = Double(ctMult).flatMap { $0 > 0 ? $0 : nil } ?? 1
             return value * multiplier
         }
-        /// Decimals of the tick: how a price on this instrument is written.
+        /// Decimals of the finest step: how a price on this instrument is
+        /// written.
         public var priceDecimals: Int {
-            guard let dot = tickSz.firstIndex(of: ".") else { return 0 }
-            return tickSz[tickSz.index(after: dot)...].reversed().drop { $0 == "0" }.count
+            func decimals(_ text: String) -> Int {
+                guard let dot = text.firstIndex(of: ".") else { return 0 }
+                return text[text.index(after: dot)...].reversed().drop { $0 == "0" }.count
+            }
+            return ([tickSz] + (tickBands ?? []).map(\.tickSz)).map(decimals).max() ?? 0
         }
     }
 

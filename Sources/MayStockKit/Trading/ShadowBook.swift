@@ -159,7 +159,7 @@ public actor ShadowBook {
                 averagePrice: position.averagePrice, markPrice: mark,
                 unrealisedPnL: mark.map { ($0 - position.averagePrice) * position.quantity } ?? 0,
                 leverage: nil, liquidationPrice: nil,
-                notionalUsd: mark.map { $0 * position.quantity }, instType: "EQUITY")
+                notionalUsd: mark.map { $0 * position.quantity }, instType: InstrumentType.stock.rawValue)
         }
     }
 

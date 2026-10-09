@@ -27,7 +27,7 @@
 - **美股同列**：自选里 `TSLA`、`QQQ` 和币对并排。每家交易所各有自己的行情源，
   都收在同一个 `MarketFeed` 端口后面：美股在 `schwabctl` 登录后读嘉信 Trader API 的
   官方行情，没登录时自动退到 Yahoo Finance 图表接口（页脚会写明当前来源），涨跌按昨收算，
-  盘前/交易中/盘后/休市在每个界面都标出来，图表按纽约时间标注并把休市时段压缩掉，
+  盘前/交易中/盘后/休市在每个界面都标出来，图表把休市时段压缩掉，时间按设置里的显示时区写（默认新加坡），
   会话装不下的 4H 周期直接不提供；回测用内核的纽交所日历，周末与节假日不算缺口。
 - **嘉信交易**：`schwabctl`（Rust，`schwabctl/`，`make.sh install` 装进 App 包并链接到 PATH）
   是凭据边界：`schwabctl configure` 把 App Key/Secret 存进钥匙串，`schwabctl login` 在

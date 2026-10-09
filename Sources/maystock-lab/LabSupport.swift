@@ -386,7 +386,6 @@ enum Lab {
             Out.note("区间内没有成交——收益 0% 是「没开过仓」，不是「持平」。")
             return
         }
-        let stamp = Date.FormatStyle().month(.twoDigits).day(.twoDigits).hour(.twoDigits(amPM: .omitted)).minute(.twoDigits)
         Out.row([("#", 5), ("方向", 5), ("入场", 13), ("出场", 13), ("持仓", -8),
                  ("入场价", -12), ("出场价", -12), ("离场", 9), ("毛利", -11),
                  ("手续费", -10), ("资金费", -10), ("净利", -11), ("收益", -9)])
@@ -394,8 +393,8 @@ enum Lab {
             Out.row([
                 (String(trade.id), 5),
                 (trade.direction.displayName, 5),
-                (trade.entryTime.formatted(stamp), 13),
-                (trade.exitTime.formatted(stamp), 13),
+                (DisplayTime.string(trade.entryTime, "MM-dd HH:mm"), 13),
+                (DisplayTime.string(trade.exitTime, "MM-dd HH:mm"), 13),
                 ("\(trade.bars) 根", -8),
                 (PriceFormatter.auto(trade.entryPrice), -12),
                 (PriceFormatter.auto(trade.exitPrice), -12),

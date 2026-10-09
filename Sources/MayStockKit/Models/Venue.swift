@@ -59,6 +59,18 @@ public enum Venue: String, Codable, Sendable, CaseIterable, Identifiable, Hashab
         instrumentTypes.contains(instType)
     }
 
+    /// The families this venue's account holds that the app reads — what a
+    /// position on it can be, and so what the close ticket handles. Wider
+    /// than `instrumentTypes`, what a strategy may trade: an option on
+    /// Schwab is bought by hand and closed from the app, but no strategy
+    /// trades one.
+    public var accountFamilies: [InstrumentType] {
+        switch self {
+        case .okx: return [.spot, .swap, .option]
+        case .schwab: return [.stock, .option]
+        }
+    }
+
     /// The spelling this venue's instruments are kept under, from however
     /// one arrived — typed in the watchlist, imported in a manifest. Upper
     /// case everywhere; on Schwab a share class takes the slash Schwab itself
@@ -88,15 +100,16 @@ public enum Venue: String, Codable, Sendable, CaseIterable, Identifiable, Hashab
             if optionKind(of: instId) != nil { return .option }
             return .spot
         case .schwab:
-            return .stock
+            // An OCC symbol is a contract; every other id is a share.
+            return USOptionContract(instId) != nil ? .option : .stock
         }
     }
 
     /// The call/put leg an option id names: OKX spells a call
-    /// `BTC-USD-260908-70000-C`. Nil for any id that is not an option, and
-    /// for every id on a venue that lists none.
+    /// `BTC-USD-260908-70000-C`, Schwab `MU    261120C01040000` (the OCC
+    /// symbol, read by the kernel). Nil for any id that is not an option.
     public func optionKind(of instId: String) -> OptionKind? {
-        guard self == .okx else { return nil }
+        guard self == .okx else { return USOptionContract(instId)?.kind }
         let parts = instId.split(separator: "-")
         guard parts.count == 5,
               parts[2].count == 6, parts[2].allSatisfy(\.isNumber),
@@ -108,10 +121,30 @@ public enum Venue: String, Codable, Sendable, CaseIterable, Identifiable, Hashab
         }
     }
 
-    /// The index an option settles against: `BTC-USD-260908-70000-C` → `BTC-USD`.
+    /// What an option settles against: `BTC-USD-260908-70000-C` → `BTC-USD`
+    /// on OKX, `MU    261120C01040000` → `MU` on Schwab.
     public func optionUnderlying(of instId: String) -> String? {
+        guard self == .okx else { return USOptionContract(instId)?.underlying }
         guard optionKind(of: instId) != nil else { return nil }
         return instId.split(separator: "-").prefix(2).joined(separator: "-")
+    }
+
+    /// Where the live layer is handed this venue's account reading — nil for
+    /// a venue whose account the layer reads itself (OKX's private socket).
+    public var liveAccountTopic: String? {
+        switch self {
+        case .okx: return nil
+        case .schwab: return SchwabVenue.accountTopic
+        }
+    }
+
+    /// Where the live layer is handed this venue's working orders — nil for
+    /// a venue whose orders the layer reads itself.
+    public var liveOrdersTopic: String? {
+        switch self {
+        case .okx: return nil
+        case .schwab: return SchwabVenue.ordersTopic
+        }
     }
 
     /// "BTC-USDT-SWAP" → ("BTC", "USDT") on OKX; "AAPL" → ("AAPL", "USD") on
@@ -170,10 +203,18 @@ public enum Venue: String, Codable, Sendable, CaseIterable, Identifiable, Hashab
         }
     }
 
-    /// The clock the venue's day runs on.
-    public var timeZone: TimeZone {
+    /// The clock the venue's day runs on: where its daily bar opens, what
+    /// "today" means for its book, which session a closed market still
+    /// shows. OKX opens all three at 00:00 UTC+8 — its 1D bar, its App's day
+    /// and the account's — and a US day is New York's, so "today" on one
+    /// never means half of yesterday on the other.
+    ///
+    /// A rule, not a display: every time shown is written in
+    /// `DisplayTime.zone`. A bar of a day or longer is named for this day
+    /// (`ChartMath.labelZone`).
+    public var dayZone: TimeZone {
         switch self {
-        case .okx: return TimeZone(identifier: "UTC")!
+        case .okx: return TimeZone(identifier: "Asia/Singapore")!
         case .schwab: return TimeZone(identifier: "America/New_York")!
         }
     }
@@ -200,16 +241,6 @@ public enum Venue: String, Codable, Sendable, CaseIterable, Identifiable, Hashab
         switch self {
         case .okx: return "OKX 公共行情"
         case .schwab: return "嘉信官方行情（未登录时 Yahoo Finance）"
-        }
-    }
-
-    /// The clock the venue's *book* keeps — what "today" means for the
-    /// equity curve's windows. OKX settles against a Singapore-hours desk;
-    /// a US account's day is New York's.
-    public var accountingTimeZone: TimeZone {
-        switch self {
-        case .okx: return TimeZone(identifier: "Asia/Singapore")!
-        case .schwab: return TimeZone(identifier: "America/New_York")!
         }
     }
 

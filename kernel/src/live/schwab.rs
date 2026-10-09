@@ -46,7 +46,7 @@ pub enum SchwabSource {
 pub const MACRO: [MacroInstrument; 9] = [
     MacroInstrument { id: "TLT", label: "TLT 20年+", meaning: "长端实时代理，涨=长端收益率跌", schwab: SchwabSource::Equity("TLT"), yahoo: Some("TLT"), scale: 1.0 },
     MacroInstrument { id: "IEF", label: "IEF 7-10年", meaning: "中长端", schwab: SchwabSource::Equity("IEF"), yahoo: Some("IEF"), scale: 1.0 },
-    MacroInstrument { id: "TNX", label: "10年收益率 %", meaning: "10 年美债收益率本身；CBOE 只算到美东 15:00（2026-09-23 实测最后一笔 14:59:54），之后停在收盘值，看 10年期货", schwab: SchwabSource::Equity("$TNX"), yahoo: None, scale: 0.1 },
+    MacroInstrument { id: "TNX", label: "10年收益率 %", meaning: "10 年美债收益率本身；CBOE 在美股收盘前一小时停算（2026-09-23 实测），之后停在那一刻的值，看 10年期货", schwab: SchwabSource::Equity("$TNX"), yahoo: None, scale: 0.1 },
     MacroInstrument { id: "ZB", label: "30年期货", meaning: "长端，24h 交易", schwab: SchwabSource::Future("/ZB"), yahoo: Some("ZB=F"), scale: 1.0 },
     MacroInstrument { id: "ZN", label: "10年期货", meaning: "10年，24h 交易", schwab: SchwabSource::Future("/ZN"), yahoo: Some("ZN=F"), scale: 1.0 },
     MacroInstrument { id: "DXY", label: "美元指数", meaning: "美元强弱（嘉信用 6 个外汇实时合成）", schwab: SchwabSource::DollarIndex, yahoo: Some("DX-Y.NYB"), scale: 1.0 },
@@ -70,6 +70,7 @@ pub const DOLLAR_INDEX_SCALE: f64 = 50.143_481_12;
 pub const EQUITIES: &str = "LEVELONE_EQUITIES";
 pub const FUTURES: &str = "LEVELONE_FUTURES";
 pub const FOREX: &str = "LEVELONE_FOREX";
+pub const OPTIONS: &str = "LEVELONE_OPTIONS";
 
 /// Field numbers per service. Equities and futures number them differently
 /// (bid/ask exchange ids and quote times are swapped between the two), which
@@ -89,14 +90,33 @@ pub fn fields(service: &str) -> Option<Fields> {
         EQUITIES => Some(Fields { bid: 1, ask: 2, last: 3, close: 12, mark: 33, quote_time: 34, trade_time: 35 }),
         FUTURES => Some(Fields { bid: 1, ask: 2, last: 3, close: 14, mark: 24, quote_time: 10, trade_time: 11 }),
         FOREX => Some(Fields { bid: 1, ask: 2, last: 3, close: 12, mark: 29, quote_time: 8, trade_time: 9 }),
+        OPTIONS => Some(Fields { bid: 2, ask: 3, last: 4, close: 7, mark: 37, quote_time: 38, trade_time: 39 }),
         _ => None,
     }
 }
+
+/// What an option's stream carries beyond its quote (the Streamer Guide's
+/// LEVELONE_OPTIONS numbering, as schwab-py's `LevelOneOptionFields` lists
+/// it): Schwab's model figures a share, and the day's open interest.
+pub struct OptionFields {
+    pub volume: u32,
+    pub open_interest: u32,
+    /// Percent.
+    pub volatility: u32,
+    pub delta: u32,
+    pub gamma: u32,
+    pub theta: u32,
+    pub vega: u32,
+}
+
+pub const OPTION_FIELDS: OptionFields =
+    OptionFields { volume: 8, open_interest: 9, volatility: 10, delta: 28, gamma: 29, theta: 30, vega: 31 };
 
 fn subscribed_fields(service: &str) -> &'static str {
     match service {
         EQUITIES => "0,1,2,3,12,33,34,35",
         FUTURES => "0,1,2,3,10,11,14,24",
+        OPTIONS => "0,2,3,4,7,8,9,10,28,29,30,31,37,38,39",
         _ => "0,1,2,3,8,9,12,29",
     }
 }
@@ -104,34 +124,44 @@ fn subscribed_fields(service: &str) -> &'static str {
 pub struct Dialect {
     schwabctl: String,
     http: reqwest::Client,
+    watch: Watch,
+}
+
+/// What the stream carries beyond the macro tape: the US underlying under
+/// review, and the option contracts held on it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Watch {
+    pub equities: Vec<String>,
+    pub options: Vec<String>,
+}
+
+/// A fresh access token from `schwabctl` — the same source the app's REST
+/// reads use, so there is one token cache and one refresh path. The stream
+/// and the chain poller both ask here.
+pub async fn access_token(schwabctl: &str) -> Result<String, String> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::process::Command::new(schwabctl).args(["token", "--json"]).output(),
+    )
+    .await
+    .map_err(|_| "schwabctl token 超过 20 秒".to_string())?
+    .map_err(|e| format!("schwabctl 起不来：{e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("嘉信未登录或登录已过期：{}", stderr.lines().last().unwrap_or("").trim()));
+    }
+    let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| "schwabctl token 输出不是 JSON".to_string())?;
+    value
+        .get("accessToken")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "schwabctl token 没有 accessToken".to_string())
 }
 
 impl Dialect {
-    pub fn new(schwabctl: String, http: reqwest::Client) -> Dialect {
-        Dialect { schwabctl, http }
-    }
-
-    /// A fresh access token from `schwabctl` — the same source the app's REST
-    /// reads use, so there is one token cache and one refresh path.
-    async fn access_token(&self) -> Result<String, String> {
-        let output = tokio::time::timeout(
-            Duration::from_secs(20),
-            tokio::process::Command::new(&self.schwabctl).args(["token", "--json"]).output(),
-        )
-        .await
-        .map_err(|_| "schwabctl token 超过 20 秒".to_string())?
-        .map_err(|e| format!("schwabctl 起不来：{e}"))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("嘉信未登录或登录已过期：{}", stderr.lines().last().unwrap_or("").trim()));
-        }
-        let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| "schwabctl token 输出不是 JSON".to_string())?;
-        value
-            .get("accessToken")
-            .and_then(Value::as_str)
-            .filter(|t| !t.is_empty())
-            .map(str::to_string)
-            .ok_or_else(|| "schwabctl token 没有 accessToken".to_string())
+    pub fn new(schwabctl: String, http: reqwest::Client, watch: Watch) -> Dialect {
+        Dialect { schwabctl, http, watch }
     }
 }
 
@@ -168,6 +198,7 @@ fn request(info: &StreamerInfo, id: u32, service: &str, command: &str, parameter
     .to_string()
 }
 
+/// The macro tape's keys on `service`.
 pub fn keys(service: &str) -> Vec<&'static str> {
     match service {
         FOREX => DOLLAR_INDEX.iter().map(|(pair, _)| *pair).collect(),
@@ -181,20 +212,43 @@ pub fn keys(service: &str) -> Vec<&'static str> {
     }
 }
 
+impl Watch {
+    /// Every key the stream subscribes on `service`: the tape's, then what
+    /// is watched, each once.
+    fn keys(&self, service: &str) -> Vec<String> {
+        let extra: &[String] = match service {
+            EQUITIES => &self.equities,
+            OPTIONS => &self.options,
+            _ => &[],
+        };
+        let mut out: Vec<String> = keys(service).into_iter().map(str::to_string).collect();
+        for key in extra {
+            if !out.contains(key) {
+                out.push(key.clone());
+            }
+        }
+        out
+    }
+}
+
 impl super::socket::Dialect for Dialect {
     fn feed(&self) -> Feed {
         Feed::Schwab
     }
     async fn plan(&self) -> Result<Plan, String> {
-        let token = self.access_token().await?;
+        let token = access_token(&self.schwabctl).await?;
         let body = super::net::get_text(&self.http, "https://api.schwabapi.com/trader/v1/userPreference", Some(&token)).await?;
         let info = streamer_info(&body)?;
         let login = request(&info, 1, "ADMIN", "LOGIN", json!({
             "Authorization": token, "SchwabClientChannel": info.channel, "SchwabClientFunctionId": info.function_id,
         }));
         let mut steps = vec![Step { frame: login, await_ack: true }];
-        for (id, service) in [(2, EQUITIES), (3, FUTURES), (4, FOREX)] {
-            let parameters = json!({"keys": keys(service).join(","), "fields": subscribed_fields(service)});
+        for (id, service) in [(2, EQUITIES), (3, FUTURES), (4, FOREX), (5, OPTIONS)] {
+            let keys = self.watch.keys(service);
+            if keys.is_empty() {
+                continue;
+            }
+            let parameters = json!({"keys": keys.join(","), "fields": subscribed_fields(service)});
             steps.push(Step { frame: request(&info, id, service, "SUBS", parameters), await_ack: true });
         }
         Ok(Plan { url: info.url, steps })
@@ -325,11 +379,24 @@ mod tests {
         assert_eq!(keys(EQUITIES), vec!["TLT", "IEF", "$TNX", "$SPX", "$COMPX"]);
         assert_eq!(keys(FUTURES), vec!["/ZB", "/ZN", "/GC"]);
         assert_eq!(keys(FOREX).len(), 6);
+        assert!(keys(OPTIONS).is_empty(), "the tape holds no options");
+    }
+
+    #[test]
+    fn what_is_watched_rides_on_the_tapes_subscriptions() {
+        let watch = Watch { equities: vec!["MU".into(), "TLT".into()], options: vec!["MU    261120C01040000".into()] };
+        assert_eq!(watch.keys(EQUITIES), vec!["TLT", "IEF", "$TNX", "$SPX", "$COMPX", "MU"], "TLT once");
+        assert_eq!(watch.keys(OPTIONS), vec!["MU    261120C01040000"]);
+        assert!(Watch::default().keys(OPTIONS).is_empty(), "no options, no subscription");
+        // Every service the stream reads has its field numbers.
+        for service in [EQUITIES, FUTURES, FOREX, OPTIONS] {
+            assert!(fields(service).is_some(), "{service}");
+        }
     }
 
     #[test]
     fn reads_acknowledgements_and_refusals() {
-        let dialect = Dialect::new("schwabctl".into(), reqwest::Client::new());
+        let dialect = Dialect::new("schwabctl".into(), reqwest::Client::new(), Watch::default());
         let ok = r#"{"response":[{"service":"ADMIN","command":"LOGIN","requestid":"1","content":{"code":0,"msg":"server=s0166;status=NP"}}]}"#;
         assert_eq!(dialect.ack(ok), Some(Ok(())));
         let denied = r#"{"response":[{"service":"ADMIN","command":"LOGIN","requestid":"1","content":{"code":3,"msg":"Login Denied.: token is invalid or has expired."}}]}"#;

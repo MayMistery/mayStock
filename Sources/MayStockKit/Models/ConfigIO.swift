@@ -469,13 +469,11 @@ public struct ConfigIO: Sendable {
         }
     }
 
-    /// Keep `data` beside the file as `config.json.<tag>-<yyyyMMdd-HHmmss>`.
+    /// Keep `data` beside the file as `config.json.<tag>-<yyyyMMdd-HHmmss>`,
+    /// stamped on the display clock May reads it by.
     private func keepCopy(of data: Data, as tag: String) throws -> URL {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyyMMdd-HHmmss"
         let copy = fileURL.deletingLastPathComponent()
-            .appendingPathComponent("\(fileURL.lastPathComponent).\(tag)-\(formatter.string(from: Date()))")
+            .appendingPathComponent("\(fileURL.lastPathComponent).\(tag)-\(DisplayTime.string(Date(), "yyyyMMdd-HHmmss"))")
         try data.write(to: copy, options: .atomic)
         return copy
     }

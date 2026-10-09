@@ -32,6 +32,7 @@ public final class CheckupModel {
 
     public private(set) var clock: LiveSnapshot.Clock?
     public private(set) var instrument: LiveSnapshot.Instrument?
+    public private(set) var reviewable: [LiveSnapshot.Reviewable] = []
     public private(set) var feeds: [LiveSnapshot.Feed] = []
     /// Several venues unreachable at once; see `LiveSnapshot.network`.
     public private(set) var outage: LiveSnapshot.Network?
@@ -51,6 +52,11 @@ public final class CheckupModel {
     /// one being shown.
     public var instId: String {
         didSet { if instId != oldValue { reconfigure() } }
+    }
+    /// The market `instId` is in (`LiveSnapshot.Reviewable.crypto` /
+    /// `.usEquity`).
+    public var reviewMarket: String {
+        didSet { if reviewMarket != oldValue { reconfigure() } }
     }
     public var followsHeldPosition: Bool {
         didSet { if followsHeldPosition != oldValue { reconfigure() } }
@@ -87,11 +93,13 @@ public final class CheckupModel {
     public init(
         kernel: LiveKernel,
         instId: String = "ETH-USDT-SWAP",
+        reviewMarket: String = LiveSnapshot.Reviewable.crypto,
         followsHeldPosition: Bool = true,
         gridDivisor: Int = 1
     ) {
         self.kernel = kernel
         self.instId = instId
+        self.reviewMarket = reviewMarket
         self.followsHeldPosition = followsHeldPosition
         self.gridDivisor = gridDivisor
     }
@@ -106,6 +114,7 @@ public final class CheckupModel {
         do {
             try kernel.update { config in
                 config.instId = instId
+                config.reviewMarket = reviewMarket
                 config.followsHeldPosition = followsHeldPosition
                 config.gridDivisor = gridDivisor
                 config.analytics = true
@@ -175,6 +184,7 @@ public final class CheckupModel {
         }
         update(\.clock, decoded.clock)
         update(\.instrument, decoded.instrument)
+        update(\.reviewable, decoded.reviewable)
         update(\.feeds, decoded.feeds)
         update(\.outage, decoded.network)
         update(\.spot, decoded.spot)
@@ -192,11 +202,30 @@ public final class CheckupModel {
         pull()
     }
 
+    /// Put `reviewable` under review, or — nil — follow whatever is held.
+    public func review(_ reviewable: LiveSnapshot.Reviewable?) {
+        guard let reviewable else {
+            followsHeldPosition = true
+            return
+        }
+        // One reconfigure for the three, not three half-changed ones.
+        batching = true
+        instId = reviewable.instId
+        reviewMarket = reviewable.market
+        followsHeldPosition = false
+        batching = false
+        reconfigure()
+    }
+
+    /// Set while several settings change together.
+    @ObservationIgnored private var batching = false
+
     private func reconfigure() {
-        guard pump != nil else { return }
+        guard pump != nil, !batching else { return }
         do {
             try kernel.update { config in
                 config.instId = instId
+                config.reviewMarket = reviewMarket
                 config.followsHeldPosition = followsHeldPosition
                 config.gridDivisor = gridDivisor
             }

@@ -25,9 +25,22 @@ public final class LiveKernel: @unchecked Sendable {
     /// stale — the kernel's rule for its feeds, and the rule for every clock
     /// the app runs itself (the REST fallback, a venue it polls).
     public static let staleAfterIntervals = Double(ms_live_stale_after_intervals())
+    /// The app's own clocks, as the kernel declares them (`Renewal`): each
+    /// loop sleeps by the interval the kernel ages its readings by.
+    public enum AppClock: String, CaseIterable, Sendable {
+        /// The account over REST while the private socket is down.
+        case restFallback
+        /// A polled account (Schwab's) holding something priced, or cash alone.
+        case polledPriced, polledCash
+        /// A polled account's working orders.
+        case accountRefresh
+
+        public var interval: TimeInterval { TimeInterval(ms_live_renewal_ms(rawValue)) / 1000 }
+    }
+
     /// How often the account is read over REST while the private
     /// socket is down: the interval the kernel ages those readings by.
-    public static let restFallbackInterval = TimeInterval(ms_live_rest_fallback_ms()) / 1000
+    public static let restFallbackInterval = AppClock.restFallback.interval
 
     /// What the live layer watches.
     public struct Config: Encodable, Sendable, Equatable {
@@ -50,13 +63,32 @@ public final class LiveKernel: @unchecked Sendable {
         /// Whether the checkup's market analytics run. The account part runs
         /// either way.
         public var analytics: Bool
+        /// The market `instId` is in: `crypto` (an OKX perpetual) or
+        /// `usEquity` (a US ticker, its options read from Schwab).
+        public var reviewMarket: String
+        /// The zone the layer writes times into its texts in, and what it is
+        /// called (`DisplayTime`).
+        public var displayZone: DisplayZone
+
+        public struct DisplayZone: Encodable, Sendable, Equatable {
+            public var identifier: String
+            public var name: String
+
+            /// The display zone in force now.
+            public static var current: DisplayZone {
+                DisplayZone(identifier: DisplayTime.identifier, name: DisplayTime.name)
+            }
+        }
 
         public init(
             instId: String, followsHeldPosition: Bool, mode: TradingMode,
             okxProfile: String?, okxConfigPath: String?, schwabctlPath: String?,
             network: Bool = true, nowOverrideMs: Int64? = nil, gridDivisor: Int = 1,
-            analytics: Bool = true
+            analytics: Bool = true, reviewMarket: String = LiveSnapshot.Reviewable.crypto,
+            displayZone: DisplayZone = .current
         ) {
+            self.displayZone = displayZone
+            self.reviewMarket = reviewMarket
             self.analytics = analytics
             self.instId = instId
             self.followsHeldPosition = followsHeldPosition

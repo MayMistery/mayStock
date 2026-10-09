@@ -12,14 +12,20 @@ struct IntelligenceModelSelectionTests {
             var reports: [IntelligenceReport]
         }
         let json = #"{"settings":{"enabled":false,"dailyHour":9,"timezone":"America/New_York","horizonHours":1},"reports":[{"id":"old-report","kind":"daily","generatedAt":1788825600,"windowStart":1788822000,"windowEnd":1788825600,"title":"旧日报","summary":"已有摘要","coverage":"","events":[],"predictions":[]}]}"#
+        struct RetiredArchive: Decodable {
+            var settings: IntelligenceSettings.Retired?
+        }
         var archive = try IntelligenceJSON.decoder().decode(Archive.self, from: Data(json.utf8))
         #expect(archive.settings.model == "model_hub/es1_orange_o50[1m]")
         #expect(!archive.settings.enabled && archive.settings.dailyHour == 9)
-        #expect(archive.settings.timezone == "America/New_York")
+        // The station's own zone is retired, but still read, so it can be said.
+        #expect(try IntelligenceJSON.decoder().decode(RetiredArchive.self, from: Data(json.utf8)).settings?.timezone == "America/New_York")
         #expect(archive.reports[0].model == nil)
         archive.settings.model = expertModel
-        let migrated = try IntelligenceJSON.decoder().decode(Archive.self,
-            from: IntelligenceJSON.encoder().encode(archive))
+        let written = try IntelligenceJSON.encoder().encode(archive)
+        #expect(try IntelligenceJSON.decoder().decode(RetiredArchive.self, from: written).settings?.timezone == nil,
+                "written back without it")
+        let migrated = try IntelligenceJSON.decoder().decode(Archive.self, from: written)
         #expect(migrated.settings.model == expertModel)
         #expect(migrated.reports[0].model == nil)
         #expect(migrated.reports[0].summary == "已有摘要")
@@ -109,7 +115,7 @@ struct IntelligenceModelSelectionTests {
 
     private func makeRequest(model: String) -> IntelligenceRequest {
         IntelligenceRequest(kind: .hourly, now: Date(timeIntervalSince1970: 1_788_825_600),
-                            settings: IntelligenceSettings(model: model), watchlist: ["BTC-USDT"],
+                            settings: IntelligenceSettings(model: model), timezone: "Asia/Singapore", watchlist: ["BTC-USDT"],
                             quotes: [], knownEvents: [])
     }
 

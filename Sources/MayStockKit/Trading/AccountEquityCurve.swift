@@ -64,22 +64,14 @@ public enum EquityWindow: String, CaseIterable, Sendable, Identifiable {
 
     public var id: String { rawValue }
 
-    /// The desk's clock, for stamping reports: the OKX book's accounting
-    /// zone, which is where this workbench has always kept its days.
-    public static var timeZone: TimeZone { Venue.okx.accountingTimeZone }
-
-    /// Monday-first, in the book's own time zone. Each venue's book keeps
-    /// its own day — Singapore for OKX, New York for a US account — so
-    /// "today" on one never means half of yesterday on the other.
+    /// Monday-first, on the venue's own day (`Venue.dayZone`): 00:00 UTC+8
+    /// for OKX, New York's for a US account.
     public static func calendar(for venue: Venue) -> Calendar {
         var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = venue.accountingTimeZone
+        calendar.timeZone = venue.dayZone
         calendar.firstWeekday = 2      // Monday
         return calendar
     }
-
-    /// The desk calendar, for callers that stamp rather than window.
-    public static var calendar: Calendar { calendar(for: .okx) }
 
     /// The instant this window measures from, on `venue`'s clock.
     public func anchor(now: Date = Date(), venue: Venue = .okx) -> Date {
@@ -108,16 +100,17 @@ public enum EquityWindow: String, CaseIterable, Sendable, Identifiable {
         }
     }
 
-    /// What the label is short for, spelled out in a tooltip.
-    public var longLabel: String { longLabel(for: .okx) }
-
-    public func longLabel(for venue: Venue) -> String {
-        let zone = venue == .okx ? "新加坡时间" : "纽约时间"
-        switch self {
-        case .hour1: return "最近 1 小时（滚动）"
-        case .day1: return "今日 00:00 起（\(zone)）"
-        case .day7: return "本周一 00:00 起（\(zone)）"
+    /// What the label is short for, spelled out in a tooltip: where the
+    /// window starts, in the display zone, and — when the venue's day turns
+    /// over at another hour there — the venue's midnight it really is.
+    public func longLabel(for venue: Venue, now: Date = Date()) -> String {
+        guard self != .hour1 else { return "最近 1 小时（滚动）" }
+        let start = anchor(now: now, venue: venue)
+        var rule = "\(DisplayTime.name) \(DisplayTime.string(start, "MM-dd HH:mm")) 起"
+        if venue.dayZone.secondsFromGMT(for: start) != DisplayTime.zone.secondsFromGMT(for: start) {
+            rule += "，即\(DisplayTime.name(of: venue.dayZone))\(self == .day7 ? "周一 0 点" : " 0 点")"
         }
+        return "\(label)（\(rule)）"
     }
 }
 
@@ -248,7 +241,7 @@ public struct EquityChange: Sendable, Equatable {
         } else if hasGaps {
             // Only the two ends enter the figure, so a hole does not make it
             // wrong — but nobody was watching the account through it.
-            notes.append("\(window.longLabel)里有 \(AccountEquityCurve.describe(missingSeconds))没有记录 —— 引擎当时没在跑")
+            notes.append("\(window.label)里有 \(AccountEquityCurve.describe(missingSeconds))没有记录 —— 引擎当时没在跑")
         }
         if rateApproximated {
             notes.append("起点按当前汇率折算（那时还没记录汇率）")
@@ -267,12 +260,8 @@ public struct EquityChange: Sendable, Equatable {
         String(format: "%.2f", value)
     }
 
-    /// Wall-clock time in the book's own zone.
     static func clock(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.timeZone = EquityWindow.timeZone
-        formatter.dateFormat = "MM-dd HH:mm"
-        return formatter.string(from: date)
+        DisplayTime.string(date, "MM-dd HH:mm")
     }
 }
 

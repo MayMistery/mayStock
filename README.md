@@ -109,7 +109,7 @@
   instrument receives an evidence-linked directional assessment or an explicit
   insufficient-evidence result. Run `./Scripts/setup-intelligence.sh` and
   configure Claude access to the requested model first. Defaults: daily at
-  08:00 Asia/Taipei, 1-hour forecast horizon. The app must be running and the
+  08:00 on the display clock (Settings › Time, Singapore unless changed), 1-hour forecast horizon. The app must be running and the
   computer awake; waking checks the current window. See [setup and verification](docs/INTELLIGENCE.md).
 
 ```bash

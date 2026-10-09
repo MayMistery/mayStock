@@ -256,6 +256,23 @@ char *ms_settlement_currency(const char *venue,
  * whole app. kind: "positions" | "equity" | "balances". Caller frees. */
 char *ms_okx_account_document(const char *kind, const char *json, char **error_out);
 
+/* Schwab's account document (`schwabctl account`), read once for the whole
+ * app: cash, liquidation value, every share and option holding, and any other
+ * family by name. Caller frees. */
+char *ms_schwab_account_document(const char *json, char **error_out);
+
+/* The family Schwab's asset type is read as: "STOCK", "OPTION", or NULL for
+ * one the app does not read. Caller frees. */
+char *ms_schwab_family(const char *asset_type);
+
+/* A US option's OCC symbol, read: underlying, side, strike, expiry; NULL when
+ * the symbol is not an option's. Caller frees. */
+char *ms_us_option(const char *symbol);
+
+/* The book spec a US share or option is ordered on: {"kind":"stock"} or
+ * {"kind":"option","underlying":…,"penny":…,"multiplier":…}. Caller frees. */
+char *ms_us_book_spec(const char *request_json, char **error_out);
+
 /* The live data layer: every real-time market and account connection the
  * app reads, held in the kernel. Read-only — nothing it sends can place,
  * amend or cancel an order.
@@ -282,9 +299,13 @@ void ms_live_stop(MSLive *handle);
 /* How many of its own intervals a feed may miss before its age reads stale:
  * the rule for the clocks the app runs itself, as for the kernel's feeds. */
 uint32_t ms_live_stale_after_intervals(void);
-/* How often the app reads the account over REST while the private
- * socket is down, in milliseconds. */
-uint64_t ms_live_rest_fallback_ms(void);
+/* How often the app runs one of its own clocks, in milliseconds:
+ * "restFallback", "polledPriced", "polledCash", "accountRefresh". 0 for a
+ * name the kernel does not declare. */
+uint64_t ms_live_renewal_ms(const char *name);
+/* The zone a fresh install writes times in, an IANA identifier
+ * ("Asia/Singapore"). Owned; free with ms_string_free(). */
+char *ms_display_zone_default(void);
 
 /* Trading: the one place an account is acted on. The kernel signs and sends
  * OKX REST requests itself, with the key from the okx CLI's config.toml, and

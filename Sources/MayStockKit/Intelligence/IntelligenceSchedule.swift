@@ -10,14 +10,16 @@ public enum IntelligenceSchedule {
         IntelligenceCalendar.days(around: now, timezone: timezone)
     }
 
+    /// When `kind` next runs; the daily report at `settings.dailyHour` in
+    /// `timezone`, the display zone.
     public static func nextRun(kind: IntelligenceKind, now: Date,
-                               lastSuccess: Date?, settings: IntelligenceSettings) -> Date {
+                               lastSuccess: Date?, settings: IntelligenceSettings, timezone: String) -> Date {
         switch kind {
         case .flash: return (lastSuccess ?? now.addingTimeInterval(-1_800)).addingTimeInterval(1_800)
         case .hourly: return (lastSuccess ?? now.addingTimeInterval(-3_600)).addingTimeInterval(3_600)
         case .daily:
             guard let lastSuccess else { return now } // Bootstrap the calendar on first launch.
-            let cal = calendar(timezone: settings.timezone)
+            let cal = calendar(timezone: timezone)
             let start = cal.startOfDay(for: now)
             let today = cal.date(bySettingHour: settings.dailyHour, minute: 0, second: 0, of: start) ?? start
             // A manually generated pre-schedule report does not skip today's scheduled refresh.

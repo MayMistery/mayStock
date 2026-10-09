@@ -86,13 +86,11 @@ extension E2EMain {
         let bySubType = Dictionary(grouping: account.transfers.items, by: { $0.subType ?? "—" })
         print("    by subType: " + bySubType.map { "\($0.key) ×\($0.value.count) \(String(format: "%+.4f", $0.value.reduce(0) { $0 + $1.amount }))" }.sorted().joined(separator: " · "))
         print("    net by currency: " + byCurrency.map { "\($0.key) \(String(format: "%+.4f", $0.value))" }.sorted().joined(separator: " · "))
-        let formatter = DateFormatter()
-        formatter.dateFormat = "MM-dd HH:mm:ss"
         for transfer in account.transfers.items where transfer.kind != .income {
-            print("    left out: \(formatter.string(from: account.date(ms: transfer.ms))) \(transfer.ccy) \(String(format: "%+.6f", transfer.amount)) subType \(transfer.subType ?? "—") \(transfer.kind)")
+            print("    left out: \(DisplayTime.string(account.date(ms: transfer.ms), "MM-dd HH:mm:ss")) \(transfer.ccy) \(String(format: "%+.6f", transfer.amount)) subType \(transfer.subType ?? "—") \(transfer.kind)")
         }
         for transfer in account.transfers.items.prefix(3) {
-            print("    \(formatter.string(from: account.date(ms: transfer.ms))) \(transfer.ccy) \(String(format: "%+.6f", transfer.amount)) subType \(transfer.subType ?? "—") (bill \(transfer.id))")
+            print("    \(DisplayTime.string(account.date(ms: transfer.ms), "MM-dd HH:mm:ss")) \(transfer.ccy) \(String(format: "%+.6f", transfer.amount)) subType \(transfer.subType ?? "—") (bill \(transfer.id))")
         }
 
         var ok = true

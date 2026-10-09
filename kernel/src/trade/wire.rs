@@ -225,9 +225,45 @@ pub enum AlgoKind {
     /// book has run `max_chase_ratio` (0.002 = 0.2%) from where it started.
     #[serde(rename_all = "camelCase")]
     Chase { max_chase_ratio: f64 },
-    /// Filled at market once the last trade crosses a trigger.
+    /// Filled at market once `trigger` crosses a level.
     #[serde(rename_all = "camelCase")]
-    Protection { take_profit: Option<f64>, stop_loss: Option<f64> },
+    Protection {
+        take_profit: Option<f64>,
+        stop_loss: Option<f64>,
+        #[serde(default)]
+        trigger: Trigger,
+    },
+}
+
+/// The price a stop or a target watches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum Trigger {
+    /// The last trade.
+    #[default]
+    Last,
+    /// The best bid: where a sale actually fills.
+    Bid,
+    /// The best ask: where a buy-back actually fills.
+    Ask,
+}
+
+impl Trigger {
+    /// The side of the book a closing order on `side` fills into.
+    pub fn exit_side(side: Side) -> Trigger {
+        match side {
+            Side::Sell => Trigger::Bid,
+            Side::Buy => Trigger::Ask,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Trigger::Last => "最新成交价",
+            Trigger::Bid => "买一",
+            Trigger::Ask => "卖一",
+        }
+    }
 }
 
 /// Everything the kernel can ask OKX to do to an account. Closed: there is no
@@ -519,7 +555,10 @@ fn algo_body(algo: &AlgoSpec) -> Result<Map<String, Value>, String> {
             }
             "chase"
         }
-        AlgoKind::Protection { take_profit, stop_loss } => match (take_profit, stop_loss) {
+        AlgoKind::Protection { trigger, .. } if *trigger != Trigger::Last => {
+            return Err(format!("OKX 的止盈止损只按最新成交价触发，不按{}", trigger.name()));
+        }
+        AlgoKind::Protection { take_profit, stop_loss, .. } => match (take_profit, stop_loss) {
             (Some(_), Some(_)) => "oco",
             (None, None) => return Err("止盈价和止损价至少要有一个".into()),
             _ => "conditional",
@@ -556,7 +595,7 @@ fn algo_body(algo: &AlgoSpec) -> Result<Map<String, Value>, String> {
             body.insert("maxChaseType".into(), json!("ratio"));
             body.insert("maxChaseVal".into(), json!(number(*max_chase_ratio)));
         }
-        AlgoKind::Protection { take_profit, stop_loss } => {
+        AlgoKind::Protection { take_profit, stop_loss, .. } => {
             // Market once triggered, on the last trade — stated rather than
             // left to a default, so the confirmation can say which price fires.
             if let Some(target) = take_profit {
@@ -678,7 +717,7 @@ mod tests {
                 let algo = AlgoSpec {
                     inst_id: "ETH-USDT-SWAP".into(), inst_type: family, side: Side::Sell, pos_side: None,
                     size: 1.0, trade_mode: None, reduce_only: family.is_derivative(), cancel_with_position: false,
-                    client_id: None, kind: AlgoKind::Protection { take_profit: None, stop_loss: Some(2500.0) },
+                    client_id: None, kind: AlgoKind::Protection { take_profit: None, stop_loss: Some(2500.0), trigger: Trigger::Last },
                 };
                 assert!(build(&Action::PlaceAlgo { algo }).is_err(), "{family:?}: an algo order states its mode too");
             }
@@ -825,7 +864,7 @@ mod tests {
             inst_id: "ETH-USDT-SWAP".into(), inst_type: Family::Swap, side: Side::Sell,
             pos_side: Some(PosSide::Long), size: 10.0, trade_mode: Some("isolated".into()),
             reduce_only: true, cancel_with_position: true, client_id: None,
-            kind: AlgoKind::Protection { take_profit: tp, stop_loss: sl },
+            kind: AlgoKind::Protection { take_profit: tp, stop_loss: sl, trigger: Trigger::Last },
         };
         let both = body(&Action::PlaceAlgo { algo: algo(Some(2750.0), Some(2600.0)) });
         assert_eq!(both["ordType"], "oco");
@@ -911,7 +950,7 @@ mod tests {
             inst_id: "ETH-USDT-SWAP".into(), inst_type: Family::Swap, side: Side::Buy,
             pos_side: Some(PosSide::Short), size: 0.01, trade_mode: Some("cross".into()),
             reduce_only: true, cancel_with_position: true, client_id: Some("ms2".into()),
-            kind: AlgoKind::Protection { take_profit: Some(81096.85), stop_loss: Some(86113.15) },
+            kind: AlgoKind::Protection { take_profit: Some(81096.85), stop_loss: Some(86113.15), trigger: Trigger::Last },
         }};
         let text = serde_json::to_string(&action).unwrap();
         assert_eq!(serde_json::from_str::<Action>(&text).unwrap(), action);

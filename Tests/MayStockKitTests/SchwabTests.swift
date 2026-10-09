@@ -53,7 +53,8 @@ private enum Fixture {
       "positions":[
         {"shortQuantity":0,"averagePrice":380.5,"longQuantity":10,"instrument":{"assetType":"EQUITY","cusip":"88160R101","symbol":"TSLA"},"marketValue":4101.0,"currentDayProfitLoss":12.5},
         {"shortQuantity":5,"averagePrice":500.0,"longQuantity":0,"instrument":{"assetType":"EQUITY","symbol":"QQQ"},"marketValue":-2502.25},
-        {"shortQuantity":0,"averagePrice":1.2,"longQuantity":2,"instrument":{"assetType":"OPTION","symbol":"TSLA  261218C00500000"},"marketValue":240.0}],
+        {"shortQuantity":0,"averagePrice":1.2,"longQuantity":2,"instrument":{"assetType":"OPTION","symbol":"TSLA  261218C00500000","putCall":"CALL","underlyingSymbol":"TSLA"},"marketValue":240.0},
+        {"shortQuantity":0,"averagePrice":99.1,"longQuantity":1000,"instrument":{"assetType":"FIXED_INCOME","symbol":"912797KX4"},"marketValue":990.0}],
       "currentBalances":{"cashBalance":12000.5,"liquidationValue":13839.25,"availableFunds":9000,"buyingPower":18000,"maintenanceRequirement":1500}},
      "aggregatedBalance":{"currentLiquidationValue":13839.25,"liquidationValue":13839.25}}
     """
@@ -257,25 +258,116 @@ struct SchwabWireTests {
         #expect(!live[0].confirmed)
     }
 
-    @Test("账户：现金 + 每只股票一行（做空为负），非股票资产只报告不折算")
+    @Test("账户由内核读：现金 + 每只股票一行（做空为负），期权进合约持仓，其余资产点名")
     func account() throws {
         let account = try SchwabWire.account(from: Data(Fixture.account.utf8))
         #expect(account.isMargin)
         #expect(account.cash == 12000.5)
         #expect(account.equity == 13839.25)
-        #expect(account.positions.count == 2)
-        #expect(account.untracked == ["TSLA  261218C00500000（OPTION）"])
+        #expect(account.positions.count == 3)
+        #expect(account.unrecognised == ["912797KX4（FIXED_INCOME）"])
         #expect(account.held("TSLA") == 10)
         #expect(account.held("QQQ") == -5)
+        #expect(account.held("TSLA  261218C00500000") == 2, "an option's contracts")
         let balances = account.balances
         #expect(balances.first?.ccy == "USD")
         #expect(balances.first?.total == 12000.5)
         #expect(balances.contains { $0.ccy == "QQQ" && $0.total == -5 })
+        #expect(!balances.contains { $0.ccy.contains("261218") }, "an option is a contract, not a balance")
         let snapshot = account.snapshot
         #expect(snapshot.totalEquity == 13839.25)
-        let positions = account.exchangePositions
-        #expect(positions.first { $0.instId == "TSLA" }?.quantity == 10)
-        #expect(positions.first { $0.instId == "QQQ" }?.quantity == -5)
+        let shares = account.shareHoldings
+        #expect(shares.first { $0.instId == "TSLA" }?.quantity == 10)
+        #expect(shares.first { $0.instId == "QQQ" }?.quantity == -5)
+        #expect(shares.allSatisfy { $0.instType == InstrumentType.stock.rawValue })
+        let call = try #require(account.contractPositions.first)
+        #expect(account.contractPositions.count == 1)
+        #expect(call.instId == "TSLA  261218C00500000" && call.instType == "OPTION" && call.isOption)
+        #expect(call.quantity == 2 && call.averagePrice == 1.2)
+        #expect(call.markPrice == 1.2, "Schwab's value over 2 contracts of 100 shares")
+        #expect(call.marketValueUsd == 240, "valued at what Schwab says it is worth")
+        #expect(call.notionalUsd == nil, "the underlying's notional is not in this document")
+        let terms = try #require(account.positions.first { $0.family == .option }?.option)
+        #expect(terms.underlying == "TSLA" && terms.call && terms.strike == 500 && terms.expiryDay == "2026-12-18")
+        #expect(terms.label == "TSLA 2026-12-18 500 C")
+        #expect(!account.document.isEmpty, "the kernel's reading travels on for the live layer")
+        // The reading carries the document the live layer is handed, under
+        // the venue's topic.
+        #expect(Venue.schwab.liveAccountTopic == SchwabVenue.accountTopic)
+        #expect(Venue.okx.liveAccountTopic == nil, "OKX's account the layer reads itself")
+    }
+
+    @Test("美股期权代码由内核读，嘉信的期权是期权，其余代码是股票")
+    func optionSymbols() throws {
+        let contract = try #require(USOptionContract("MU    261120C01040000"))
+        #expect(contract.underlying == "MU" && contract.call && contract.strike == 1040 && contract.expiryDay == "2026-11-20")
+        #expect(USOptionContract("MU") == nil)
+        #expect(Venue.schwab.instrumentType(of: "MU    261120P01000000") == .option)
+        #expect(Venue.schwab.optionKind(of: "MU    261120P01000000") == .put)
+        #expect(Venue.schwab.optionUnderlying(of: "MU    261120P01000000") == "MU")
+        #expect(Venue.schwab.instrumentType(of: "MU") == .stock)
+        #expect(Venue.schwab.optionKind(of: "MU") == nil)
+    }
+
+    @Test("期权平仓的请求体：OPTION、SELL_TO_CLOSE / BUY_TO_CLOSE、止损按买一 / 卖一触发")
+    func optionOrderBodies() throws {
+        let close = SchwabOrderSpec(
+            symbol: "MU    261120C01040000", assetType: "OPTION",
+            instruction: SchwabOrderSpec.optionClosingInstruction(forLong: true),
+            quantity: 2, orderType: "LIMIT", price: 3.05, duration: "DAY")
+        let body = close.body
+        let leg = try #require((body["orderLegCollection"] as? [[String: Any]])?.first)
+        #expect(leg["instruction"] as? String == "SELL_TO_CLOSE")
+        #expect((leg["instrument"] as? [String: Any])?["assetType"] as? String == "OPTION")
+        #expect((leg["instrument"] as? [String: Any])?["symbol"] as? String == "MU    261120C01040000")
+        #expect(body["price"] as? String == "3.05")
+        #expect(body["stopType"] == nil)
+        let stop = SchwabOrderSpec(
+            symbol: "MU    261120P01000000", assetType: "OPTION",
+            instruction: SchwabOrderSpec.optionClosingInstruction(forLong: false),
+            quantity: 1, orderType: "STOP", stopPrice: 40, stopType: SchwabOrderSpec.stopType(.ask),
+            duration: "GOOD_TILL_CANCEL")
+        #expect(stop.body["stopType"] as? String == "ASK")
+        #expect(((stop.body["orderLegCollection"] as? [[String: Any]])?.first?["instruction"] as? String) == "BUY_TO_CLOSE")
+        #expect(SchwabOrderSpec.stopType(.last) == nil, "a share's stop keeps Schwab's standard")
+        #expect(SchwabOrderSpec.stopType(.bid) == "BID")
+        for instruction in ["SELL", "BUY_TO_COVER", "SELL_TO_CLOSE", "BUY_TO_CLOSE"] {
+            #expect(SchwabOrderSpec.closingInstructions.contains(instruction))
+        }
+        #expect(!SchwabOrderSpec.closingInstructions.contains("BUY_TO_OPEN"))
+    }
+
+    @Test("期权平仓只平不开：限价才发，多头卖出、空头买回，超过持有量拒绝")
+    func optionClosesOnlyClose() throws {
+        let symbol = "MU    261120C01040000"
+        let sell = TradeOrderSpec(instId: symbol, instType: .option, side: .sell, kind: .limit, size: 2, price: 3.05, reduceOnly: true)
+        let spec = try SchwabVenue.optionClose(sell, held: 3)
+        #expect(spec.instruction == "SELL_TO_CLOSE" && spec.assetType == "OPTION" && spec.quantity == 2 && spec.price == 3.05)
+        let buyBack = TradeOrderSpec(instId: symbol, instType: .option, side: .buy, kind: .limit, size: 1, price: 2.0, reduceOnly: true)
+        #expect(try SchwabVenue.optionClose(buyBack, held: -1).instruction == "BUY_TO_CLOSE")
+        // Each of these would open, or is not what the declaration offers.
+        #expect(throws: TradeError.self) { try SchwabVenue.optionClose(buyBack, held: 3) }
+        #expect(throws: TradeError.self) { try SchwabVenue.optionClose(sell, held: 1) }
+        #expect(throws: TradeError.self) { try SchwabVenue.optionClose(sell, held: 0) }
+        var opening = sell
+        opening.reduceOnly = false
+        #expect(throws: TradeError.self) { try SchwabVenue.optionClose(opening, held: 3) }
+        var market = sell
+        market.kind = .market
+        #expect(throws: TradeError.self) { try SchwabVenue.optionClose(market, held: 3) }
+        let stop = try SchwabVenue.optionStop(symbol, size: 3, stopPrice: 2.5, trigger: .bid, held: 3)
+        #expect(stop.instruction == "SELL_TO_CLOSE" && stop.orderType == "STOP" && stop.stopType == "BID" && stop.duration == "GOOD_TILL_CANCEL")
+        #expect(throws: TradeError.self) { try SchwabVenue.optionStop(symbol, size: 4, stopPrice: 2.5, trigger: .bid, held: 3) }
+    }
+
+    @Test("盘口规格由内核声明：股票 1 美元以下万分之一，期权 3 美元起五分")
+    func usBookSpecs() throws {
+        let shares = try BookDocument.Spec.us(.stock)
+        #expect(shares.instType == "STOCK" && shares.lot == 1 && shares.priceDecimals == 4)
+        let option = try BookDocument.Spec.us(.option(underlying: "MU", penny: true, multiplier: 100))
+        #expect(option.instType == "OPTION" && option.contractValue == 100 && option.priceDecimals == 2)
+        #expect(option.tickBands?.map(\.tickSz) == ["0.01", "0.05"])
+        #expect(throws: (any Error).self) { try BookDocument.Spec.us(.option(underlying: "MU", penny: true, multiplier: 0)) }
     }
 
     @Test("订单状态按运行器的口径读：成交均价、拒绝、挂单、OCO 子单")
@@ -604,7 +696,7 @@ struct PortfolioPerVenueTests {
         for venue in Venue.allCases {
             #expect(venue.defaultPortfolioCapital > 0)
             #expect(infixes.insert(venue.stateFileInfix).inserted, "state files must not collide")
-            #expect(venue.accountingTimeZone.identifier.isEmpty == false)
+            #expect(venue.dayZone.identifier.isEmpty == false)
             let store = StrategyLedgerStore(directory: URL(fileURLWithPath: "/tmp"), mode: .demo, venue: venue)
             #expect(store.fileURL.lastPathComponent.hasSuffix("-demo.json"))
         }
@@ -823,9 +915,33 @@ struct SchwabAccountReadingTests {
         #expect(invoked == ["account"], "the piecewise default asked twice: \(invoked)")
         #expect(reading.snapshot.totalEquity == 13839.25)
         #expect(reading.shareHoldings.map(\.instId).sorted() == ["QQQ", "TSLA"])
-        #expect(reading.positions == [], "Schwab holds no contract this app values")
+        #expect(reading.positions?.map(\.instId) == ["TSLA  261218C00500000"], "the option is a contract position")
         #expect(reading.positionsAt == reading.equityAt)
         #expect(reading.source == .polled)
         #expect(reading.pollInterval(quoteCurrency: Venue.schwab.quoteCurrency) == AccountReading.pricedPollInterval)
+        // The same reading, as the live layer is handed it.
+        let document = try #require(reading.liveDocument)
+        #expect(document.topic == "schwab.account")
+        let envelope = try #require(try JSONSerialization.jsonObject(with: Data(document.payload.utf8)) as? [String: Any])
+        #expect(envelope["source"] as? String == "schwab")
+        #expect(((envelope["account"] as? [String: Any])?["positions"] as? [Any])?.count == 3)
+    }
+
+    @Test("模拟盘的影子账户也按内核的账户文档交给实时层")
+    func shadowReadingIsHandedInTheKernelsShape() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("maystock-schwab-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let venue = try venue(in: dir, calls: dir.appendingPathComponent("calls"))
+        let reading = try await venue.accountReading(mode: .demo, source: .polled)
+        let document = try #require(reading.liveDocument)
+        let envelope = try #require(try JSONSerialization.jsonObject(with: Data(document.payload.utf8)) as? [String: Any])
+        #expect(envelope["source"] as? String == "shadow")
+        // The live layer reads it with the same type it reads Schwab's with.
+        let kernel = try LiveKernel(config: LiveKernel.Config(
+            instId: "ETH-USDT-SWAP", followsHeldPosition: true, mode: .demo,
+            okxProfile: nil, okxConfigPath: nil, schwabctlPath: nil, network: false))
+        defer { kernel.stop() }
+        try kernel.ingest(topic: document.topic, payload: document.payload)
     }
 }

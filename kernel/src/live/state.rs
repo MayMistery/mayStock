@@ -23,13 +23,17 @@ use super::polymarket;
 use super::reactions::{self, CellReaction, Side, TopicReaction};
 use super::rest::{self, HistoryKind, Leg, MacroQuote, OptionVenue, RestUpdate};
 use super::schwab::{self, SchwabSource};
-use super::{Effect, Feed, FeedState, LiveConfig, Renewal, Update};
+use super::{Effect, Feed, FeedState, LiveConfig, Market, Renewal, Update};
+use crate::display::DisplayClock;
 use crate::gravity::{self, StrikeInterest};
 use crate::trade::reads::{self, Book, TransferListing, WorkingOrder, WorkingOrders};
 use crate::trade::terms::{self, Terms};
 use crate::trade::wire::{Family, PosSide};
 use crate::trade::Delivery;
 use crate::implied::{self, Smile, SmilePoint};
+
+mod us;
+use us::{HandedAccount, HandedOrder};
 
 const HOUR_MS: i64 = 3_600_000;
 const YEAR_MS: f64 = 365.0 * 86_400_000.0;
@@ -160,9 +164,14 @@ struct ClockReading {
 
 pub struct State {
     pub config: LiveConfig,
+    /// The market the instrument under review is in, and the instrument: an
+    /// OKX perpetual and its coin, or a US share (both its ticker).
+    pub market: Market,
     pub base: String,
     pub inst_id: String,
     clock: Option<ClockReading>,
+    /// The zone the texts write times in (`LiveConfig::display_zone`).
+    display: DisplayClock,
     feeds: BTreeMap<Feed, FeedHealth>,
     events: VecDeque<EventLine>,
     next_event: u64,
@@ -225,6 +234,14 @@ pub struct State {
     predictions: BTreeMap<&'static str, PredictionReading>,
     // Derived memory: the price grid keeps its anchor while spot hovers.
     grid: Option<GridAnchor>,
+    // Schwab: the app's one reading of the account and its working orders,
+    // handed in (`ingest`), and the reviewed US underlying's option chain.
+    schwab_account: Option<(HandedAccount, LocalMs)>,
+    schwab_account_error: Option<String>,
+    schwab_orders: Option<(Vec<HandedOrder>, LocalMs)>,
+    schwab_orders_error: Option<String>,
+    chain: Option<(super::schwab_chain::Chain, LocalMs)>,
+    chain_error: Option<String>,
 }
 
 /// One topic's last good reading, when it was taken (local), and the error
@@ -260,13 +277,23 @@ fn base_of(inst_id: &str) -> String {
     inst_id.split('-').next().unwrap_or("ETH").to_ascii_uppercase()
 }
 
+/// What a market's instrument is "of": a perpetual's coin, a share itself.
+fn base_for(market: Market, inst_id: &str) -> String {
+    match market {
+        Market::Crypto => base_of(inst_id),
+        Market::UsEquity => inst_id.trim().to_ascii_uppercase(),
+    }
+}
+
 impl State {
     pub fn new(config: LiveConfig, now: i64) -> State {
         let mut state = State {
-            base: base_of(&config.inst_id),
+            market: config.review_market,
+            base: base_for(config.review_market, &config.inst_id),
             inst_id: config.inst_id.clone(),
             config,
             clock: None,
+            display: DisplayClock::default(),
             feeds: BTreeMap::new(),
             events: VecDeque::new(),
             next_event: 1,
@@ -304,9 +331,16 @@ impl State {
             schwab_live: Arc::new(AtomicBool::new(false)),
             predictions: BTreeMap::new(),
             grid: None,
+            schwab_account: None,
+            schwab_account_error: None,
+            schwab_orders: None,
+            schwab_orders_error: None,
+            chain: None,
+            chain_error: None,
         };
         state.event(now, format!("实时层启动：{}（{}）", state.inst_id, state.config.mode));
         state.note_grid_divisor(now);
+        state.adopt_display_zone(now);
         state
     }
 
@@ -506,6 +540,9 @@ impl State {
                 }
                 Vec::new()
             }
+            // A stream still winding down after the review left its market
+            // must not lay its surface under the new one.
+            Feed::Deribit if self.market != Market::Crypto => Vec::new(),
             Feed::Deribit => {
                 match deribit::decode(text) {
                     Some(deribit::Event::Surface(quotes)) => {
@@ -530,15 +567,20 @@ impl State {
                 Vec::new()
             }
             Feed::Schwab => {
+                let mut underlying_moved = false;
                 for event in schwab::decode(text) {
                     match event {
                         schwab::Event::Deltas(deltas) => {
                             for delta in deltas {
+                                underlying_moved |= self.market == Market::UsEquity && delta.service == schwab::EQUITIES && delta.key == self.inst_id;
                                 self.schwab_quotes.entry((delta.service.clone(), delta.key.clone())).or_default().merge(&delta);
                             }
                         }
                         schwab::Event::Notice(why) => self.event(now, why),
                     }
+                }
+                if underlying_moved {
+                    self.update_grid();
                 }
                 Vec::new()
             }
@@ -581,6 +623,18 @@ impl State {
     /// the automatic step (and `note_grid_divisor` has said why).
     fn grid_divisor(&self) -> u32 {
         if GRID_DIVISORS.contains(&self.config.grid_divisor) { self.config.grid_divisor } else { 1 }
+    }
+
+    /// Take up the configured display zone. One the kernel cannot resolve
+    /// keeps the default, and the event log says so.
+    fn adopt_display_zone(&mut self, now: i64) {
+        match DisplayClock::of(&self.config.display_zone) {
+            Ok(clock) => self.display = clock,
+            Err(why) => {
+                self.display = DisplayClock::default();
+                self.event(now, format!("{why}，时间按 {} 写", crate::display::DEFAULT_ZONE));
+            }
+        }
     }
 
     fn note_grid_divisor(&mut self, now: i64) {
@@ -699,22 +753,70 @@ impl State {
     /// Risk lives in positions, so the instrument under review is whatever
     /// perpetual the account actually holds. Assuming one and reporting
     /// "flat" when the guess was wrong is the one failure this must not have.
+    ///
+    /// An OKX perpetual leads, as it always has; with none held, the US
+    /// underlying the Schwab account holds the most of (by Schwab's own
+    /// market value) is reviewed. Whatever is held stays reachable from the
+    /// page (`reviewable`).
     fn follow_held_position(&mut self, now: i64) -> Vec<Effect> {
         if !self.config.follows_held_position {
             return Vec::new();
         }
-        let held = self.positions.values().find(|r| r.inst_id.ends_with("-SWAP")).map(|r| r.inst_id.clone());
+        let held = self
+            .positions
+            .values()
+            .find(|r| r.inst_id.ends_with("-SWAP"))
+            .map(|r| (Market::Crypto, r.inst_id.clone()))
+            .or_else(|| self.largest_us_holding().map(|symbol| (Market::UsEquity, symbol)));
         match held {
-            Some(held) if held != self.inst_id => {
+            Some((market, held)) if market != self.market || held != self.inst_id => {
                 self.event(now, format!("跟随持仓切换到 {held}（原 {}）", self.inst_id));
-                self.switch_instrument(held)
+                self.switch_review(market, held, now)
             }
             _ => Vec::new(),
         }
     }
 
+    /// Put `inst_id` in `market` under review. A change of market retires
+    /// the other market's feeds (their dots must not age on the page as if
+    /// they were in trouble) and restarts what reads the review.
+    fn switch_review(&mut self, market: Market, inst_id: String, now: i64) -> Vec<Effect> {
+        if market == self.market {
+            return self.switch_instrument(inst_id);
+        }
+        self.market = market;
+        let reason = match market {
+            Market::Crypto => format!("体检对象是 {inst_id}，不读美股期权链"),
+            Market::UsEquity => format!("体检对象是美股 {inst_id}，不读加密货币的这一路"),
+        };
+        let retired: Vec<Feed> = self.feeds.keys().copied().filter(|f| f.market().is_some_and(|m| m != market)).collect();
+        for feed in retired {
+            self.set_health(feed, FeedState::Off(reason.clone()), now);
+        }
+        let mut effects = self.switch_instrument(inst_id);
+        // Everything read for the other market's underlying goes with it.
+        self.base = base_for(market, &self.inst_id);
+        self.forget_underlying();
+        effects.retain(|e| !matches!(e, Effect::InstrumentChanged | Effect::BaseChanged));
+        effects.push(Effect::ReviewChanged);
+        effects
+    }
+
+    /// Nothing read for one underlying may show under another.
+    fn forget_underlying(&mut self) {
+        self.index = None;
+        self.index_trail.clear();
+        self.surface.clear();
+        self.fits.clear();
+        self.deribit_index = None;
+        self.book.clear();
+        self.grid = None;
+        self.chain = None;
+        self.chain_error = None;
+    }
+
     fn switch_instrument(&mut self, inst_id: String) -> Vec<Effect> {
-        let base = base_of(&inst_id);
+        let base = base_for(self.market, &inst_id);
         let base_changed = base != self.base;
         self.inst_id = inst_id;
         // Nothing read for the old instrument may show under the new one.
@@ -730,14 +832,12 @@ impl State {
         self.binance_oi = None;
         if base_changed {
             self.base = base;
-            self.index = None;
-            self.index_trail.clear();
-            self.surface.clear();
-            self.fits.clear();
-            self.deribit_index = None;
-            self.book.clear();
-            self.grid = None;
-            vec![Effect::BaseChanged]
+            self.forget_underlying();
+            match self.market {
+                Market::Crypto => vec![Effect::BaseChanged],
+                // A share is its own underlying: a new one is a new review.
+                Market::UsEquity => vec![Effect::ReviewChanged],
+            }
         } else {
             vec![Effect::InstrumentChanged]
         }
@@ -746,10 +846,14 @@ impl State {
     pub(crate) fn reconfigure(&mut self, config: LiveConfig, now: i64) -> Vec<Effect> {
         let mode_changed = config.mode != self.config.mode;
         let divisor_changed = config.grid_divisor != self.config.grid_divisor;
+        let zone_changed = config.display_zone != self.config.display_zone;
         let requested = config.inst_id.clone();
         self.config = config;
         if divisor_changed {
             self.note_grid_divisor(now);
+        }
+        if zone_changed {
+            self.adopt_display_zone(now);
         }
         if mode_changed {
             // Positions and equity belong to an account; the other account's
@@ -765,18 +869,24 @@ impl State {
             self.orders_error = None;
             self.risk_source = RiskSource::None("切换账户中".into());
             self.private_down_since = Some(now);
+            self.schwab_account = None;
+            self.schwab_account_error = None;
+            self.schwab_orders = None;
+            self.schwab_orders_error = None;
             self.event(now, format!("切换到{}账户", if self.config.mode == "demo" { "模拟盘" } else { "实盘" }));
         }
         let mut effects = Vec::new();
-        if requested != self.inst_id && !(self.config.follows_held_position && self.holds_swap()) {
-            effects = self.switch_instrument(requested);
+        let market = self.config.review_market;
+        if (market != self.market || requested != self.inst_id) && !(self.config.follows_held_position && self.holds_reviewable()) {
+            effects = self.switch_review(market, requested, now);
         }
         effects.extend(self.follow_held_position(now));
         effects
     }
 
-    fn holds_swap(&self) -> bool {
-        self.positions.values().any(|r| r.inst_id.ends_with("-SWAP"))
+    /// Anything a held-position follow would review.
+    fn holds_reviewable(&self) -> bool {
+        self.positions.values().any(|r| r.inst_id.ends_with("-SWAP")) || self.largest_us_holding().is_some()
     }
 
     fn apply_rest(&mut self, update: RestUpdate, now: i64) {
@@ -854,6 +964,7 @@ impl State {
                 }
                 self.terms.insert(inst_id, terms);
             }
+            RestUpdate::Chain { symbol, result, ms } => self.apply_chain(symbol, result, LocalMs(ms), now),
             RestUpdate::Prediction { topic, result, ms } => {
                 let label = polymarket::topic(topic).map(|t| t.label).unwrap_or(topic);
                 let reading = self.predictions.entry(topic).or_default();
@@ -939,6 +1050,16 @@ impl State {
                 None => Vec::new(),
             },
             "okx.marks" => self.apply(frame(Feed::OkxMarks), now),
+            "schwab.account" => self.apply_schwab_account(payload, now)?,
+            "schwab.orders" => {
+                self.apply_schwab_orders(payload, now)?;
+                Vec::new()
+            }
+            other if other.starts_with("rest.schwab.chain.") => {
+                let symbol = other["rest.schwab.chain.".len()..].to_string();
+                self.apply_rest(RestUpdate::Chain { symbol, result: super::schwab_chain::parse(payload), ms: now }, now);
+                Vec::new()
+            }
             "rest.okx.transfers" => {
                 let listing = reads::parse_transfers(payload).map(|items| TransferListing { items, complete: true });
                 self.apply_rest(RestUpdate::Transfers(listing, now, Delivery::default()), now);
@@ -978,14 +1099,25 @@ impl State {
             seq,
             generated_ms: now,
             clock: self.clock_view(),
-            instrument: InstrumentView { inst_id: self.inst_id.clone(), base: self.base.clone(), mode: self.config.mode.clone() },
+            instrument: InstrumentView {
+                inst_id: self.inst_id.clone(),
+                base: self.base.clone(),
+                mode: self.config.mode.clone(),
+                market: self.market.id(),
+                follows_held: self.config.follows_held_position,
+            },
+            reviewable: self.reviewable(),
             feeds: self.feed_views(),
             network: self.network_view(),
             events: self.event_views(),
             spot: spot.map(|(value, ms, source)| SpotView { value, ms, source }),
             account: self.account_view(now),
             risk: self.risk_view(now, &smiles),
-            structure: vec![self.okx_structure(now), self.binance_structure(now)],
+            // Perpetual positioning; a share has none.
+            structure: match self.market {
+                Market::Crypto => vec![self.okx_structure(now), self.binance_structure(now)],
+                Market::UsEquity => Vec::new(),
+            },
             gravity: self.gravity_view(now, &smiles),
             probability: self.probability_view(now, &smiles),
             macro_tape: self.macro_view(),
@@ -1028,13 +1160,27 @@ impl State {
         self.events.iter().map(|e| EventView { id: e.id, ms: self.to_server(e.ms), message: e.message.clone() }).collect()
     }
 
-    /// OKX's index, which OKX's options settle on and which streams fastest;
-    /// Deribit's when OKX's is missing — and the source says which.
+    /// What the reviewed market's options settle on, as it streams. For a
+    /// coin: OKX's index, which OKX's options settle on and which streams
+    /// fastest; Deribit's when OKX's is missing. For a US share: Schwab's
+    /// quote stream; the chain's own underlying price until it ticks. The
+    /// source says which.
     fn spot(&self) -> Option<(f64, i64, &'static str)> {
-        match (self.index, self.deribit_index) {
-            (Some(s), _) => Some((s.value, s.ms, "OKX 指数")),
-            (None, Some(s)) => Some((s.value, s.ms, "Deribit 指数（OKX 指数缺失）")),
-            _ => None,
+        match self.market {
+            Market::Crypto => match (self.index, self.deribit_index) {
+                (Some(s), _) => Some((s.value, s.ms, "OKX 指数")),
+                (None, Some(s)) => Some((s.value, s.ms, "Deribit 指数（OKX 指数缺失）")),
+                _ => None,
+            },
+            Market::UsEquity => self.us_spot(),
+        }
+    }
+
+    /// The renewal of whatever `spot` read.
+    fn spot_renewal(&self) -> Renewal {
+        match self.market {
+            Market::Crypto => Renewal::Frames(Feed::OkxPublic),
+            Market::UsEquity => self.us_price().map_or(Renewal::Frames(Feed::Schwab), |(_, _, _, renewal)| renewal),
         }
     }
 
@@ -1078,20 +1224,27 @@ impl State {
             let years = (expiry_ms - now) as f64 / YEAR_MS;
             let Some(smile) = Smile::new(forward, years, &points) else { continue };
             let quoted_ms = quotes.iter().map(|q| q.ms).max().unwrap_or(now);
-            fits.insert(expiry_ms, Fit { smile, forward, quoted_ms });
+            fits.insert(expiry_ms, Fit { smile, forward, quoted_ms, reference: None });
         }
         self.fits = fits;
     }
 
     /// The fitted smiles for expiries still ahead, each with its forward
-    /// carried by the index from the moment it was quoted.
+    /// carried by the underlying from the moment it was quoted: by OKX's
+    /// index from its trail for a coin, by the stream from the price the
+    /// chain was quoted against for a share.
     fn smiles(&self, now: i64) -> BTreeMap<i64, LiveSmile> {
+        let current = match self.market {
+            Market::Crypto => self.index.map(|s| s.value),
+            Market::UsEquity => self.spot().map(|s| s.0),
+        };
         self.fits
             .iter()
             .filter(|(expiry, _)| **expiry > now)
             .map(|(expiry, fit)| {
-                let (live_forward, anchored) = match (self.index, self.index_at(fit.quoted_ms)) {
-                    (Some(now_index), Some(then_index)) if then_index > 0.0 => (fit.forward * now_index.value / then_index, true),
+                let then = fit.reference.or_else(|| self.index_at(fit.quoted_ms));
+                let (live_forward, anchored) = match (current, then) {
+                    (Some(now_value), Some(then_value)) if then_value > 0.0 => (fit.forward * now_value / then_value, true),
                     _ => (fit.forward, false),
                 };
                 (*expiry, LiveSmile { smile: fit.smile.clone(), live_forward, quoted_ms: fit.quoted_ms, anchored })
@@ -1111,14 +1264,31 @@ impl State {
         by_expiry
     }
 
+    /// The feed a market's smiles come from.
+    fn smile_feed(&self) -> Feed {
+        match self.market {
+            Market::Crypto => Feed::Deribit,
+            Market::UsEquity => Feed::SchwabChain,
+        }
+    }
+
     fn probability_view(&self, now: i64, smiles: &BTreeMap<i64, LiveSmile>) -> ProbabilityView {
         let spot = self.spot();
         let mut view = ProbabilityView {
-            smile_venue: "Deribit",
-            surface_ms: self.surface.values().map(|q| q.ms).max(),
-            surface_stale_after_ms: Feed::Deribit.stale_after_ms(),
-            index_ms: self.index.map(|s| s.ms),
-            index_stale_after_ms: Feed::OkxPublic.stale_after_ms(),
+            smile_venue: match self.market {
+                Market::Crypto => "Deribit",
+                Market::UsEquity => "嘉信期权链",
+            },
+            smile_feed: self.smile_feed().id(),
+            surface_ms: match self.market {
+                Market::Crypto => self.surface.values().map(|q| q.ms).max(),
+                Market::UsEquity => self.fits.values().map(|f| f.quoted_ms).max().filter(|ms| *ms > 0),
+            },
+            surface_stale_after_ms: self.smile_feed().stale_after_ms(),
+            index_ms: spot.map(|s| s.1),
+            index_stale_after_ms: self.spot_renewal().stale_after_ms(),
+            spot_source: spot.map(|s| s.2),
+            notes: self.smile_notes(now),
             spot: spot.map(|s| s.0),
             grid_divisor: self.grid_divisor(),
             grid_step: None,
@@ -1148,6 +1318,14 @@ impl State {
             smiles.keys().copied().filter(|e| e - now >= HOUR_MS).collect()
         };
         expiries.truncate(MAX_COLUMNS);
+        // A held contract's own expiry is always a column: it is the one its
+        // holder needs read, whatever the market's money is doing.
+        for expiry in self.held_expiries() {
+            if smiles.contains_key(&expiry) && !expiries.contains(&expiry) {
+                expiries.push(expiry);
+            }
+        }
+        expiries.sort();
         let mut all_anchored = true;
         for expiry in expiries {
             let Some(live) = smiles.get(&expiry) else { continue };
@@ -1181,10 +1359,25 @@ impl State {
     fn gravity_view(&self, now: i64, smiles: &BTreeMap<i64, LiveSmile>) -> GravityView {
         let spot = self.spot().map(|s| s.0);
         let book = self.book_by_expiry(now);
+        let venues = OptionVenue::of(self.market);
+        let (oi_unit, oi_per_unit) = match self.market {
+            Market::Crypto => (self.base.clone(), 1.0),
+            // Listed options are counted in contracts of 100 shares.
+            Market::UsEquity => ("张".to_string(), crate::us_options::STANDARD_MULTIPLIER),
+        };
         let mut view = GravityView {
             book_ms: self.book.values().filter_map(|v| v.fetched_ms).min().map(|ms| self.to_server(ms)),
-            book_stale_after_ms: Feed::OptionBook.stale_after_ms(),
-            venues: OptionVenue::ALL
+            book_stale_after_ms: match self.market {
+                Market::Crypto => Feed::OptionBook.stale_after_ms(),
+                Market::UsEquity => Feed::SchwabChain.stale_after_ms(),
+            },
+            book_feed: match self.market {
+                Market::Crypto => Feed::OptionBook.id(),
+                Market::UsEquity => Feed::SchwabChain.id(),
+            },
+            oi_unit,
+            oi_per_unit,
+            venues: venues
                 .iter()
                 .map(|venue| {
                     let entry = self.book.get(venue);
@@ -1213,7 +1406,7 @@ impl State {
             let pain = gravity::max_pain(&rows, spot, sigma);
             let market_values: Vec<f64> = legs.iter().filter_map(|l| l.mark.map(|m| m.usd(spot) * l.oi)).collect();
             let oi_base: f64 = legs.iter().map(|l| l.oi).sum();
-            let mut shares: Vec<ShareView> = OptionVenue::ALL
+            let mut shares: Vec<ShareView> = venues
                 .iter()
                 .map(|venue| ShareView { venue: venue.label(), oi_base: legs.iter().filter(|l| l.venue == *venue).map(|l| l.oi).sum() })
                 .collect();
@@ -1550,6 +1743,13 @@ impl BalanceView {
 
 impl State {
     fn risk_view(&self, now: i64, smiles: &BTreeMap<i64, LiveSmile>) -> RiskView {
+        match self.market {
+            Market::Crypto => self.crypto_risk_view(now, smiles),
+            Market::UsEquity => self.us_risk_view(now, smiles),
+        }
+    }
+
+    fn crypto_risk_view(&self, now: i64, smiles: &BTreeMap<i64, LiveSmile>) -> RiskView {
         let (source, note) = self.source();
         let fallback_needed = self.fallback_needed(now);
         let valued: Vec<(&PositionRow, Valued)> = self.positions.values().map(|row| (row, self.value_leg(row))).collect();
@@ -1579,6 +1779,8 @@ impl State {
             stops_ms: self.orders.as_ref().map(|(_, ms)| self.to_server(*ms)),
             stops_stale_after_ms: Feed::OkxOrders.stale_after_ms(),
             stops_error: self.orders_error.clone(),
+            venue: "okx",
+            exposure_note: None,
         };
         // One instrument can hold more than one leg — a long/short account
         // holds both sides of it at once — and every leg is shown: a page
@@ -1674,6 +1876,11 @@ impl State {
         PositionView {
             key: row.key.clone(),
             inst_id: row.inst_id.clone(),
+            venue: "okx",
+            family: terms::family_of_inst_type(&row.inst_type),
+            option: None,
+            venue_figures: None,
+            note: valued.note.clone(),
             pos_side: row.pos_side.clone(),
             margin_mode: row.margin_mode.clone(),
             contracts: row.contracts,
@@ -1831,6 +2038,7 @@ impl State {
                 let cell = |m: &polymarket::Market, deadline: bool| PredictionCellView {
                     label: m.label.clone(),
                     deadline: if deadline { polymarket::deadline_day(m.end_ms) } else { None },
+                    deadline_ends_ms: if deadline { polymarket::deadline_ends_ms(m.end_ms) } else { None },
                     upcoming: polymarket::is_upcoming(m.end_ms, now),
                     reactions: Vec::new(),
                     probability: m.probability,
@@ -1847,7 +2055,7 @@ impl State {
                 ahead_markets.sort_by_key(|m| m.end_ms);
                 let one_line = |cells: Vec<PredictionCellView>| PredictionLineView {
                     title: topic.label.to_string(),
-                    deadline: None,
+                    deadline_ends_ms: None,
                     volume_24h: events.iter().map(|e| e.volume_24h).sum(),
                     liquidity: events.iter().map(|e| e.liquidity).sum(),
                     cells,
@@ -1858,7 +2066,7 @@ impl State {
                         .filter(|e| e.markets.iter().any(|m| ahead(&m)))
                         .map(|e| PredictionLineView {
                             title: e.title.clone(),
-                            deadline: polymarket::deadline_day(e.end_ms),
+                            deadline_ends_ms: polymarket::deadline_ends_ms(e.end_ms),
                             volume_24h: e.volume_24h,
                             liquidity: e.liquidity,
                             cells: e.markets.iter().filter(ahead).map(|m| cell(m, false)).collect(),
@@ -2015,6 +2223,10 @@ struct Fit {
     smile: Smile,
     forward: f64,
     quoted_ms: i64,
+    /// The underlying the quotes stood against, where the source states it
+    /// (a chain's `underlyingPrice`); otherwise read from the index trail at
+    /// `quoted_ms`.
+    reference: Option<f64>,
 }
 
 struct LiveSmile {
@@ -2036,6 +2248,8 @@ struct Snapshot {
     generated_ms: i64,
     clock: Option<ClockView>,
     instrument: InstrumentView,
+    /// Everything the page can review, held first.
+    reviewable: Vec<ReviewableView>,
     feeds: Vec<FeedView>,
     /// Several operators unreachable at once: this machine's network.
     network: Option<NetworkView>,
@@ -2215,6 +2429,22 @@ struct InstrumentView {
     inst_id: String,
     base: String,
     mode: String,
+    /// `crypto` or `usEquity` (`Market::id`).
+    market: &'static str,
+    /// The review follows what is held rather than a choice.
+    follows_held: bool,
+}
+
+/// Something the page can put under review: whatever is held, and what is
+/// under review now.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct ReviewableView {
+    market: &'static str,
+    inst_id: String,
+    /// `ETH-USDT-SWAP`, or `MU · 2 张期权 · 30 股`.
+    label: String,
+    held: bool,
 }
 
 #[derive(Serialize)]
@@ -2291,6 +2521,11 @@ struct RiskView {
     /// The stops feed's stale age, for `stops_ms`.
     stops_stale_after_ms: i64,
     stops_error: Option<String>,
+    /// `okx` or `schwab`: whose account the legs are on.
+    venue: &'static str,
+    /// What the exposure is measured in and leaves out, where that is not
+    /// the plain notional (a share's options, by delta).
+    exposure_note: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -2324,6 +2559,17 @@ struct PositionView {
     /// The venue's id for this leg.
     key: String,
     inst_id: String,
+    /// `okx` or `schwab`: where the leg is held, and closed.
+    venue: &'static str,
+    /// The leg's family as the venue files it; none for one no rule reads.
+    family: Option<Family>,
+    /// An option leg's contract, quote, greeks and odds.
+    option: Option<us::OptionLegView>,
+    /// The venue's own figures for the leg, where it states them apart from
+    /// the live valuation (Schwab's market value and open profit).
+    venue_figures: Option<us::VenueFiguresView>,
+    /// What about the leg's figures is not as read, in words.
+    note: Option<String>,
     pos_side: String,
     /// `cross` or `isolated`: whether this leg's liquidation price is its own.
     margin_mode: Option<String>,
@@ -2484,6 +2730,12 @@ struct GravityView {
     book_ms: Option<i64>,
     /// The option book feed's stale age, for `book_ms`.
     book_stale_after_ms: i64,
+    /// The feed the book is read through, for saying why it is empty.
+    book_feed: &'static str,
+    /// What open interest is counted in on the page — the coin, or listed
+    /// contracts — and how many of `oi_base`'s units make one.
+    oi_unit: String,
+    oi_per_unit: f64,
     venues: Vec<VenueCoverageView>,
     expiries: Vec<ExpiryRowView>,
     near_expiry_ms: Option<i64>,
@@ -2555,10 +2807,16 @@ struct StrikeRowView {
 #[serde(rename_all = "camelCase")]
 struct ProbabilityView {
     smile_venue: &'static str,
+    /// The feed the smiles come from, for saying why there are none.
+    smile_feed: &'static str,
     surface_ms: Option<i64>,
     surface_stale_after_ms: i64,
+    /// When the underlying the table is laid on was quoted, and from where.
     index_ms: Option<i64>,
     index_stale_after_ms: i64,
+    spot_source: Option<&'static str>,
+    /// What about these smiles is not the plain reading, in words.
+    notes: Vec<String>,
     spot: Option<f64>,
     /// The divisor in force — the configured one, or 1 when that one is not
     /// on offer.
@@ -2647,8 +2905,10 @@ struct PredictionTopicView {
 #[serde(rename_all = "camelCase")]
 struct PredictionLineView {
     title: String,
-    /// The New York day an event of mutually exclusive outcomes resolves.
-    deadline: Option<String>,
+    /// When an event of mutually exclusive outcomes runs out — the end of
+    /// the New York day it resolves on — for the app to write in the
+    /// display zone.
+    deadline_ends_ms: Option<i64>,
     volume_24h: f64,
     liquidity: f64,
     cells: Vec<PredictionCellView>,
@@ -2658,8 +2918,11 @@ struct PredictionLineView {
 #[serde(rename_all = "camelCase")]
 struct PredictionCellView {
     label: String,
-    /// The New York day of a deadline cell.
+    /// The New York day of a deadline cell: what the market is named for.
     deadline: Option<String>,
+    /// When that day runs out — the instant "by October 9" is over — for
+    /// the app to write in the display zone.
+    deadline_ends_ms: Option<i64>,
     /// Settles within the coming week.
     upcoming: bool,
     /// ETH if this outcome happens, one per the topic's reaction windows.
@@ -2920,9 +3183,9 @@ mod tests {
             match topic.layout {
                 polymarket::Layout::Outcomes => {
                     assert_eq!(lines.len(), 2, "{}: one line per event", topic.id);
-                    assert_eq!(lines[0]["deadline"], "2026-10-28");
-                    assert_eq!(lines[1]["deadline"], "2026-12-31");
-                    assert!(lines.iter().flat_map(cells).all(|c| c["deadline"].is_null()));
+                    assert_eq!(lines[0]["deadlineEndsMs"], new_york_midnight_after("2026-10-28"));
+                    assert_eq!(lines[1]["deadlineEndsMs"], new_york_midnight_after("2026-12-31"));
+                    assert!(lines.iter().flat_map(cells).all(|c| c["deadline"].is_null() && c["deadlineEndsMs"].is_null()));
                     let first = &cells(&lines[0])[0];
                     assert_eq!((first["bid"].as_f64(), first["ask"].as_f64(), first["lastTrade"].as_f64()), (Some(0.6), Some(0.62), Some(0.61)));
                     assert_eq!((first["change1d"].as_f64(), first["volume24h"].as_f64()), (Some(-0.02), Some(800.0)));
@@ -2931,6 +3194,8 @@ mod tests {
                     assert_eq!(lines.len(), 1, "{}: one line for the topic", topic.id);
                     let days: Vec<String> = cells(&lines[0]).iter().map(|c| c["deadline"].as_str().unwrap()[5..].to_string()).collect();
                     assert_eq!(days, ["10-28", "10-31", "12-31"], "{}: every open deadline, earliest first, settled ones gone", topic.id);
+                    let ends: Vec<i64> = cells(&lines[0]).iter().map(|c| c["deadlineEndsMs"].as_i64().unwrap()).collect();
+                    assert_eq!(ends, ["2026-10-28", "2026-10-31", "2026-12-31"].map(new_york_midnight_after), "{}: each runs out at New York midnight", topic.id);
                     assert_eq!(lines[0]["volume24h"], 1300.0);
                 }
                 polymarket::Layout::Daily => {
@@ -2942,6 +3207,13 @@ mod tests {
             assert_eq!(view["layout"], topic.layout.id());
         }
         assert!(state.ingest("rest.polymarket.nope", GAMMA_BODY, NOW).is_err(), "an undeclared topic is refused, not dropped");
+    }
+
+    /// The instant a New York day runs out.
+    fn new_york_midnight_after(day: &str) -> i64 {
+        use chrono::TimeZone;
+        let next = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").unwrap().succ_opt().unwrap().and_hms_opt(0, 0, 0).unwrap();
+        chrono_tz::America::New_York.from_local_datetime(&next).unwrap().timestamp_millis()
     }
 
     /// A month of daily questions on 2026-09-23 (New York morning): one day
@@ -3107,7 +3379,7 @@ mod tests {
             Feed::OkxPublic | Feed::OkxPrivate | Feed::OkxOrders | Feed::OkxOrderEvents | Feed::OkxMarks | Feed::OkxTransfers | Feed::OkxBook
             | Feed::Deribit | Feed::BinanceStream
             | Feed::Schwab | Feed::OptionBook | Feed::OkxHistory | Feed::BinanceHistory | Feed::BinanceOpenInterest
-            | Feed::Clock | Feed::Yahoo | Feed::Polymarket => Feed::ALL.contains(&feed),
+            | Feed::Clock | Feed::Yahoo | Feed::Polymarket | Feed::SchwabChain => Feed::ALL.contains(&feed),
         }
     }
 

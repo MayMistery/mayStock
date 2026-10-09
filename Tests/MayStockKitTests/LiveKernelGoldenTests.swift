@@ -232,7 +232,22 @@ struct LiveKernelGoldenTests {
     func everyStaleAgeIsDeclared() throws {
         let model = try startedModel()
         defer { model.stop() }
-        let snapshot = try #require(model.snapshot)
+        let found = staleAges(in: try #require(model.snapshot))
+        for section in ["structure", "probability", "risk", "macro", "account", "feeds", "gravity"] {
+            #expect(found.contains { $0.hasPrefix("snapshot.\(section)") }, "the fixture ages nothing under \(section)")
+        }
+        // A US review ages what only it carries: an option's quote, and the
+        // venue's own figures for a leg.
+        let us = try startedUSModel()
+        defer { us.stop() }
+        let usFound = staleAges(in: try #require(us.snapshot))
+        for path in ["option.quote.staleAfterMs", "venueFigures.staleAfterMs", "risk.positionsStaleAfterMs", "risk.stopsStaleAfterMs"] {
+            #expect(usFound.contains { $0.hasSuffix(path) }, "the US fixture ages nothing at \(path): \(usFound)")
+        }
+    }
+
+    /// Every `…staleAfterMs` in a decoded snapshot, held to being positive.
+    private func staleAges(in snapshot: LiveSnapshot) -> [String] {
         var found: [String] = []
         func walk(_ value: Any, path: String) {
             let mirror = Mirror(reflecting: value)
@@ -254,9 +269,154 @@ struct LiveKernelGoldenTests {
             }
         }
         walk(snapshot, path: "snapshot")
-        for section in ["structure", "probability", "risk", "macro", "account", "feeds", "gravity"] {
-            #expect(found.contains { $0.hasPrefix("snapshot.\(section)") }, "the fixture ages nothing under \(section)")
+        return found
+    }
+
+    // MARK: A US share and its options
+
+    /// 2026-10-09 07:00 UTC, a Friday before New York opens; MU's 20NOV26
+    /// contracts stop trading 2026-11-20 16:00 EST.
+    private let usNow: Int64 = 1_791_529_200_000
+    private let usExpiry: Int64 = 1_795_208_400_000
+    private let mu = 1035.84
+    private let call = "MU    261120C01040000"
+    private let put = "MU    261120P01000000"
+
+    /// Schwab's chain for MU's 20NOV26 expiry, priced off a skewed smile on
+    /// the forward its rate gives.
+    private func chainBody() -> String {
+        let years = Double(usExpiry - usNow) / (365 * 86_400_000)
+        let growth = exp(0.04043 * years)
+        let forward = mu * growth
+        func value(_ isCall: Bool, _ strike: Double) -> Double {
+            let k = log(strike / forward)
+            let iv = 0.45 - 0.3 * k + 0.6 * k * k
+            let v = iv * years.squareRoot()
+            let d1 = (log(forward / strike) + v * v / 2) / v
+            let d2 = d1 - v
+            let undiscounted = isCall ? forward * normalCDF(d1) - strike * normalCDF(d2) : strike * normalCDF(-d2) - forward * normalCDF(-d1)
+            return undiscounted / growth
         }
+        func side(_ isCall: Bool) -> [String: Any] {
+            var strikes: [String: Any] = [:]
+            for strike in stride(from: 800.0, through: 1300.0, by: 20.0) {
+                let price = value(isCall, strike)
+                strikes[String(format: "%.1f", strike)] = [[
+                    "putCall": isCall ? "CALL" : "PUT",
+                    "symbol": String(format: "MU    261120%@%08d", isCall ? "C" : "P", Int(strike * 1000)),
+                    "bid": max(price - 0.05, 0), "ask": price + 0.05, "last": price, "mark": price,
+                    "openInterest": 100 + Int(strike) % 300, "totalVolume": 3,
+                    "delta": isCall ? 0.5 : -0.5, "gamma": 0.002, "theta": -0.7, "vega": 1.4, "volatility": -999.0,
+                    "quoteTimeInLong": usNow - 40_000_000, "strikePrice": strike,
+                    "expirationDate": "2026-11-20T21:00:00.000+00:00", "multiplier": 100.0, "nonStandard": false, "pennyPilot": true,
+                    "optionDeliverablesList": [["symbol": "MU", "assetType": "STOCK", "deliverableUnits": 100.0]],
+                ] as [String: Any]]
+            }
+            return ["2026-11-20:42": strikes]
+        }
+        return json([
+            "symbol": "MU", "status": "SUCCESS", "isDelayed": false, "interestRate": 4.043, "underlyingPrice": mu,
+            "underlying": ["symbol": "MU", "last": mu, "quoteTime": usNow - 39_000_000],
+            "callExpDateMap": side(true), "putExpDateMap": side(false),
+        ])
+    }
+
+    /// The account holds a call and a written put on MU; the page follows it
+    /// there. Everything arrives down the paths the app and the stream use.
+    private func startedUSModel() throws -> CheckupModel {
+        let kernel = try LiveKernel(config: LiveKernel.Config(
+            instId: "ETH-USDT-SWAP", followsHeldPosition: true, mode: .live,
+            okxProfile: nil, okxConfigPath: nil, schwabctlPath: nil,
+            network: false, nowOverrideMs: usNow, analytics: false))
+        let model = CheckupModel(kernel: kernel)
+        model.start()
+        let document = json(["securitiesAccount": [
+            "type": "MARGIN", "accountNumber": "42324703",
+            "currentBalances": ["cashBalance": 10_000.0, "liquidationValue": 20_815.0, "availableFunds": 9_000.0],
+            "positions": [
+                ["longQuantity": 2, "shortQuantity": 0, "averagePrice": 60.5, "marketValue": 13_625.0, "longOpenProfitLoss": 1_525.0,
+                 "instrument": ["assetType": "OPTION", "symbol": call, "putCall": "CALL", "underlyingSymbol": "MU", "optionMultiplier": 100]],
+                ["longQuantity": 0, "shortQuantity": 1, "averagePrice": 31.0, "marketValue": -2_810.0, "shortOpenProfitLoss": 290.0,
+                 "maintenanceRequirement": 20_500.0,
+                 "instrument": ["assetType": "OPTION", "symbol": put, "putCall": "PUT", "underlyingSymbol": "MU"]],
+            ],
+        ]])
+        let account = try SchwabAccount.read(Data(document.utf8))
+        try model.ingest(topic: SchwabVenue.accountTopic, payload: "{\"source\":\"schwab\",\"account\":\(account.document)}")
+        try model.ingest(topic: SchwabVenue.ordersTopic, payload: json(["orders": [
+            ["id": "9", "instId": call, "ordType": "stop", "side": "sell", "stopPrice": 50.0, "size": 2, "filledSize": 0, "state": "working", "reduceOnly": true],
+        ]]))
+        try model.ingest(topic: "rest.schwab.chain.MU", payload: chainBody())
+        try model.ingest(topic: "schwab", payload: json(["data": [
+            ["service": "LEVELONE_EQUITIES", "content": [["key": "MU", "1": mu - 0.05, "2": mu + 0.05, "3": mu, "34": usNow - 1_000]]],
+            ["service": "LEVELONE_OPTIONS", "content": [["key": call, "2": 67.2, "3": 69.05, "4": 68.0, "37": 68.125, "8": 660, "9": 2778,
+                                                         "10": 45.48, "28": 0.525, "29": 0.0025, "30": -0.77, "31": 1.42, "38": usNow - 2_000]]],
+        ]]))
+        return model
+    }
+
+    @Test("a US share and its options decode, leg by leg, off Schwab's account, chain and stream")
+    func usReviewDecodes() throws {
+        let model = try startedUSModel()
+        defer { model.stop() }
+        #expect(model.failure == nil, "decode failure: \(model.failure ?? "")")
+        let snapshot = try #require(model.snapshot)
+        #expect(snapshot.instrument.instId == "MU" && snapshot.instrument.isUSEquity && snapshot.instrument.followsHeld)
+        #expect(snapshot.reviewable.first?.label == "MU · 3 张期权")
+        #expect(snapshot.structure.isEmpty, "a share has no perpetual positioning")
+        #expect(abs((snapshot.spot?.value ?? 0) - mu) < 1e-9 && snapshot.spot?.source == "嘉信报价推送", "mid of the streamed quote")
+
+        let risk = snapshot.risk
+        #expect(risk.venue == "schwab" && risk.source == "schwab" && risk.wasRead)
+        #expect(risk.equity?.value == 20_815)
+        #expect(risk.exposureNote?.contains("Delta") == true)
+        let long = try #require(risk.positions.first { $0.instId == call })
+        let option = try #require(long.option)
+        #expect(long.family == "OPTION" && long.venue == "schwab" && !long.isShort)
+        #expect(option.label == "MU 2026-11-20 1040 C" && option.call && option.strike == 1040 && option.expiryMs == usExpiry)
+        let quote = try #require(option.quote)
+        #expect(quote.source == "schwab.stream" && abs(quote.mark - (67.2 + 69.05) / 2) < 1e-9)
+        #expect(quote.volume == 660 && quote.openInterest == 2778)
+        #expect(abs((long.unrealisedPnl ?? 0) - (quote.mark - 60.5) * 200) < 1e-6 && long.remarked)
+        #expect(long.venueFigures?.openProfitLoss == 1_525)
+        #expect(option.delta == 0.525 && abs((option.positionDelta ?? 0) - 105) < 1e-9)
+        #expect(option.iv == 45.48 && option.greeksSource == "stream")
+        #expect(option.breakeven == 1_100.5 && option.maxLoss == 12_100 && option.assignment == nil)
+        #expect(option.oddsBasis?.exact == true)
+        let pItm = try #require(option.pItm)
+        #expect(pItm > 0.3 && pItm < 0.6 && (option.pProfit ?? 1) < pItm)
+        #expect(long.protective.first?.stopPrice == 50 && long.protective.first?.kind == "止损单")
+
+        let written = try #require(risk.positions.first { $0.instId == put })
+        #expect(written.isShort && written.margin == 20_500)
+        let writtenOption = try #require(written.option)
+        #expect(writtenOption.quote?.source == "schwab.chain", "not streamed: the chain's quote")
+        #expect((writtenOption.pTouchStrike ?? 0) > (writtenOption.pItm ?? 1))
+        #expect(writtenOption.maxLoss == 96_900)
+        #expect(written.protective.isEmpty)
+
+        let probability = snapshot.probability
+        #expect(probability.smileVenue == "嘉信期权链" && probability.smileFeed == "schwab.chain")
+        #expect(probability.columns.contains { $0.expiryMs == usExpiry }, "the held expiry is a column")
+        #expect(!probability.notes.isEmpty)
+        let gravity = snapshot.gravity
+        #expect(gravity.venues.map(\.venue) == ["嘉信（全美合并）"] && gravity.oiUnit == "张" && gravity.oiPerUnit == 100)
+        #expect(gravity.bookFeed == "schwab.chain")
+        let row = try #require(gravity.expiries.first)
+        #expect(row.expiryMs == usExpiry && row.maxPain != nil)
+    }
+
+    @Test("choosing what to review moves the page there, and following goes back to what is held")
+    func reviewIsChosen() throws {
+        let model = try startedUSModel()
+        defer { model.stop() }
+        let eth = LiveSnapshot.Reviewable(market: LiveSnapshot.Reviewable.crypto, instId: "ETH-USDT-SWAP", label: "ETH-USDT-SWAP", held: false)
+        model.review(eth)
+        #expect(model.snapshot?.instrument.instId == "ETH-USDT-SWAP" && model.snapshot?.instrument.market == "crypto")
+        #expect(model.snapshot?.instrument.followsHeld == false)
+        #expect(model.snapshot?.risk.venue == "okx")
+        model.review(nil)
+        #expect(model.snapshot?.instrument.instId == "MU", "following the held options again")
     }
 
     @Test("an unchanged snapshot is not handed out twice")

@@ -185,7 +185,7 @@ public struct OKXVenue: ExchangeVenue {
         let algo = TradeAlgoSpec(
             instId: instId, instType: instType, side: posSide == .short ? .buy : .sell, posSide: posSide,
             size: size, tradeMode: tradeMode, reduceOnly: true, cancelWithPosition: false,
-            kind: .protection(takeProfit: nil, stopLoss: stopPrice))
+            kind: .protection(takeProfit: nil, stopLoss: stopPrice, trigger: .last))
         _ = try await trade.send(.placeAlgo(algo), mode: mode, liveUnlocked: liveUnlocked)
     }
 

@@ -369,6 +369,19 @@ pub struct Spec {
     pub group_id: String,
     #[serde(default)]
     pub state: String,
+    /// Where the step changes with the price — a US share under a dollar, a
+    /// US option from $3 — each band's start and step as text. Empty when
+    /// `tick_sz` holds at every price, which is every OKX instrument.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tick_bands: Vec<TickBandText>,
+}
+
+/// One band of a stepped tick, as text like the rest of the spec.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TickBandText {
+    pub from: String,
+    pub tick_sz: String,
 }
 
 pub fn parse_spec(body: &str, inst_id: &str) -> Result<Spec, String> {

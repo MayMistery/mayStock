@@ -9,6 +9,8 @@ import MayStockKit
 @main
 struct LabMain {
     static func main() async {
+        // Times print on the clock the app's settings name.
+        DisplayTime.adopt(ConfigIO(directory: ConfigIO.defaultDirectory()).load().general)
         let raw = Array(CommandLine.arguments.dropFirst())
         let command = raw.first ?? "help"
         let arguments = Arguments(Array(raw.dropFirst()))
@@ -154,8 +156,8 @@ struct LabMain {
             strategy: strategy, candles: candles, series: data.series, arguments: arguments)
 
         let result = try BacktestEngine(strategy: strategy, config: config).run(candles: candles)
-        Out.kv("区间", "\(result.start.formatted(date: .numeric, time: .shortened))"
-               + " → \(result.end.formatted(date: .numeric, time: .shortened))"
+        Out.kv("区间", "\(DisplayTime.string(result.start, "yyyy-MM-dd HH:mm"))"
+               + " → \(DisplayTime.string(result.end, "yyyy-MM-dd HH:mm"))"
                + "  (\(result.barCount) 根，预热 \(result.warmupBars) 根)")
         Out.rule()
         Lab.printMetrics(result.metrics, capital: capital, quote: quote)
@@ -826,7 +828,7 @@ struct LabMain {
                 (pct(quantile(0.99)), -8), (pct(moves[moves.count - 1]), -8), (pct(share(0.5)), -8),
                 (pct(share(1.5)), -8), (pct(3 * quantile(0.99)), -8), ("\(Int(took.rounded())) 秒", -8),
             ])
-            Out.note("\(bar.rawValue) 区间 \(first.ts.formatted(.iso8601)) → \(last.ts.formatted(.iso8601))")
+            Out.note("\(bar.rawValue) 区间 \(DisplayTime.string(first.ts, "yyyy-MM-dd HH:mm")) → \(DisplayTime.string(last.ts, "yyyy-MM-dd HH:mm"))")
         }
         Out.rule()
         Out.note("止盈止损距离小于「3×P99」的粒度，同根先碰哪条线回测并不知道，结果由最坏假设决定。")
@@ -852,8 +854,8 @@ struct LabMain {
         guard candles.count > 30 else { throw LabError.usage("历史不足") }
 
         Out.heading("上帝视角上限 · \(instId) · \(bar.rawValue)")
-        Out.kv("区间", "\(candles.first!.ts.formatted(date: .numeric, time: .omitted))"
-               + " → \(candles.last!.ts.formatted(date: .numeric, time: .omitted))"
+        Out.kv("区间", "\(DisplayTime.string(candles.first!.ts, "yyyy-MM-dd"))"
+               + " → \(DisplayTime.string(candles.last!.ts, "yyyy-MM-dd"))"
                + "（\(candles.count) 根）")
         Out.kv("成本", "往返 \(PriceFormatter.percent(roundTrip, decimals: 3))（每个波段都要付）")
         Out.rule()

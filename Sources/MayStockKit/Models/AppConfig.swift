@@ -208,21 +208,28 @@ public struct GeneralPrefs: Codable, Sendable, Equatable {
     public var hideDelayMs: Int
     /// What a market that never closes measures its change from — one of
     /// `ChangeBasis.continuous` — so the menu bar reads the way the phone
-    /// does. Beijing midnight unless set (May, 2026-10-08: 「不确定，做成开关」).
+    /// does. UTC+8 midnight unless set (May, 2026-10-08: 「不确定，做成开关」).
     public var changeBasis: ChangeBasis
+    /// The IANA zone every displayed time is read in (`DisplayTime`).
+    /// Singapore unless set (May, 2026-10-09: 「支持配置时区吧，默认sg」). Kept
+    /// as written: one the system does not know is shown in the default and
+    /// said so, not rewritten behind May's back.
+    public var displayTimeZone: String
 
     public init(
         launchAtLogin: Bool = false, hoverDelayMs: Int = 150, hideDelayMs: Int = 350,
-        changeBasis: ChangeBasis = .sinceUtc8Midnight
+        changeBasis: ChangeBasis = .sinceUtc8Midnight,
+        displayTimeZone: String = DisplayTime.defaultIdentifier
     ) {
         self.launchAtLogin = launchAtLogin
         self.hoverDelayMs = hoverDelayMs
         self.hideDelayMs = hideDelayMs
         self.changeBasis = changeBasis
+        self.displayTimeZone = displayTimeZone
     }
 
     private enum CodingKeys: String, CodingKey {
-        case launchAtLogin, hoverDelayMs, hideDelayMs, changeBasis
+        case launchAtLogin, hoverDelayMs, hideDelayMs, changeBasis, displayTimeZone
     }
 
     /// Every field has a default: a file written before a field existed must
@@ -236,6 +243,7 @@ public struct GeneralPrefs: Codable, Sendable, Equatable {
         hideDelayMs = try c.decodeIfPresent(Int.self, forKey: .hideDelayMs) ?? defaults.hideDelayMs
         let basis = (try? c.decodeIfPresent(ChangeBasis.self, forKey: .changeBasis)) ?? nil
         changeBasis = basis.flatMap { ChangeBasis.continuous.contains($0) ? $0 : nil } ?? defaults.changeBasis
+        displayTimeZone = (try? c.decodeIfPresent(String.self, forKey: .displayTimeZone)) ?? nil ?? defaults.displayTimeZone
     }
 }
 

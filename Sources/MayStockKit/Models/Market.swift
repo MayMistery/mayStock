@@ -52,7 +52,7 @@ public enum ChangeBasis: String, Sendable, Codable, Equatable, CaseIterable {
     /// Against the previous session's close: what a stock's daily change
     /// means everywhere it is quoted.
     case previousClose
-    /// Against the price at 00:00 Beijing time (UTC+8).
+    /// Against the price at 00:00 UTC+8 (OKX's `sodUtc8`, its day).
     case sinceUtc8Midnight
     /// Against the price at 00:00 UTC.
     case sinceUtcMidnight
@@ -75,8 +75,9 @@ public enum ChangeBasis: String, Sendable, Codable, Equatable, CaseIterable {
         switch self {
         case .rolling24h: return "较 24h 前"
         case .previousClose: return "较昨收"
-        case .sinceUtc8Midnight: return "较北京时间 0 点"
-        case .sinceUtcMidnight: return "较 UTC 0 点"
+        case .sinceUtc8Midnight, .sinceUtcMidnight:
+            let midnight = midnightLabel()
+            return "较\(midnight.name) 0 点\(midnight.onDisplayClock)"
         }
     }
 
@@ -85,9 +86,24 @@ public enum ChangeBasis: String, Sendable, Codable, Equatable, CaseIterable {
         switch self {
         case .rolling24h: return "24 小时滚动"
         case .previousClose: return "较昨收"
-        case .sinceUtc8Midnight: return "北京时间 0 点起"
-        case .sinceUtcMidnight: return "UTC 0 点起"
+        case .sinceUtc8Midnight, .sinceUtcMidnight:
+            let midnight = midnightLabel()
+            return "\(midnight.name) 0 点起\(midnight.onDisplayClock)"
         }
+    }
+
+    /// Whose midnight a basis measures from — `新加坡时间` — and, when that
+    /// is not midnight on the display clock too, where it falls there:
+    /// `（新加坡时间 08:00）` for UTC's.
+    private func midnightLabel(now: Date = Date()) -> (name: String, onDisplayClock: String) {
+        let (zone, name): (TimeZone, String)
+        switch self {
+        case .sinceUtcMidnight: (zone, name) = (TimeZone(identifier: "UTC")!, "UTC")
+        default: (zone, name) = (Venue.okx.dayZone, DisplayTime.name(of: Venue.okx.dayZone))
+        }
+        let start = SparkWindow.dayStart(of: now, in: zone)
+        guard zone.secondsFromGMT(for: start) != DisplayTime.zone.secondsFromGMT(for: start) else { return (name, "") }
+        return (name, "（\(DisplayTime.name) \(DisplayTime.string(start, "HH:mm"))）")
     }
 }
 
