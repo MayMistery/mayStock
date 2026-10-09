@@ -361,6 +361,8 @@ public struct KernelMetrics: Decodable, Sendable, Equatable {
     public let largestLossPct: Double
 
     public let feesPaid: Double
+    /// Σ of the trades' funding: positive when paid (the kernel's `funding`
+    /// is a cost). `BacktestMetrics.fundingCost` carries it under that name.
     public let fundingPaid: Double
     public let exposurePct: Double
     public let buyHoldReturnPct: Double

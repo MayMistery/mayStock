@@ -44,8 +44,10 @@ struct LabMain {
         maystock-lab — 策略研究台（只读公开行情，无需 API Key）
 
           backtest <策略> [--days 365] [--capital 30000] [--tier lv1] [--slippage 5]
-                          [--allow-scripts]
+                          [--allow-scripts] [--trades]
               单策略回测，输出完整绩效表。脚本策略需 --allow-scripts 显式解锁。
+              --trades 逐笔列出方向、离场原因、手续费与资金费：汇总表分不出
+              一笔是止盈走的还是被强平的，杠杆策略必看。
 
           optimize <策略> [--days 365] [--objective calmar] [--max-dd 10]
                           [--min-trades 30] [--min-daily 0.5] [--top 10] [--limit 20000]
@@ -148,6 +150,7 @@ struct LabMain {
                + "  (\(result.barCount) 根，预热 \(result.warmupBars) 根)")
         Out.rule()
         Lab.printMetrics(result.metrics, capital: capital, quote: quote)
+        if arguments.has("trades") { Lab.printTrades(result.trades, quote: quote) }
 
         if result.liquidations > 0 { Out.warn("发生 \(result.liquidations) 次强平") }
         if result.fundingUnmodelled { Out.warn("未取到资金费率历史，永续成本被低估") }
@@ -171,10 +174,14 @@ struct LabMain {
             Out.note("\(quality.offGrid) 根 K 线不在该市场的常规时段网格上（多半是盘前盘后数据）")
         }
 
-        // The multi-window view the app shows, for the same strategy.
+        // The multi-window view the app shows, for the same strategy — over
+        // the history just fetched, rather than downloading it again.
         Out.heading("分窗口")
         let report = try await BacktestRunner(feeSchedules: schedules).run(
-            strategy: strategy, capital: capital, maxDays: days)
+            strategy: strategy, capital: capital, maxDays: days,
+            preloaded: BacktestHistory(
+                candles: candles, fundingRates: config.fundingRates,
+                series: data.series, coverage: data.coverage))
         Out.row([("窗口", 8), ("日均", -10), ("总收益", -10), ("回撤", -9),
                  ("交易", -6), ("夏普", -7), ("买入持有", -10)])
         for window in BacktestWindow.allCases {

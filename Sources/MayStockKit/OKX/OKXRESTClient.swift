@@ -4,8 +4,8 @@ import FoundationNetworking
 #endif
 
 /// Thin async client for OKX v5 public REST market data.
-/// Rate-limit aware: candle backfill paginates with ≥120ms spacing
-/// (limit is 20 requests / 2 seconds).
+/// Rate-limit aware: every paginated download shares one per-endpoint
+/// schedule (`OKXPublicPacer`) and retries the pages that fail in passing.
 public struct OKXRESTClient: Sendable {
     public let baseURL: URL
     /// Read the demo environment's market data rather than the real market's.
@@ -73,7 +73,7 @@ public struct OKXRESTClient: Sendable {
             throw OKXError.transport(String(describing: error))
         }
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-            throw OKXError.transport("HTTP \(http.statusCode)")
+            throw OKXError.http(status: http.statusCode)
         }
         let envelope: Envelope<Row>
         do {
@@ -86,6 +86,30 @@ public struct OKXRESTClient: Sendable {
         }
         return envelope.data
     }
+
+    /// One page of a long download: paced with every other download in the
+    /// process (`OKXPublicPacer`), and asked again on a failure that passes —
+    /// a rate limit, a busy server, a dropped connection — after 0.5, 1, 2, 4
+    /// and 8 seconds. A download is hundreds of pages since the full sample
+    /// became the whole history, and one failed page used to fail the whole
+    /// backtest. Every retry is logged, and the last failure is what throws.
+    private func page<Row: Decodable>(
+        _ type: Row.Type, path: String, query: [String: String]
+    ) async throws -> [Row] {
+        for (attempt, delay) in Self.pageRetryDelays.enumerated() {
+            await OKXPublicPacer.shared.reserve(path)
+            do {
+                return try await get(type, path: path, query: query)
+            } catch let error as OKXError where error.isTransient {
+                Log.warn("okx-rest: \(path) 第 \(attempt + 1) 次失败（\(error)），\(delay) 后重试")
+                try await Task.sleep(for: delay)
+            }
+        }
+        await OKXPublicPacer.shared.reserve(path)
+        return try await get(type, path: path, query: query)
+    }
+
+    static let pageRetryDelays: [Duration] = [.milliseconds(500), .seconds(1), .seconds(2), .seconds(4), .seconds(8)]
 
     /// Envelope-aware GET for callers outside this file (alternative data).
     public func getRaw<Row: Decodable>(
@@ -138,7 +162,7 @@ public struct OKXRESTClient: Sendable {
         while collected.count < target {
             var query = ["instId": instId, "bar": bar.restBar, "limit": "100"]
             if let after { query["after"] = after }
-            let rows = try await get([String].self, path: "api/v5/market/candles", query: query)
+            let rows = try await self.page([String].self, path: "api/v5/market/candles", query: query)
             let page = rows.compactMap(OKXWireDecoder.candle(fromRow:))
             guard !page.isEmpty else { break }
             collected.append(contentsOf: page)
@@ -147,7 +171,6 @@ public struct OKXRESTClient: Sendable {
                 after = String(Int(oldest.timeIntervalSince1970 * 1000))
             }
             if page.count < 100 { break }
-            try? await Task.sleep(nanoseconds: 120_000_000) // rate-limit spacing
         }
         return collected.sorted { $0.ts < $1.ts }
     }
@@ -177,7 +200,7 @@ public struct OKXRESTClient: Sendable {
             var query = ["instId": instId, "bar": bar.restBar, "limit": usingHistory ? "100" : "300"]
             if let after { query["after"] = after }
 
-            let rows = try await get([String].self, path: path, query: query)
+            let rows = try await self.page([String].self, path: path, query: query)
             let page = rows.compactMap(OKXWireDecoder.candle(fromRow:))
             guard !page.isEmpty else {
                 if usingHistory { break }
@@ -194,7 +217,6 @@ public struct OKXRESTClient: Sendable {
 
             if byTimestamp.count >= target { break }
             if !usingHistory, page.count < 300 { usingHistory = true }
-            try? await Task.sleep(nanoseconds: 120_000_000)
         }
 
         let sorted = byTimestamp.values.sorted { $0.ts < $1.ts }
@@ -219,8 +241,8 @@ public struct OKXRESTClient: Sendable {
         for _ in 0..<maxRequests {
             var query = ["instId": instId, "limit": "100"]
             if let after { query["after"] = after }
-            let rows = try await get(FundingRateRow.self,
-                                     path: "api/v5/public/funding-rate-history", query: query)
+            let rows = try await self.page(FundingRateRow.self,
+                                           path: "api/v5/public/funding-rate-history", query: query)
             guard !rows.isEmpty else { break }
             let page = rows.compactMap { row -> FundingRate? in
                 guard let rate = Double(row.fundingRate), let ms = Double(row.fundingTime) else { return nil }
@@ -232,7 +254,6 @@ public struct OKXRESTClient: Sendable {
             let cursor = String(Int(oldest.timeIntervalSince1970 * 1000))
             if cursor == after { break }
             after = cursor
-            try? await Task.sleep(nanoseconds: 120_000_000)
         }
         return collected.filter { $0.ts >= since }.sorted { $0.ts < $1.ts }
     }

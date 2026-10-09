@@ -221,8 +221,10 @@ struct BacktestMetricGrid: View {
             cell("平均持仓", "\(PriceFormatter.decimals(metrics.averageHoldBars, 1)) 根")
             cell("持仓占比", PriceFormatter.percent(metrics.exposurePct, decimals: 0))
             cell("手续费", PriceFormatter.money(metrics.feesPaid) + " " + quoteCurrency)
-            if metrics.fundingPaid != 0 {
-                cell("资金费", PriceFormatter.signedMoney(metrics.fundingPaid) + " " + quoteCurrency)
+            if metrics.fundingCost != 0 {
+                // As a cash flow, the way the live position shows it: paid is negative.
+                cell("资金费", PriceFormatter.signedMoney(-metrics.fundingCost) + " " + quoteCurrency,
+                     tint: ChartStyle.trend(metrics.fundingCost <= 0))
             }
             if result.liquidations > 0 {
                 cell("强平", "\(result.liquidations) 次", tint: ChartStyle.down)

@@ -36,7 +36,11 @@ public struct BacktestMetrics: Sendable, Equatable {
 
     // Costs & exposure
     public let feesPaid: Double
-    public let fundingPaid: Double
+    /// Funding the trades paid: positive is a cost. The opposite sign of the
+    /// ledger's `fundingPaid`, which is a cash flow (negative when paid) —
+    /// the two shared a name, and a backtest's paid funding showed as "+".
+    /// On screen it is the cash flow, `-fundingCost`, like the ledger's.
+    public let fundingCost: Double
     public let exposurePct: Double
 
     // Benchmark
@@ -89,7 +93,7 @@ public struct BacktestMetrics: Sendable, Equatable {
         largestWinPct = m.largestWinPct
         largestLossPct = m.largestLossPct
         feesPaid = m.feesPaid
-        fundingPaid = m.fundingPaid
+        fundingCost = m.fundingPaid
         exposurePct = m.exposurePct
         buyHoldReturnPct = m.buyHoldReturnPct
         freeParameterCount = m.freeParameterCount

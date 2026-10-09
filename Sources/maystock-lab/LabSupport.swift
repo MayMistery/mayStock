@@ -177,19 +177,27 @@ enum Lab {
         let market = strategy.market
         let bars = market.calendar.barCount(days: days)
         let target = Swift.min(bars + strategy.warmupBars, BacktestRunner.maxBars)
+        // Fetched on a coarse grid, returned exactly. Warm-up follows the
+        // indicators a variant happens to use, so two variants of one
+        // strategy ask for 139 682 and 139 684 bars; keyed exactly, the second
+        // missed and downloaded the whole minute-bar window again. Rounding
+        // the fetch up shares one window across the family, and the cut back
+        // to `target` keeps `--days 90` meaning ninety days.
+        let fetchTarget = Swift.min((target + CandleCache.grid - 1) / CandleCache.grid * CandleCache.grid,
+                                    BacktestRunner.maxBars)
         if let cached = CandleCache.load(
-            venue: market.venue, instId: market.instId, bar: market.bar, atLeast: target) {
-            return cached
+            venue: market.venue, instId: market.instId, bar: market.bar, atLeast: fetchTarget) {
+            return Array(cached.suffix(target))
         }
         let fetched = try await sources.source(for: market.venue).historyCandles(
-            instId: market.instId, bar: market.bar, target: target, progress: nil)
+            instId: market.instId, bar: market.bar, target: fetchTarget, progress: nil)
         guard !fetched.isEmpty else {
             throw LabError.usage("\(market.venue.displayName)的行情源取不到 \(market.instId) 的历史 K 线")
         }
         CandleCache.save(
             fetched, venue: market.venue, instId: market.instId, bar: market.bar,
-            requested: target)
-        return fetched
+            requested: fetchTarget)
+        return Array(fetched.suffix(target))
     }
 
     /// Funding history for a perpetual, or an empty list for anything else.
@@ -198,14 +206,28 @@ enum Lab {
     /// so gates 1 and 2 scored perpetuals with no carry cost while gate 3 did —
     /// three commands judging the same strategy under different economics. For
     /// a short held across days, funding is not a rounding error.
+    ///
+    /// A failed read is said, not swallowed — an empty list reads as "no
+    /// funding was due", the cheapest answer there is — and a record that
+    /// starts after the first bar is said too (`FundingCoverage`).
     static func fundingRates(
         strategy: CompiledStrategy, candles: [Candle], days: Int,
         sources: MarketDataSources = MarketDataSources()
     ) async -> [FundingRate] {
         guard strategy.market.instType == .swap, let first = candles.first else { return [] }
-        return (try? await sources.okx.fundingRateHistory(
-            instId: strategy.market.instId, since: first.ts,
-            limit: days * 3 + 10)) ?? []
+        do {
+            let rates = try await sources.okx.fundingRateHistory(
+                instId: strategy.market.instId, since: first.ts, limit: days * 3 + 10)
+            if let note = FundingCoverage.note(
+                instType: strategy.market.instType, candles: candles, warmup: strategy.warmupBars,
+                fundingRates: rates) {
+                Out.warn(note)
+            }
+            return rates
+        } catch {
+            Out.warn("资金费率历史取不到（\(error)），永续的持仓成本没有计入")
+            return []
+        }
     }
 
     /// A backtest config with everything the manifest and the account imply —
@@ -353,6 +375,47 @@ enum Lab {
 
     /// The metric block printed under every backtest. `quote` is the venue's
     /// currency — what the money figures are in.
+    /// Every trade, and how the run's trades ended and what they cost.
+    ///
+    /// The summary cannot tell a target from a liquidation: "two trades,
+    /// +14%" and "two trades, one target and one liquidation" print the same
+    /// table, and on a levered strategy the second is the one that matters.
+    static func printTrades(_ trades: [BacktestTrade], quote: String) {
+        Out.heading("成交明细")
+        guard !trades.isEmpty else {
+            Out.note("区间内没有成交——收益 0% 是「没开过仓」，不是「持平」。")
+            return
+        }
+        let stamp = Date.FormatStyle().month(.twoDigits).day(.twoDigits).hour(.twoDigits(amPM: .omitted)).minute(.twoDigits)
+        Out.row([("#", 5), ("方向", 5), ("入场", 13), ("出场", 13), ("持仓", -8),
+                 ("入场价", -12), ("出场价", -12), ("离场", 9), ("毛利", -11),
+                 ("手续费", -10), ("资金费", -10), ("净利", -11), ("收益", -9)])
+        for trade in trades {
+            Out.row([
+                (String(trade.id), 5),
+                (trade.direction.displayName, 5),
+                (trade.entryTime.formatted(stamp), 13),
+                (trade.exitTime.formatted(stamp), 13),
+                ("\(trade.bars) 根", -8),
+                (PriceFormatter.auto(trade.entryPrice), -12),
+                (PriceFormatter.auto(trade.exitPrice), -12),
+                (trade.exitReason.displayName, 9),
+                (PriceFormatter.signedMoney(trade.grossPnL), -11),
+                (PriceFormatter.money(trade.fees), -10),
+                (PriceFormatter.signedMoney(-trade.funding), -10),
+                (Out.tinted(trade.netPnL, PriceFormatter.signedMoney(trade.netPnL)), -11),
+                (Out.signed(trade.returnPct), -9),
+            ])
+        }
+        let exits = Dictionary(grouping: trades, by: \.exitReason)
+            .sorted { $0.value.count == $1.value.count ? $0.key.rawValue < $1.key.rawValue : $0.value.count > $1.value.count }
+            .map { "\($0.key.displayName) \($0.value.count)" }
+        Out.rule()
+        Out.kv("离场分布", exits.joined(separator: " · "))
+        Out.kv("成本合计", "手续费 \(PriceFormatter.money(trades.reduce(0) { $0 + $1.fees })) \(quote)"
+               + " · 资金费 \(PriceFormatter.signedMoney(-trades.reduce(0) { $0 + $1.funding })) \(quote)")
+    }
+
     static func printMetrics(_ metrics: BacktestMetrics, capital: Double, quote: String) {
         let daily = metrics.dailyReturnPct
         Out.kv("日均收益", Out.tinted(daily, Out.signed(daily, decimals: 3))
@@ -372,8 +435,8 @@ enum Lab {
                + " · 占比 \(PriceFormatter.percent(metrics.exposurePct, decimals: 0))"
                + " · 最长连亏 \(metrics.maxConsecutiveLosses) 笔")
         Out.kv("成本", "手续费 \(PriceFormatter.money(metrics.feesPaid)) \(quote)"
-               + (metrics.fundingPaid != 0
-                  ? " · 资金费 \(PriceFormatter.signedMoney(metrics.fundingPaid)) \(quote)" : ""))
+               + (metrics.fundingCost != 0
+                  ? " · 资金费 \(PriceFormatter.signedMoney(-metrics.fundingCost)) \(quote)" : ""))
     }
 }
 
@@ -424,6 +487,9 @@ enum CandleCache {
     /// How long a window may be reused. Long enough to cover a research
     /// session, short enough that "today's backtest" means today.
     static let maxAge: TimeInterval = 3_600
+
+    /// Bars a fetch is rounded up to, so a family of variants shares one.
+    static let grid = 5_000
 
     static var directory: URL {
         URL(fileURLWithPath: NSTemporaryDirectory())
