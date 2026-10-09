@@ -66,7 +66,7 @@
 ```
 
 - `market.venue`：`okx`（默认）或 `schwab`。`instType`：OKX 为 `SPOT` / `SWAP` / `OPTION`，嘉信为 `STOCK`。做空与杠杆上限由品种决定：现货不能做空、杠杆 1；永续可做空（卖出）、杠杆 ≤ 50；期权的做空信号买入看跌、杠杆 1；美股（保证金账户）可做空、杠杆 ≤ 2。规则只在内核里写一份，清单编译时照它拒绝。`OPTION` 的 `instId` 是信号所读的标的，仓位是它的期权合约，细节见 [STRATEGY-DEV.md §1.5](STRATEGY-DEV.md)。
-- `sizing.mode`：`equityPct`（占本策略分配资金的百分比）/ `fixedQuote`（固定计价币金额）/ `riskPerTrade`（按止损距离反推头寸，`value` 为单笔风险百分比）。
+- `sizing.mode`：`equityPct`（占本策略分配资金的百分比）/ `fixedQuote`（固定计价币金额）/ `riskPerTrade`（按止损距离反推头寸，`value` 为单笔风险百分比）。无论哪种模式，一张单开仓占用的保证金加手续费都不超过资金——`equityPct: 100` 就是资金撑得住的最大仓位。
 - `costs` 省略时按交易所费率表取：OKX 现货 taker 10 bps、永续 taker 5 bps、滑点 5 bps；嘉信美股买入 0、卖出 SEC §31 + FINRA TAF、滑点 2 bps。也可写成费用组件列表 `fees`（按名义额 / 按股数 / 按单，分买卖方向，可封顶），细节见 [STRATEGY-DEV.md](STRATEGY-DEV.md) §3。
 
 ### 表达式文法

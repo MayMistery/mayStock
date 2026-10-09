@@ -76,7 +76,7 @@ public struct BacktestConfig: Sendable {
     /// here, before any bar is simulated.
     public func kernelConfig(for manifest: StrategyManifest) throws -> KernelBacktestConfig {
         let market = manifest.market
-        let fallback = feeSchedules.schedule(for: market.venue).costs(for: market.instType)
+        let fallback = manifest.fallbackCosts(under: feeSchedules)
         guard manifest.costs != nil || fallback != nil else {
             throw BacktestError.noCostModel(market.venue, market.instType)
         }

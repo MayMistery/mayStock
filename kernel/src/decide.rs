@@ -14,6 +14,7 @@ use crate::candle::Candle;
 use crate::expr::eval::{truthy, Evaluator};
 use crate::expr::ExprResult;
 use crate::options::{self, OptionKind};
+use crate::sizing::Footing;
 use crate::strategy::{CompiledStrategy, SizingMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,7 +186,9 @@ pub struct LiveDecision {
     /// less than a slightly slower one that behaves identically.
     #[serde(rename = "trailingStopPrice")]
     pub trailing_stop_price: Option<f64>,
-    /// Continuous exposure in −1…+1 for exposure strategies; NaN otherwise.
+    /// Continuous exposure in −1…+1 for exposure strategies — what the
+    /// strategy asks for; `target_base_quantity` is as much of it as the
+    /// capital can commit to (`sizing::Footing`). NaN otherwise.
     #[serde(rename = "targetExposure")]
     pub target_exposure: f64,
     /// Confirmed bars available after filtering.
@@ -272,7 +275,7 @@ impl OptionPlan {
 }
 
 /// What the runner knows about the account when it asks for a plan.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct AccountState {
     /// Capital this strategy may deploy, already compounded by its own P&L.
     pub equity: f64,
@@ -297,6 +300,11 @@ pub struct AccountState {
     /// trailing anchor, so a position that never moved in its favour trails
     /// from where it was opened rather than from an arbitrary bar.
     pub entry_price: f64,
+    /// The venue's fee schedule for the instrument, for a manifest that states
+    /// no costs — what `BacktestConfig::fees` is to a backtest, resolved by the
+    /// same `CompiledStrategy::costs`. Sizing needs it: what an entry commits
+    /// is its margin and its fee (`sizing::Footing`).
+    pub fees: Option<Vec<crate::fees::FeeComponent>>,
 }
 
 impl Default for AccountState {
@@ -311,6 +319,7 @@ impl Default for AccountState {
             now_ms: None,
             limits: crate::guard::OrderLimits::default(),
             entry_price: 0.0,
+            fees: None,
         }
     }
 }
@@ -322,6 +331,31 @@ fn refused_reason(refusal: &crate::guard::OrderDenied, closing_only: bool) -> St
         format!("{}；反手只平仓、不开新仓", refusal.reason)
     } else {
         refusal.reason.clone()
+    }
+}
+
+/// What the status line adds when sizing stopped at the capital's ceiling.
+const SIZED_TO_CAPITAL: &str = "保证金加开仓手续费按资金上限定仓";
+
+/// A status line with its note, when there is one.
+fn with_note(reason: String, note: Option<&str>) -> String {
+    match note {
+        Some(note) => format!("{reason}（{note}）"),
+        None => reason,
+    }
+}
+
+/// What an order that cannot be sized may still do: close or trim what is
+/// held, and close a side its signal has turned against — never add. `wanted`
+/// is the position asked for; an infinite one stands for a side whose size is
+/// what could not be known.
+fn unsized_target(held: f64, wanted: f64) -> f64 {
+    if crate::guard::opening_base(wanted - held, held) == 0.0 {
+        wanted
+    } else if held != 0.0 && (wanted > 0.0) != (held > 0.0) {
+        0.0
+    } else {
+        held
     }
 }
 
@@ -503,6 +537,17 @@ pub fn decide_live(
 
     let mut evaluator = Evaluator::new(&candles, &strategy.params, external);
 
+    // What a fill costs, resolved as a backtest resolves it: the manifest's
+    // own costs, else the venue's schedule, else the instrument's default.
+    // Sizing an entry needs it; an order that only closes or trims never
+    // waits on it.
+    let costs = strategy.costs(account.fees.as_deref(), None);
+    let footing = |costs| Footing {
+        costs, capital: account.equity, price, leverage,
+        regime: strategy.manifest.market.inst_type.margin_regime(),
+        held_base: account.held_base, held_basis: account.entry_price,
+    };
+
     if let Some(exposure) = strategy.exposure.as_ref() {
         let series = evaluator.evaluate(exposure)?;
         let raw = series.get(index).copied().unwrap_or(f64::NAN);
@@ -530,43 +575,52 @@ pub fn decide_live(
             _ => 1.0,
         };
         let cap = strategy.manifest.risk.max_exposure;
-        let effective = (bounded * scale).clamp(if allows_short { -cap } else { 0.0 }, cap);
+        let wanted_exposure = (bounded * scale).clamp(if allows_short { -cap } else { 0.0 }, cap);
 
-        // Size to the fraction, not merely to its sign.
-        let target_base = if price > 0.0 && account.equity > 0.0 {
-            account.equity * effective * leverage / price
-        } else {
-            0.0
+        // Size to the fraction, not merely to its sign — and no further than
+        // the capital can commit to, the backtest's rule
+        // (`sizing::Footing::exposure_target`).
+        let wanted_base = crate::sizing::exposure_base(wanted_exposure, account.equity, price, leverage);
+        let (target_base, cut) = match &costs {
+            Ok(costs) => {
+                let target = footing(costs).affordable(wanted_base);
+                (target, (target != wanted_base).then(|| SIZED_TO_CAPITAL.to_string()))
+            }
+            Err(why) => {
+                let target = unsized_target(account.held_base, wanted_base);
+                (target, (target != wanted_base).then(|| format!("无法定仓：{why}")))
+            }
         };
-        let current_exposure = if account.equity > 0.0 && leverage > 0.0 {
-            account.held_base * price / (account.equity * leverage)
-        } else {
-            0.0
-        };
+        // The drift is judged on what the order would leave held; the exposure
+        // reported is what the strategy asks for, as a binary decision reports
+        // its signal however much of it the capital can carry.
+        let sized_exposure = crate::sizing::exposure_of(target_base, account.equity, price, leverage);
+        let current_exposure = crate::sizing::exposure_of(account.held_base, account.equity, price, leverage);
         // Rebalancing every bar would churn the edge away in fees; this is the
         // same threshold the backtester honours.
         let threshold = strategy.manifest.risk.rebalance_threshold.max(0.0);
-        let drift = (effective - current_exposure).abs();
+        let drift = (sized_exposure - current_exposure).abs();
         let wanted = target_base - account.held_base;
         let admission = crate::guard::admit(
             wanted, account.held_base, price, account.equity, strategy.max_notional_multiple(), &account.limits);
         let closing_only = admission.denied.is_some() && admission.base_delta != 0.0;
-        let (effective, target_base) = if closing_only { (0.0, 0.0) } else { (effective, target_base) };
+        let (wanted_exposure, sized_exposure, target_base) =
+            if closing_only { (0.0, 0.0, 0.0) } else { (wanted_exposure, sized_exposure, target_base) };
 
         return Ok(LiveDecision {
-            target: if effective > 1e-9 { 1 } else if effective < -1e-9 { -1 } else { 0 },
-            target_exposure: effective,
+            target: if wanted_exposure > 1e-9 { 1 } else if wanted_exposure < -1e-9 { -1 } else { 0 },
+            target_exposure: wanted_exposure,
             target_base_quantity: target_base,
             base_delta: if closing_only { admission.base_delta } else { wanted },
             should_trade: drift >= threshold && admission.base_delta.abs() > 1e-12,
             halt_daily_loss: false,
-            reason: if let Some(refusal) = &admission.denied {
+            reason: with_note(if let Some(refusal) = &admission.denied {
                 refused_reason(refusal, closing_only)
             } else if drift >= threshold {
-                format!("敞口 {current_exposure:.3} → {effective:.3}")
+                format!("敞口 {current_exposure:.3} → {sized_exposure:.3}")
             } else {
-                format!("敞口 {current_exposure:.3} → {effective:.3}，未达再平衡阈值 {threshold:.3}")
-            },
+                format!("敞口 {current_exposure:.3} → {sized_exposure:.3}，未达再平衡阈值 {threshold:.3}")
+            }, cut.as_deref()),
             confirmed_bars: candles.len(),
             bar_ts,
             warming_up: false,
@@ -642,6 +696,7 @@ pub fn decide_live(
     let mut target_base = 0.0;
     let mut stop_price = None;
     let mut take_profit_price = None;
+    let mut cut = None;
     if let Some(direction) = target {
         let highs: Vec<f64> = candles.iter().map(|c| c.high).collect();
         let lows: Vec<f64> = candles.iter().map(|c| c.low).collect();
@@ -665,13 +720,61 @@ pub fn decide_live(
                 price * (1.0 - pct / 100.0)
             }
         });
-        match crate::sizing::target_notional(strategy, account.equity, price, leverage, distance) {
-            Some(notional) => target_base = notional / price * direction.sign(),
-            None => {
+        // A reversal is sized from the position it closes, so the close's fee
+        // comes out of the same capital — as in the backtest, which closes
+        // and pays before it sizes the other side.
+        let sized = match &costs {
+            Ok(costs) => {
+                let at = footing(costs);
+                crate::sizing::target_base(strategy, &at, distance, direction)
+                    .map(|base| (base, at.committed(base) >= account.equity * (1.0 - 1e-9)))
+                    .ok_or_else(|| "无法定仓（缺少止损距离，或资金付不起任何仓位的保证金和手续费）".to_string())
+            }
+            Err(why) => Err(format!("无法定仓：{why}")),
+        };
+        match sized {
+            Ok((base, at_ceiling)) => {
+                target_base = base;
+                cut = at_ceiling.then_some(SIZED_TO_CAPITAL);
+            }
+            Err(reason) => {
                 // The signal is still the signal. Reporting it as "flat"
                 // because the position cannot be sized would tell the caller
                 // the strategy has no opinion, when in fact it has one it
                 // cannot act on — and a status line saying so is the point.
+                //
+                // What it can still do is what any unsized order can
+                // (`unsized_target`): close a side the signal has turned
+                // against. The backtest closes before it sizes the other side,
+                // so this used to be a reversal live kept and the backtest did
+                // not.
+                let after = unsized_target(account.held_base, direction.sign() * f64::INFINITY);
+                if after != account.held_base {
+                    let close = crate::guard::admit(
+                        after - account.held_base, account.held_base, price, account.equity,
+                        strategy.max_notional_multiple(), &account.limits);
+                    return Ok(LiveDecision {
+                        target: 0,
+                        target_exposure: f64::NAN,
+                        target_base_quantity: account.held_base + close.base_delta,
+                        base_delta: close.base_delta,
+                        should_trade: close.base_delta.abs() > 1e-12,
+                        halt_daily_loss: false,
+                        reason: match &close.denied {
+                            Some(refusal) => refused_reason(refusal, false),
+                            None => format!("{reason}；反手只平仓、不开新仓"),
+                        },
+                        confirmed_bars: candles.len(),
+                        bar_ts,
+                        warming_up: false,
+                        stop_price: None,
+                        take_profit_price: None,
+                        trailing_stop_price: None,
+                        denied: close.denied,
+                        data_quality: None,
+                        option_plan: None,
+                    });
+                }
                 return Ok(LiveDecision {
                     target: Direction::to_i32(target),
                     target_exposure: f64::NAN,
@@ -679,7 +782,7 @@ pub fn decide_live(
                     base_delta: 0.0,
                     should_trade: false,
                     halt_daily_loss: false,
-                    reason: "无法定仓（缺少止损距离或资金为零）".to_string(),
+                    reason,
                     confirmed_bars: candles.len(),
                     bar_ts,
                     warming_up: false,
@@ -715,7 +818,7 @@ pub fn decide_live(
         halt_daily_loss: false,
         reason: match (&admission.denied, target) {
             (Some(refusal), _) => refused_reason(refusal, closing_only),
-            (None, Some(d)) => format!("信号{}", if d == Direction::Long { "做多" } else { "做空" }),
+            (None, Some(d)) => with_note(format!("信号{}", if d == Direction::Long { "做多" } else { "做空" }), cut),
             (None, None) => "信号平仓".to_string(),
         },
         confirmed_bars: candles.len(),
@@ -1024,17 +1127,25 @@ mod tests {
     /// A full-size reversal is one full-size position closed and one opened:
     /// sent whole, at any leverage, binary or continuous. The guard used to
     /// judge the whole order — twice the position — as an entry, and refused
-    /// every one of them, close included.
+    /// every one of them, close included. The side it opens is as large as
+    /// the capital can commit to once the order's fee, on the close and the
+    /// opening alike, is paid (`sizing::Footing`).
     #[test]
     fn a_full_size_reversal_is_sent_whole() {
+        let fee_rate = 5.0 / 10_000.0; // the perpetual's default
         for exposure in [false, true] {
-            for leverage in [1.0, 10.0, crate::strategy::InstrumentType::Swap.max_leverage()] {
+            let mut leverage = 1.0;
+            while leverage <= crate::strategy::InstrumentType::Swap.max_leverage() {
                 let decision = decide_reversal(&reversing(leverage, exposure), leverage, Default::default());
                 let held = 10_000.0 * leverage / 100.0;
                 assert!(decision.should_trade && decision.denied.is_none(),
                         "{leverage}x exposure={exposure}: {}", decision.reason);
-                assert!((decision.base_delta + 2.0 * held).abs() < 1e-6 * held, "{}", decision.base_delta);
+                let opened = -decision.base_delta - held;
+                let committed = opened * 100.0 / leverage + (held + opened) * 100.0 * fee_rate;
+                assert!(opened > 0.0 && (committed - 10_000.0).abs() < 1e-6,
+                        "{leverage}x exposure={exposure}: opens {opened}, commits {committed}");
                 assert_eq!(decision.target, -1);
+                leverage += 1.0;
             }
         }
     }
@@ -1062,6 +1173,53 @@ mod tests {
             let halted = OrderLimits { max_order_notional: None, state: TradingState::Halted };
             assert!(!decide_reversal(&strategy, 3.0, halted).should_trade);
         }
+    }
+
+    // MARK: Sizing that cannot be done
+
+    /// A stock with no cost model: no schedule handed over, and a stock has no
+    /// documented default, so no entry can be sized.
+    fn unpriced_stock(signals: &str) -> CompiledStrategy {
+        let json = format!(
+            r#"{{"id":"u","market":{{"instId":"AAPL","instType":"STOCK","bar":"1H","venue":"schwab"}},
+                 "signals":{signals},"sizing":{{"mode":"equityPct","value":100}},
+                 "risk":{{"leverage":1,"rebalanceThreshold":0.01}}}}"#
+        );
+        CompiledStrategy::compile(serde_json::from_str(&json).unwrap(), &[]).unwrap()
+    }
+
+    fn decide_unpriced(strategy: &CompiledStrategy, current: Option<Direction>, held: f64) -> LiveDecision {
+        let candles: Vec<Candle> = (0..30).map(|i| bar(i * 3_600_000, 100.0, 100.5, 99.5, 100.0)).collect();
+        decide_live(
+            strategy, &candles, current, 5, &std::collections::HashMap::new(),
+            AccountState { equity: 10_000.0, held_base: held, entry_price: 100.0, ..AccountState::default() },
+        )
+        .unwrap()
+    }
+
+    /// An order that cannot be sized still closes what the signal turned
+    /// against — the backtest closes before it sizes the other side — and
+    /// still trims; it never adds or opens, and it says why.
+    #[test]
+    fn an_order_that_cannot_be_sized_closes_but_never_adds() {
+        // Binary: from flat nothing goes; a reversal closes and opens nothing.
+        let binary = unpriced_stock(r#"{"longEntry":"close < 0","shortEntry":"close > 0"}"#);
+        let flat = decide_unpriced(&binary, None, 0.0);
+        assert!(!flat.should_trade && flat.reason.contains("无法定仓"), "{}", flat.reason);
+        assert_eq!(flat.target, -1, "the signal is still reported");
+        let reversal = decide_unpriced(&binary, Some(Direction::Long), 40.0);
+        assert!(reversal.should_trade && reversal.reason.contains("反手只平仓"), "{}", reversal.reason);
+        assert_eq!((reversal.base_delta, reversal.target, reversal.target_base_quantity), (-40.0, 0, 0.0));
+
+        // Continuous: a trim goes, an addition does not, a flip closes.
+        let half = unpriced_stock(r#"{"exposure":"0.5"}"#);
+        let trim = decide_unpriced(&half, Some(Direction::Long), 80.0);
+        assert!(trim.should_trade && (trim.base_delta + 30.0).abs() < 1e-9, "{}: {}", trim.reason, trim.base_delta);
+        let add = decide_unpriced(&half, Some(Direction::Long), 20.0);
+        assert!(!add.should_trade && add.base_delta == 0.0 && add.reason.contains("无法定仓"), "{}", add.reason);
+        let short = unpriced_stock(r#"{"exposure":"-0.5"}"#);
+        let flip = decide_unpriced(&short, Some(Direction::Long), 20.0);
+        assert!(flip.should_trade && (flip.base_delta + 20.0).abs() < 1e-9, "{}: {}", flip.reason, flip.base_delta);
     }
 
     // MARK: Trailing stop

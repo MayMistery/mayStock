@@ -1181,7 +1181,11 @@ public final class StrategyRunner {
                     // The kernel has no clock of its own, by design. Staleness
                     // is the one property it cannot judge without one.
                     now: Date(),
-                    limits: orderLimits(for: host)))
+                    limits: orderLimits(for: host),
+                    // The fee a backtest of this manifest charges, so an entry
+                    // is sized to fit its margin and its fee in the equity
+                    // exactly as it was simulated.
+                    fees: strategy.manifest.fallbackCosts(under: host.portfolio.feeSchedules)?.fees))
         } catch {
             update(strategy.id) {
                 $0.status = .failed
@@ -1928,27 +1932,47 @@ public final class StrategyRunner {
             return
         }
 
-        // The exchange quotes in the settlement coin per unit of underlying;
-        // the budget is in quote currency, so the ask converts at the same
-        // index the fill will be booked at.
-        let premiumQuotePerUnit = ask * quote.indexPrice
-        let perContract = premiumQuotePerUnit * contract.contractValue
+        // The order pays at most its limit, a little through the ask, and the
+        // exchange freezes the premium at that price — so the budget is held
+        // against it. Quotes are in the settlement coin per unit of
+        // underlying and the budget in quote currency, so the limit converts
+        // at the index the fill will be booked at.
+        let tick = contract.tickSize > 0 ? contract.tickSize : 0.0001
+        let limit = Self.snapToTick(ask * (1 + Self.optionPriceBuffer), tick: tick, roundingUp: true)
+        let perContract = limit * quote.indexPrice * contract.contractValue
         let lot = contract.lotSize > 0 ? contract.lotSize : 1
-        // Floored onto the lot grid with the same 1e-9 `snapToTick` and
-        // `exchangeSize` carry: a budget that buys a whole number of lots does
-        // not divide back into them exactly in binary, and flooring the raw
-        // ratio drops a lot the account could afford.
-        let contracts = perContract > 0
-            ? ((plan.premiumBudget / perContract / lot) + 1e-9).rounded(.down) * lot : 0
-        guard contracts >= Swift.max(contract.minSize, lot), contracts > 0 else {
+        guard let costs = strategy.manifest.effectiveCosts(under: host.portfolio.feeSchedules) else {
+            update(strategy.id) { $0.message = "没有 \(contract.instId) 的费率模型，算不出预算付得起几张，未开仓" }
+            Log.warn("runner: \(strategy.id) 没有 \(contract.instId) 的费率模型，未开仓")
+            return
+        }
+        // The premium and the fee to buy it both come out of the budget: the
+        // kernel's count, the one the option backtest buys by. Counted on the
+        // premium alone, a budget that was the whole capital bought contracts
+        // its fee then overdrew.
+        let bought: KernelOptionPurchase
+        do {
+            bought = try TradingKernel.optionPurchase(
+                budget: plan.premiumBudget,
+                terms: KernelOptionPurchaseTerms(
+                    premiumPerUnit: limit * quote.indexPrice, multiplier: contract.contractValue,
+                    lot: lot, spot: quote.indexPrice, fees: costs.fees,
+                    feeCapPctOfPremium: strategy.optionsSpec.feeCapPctOfPremium))
+        } catch {
             update(strategy.id) {
-                $0.message = "权利金预算 \(PriceFormatter.money(plan.premiumBudget)) 买不起一张 "
-                    + "\(contract.instId)（每张约 \(PriceFormatter.money(perContract))），未开仓"
+                $0.status = .failed
+                $0.message = "期权买入数量计算失败：\(error)"
             }
             return
         }
-        let tick = contract.tickSize > 0 ? contract.tickSize : 0.0001
-        let limit = Self.snapToTick(ask * (1 + Self.optionPriceBuffer), tick: tick, roundingUp: true)
+        let contracts = bought.contracts
+        guard contracts >= Swift.max(contract.minSize, lot), contracts > 0 else {
+            update(strategy.id) {
+                $0.message = "权利金预算 \(PriceFormatter.money(plan.premiumBudget)) 付不起一张 "
+                    + "\(contract.instId)（每张最多 \(PriceFormatter.money(perContract)) 加手续费），未开仓"
+            }
+            return
+        }
         let config = await accountTradingConfig(host: host)
         let tradeMode = (config ?? AccountTradingConfig(positionMode: nil, accountLevel: nil))
             .optionTradeMode
@@ -1970,8 +1994,9 @@ public final class StrategyRunner {
             runner: 期权下单 \(strategy.id) 买入 \(contract.instId) \
             \(PriceFormatter.plain(contracts)) 张 @≤\(PriceFormatter.plain(limit)) \
             \(contract.settleCurrency)（卖一 \(PriceFormatter.plain(ask))，\
-            指数 \(PriceFormatter.plain(quote.indexPrice))，每张 \(PriceFormatter.money(perContract))，\
-            预算 \(PriceFormatter.money(plan.premiumBudget))，tdMode \(tradeMode)）理由：\(reason)
+            指数 \(PriceFormatter.plain(quote.indexPrice))，每张最多 \(PriceFormatter.money(perContract))，\
+            预算 \(PriceFormatter.money(plan.premiumBudget))，权利金 \(PriceFormatter.money(bought.premium)) \
+            + 手续费 \(PriceFormatter.money(bought.fee))，tdMode \(tradeMode)）理由：\(reason)
             """)
         switch await placeOrTrack(order, strategy: strategy, host: host, reason: reason) {
         case .rejected(let rejection):

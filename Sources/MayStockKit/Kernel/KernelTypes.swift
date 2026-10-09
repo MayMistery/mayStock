@@ -59,13 +59,19 @@ public struct KernelAccountState: Encodable, Sendable {
     public var now: Date?
     /// Pre-trade limits applied to whatever sizing produces.
     public var limits: KernelOrderLimits
+    /// The venue's fee model for the instrument, for a manifest that states no
+    /// costs (`StrategyManifest.fallbackCosts`) — the kernel sizes an entry so
+    /// its margin and its fee together fit in `equity`. Nil leaves the
+    /// instrument's documented default.
+    public var fees: FeeModel?
 
     public init(
         equity: Double = 0, heldBase: Double = 0,
         dayStartEquity: Double = 0, leverageCap: Double? = nil,
         barsSinceExit: Int? = nil, haltedToday: Bool = false,
         entryPrice: Double = 0, now: Date? = nil,
-        limits: KernelOrderLimits = KernelOrderLimits()
+        limits: KernelOrderLimits = KernelOrderLimits(),
+        fees: FeeModel? = nil
     ) {
         self.equity = equity
         self.heldBase = heldBase
@@ -76,6 +82,7 @@ public struct KernelAccountState: Encodable, Sendable {
         self.entryPrice = entryPrice
         self.now = now
         self.limits = limits
+        self.fees = fees
     }
 }
 
@@ -154,8 +161,9 @@ public enum KernelOptionAction: String, Decodable, Sendable, Equatable {
 public struct KernelOptionPlan: Decodable, Sendable, Equatable {
     public let action: KernelOptionAction
     public let kind: OptionKind?
-    /// Premium to spend on the entry, in quote currency — the position's
-    /// maximum loss.
+    /// What the entry may spend, in quote currency: the premium and the fee to
+    /// buy it together — the position's maximum loss. Turned into contracts by
+    /// `TradingKernel.optionPurchase`.
     public let premiumBudget: Double
     public let minDaysToExpiry: Double
     public let moneynessPct: Double
@@ -164,6 +172,42 @@ public struct KernelOptionPlan: Decodable, Sendable, Equatable {
     /// runner against the option's own mark.
     public let stopLossPct: Double?
     public let takeProfitPct: Double?
+}
+
+/// What one listed contract is and what buying it costs, in quote currency,
+/// for `TradingKernel.optionPurchase`.
+public struct KernelOptionPurchaseTerms: Encodable, Sendable, Equatable {
+    /// The most the order pays per unit of underlying: its limit price,
+    /// converted at the index the fill is booked at.
+    public var premiumPerUnit: Double
+    /// Units of underlying one contract covers.
+    public var multiplier: Double
+    public var lot: Double
+    /// The underlying's price, which the fee is charged on.
+    public var spot: Double
+    public var fees: FeeModel
+    /// The exchange's cap on that fee, as a share of the premium.
+    public var feeCapPctOfPremium: Double
+
+    public init(
+        premiumPerUnit: Double, multiplier: Double, lot: Double, spot: Double,
+        fees: FeeModel, feeCapPctOfPremium: Double
+    ) {
+        self.premiumPerUnit = premiumPerUnit
+        self.multiplier = multiplier
+        self.lot = lot
+        self.spot = spot
+        self.fees = fees
+        self.feeCapPctOfPremium = feeCapPctOfPremium
+    }
+}
+
+/// Whole contracts bought out of a premium budget, and what they cost it, in
+/// quote currency.
+public struct KernelOptionPurchase: Decodable, Sendable, Equatable {
+    public let contracts: Double
+    public let premium: Double
+    public let fee: Double
 }
 
 /// One contract offered to the kernel's selection rule, and what it picks.
