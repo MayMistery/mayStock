@@ -536,7 +536,7 @@ pub fn decide_live(
         let drift = (effective - current_exposure).abs();
         let delta = target_base - account.held_base;
         let denied = crate::guard::check_order(
-            delta, account.held_base, price, account.equity, &account.limits);
+            delta, account.held_base, price, account.equity, strategy.max_notional_multiple(), &account.limits);
 
         return Ok(LiveDecision {
             target: if effective > 1e-9 { 1 } else if effective < -1e-9 { -1 } else { 0 },
@@ -681,7 +681,7 @@ pub fn decide_live(
 
     let delta = target_base - account.held_base;
     let denied = crate::guard::check_order(
-        delta, account.held_base, price, account.equity, &account.limits);
+        delta, account.held_base, price, account.equity, strategy.max_notional_multiple(), &account.limits);
     Ok(LiveDecision {
         denied: denied.clone(),
         data_quality: None,
@@ -789,7 +789,8 @@ fn option_decision(
     // the underlying it would buy at this price, so the same notional caps
     // apply to an option entry as to any other.
     let equivalent = budget / price * direction.sign();
-    let denied = crate::guard::check_order(equivalent, 0.0, price, account.equity, &account.limits);
+    let denied = crate::guard::check_order(
+        equivalent, 0.0, price, account.equity, strategy.max_notional_multiple(), &account.limits);
     let action = if current.is_some() { OptionAction::Flip } else { OptionAction::Open };
     let view = if direction == Direction::Long { "做多" } else { "做空" };
     let contract = if kind == OptionKind::Call { "看涨" } else { "看跌" };

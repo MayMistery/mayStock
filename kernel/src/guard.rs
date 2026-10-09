@@ -29,31 +29,29 @@ pub enum TradingState {
 }
 
 /// Limits applied to every order, independent of the strategy that asked.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct OrderLimits {
     /// Hard ceiling on one order's notional, in quote currency. `None` for no
     /// cap, which is only sensible in a backtest.
     #[serde(rename = "maxOrderNotional")]
     pub max_order_notional: Option<f64>,
-    /// Ceiling on one order's notional as a share of account equity. Catches
-    /// the same class of bug as the absolute cap but scales with the account,
-    /// so it stays meaningful after the balance changes.
-    #[serde(rename = "maxOrderEquityPct")]
-    pub max_order_equity_pct: Option<f64>,
+    #[serde(default)]
     pub state: TradingState,
 }
 
-impl Default for OrderLimits {
-    fn default() -> Self {
-        Self {
-            max_order_notional: None,
-            // Ten times the account is not a plausible single order for any
-            // strategy this workbench runs, and is comfortably above anything
-            // legitimate sizing produces at the leverage caps in use.
-            max_order_equity_pct: Some(1_000.0),
-            state: TradingState::Active,
-        }
-    }
+/// How far past what sizing can produce one order may go before it is called
+/// a runaway: half as much again, room for a fill that moved against the
+/// estimate and none for a broken calculation.
+pub const RUNAWAY_MARGIN: f64 = 1.5;
+
+/// The share of equity, in percent, past which one order is a runaway for a
+/// strategy whose sizing reaches `max_multiple` × equity
+/// (`CompiledStrategy::max_notional_multiple`). Scales with the account and
+/// with the strategy: a single figure for every strategy was either too tight
+/// for the leveraged ones — the old 1 000% refused every full-size order above
+/// 10×, silently, in backtests and live alike — or too loose for the rest.
+pub fn runaway_equity_pct(max_multiple: f64) -> f64 {
+    max_multiple.max(1.0) * 100.0 * RUNAWAY_MARGIN
 }
 
 /// Why an order was refused. `None` means it may go.
@@ -68,12 +66,15 @@ pub struct OrderDenied {
 
 /// Check one order against the limits.
 ///
-/// `base_delta` is signed in coins, `held_base` is the position it acts on.
+/// `base_delta` is signed in coins, `held_base` is the position it acts on,
+/// `max_multiple` the most of its equity the strategy's sizing can put behind
+/// one position (`CompiledStrategy::max_notional_multiple`).
 pub fn check_order(
     base_delta: f64,
     held_base: f64,
     price: f64,
     equity: f64,
+    max_multiple: f64,
     limits: &OrderLimits,
 ) -> Option<OrderDenied> {
     if base_delta == 0.0 {
@@ -123,17 +124,17 @@ pub fn check_order(
             });
         }
     }
-    if let Some(pct) = limits.max_order_equity_pct {
-        if equity > 0.0 && notional > equity * pct / 100.0 {
-            return Some(OrderDenied {
-                reason: format!(
-                    "单笔名义 {notional:.2} 达到权益的 {:.0}%（上限 {pct:.0}%），\
-                     这不像是正常的定仓结果，已拒绝",
-                    notional / equity * 100.0
-                ),
-                by_policy: false,
-            });
-        }
+    let pct = runaway_equity_pct(max_multiple);
+    if equity > 0.0 && notional > equity * pct / 100.0 {
+        return Some(OrderDenied {
+            reason: format!(
+                "单笔名义 {notional:.2} 达到权益的 {:.0}%（这个策略的定仓最多 {:.0}%，上限 {pct:.0}%），\
+                 这不像是正常的定仓结果，已拒绝",
+                notional / equity * 100.0,
+                max_multiple.max(1.0) * 100.0
+            ),
+            by_policy: false,
+        });
     }
     None
 }
@@ -154,53 +155,70 @@ pub fn reduces_exposure(base_delta: f64, held_base: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::strategy::InstrumentType;
 
     fn limits() -> OrderLimits {
-        OrderLimits {
-            max_order_notional: Some(50_000.0),
-            max_order_equity_pct: Some(200.0),
-            state: TradingState::Active,
-        }
+        OrderLimits { max_order_notional: Some(50_000.0), state: TradingState::Active }
     }
 
     #[test]
     fn an_ordinary_order_passes() {
-        assert!(check_order(1.0, 0.0, 100.0, 10_000.0, &limits()).is_none());
+        assert!(check_order(1.0, 0.0, 100.0, 10_000.0, 1.0, &limits()).is_none());
     }
 
     #[test]
     fn a_nan_size_never_reaches_the_exchange() {
         // Not a big order — a broken calculation. Refused in every state.
-        let denial = check_order(f64::NAN, 0.0, 100.0, 10_000.0, &limits()).unwrap();
+        let denial = check_order(f64::NAN, 0.0, 100.0, 10_000.0, 1.0, &limits()).unwrap();
         assert!(!denial.by_policy);
         let mut reducing = limits();
         reducing.state = TradingState::Reducing;
-        assert!(check_order(f64::INFINITY, 5.0, 100.0, 10_000.0, &reducing).is_some());
+        assert!(check_order(f64::INFINITY, 5.0, 100.0, 10_000.0, 1.0, &reducing).is_some());
     }
 
     #[test]
     fn an_absurd_notional_is_refused() {
         // The shape of a `riskPerTrade` sizing whose stop distance came back as
         // a rounding error.
-        let denial = check_order(10_000.0, 0.0, 100.0, 10_000.0, &limits()).unwrap();
+        let denial = check_order(10_000.0, 0.0, 100.0, 10_000.0, 1.0, &limits()).unwrap();
         assert!(denial.reason.contains("超过上限"));
     }
 
+    /// Walks every instrument family at every leverage it allows: a full-size
+    /// order at that leverage passes, and one twice past it is refused. The
+    /// old single 1 000% refused every full-size order above 10×.
     #[test]
-    fn the_equity_share_cap_scales_with_the_account() {
-        let mut only_pct = limits();
-        only_pct.max_order_notional = None;
-        // 300 units at 100 = 30_000 notional against 10_000 equity = 300%.
-        assert!(check_order(300.0, 0.0, 100.0, 10_000.0, &only_pct).is_some());
-        // The same order against a larger account is within 200%.
-        assert!(check_order(300.0, 0.0, 100.0, 100_000.0, &only_pct).is_none());
+    fn the_runaway_cap_follows_the_strategy_at_every_leverage_the_families_allow() {
+        let equity = 10_000.0;
+        let price = 100.0;
+        let open = OrderLimits::default();
+        for family in InstrumentType::ALL {
+            let mut leverage = 1.0;
+            while leverage <= family.max_leverage() + 1e-9 {
+                let full = equity * leverage / price;
+                assert!(check_order(full, 0.0, price, equity, leverage, &open).is_none(),
+                        "{family:?} at {leverage}x: a full-size order is what sizing produces");
+                assert!(check_order(full * 2.0, 0.0, price, equity, leverage, &open).is_some(),
+                        "{family:?} at {leverage}x: twice that is a runaway");
+                leverage += 1.0;
+            }
+        }
+    }
+
+    #[test]
+    fn the_runaway_cap_scales_with_the_account() {
+        let open = OrderLimits::default();
+        // 300 units at 100 = 30_000 notional: 300% of 10_000, past 150% at 1x.
+        assert!(check_order(300.0, 0.0, 100.0, 10_000.0, 1.0, &open).is_some());
+        // The same order against a larger account is 30%.
+        assert!(check_order(300.0, 0.0, 100.0, 100_000.0, 1.0, &open).is_none());
     }
 
     #[test]
     fn a_halted_engine_refuses_everything_as_policy() {
         let mut halted = limits();
         halted.state = TradingState::Halted;
-        let denial = check_order(1.0, 0.0, 100.0, 10_000.0, &halted).unwrap();
+        let denial = check_order(1.0, 0.0, 100.0, 10_000.0, 1.0, &halted).unwrap();
         assert!(denial.by_policy, "paused is not the same as suspect");
     }
 
@@ -209,29 +227,19 @@ mod tests {
         let mut reducing = limits();
         reducing.state = TradingState::Reducing;
         // Closing 5 of a 5-long.
-        assert!(check_order(-5.0, 5.0, 100.0, 10_000.0, &reducing).is_none());
+        assert!(check_order(-5.0, 5.0, 100.0, 10_000.0, 1.0, &reducing).is_none());
         // Adding to it.
-        assert!(check_order(1.0, 5.0, 100.0, 10_000.0, &reducing).is_some());
+        assert!(check_order(1.0, 5.0, 100.0, 10_000.0, 1.0, &reducing).is_some());
         // Flipping through zero is an entry wearing an exit's clothes.
-        assert!(check_order(-9.0, 5.0, 100.0, 10_000.0, &reducing).is_some());
+        assert!(check_order(-9.0, 5.0, 100.0, 10_000.0, 1.0, &reducing).is_some());
     }
 
     #[test]
     fn a_close_is_never_blocked_by_a_size_cap() {
         // Refusing to close is how a protective limit becomes the thing it was
         // meant to prevent. The exposure was already permitted when opened.
-        let huge = check_order(-10_000.0, 10_000.0, 100.0, 10_000.0, &limits());
+        let huge = check_order(-10_000.0, 10_000.0, 100.0, 10_000.0, 1.0, &limits());
         assert!(huge.is_none());
-    }
-
-    #[test]
-    fn the_default_cap_still_catches_a_runaway() {
-        // Ten times the account: nothing legitimate produces this at the
-        // leverage caps in use, and it is the signature of a sizing bug.
-        let denial = check_order(2_000.0, 0.0, 100.0, 10_000.0, &OrderLimits::default());
-        assert!(denial.is_some());
-        // While a fully committed 3x position passes untouched.
-        assert!(check_order(300.0, 0.0, 100.0, 10_000.0, &OrderLimits::default()).is_none());
     }
 
     #[test]

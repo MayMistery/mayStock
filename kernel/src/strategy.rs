@@ -883,6 +883,15 @@ impl CompiledStrategy {
     pub fn leverage(&self) -> f64 {
         self.manifest.risk.leverage.max(1.0)
     }
+
+    /// The most notional sizing can put behind one position, as a multiple of
+    /// equity: the declared leverage (`sizing::target_notional` caps at
+    /// equity × leverage), times the declared maximum exposure where that is
+    /// above one (the continuous engine sizes to it). The order guard calls an
+    /// order well past this a runaway (`guard::runaway_equity_pct`).
+    pub fn max_notional_multiple(&self) -> f64 {
+        self.leverage() * self.manifest.risk.max_exposure.max(1.0)
+    }
 }
 
 #[cfg(test)]

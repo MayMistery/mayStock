@@ -165,6 +165,15 @@ pub struct BacktestResult {
     /// True when the strategy is a swap but no funding history was supplied.
     #[serde(rename = "fundingUnmodelled")]
     pub funding_unmodelled: bool,
+    /// Entries the pre-trade guard refused — orders the live runner would
+    /// refuse too. Zero for a sound strategy; anything else is a sizing
+    /// problem the backtest shows rather than quietly skipping, which it
+    /// used to (a 20× strategy traded nothing and said nothing).
+    #[serde(rename = "guardRefusals")]
+    pub guard_refusals: usize,
+    /// Why the first refusal was refused.
+    #[serde(rename = "guardRefusal")]
+    pub guard_refusal: Option<String>,
     /// What the candle series itself was like.
     ///
     /// A backtest run over history with holes in it is not wrong so much as
@@ -295,6 +304,7 @@ pub fn run(
     // it would be live. The trading-state machine is *not* applied: a portfolio
     // drawdown brake is a live risk control, not a rule of the strategy.
     let limits = crate::guard::OrderLimits::default();
+    let mut refusals = GuardRefusals::default();
 
     if candles.len() <= 1 {
         return Ok(empty_result(strategy, &candles, config));
@@ -403,6 +413,7 @@ pub fn run(
                             &mut equity,
                             leverage,
                             &limits,
+                            &mut refusals,
                             &costs,
                             atr,
                         );
@@ -572,8 +583,26 @@ pub fn run(
             &candles, calendar, manifest.market.bar_seconds(), None),
         funding_unmodelled: manifest.market.inst_type == crate::strategy::InstrumentType::Swap
             && config.funding_rates.is_empty(),
+        guard_refusals: refusals.count,
+        guard_refusal: refusals.first,
         metrics,
     })
+}
+
+/// Entries the pre-trade guard refused during one run, and why the first was.
+#[derive(Debug, Default)]
+pub(crate) struct GuardRefusals {
+    pub count: usize,
+    pub first: Option<String>,
+}
+
+impl GuardRefusals {
+    pub(crate) fn note(&mut self, denied: crate::guard::OrderDenied) {
+        self.count += 1;
+        if self.first.is_none() {
+            self.first = Some(denied.reason);
+        }
+    }
 }
 
 
@@ -589,6 +618,7 @@ fn open_position(
     equity: &mut f64,
     leverage: f64,
     limits: &crate::guard::OrderLimits,
+    refusals: &mut GuardRefusals,
     costs: &Costs,
     atr: Option<f64>,
 ) {
@@ -611,9 +641,10 @@ fn open_position(
     // brake is a live risk control, not a rule of the strategy, and folding it
     // into the simulation would test a different strategy than the one written.
     let quantity = notional / price;
-    if crate::guard::check_order(
-        quantity * direction.sign(), 0.0, price, *equity, limits).is_some()
+    if let Some(denied) = crate::guard::check_order(
+        quantity * direction.sign(), 0.0, price, *equity, strategy.max_notional_multiple(), limits)
     {
+        refusals.note(denied);
         return;
     }
     // Opening a long buys; opening a short sells — and a short sale pays the
@@ -818,6 +849,8 @@ fn empty_result(
             &candles, manifest.market.calendar(), manifest.market.bar_seconds(), None),
         funding_unmodelled: manifest.market.inst_type == crate::strategy::InstrumentType::Swap
             && config.funding_rates.is_empty(),
+        guard_refusals: 0,
+        guard_refusal: None,
         metrics: Metrics::compute(
             &[],
             &[],
@@ -828,3 +861,40 @@ fn empty_result(
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::strategy::Manifest;
+
+    fn swap(leverage: f64) -> CompiledStrategy {
+        let json = format!(
+            r#"{{"id":"b","name":"b","market":{{"instId":"BTC-USDT-SWAP","instType":"SWAP","bar":"1H"}},
+                 "signals":{{"longEntry":"close > 0","longExit":"close < 0"}},
+                 "sizing":{{"mode":"equityPct","value":100}},
+                 "risk":{{"leverage":{leverage}}}}}"#
+        );
+        let manifest: Manifest = serde_json::from_str(&json).unwrap();
+        CompiledStrategy::compile(manifest, &[]).unwrap()
+    }
+
+    fn flat(count: i64) -> Vec<Candle> {
+        (0..count)
+            .map(|i| Candle { ts_ms: i * 3_600_000, open: 100.0, high: 100.5, low: 99.5, close: 100.0, volume: 1.0, confirmed: 1 })
+            .collect()
+    }
+
+    /// Walks every leverage a perpetual allows: a full-size entry is what
+    /// sizing produces at that leverage and what the live runner sends. The
+    /// old single 1 000% cap refused every one above 10× — the run traded
+    /// nothing and said nothing.
+    #[test]
+    fn a_full_size_entry_opens_at_every_leverage_a_perpetual_allows() {
+        let max = crate::strategy::InstrumentType::Swap.max_leverage() as i64;
+        for leverage in [1, 5, 10, 11, 20, max] {
+            let result = run(&swap(leverage as f64), &flat(48), &BacktestConfig::default()).unwrap();
+            assert_eq!(result.guard_refusals, 0, "{leverage}x: {:?}", result.guard_refusal);
+            assert!(!result.trades.is_empty(), "{leverage}x opened and closed nothing");
+        }
+    }
+}

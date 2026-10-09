@@ -44,6 +44,10 @@ pub fn run(
     let slippage = costs.slippage_bps / 10_000.0;
     let allows_short = manifest.market.inst_type.allows_short();
     let leverage = strategy.leverage();
+    // The pre-trade check live applies to every rebalance (`decide_live`), so
+    // the simulation never trades an order the runner would refuse.
+    let limits = crate::guard::OrderLimits::default();
+    let mut refusals = super::GuardRefusals::default();
 
     let Some(exposure_expression) = strategy.exposure.as_ref() else {
         return Ok(empty_result(strategy, &candles, config));
@@ -316,7 +320,13 @@ pub fn run(
                 let current_exposure = quantity * candle.close / marked_equity;
                 // Only trade when the drift is worth the fee.
                 if (effective - current_exposure).abs() >= threshold {
-                    pending_target_quantity = Some(target_quantity);
+                    match crate::guard::check_order(
+                        target_quantity - quantity, quantity, price, marked_equity,
+                        strategy.max_notional_multiple(), &limits)
+                    {
+                        Some(denied) => refusals.note(denied),
+                        None => pending_target_quantity = Some(target_quantity),
+                    }
                 }
             }
         }
@@ -405,6 +415,8 @@ pub fn run(
             &candles, calendar, manifest.market.bar_seconds(), None),
         funding_unmodelled: manifest.market.inst_type == InstrumentType::Swap
             && config.funding_rates.is_empty(),
+        guard_refusals: refusals.count,
+        guard_refusal: refusals.first,
         metrics,
     })
 }
@@ -442,6 +454,19 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// A full-size position at 20× is what sizing produces for this manifest,
+    /// and the live runner sends it. Under the old single 1 000% cap the
+    /// backtest refused every rebalance and reported nothing at all.
+    #[test]
+    fn a_full_size_position_at_high_leverage_trades_and_nothing_is_refused() {
+        let bars: Vec<Candle> = (0..48)
+            .map(|i| Candle { ts_ms: i * 3_600_000, open: 100.0, high: 100.5, low: 99.5, close: 100.0, volume: 1.0, confirmed: 1 })
+            .collect();
+        let result = run(&strategy("", 20.0), &bars, &BacktestConfig::default()).unwrap();
+        assert_eq!(result.guard_refusals, 0, "{:?}", result.guard_refusal);
+        assert!(result.final_equity != BacktestConfig::default().initial_capital, "the position was opened and paid its fees");
     }
 
     #[test]

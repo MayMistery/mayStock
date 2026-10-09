@@ -85,6 +85,7 @@ pub fn run(
     let slippage = costs.slippage_bps / 10_000.0;
     // The same pre-trade caps the runner applies; see the binary engine.
     let limits = crate::guard::OrderLimits::default();
+    let mut refusals = super::GuardRefusals::default();
 
     if candles.len() <= 1 {
         return Ok(empty_result(strategy, &candles, config));
@@ -185,7 +186,7 @@ pub fn run(
                         open_position(
                             strategy, &spec, &mut position, direction, candle.open,
                             candle.ts_ms, index, sigma_prev, slippage, &costs.fees,
-                            &limits, &mut cash,
+                            &limits, &mut refusals, &mut cash,
                         );
                     }
                 }
@@ -311,6 +312,8 @@ pub fn run(
         // A long option is not charged carry. Not "unmodelled": there is
         // nothing to model.
         funding_unmodelled: false,
+        guard_refusals: refusals.count,
+        guard_refusal: refusals.first,
         metrics,
     })
 }
@@ -328,6 +331,7 @@ fn open_position(
     slippage: f64,
     fees: &[FeeComponent],
     limits: &crate::guard::OrderLimits,
+    refusals: &mut super::GuardRefusals,
     cash: &mut f64,
 ) {
     if !(spot > 0.0) || !(*cash > 0.0) {
@@ -358,9 +362,10 @@ fn open_position(
     let Some(budget) = options::premium_budget(strategy, *cash) else { return };
     // The premium is the order's whole exposure, and the same pre-trade caps
     // the runner applies judge it here.
-    if crate::guard::check_order(budget / spot * direction.sign(), 0.0, spot, *cash, limits)
-        .is_some()
+    if let Some(denied) = crate::guard::check_order(
+        budget / spot * direction.sign(), 0.0, spot, *cash, strategy.max_notional_multiple(), limits)
     {
+        refusals.note(denied);
         return;
     }
     let contracts = options::contracts_for(budget, paid, spec.contract_multiplier, 1.0);

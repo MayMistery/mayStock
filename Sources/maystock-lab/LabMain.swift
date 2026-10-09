@@ -151,6 +151,9 @@ struct LabMain {
 
         if result.liquidations > 0 { Out.warn("发生 \(result.liquidations) 次强平") }
         if result.fundingUnmodelled { Out.warn("未取到资金费率历史，永续成本被低估") }
+        if result.guardRefusals > 0 {
+            Out.warn("风控拒绝了 \(result.guardRefusals) 次开仓（实盘同样会拒）：\(result.guardRefusal ?? "原因未给出")")
+        }
         if strategy.isOptionStrategy {
             let spec = strategy.optionsSpec
             Out.warn("期权按 Black–Scholes 模型定价：标的 \(spec.resolvedUnderlying(for: strategy.market))，"

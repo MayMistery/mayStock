@@ -88,19 +88,16 @@ public enum KernelTradingState: String, Codable, Sendable, Equatable {
     case reducing
 }
 
-/// Limits applied to every order regardless of the strategy that asked.
+/// Limits applied to every order regardless of the strategy that asked. The
+/// runaway cap — an order far past what the strategy's own sizing can reach —
+/// is the kernel's (`guard::runaway_equity_pct`), derived from each strategy;
+/// there is no second figure for it here.
 public struct KernelOrderLimits: Codable, Sendable, Equatable {
     public var maxOrderNotional: Double?
-    public var maxOrderEquityPct: Double?
     public var state: KernelTradingState
 
-    public init(
-        maxOrderNotional: Double? = nil,
-        maxOrderEquityPct: Double? = 1_000,
-        state: KernelTradingState = .active
-    ) {
+    public init(maxOrderNotional: Double? = nil, state: KernelTradingState = .active) {
         self.maxOrderNotional = maxOrderNotional
-        self.maxOrderEquityPct = maxOrderEquityPct
         self.state = state
     }
 }
@@ -419,6 +416,10 @@ public struct KernelBacktestResult: Decodable, Sendable {
     /// True when the strategy is a swap but no funding history was supplied —
     /// the result is optimistic by an unknown amount.
     public let fundingUnmodelled: Bool
+    /// Entries the kernel's pre-trade guard refused, as the live runner would,
+    /// and the first one's reason.
+    public let guardRefusals: Int
+    public let guardRefusal: String?
     /// What the candle series itself was like. Nil only for a result written
     /// by a kernel that predates the field.
     public let dataQuality: KernelDataQuality?

@@ -222,6 +222,10 @@ public struct RobustnessAssessment: Sendable, Equatable {
         if primary.fundingUnmodelled {
             notes.append("未取到资金费率历史，永续的持仓成本被低估。")
         }
+        if primary.guardRefusals > 0 {
+            notes.append("风控拒绝了 \(primary.guardRefusals) 次开仓，实盘同样会拒——这是定仓问题，不是行情："
+                         + (primary.guardRefusal ?? "原因未给出"))
+        }
         if grade == .robust, notes.isEmpty {
             notes.append("样本 \(observed) 笔（阈值 \(required)），样本外效率 \(PriceFormatter.decimals(efficiency, 2))。")
         }

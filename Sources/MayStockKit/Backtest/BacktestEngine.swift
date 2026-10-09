@@ -216,6 +216,10 @@ public struct BacktestResult: Sendable {
     public let warmupBars: Int
     /// True when the strategy is a swap but no funding history was supplied.
     public let fundingUnmodelled: Bool
+    /// Entries the pre-trade guard refused — the live runner would refuse
+    /// them too — and why the first was. A sound strategy has none.
+    public let guardRefusals: Int
+    public let guardRefusal: String?
     /// Gaps, duplicates and malformed bars in the history this ran over.
     ///
     /// A backtest over holed history is not so much wrong as *less than it
@@ -241,7 +245,7 @@ public struct BacktestResult: Sendable {
         strategyId: String, market: StrategyMarket, start: Date, end: Date,
         barCount: Int, initialCapital: Double, finalEquity: Double,
         trades: [BacktestTrade], equityCurve: [EquityPoint], liquidations: Int,
-        warmupBars: Int, fundingUnmodelled: Bool,
+        warmupBars: Int, fundingUnmodelled: Bool, guardRefusals: Int = 0, guardRefusal: String? = nil,
         dataQuality: KernelDataQuality? = nil, metrics: BacktestMetrics
     ) {
         self.strategyId = strategyId
@@ -256,6 +260,8 @@ public struct BacktestResult: Sendable {
         self.liquidations = liquidations
         self.warmupBars = warmupBars
         self.fundingUnmodelled = fundingUnmodelled
+        self.guardRefusals = guardRefusals
+        self.guardRefusal = guardRefusal
         self.dataQuality = dataQuality
         self.metrics = metrics
     }
@@ -315,6 +321,8 @@ extension BacktestResult {
             liquidations: kernel.liquidations,
             warmupBars: kernel.warmupBars,
             fundingUnmodelled: kernel.fundingUnmodelled,
+            guardRefusals: kernel.guardRefusals,
+            guardRefusal: kernel.guardRefusal,
             dataQuality: kernel.dataQuality,
             metrics: BacktestMetrics(kernel: kernel.metrics))
     }
