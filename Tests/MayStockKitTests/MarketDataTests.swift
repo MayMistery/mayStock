@@ -307,7 +307,7 @@ struct VenueMarketDataTests {
     /// would draw one thing and backtest another.
     @Test func continuityMatchesTheKernelCalendar() throws {
         for venue in Venue.allCases {
-            let market = StrategyMarket(instId: "X", instType: venue.instrumentTypes[0], bar: .h1, venue: venue)
+            let market = StrategyMarket.sample(venue.instrumentTypes[0], on: venue)
             let strategy = try StrategyManifest(
                 id: "v", name: "v", market: market, signals: StrategySignals(longEntry: "close > 1")).compile()
             let info = try strategy.kernel.describe()

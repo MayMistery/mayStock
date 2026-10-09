@@ -687,6 +687,8 @@ public enum StrategyManifestError: Error, CustomStringConvertible, Sendable, Equ
     case leverageNotAllowed(InstrumentType, Double)
     case leverageOutOfRange(Double, max: Double)
     case instrumentNotOnVenue(InstrumentType, Venue)
+    /// The id names one family and the manifest declares another.
+    case instrumentMismatch(instId: String, named: InstrumentType, declared: InstrumentType, venue: Venue)
     case dataSourceNotOnVenue(name: String, source: AlternativeSeriesSource, venue: Venue)
     case unknownIdentifier(signal: String, name: String)
     case badExpression(signal: String, reason: String)
@@ -712,6 +714,9 @@ public enum StrategyManifestError: Error, CustomStringConvertible, Sendable, Equ
             return "杠杆 \(PriceFormatter.plain(x))× 超出允许范围（1~\(PriceFormatter.plain(max))）"
         case .instrumentNotOnVenue(let type, let venue):
             return "\(venue.displayName)不交易\(type.displayName)（可选：\(venue.instrumentTypes.map(\.displayName).joined(separator: "、"))）"
+        case .instrumentMismatch(let instId, let named, let declared, let venue):
+            return "\(instId) 在\(venue.displayName)是\(named.displayName)，清单却声明为\(declared.displayName)："
+                + "回测读的是 instId 的 K 线，下单的是 instType 的品种，两者必须是同一个"
         case .dataSourceNotOnVenue(let name, let source, let venue):
             return "data 中的「\(name)」（\(source.displayName)）是 \(Venue.okx.displayName) 专有的数据源，\(venue.displayName)上没有"
         case .unknownIdentifier(let signal, let name):
@@ -833,6 +838,18 @@ extension StrategyManifest {
         // precise reason rather than the kernel's generic refusal.
         guard market.venue.trades(market.instType) else {
             throw StrategyManifestError.instrumentNotOnVenue(market.instType, market.venue)
+        }
+        // What is backtested is the instId's candles; what is traded is the
+        // instType's instrument. A perpetual spelled as its spot pair
+        // ("BTC-USDT" declared SWAP) simulated on spot candles, and OKX
+        // refuses that spelling on its funding endpoint, so every such
+        // backtest charged no funding. An option strategy names the
+        // underlying it reads signals from, never a contract, so it is the
+        // one family whose id names something else by design.
+        let named = market.venue.instrumentType(of: market.instId)
+        if market.instType != .option, named != market.instType {
+            throw StrategyManifestError.instrumentMismatch(
+                instId: market.instId, named: named, declared: market.instType, venue: market.venue)
         }
         if hasShortEntry, !market.instType.allowsShorting {
             throw StrategyManifestError.shortingNotAllowed(market.instType)

@@ -59,12 +59,44 @@ struct ManifestVenueTests {
         }
     }
 
+    /// Every family a venue trades has a sample id, and the venue reads each
+    /// back as the family it was written for — an option names its
+    /// underlying, which is the one exception by design.
+    @Test func everyFamilyHasASampleSpelledAsItsOwn() throws {
+        for venue in Venue.allCases {
+            for type in venue.instrumentTypes {
+                let id = try #require(StrategyMarket.sampleId(for: type, on: venue), "\(venue) \(type)")
+                if type != .option { #expect(venue.instrumentType(of: id) == type, "\(venue) \(id)") }
+            }
+        }
+    }
+
+    /// The candles a backtest reads are the instId's and the position is the
+    /// instType's: a manifest whose id names another family is refused. A
+    /// perpetual spelled as its spot pair used to backtest on spot candles
+    /// and charge no funding — OKX refuses that spelling for funding.
+    @Test func anIdNamingAnotherFamilyIsRefused() throws {
+        for venue in Venue.allCases {
+            for declared in venue.instrumentTypes where declared != .option {
+                for named in venue.instrumentTypes where named != declared && named != .option {
+                    let id = try #require(StrategyMarket.sampleId(for: named, on: venue))
+                    let manifest = manifest(market: StrategyMarket(instId: id, instType: declared, bar: .h1, venue: venue))
+                    #expect(throws: StrategyManifestError.instrumentMismatch(
+                        instId: id, named: named, declared: declared, venue: venue)) {
+                        _ = try manifest.compile()
+                    }
+                }
+                #expect(throws: Never.self) { _ = try manifest(market: .sample(declared, on: venue)).compile() }
+            }
+        }
+    }
+
     @Test func aDataSourceTheVenueLacksIsRefusedAtImport() throws {
         for venue in Venue.allCases {
             let type = try #require(venue.instrumentTypes.first)
             for source in AlternativeSeriesSource.allCases where !source.isAvailable(on: venue) {
                 let manifest = manifest(
-                    market: StrategyMarket(instId: "X", instType: type, bar: .h1, venue: venue),
+                    market: .sample(type, on: venue),
                     data: ["feed": AlternativeSeriesSpec(source: source)])
                 #expect(throws: StrategyManifestError.dataSourceNotOnVenue(
                     name: "feed", source: source, venue: venue)) {
@@ -77,8 +109,7 @@ struct ManifestVenueTests {
     @Test func leverageStopsAtTheTypesCeiling() throws {
         for venue in Venue.allCases {
             for type in venue.instrumentTypes where type.allowsLeverage {
-                var manifest = manifest(
-                    market: StrategyMarket(instId: "X", instType: type, bar: .h1, venue: venue))
+                var manifest = manifest(market: .sample(type, on: venue))
                 manifest.risk.leverage = type.maxLeverage
                 #expect(throws: Never.self) { _ = try manifest.compile() }
                 manifest.risk.leverage = type.maxLeverage + 1
@@ -98,7 +129,7 @@ struct ManifestVenueTests {
         for venue in Venue.allCases {
             for type in venue.instrumentTypes {
                 let manifest = manifest(
-                    market: StrategyMarket(instId: "X", instType: type, bar: .h1, venue: venue),
+                    market: .sample(type, on: venue),
                     signals: StrategySignals(longEntry: "close > 1", shortEntry: "close < 1"))
                 if type.allowsShorting {
                     #expect(throws: Never.self) { _ = try manifest.compile() }
