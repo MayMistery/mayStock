@@ -108,3 +108,73 @@ struct AlertEngineTests {
         #expect(fired == 0)
     }
 }
+
+/// A fired alert stays pending until acknowledged — the menu bar item's red
+/// state, its count and the alerts page all read `AlertEngine.isPending`.
+@Suite("Alert attention")
+@MainActor
+struct AlertAttentionTests {
+    private let t0 = Date(timeIntervalSince1970: 1_000)
+
+    private func tick(_ instId: String, _ price: Double, at ts: Date) -> Ticker {
+        Ticker(instId: instId, last: price, bid: nil, ask: nil,
+               reference: 100, high: 120, low: 80, volume: 0, basis: .rolling24h, ts: ts)
+    }
+
+    /// One real cross up through 105 on `instId`, at `at`.
+    private func fire(_ engine: AlertEngine, _ instId: String, at: Date) {
+        let spark = SparklineBuffer()
+        engine.evaluate(instId: instId, ticker: tick(instId, 104, at: at), spark: spark, now: at)
+        engine.evaluate(instId: instId, ticker: tick(instId, 106, at: at + 0.5), spark: spark, now: at + 0.5)
+    }
+
+    private func engine(_ instIds: String...) -> AlertEngine {
+        let engine = AlertEngine()
+        engine.setRules(instIds.map { AlertRule(instId: $0, condition: .priceAbove(105), rearmAfterSeconds: 0) })
+        return engine
+    }
+
+    @Test("触发即待确认，同一标的累加，标的之间互不影响")
+    func pendingAccumulatesPerInstrument() {
+        let engine = engine("A", "B")
+        fire(engine, "A", at: t0)
+        #expect(engine.pendingCount(for: "A") == 1)
+        fire(engine, "A", at: t0 + 10)
+        #expect(engine.pendingCount(for: "A") == 2)
+        #expect(engine.pendingCount(for: "B") == 0)
+        fire(engine, "B", at: t0 + 20)
+        #expect(engine.pendingCount(for: "B") == 1)
+        #expect(engine.pendingEvents.count == 3)
+    }
+
+    @Test("确认清掉这个标的的全部；重复确认无副作用；不碰别的标的；之后再触发是新的一条")
+    func acknowledgementClearsOneInstrument() {
+        let engine = engine("A", "B")
+        fire(engine, "A", at: t0)
+        fire(engine, "A", at: t0 + 10)
+        fire(engine, "B", at: t0 + 20)
+        #expect(engine.acknowledge(instId: "A") == 2)
+        #expect(engine.pendingCount(for: "A") == 0)
+        #expect(engine.pendingCount(for: "B") == 1)
+        #expect(engine.acknowledge(instId: "A") == 0)
+        #expect(engine.recentEvents.count == 3, "acknowledged alerts stay listed")
+        fire(engine, "A", at: t0 + 40)
+        #expect(engine.pendingCount(for: "A") == 1)
+        #expect(engine.acknowledgeAll() == 2)
+        #expect(engine.pendingEvents.isEmpty)
+    }
+
+    @Test("列表只留最新的若干条，但没确认的一条也不丢")
+    func trimmingNeverDropsAPendingAlert() {
+        let engine = engine("A")
+        let fired = AlertEngine.recentLimit + 10
+        for i in 0..<fired { fire(engine, "A", at: t0 + Double(i) * 10) }
+        #expect(engine.recentEvents.count == fired, "all pending: none dropped")
+        #expect(engine.pendingCount(for: "A") == fired)
+        engine.acknowledge(instId: "A")
+        #expect(engine.recentEvents.count == AlertEngine.recentLimit, "acknowledged: trimmed to the newest")
+        fire(engine, "A", at: t0 + Double(fired + 1) * 10)
+        #expect(engine.recentEvents.count == AlertEngine.recentLimit)
+        #expect(engine.isPending(engine.recentEvents[0]) && !engine.isPending(engine.recentEvents[1]))
+    }
+}

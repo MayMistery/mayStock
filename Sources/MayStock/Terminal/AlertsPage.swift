@@ -95,20 +95,35 @@ struct AlertsPage: View {
         .rowStyle(padding: 8)
     }
 
+    /// The newest twenty, and every older one nobody has acknowledged — the
+    /// engine keeps its events newest first, and this used to take the
+    /// *last* twenty of them: the oldest, with the newest hidden once more
+    /// than twenty had fired (2026-10-09). A pending alert is marked here
+    /// too, so one on an instrument with no menu bar item is still seen.
     private var recentCard: some View {
-        let events = Array(appState.alerts.recentEvents.suffix(20).reversed())
-        return Card(title: "最近触发", subtitle: events.isEmpty ? "本次运行以来没有触发" : "本次运行以来的 \(events.count) 次") {
-            EmptyView()
+        let alerts = appState.alerts
+        let events = alerts.recentEvents.enumerated()
+            .filter { $0.offset < 20 || alerts.isPending($0.element) }
+            .map(\.element)
+        let pending = alerts.pendingEvents.count
+        let subtitle = events.isEmpty ? "本次运行以来没有触发"
+            : "最近 \(events.count) 次" + (pending > 0 ? " · \(pending) 条待确认" : "")
+        return Card(title: "最近触发", subtitle: subtitle) {
+            if pending > 0 {
+                Button("全部确认") { alerts.acknowledgeAll() }.controlSize(.small)
+            }
         } content: {
             DataGrid(columns: [
                 GridColumn(title: "时间"), GridColumn(title: "标的"), GridColumn(title: "条件"),
-                GridColumn(title: "触发价", alignment: .trailing), GridColumn(title: "备注"),
+                GridColumn(title: "触发价", alignment: .trailing), GridColumn(title: "备注"), GridColumn(title: "状态"),
             ], rows: events.map(IdentifiedEvent.init), emptyText: "尚无触发记录") { entry in
                 GridText(Format.stamp(entry.event.firedAt), tint: .secondary, mono: true, fit: true)
                 GridText(entry.event.rule.instId, weight: .medium, fit: true)
                 GridText(entry.event.summary, mono: true, fit: true)
                 GridText(PriceFormatter.auto(entry.event.price), mono: true, alignment: .trailing)
                 GridText(entry.event.rule.note.isEmpty ? "—" : entry.event.rule.note, tint: .secondary)
+                GridText(alerts.isPending(entry.event) ? "● 待确认" : "已确认",
+                         tint: alerts.isPending(entry.event) ? Theme.down : .secondary, fit: true)
             }
         }
     }

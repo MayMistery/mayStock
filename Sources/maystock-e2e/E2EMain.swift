@@ -207,7 +207,18 @@ struct E2EMain {
             return true
         }
         let firedOK = await checkFired(fired)
-        return setupOK && firedOK
+        // Both stay pending — the menu bar item stays red — until a left
+        // click acknowledges them, and the click clears exactly those.
+        let attentionOK: Bool = await MainActor.run {
+            let pending = engine.pendingCount(for: "SIM-USDT")
+            pending == 2 ? pass("both alerts pending until acknowledged") : fail("pending", "count=\(pending)")
+            let cleared = engine.acknowledge(instId: "SIM-USDT")
+            let after = engine.pendingCount(for: "SIM-USDT")
+            let ok = cleared == 2 && after == 0
+            ok ? pass("one acknowledgement clears them") : fail("acknowledge", "cleared=\(cleared) after=\(after)")
+            return pending == 2 && ok
+        }
+        return setupOK && firedOK && attentionOK
     }
 
     static func checkFired(_ fired: FiredBox) async -> Bool {

@@ -19,6 +19,9 @@ final class StatusItemController: NSObject {
     private var renderScheduled = false
     private var lastRenderAt = Date.distantPast
     private var hoverWorkItem: DispatchWorkItem?
+    /// Redraws the alert line when Reduce Motion is switched, so a pulse
+    /// stops (or starts) at once rather than at the next tick.
+    private var displayOptionsObserver: NSObjectProtocol?
 
     /// The drawn sparkline, and the sample it was drawn from.
     ///
@@ -40,6 +43,11 @@ final class StatusItemController: NSObject {
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
         configureButton()
+        displayOptionsObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.scheduleRender(force: true) }
+        }
         observeAndRender()
     }
 
@@ -47,7 +55,11 @@ final class StatusItemController: NSObject {
         // NSStatusBar removal must happen on main; deinit of a @MainActor
         // object is already main-bound in practice, but be explicit.
         let item = statusItem
-        Task { @MainActor in NSStatusBar.system.removeStatusItem(item) }
+        let observer = displayOptionsObserver
+        Task { @MainActor in
+            NSStatusBar.system.removeStatusItem(item)
+            if let observer { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
+        }
     }
 
     func update(watchItem: WatchItem) {
@@ -57,6 +69,10 @@ final class StatusItemController: NSObject {
 
     func remove() {
         hoverWorkItem?.cancel()
+        if let observer = displayOptionsObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+            displayOptionsObserver = nil
+        }
         NSStatusBar.system.removeStatusItem(statusItem)
     }
 
@@ -98,9 +114,13 @@ final class StatusItemController: NSObject {
     @objc private func handleClick() {
         guard let event = NSApp.currentEvent else { return }
         if event.type == .rightMouseUp {
+            // The menu leaves pending alerts as they are.
             showContextMenu()
         } else {
             hoverWorkItem?.cancel()
+            // Acknowledged before the panel opens, so the red goes the moment
+            // the click lands; an alert fired after this is a new one.
+            appState.alerts.acknowledge(instId: watchItem.instId)
             appState.panel.togglePinned(instId: watchItem.instId, anchoredTo: statusItem)
         }
     }
@@ -198,17 +218,50 @@ final class StatusItemController: NSObject {
         lastRenderAt = Date()
         guard let button = statusItem.button else { return }
 
-        let title = NSMutableAttributedString()
-        let baseFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
-        let smallFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
-
         // Reading these registers observation dependencies. `spark` is read as
         // a whole — that is what registers it — but the window is only *taken*
         // when the drawing below actually needs one.
         let ticker = session.ticker
         let spark = session.spark
         let connection = session.connection
-        let decimals = watchItem.decimals ?? session.priceDecimals
+        let pending = appState.alerts.pendingCount(for: watchItem.instId)
+
+        button.attributedTitle = Self.title(
+            for: watchItem, ticker: ticker, connection: connection,
+            decimals: watchItem.decimals ?? session.priceDecimals, pending: pending)
+
+        // Trailing sparkline, redrawn only when the series actually advanced.
+        if watchItem.style == .sparkline || watchItem.style == .full {
+            let window = watchItem.sparkWindow
+            let key = SparkKey(newest: spark.last?.ts, window: window)
+            if key != sparkImageKey || sparkImage == nil {
+                sparkImageKey = key
+                sparkImage = SparklineRenderer.image(
+                    points: window.points(from: spark, venue: watchItem.venue))
+            }
+            button.image = sparkImage
+            button.imagePosition = .imageTrailing
+        } else {
+            button.image = nil
+            sparkImage = nil
+            sparkImageKey = nil
+        }
+
+        StatusItemAlertStyle.updateLine(
+            on: button, active: pending > 0,
+            reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
+        button.toolTip = [StatusItemAlertStyle.toolTip(pending: pending), toolTip(ticker: ticker, connection: connection)]
+            .compactMap { $0 }.joined(separator: "\n")
+    }
+
+    /// The item's title as the bar draws it, alerts included — one function
+    /// for the live item and the snapshot of it.
+    static func title(
+        for watchItem: WatchItem, ticker: Ticker?, connection: FeedState, decimals: Int, pending: Int
+    ) -> NSAttributedString {
+        let title = NSMutableAttributedString()
+        let baseFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        let smallFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
 
         // Leading glyph / label.
         if watchItem.style == .full, let glyph = watchItem.glyph {
@@ -256,27 +309,8 @@ final class StatusItemController: NSObject {
                 .foregroundColor: NSColor.tertiaryLabelColor,
             ]))
         }
-
-        button.attributedTitle = title
-
-        // Trailing sparkline, redrawn only when the series actually advanced.
-        if watchItem.style == .sparkline || watchItem.style == .full {
-            let window = watchItem.sparkWindow
-            let key = SparkKey(newest: spark.last?.ts, window: window)
-            if key != sparkImageKey || sparkImage == nil {
-                sparkImageKey = key
-                sparkImage = SparklineRenderer.image(
-                    points: window.points(from: spark, venue: watchItem.venue))
-            }
-            button.image = sparkImage
-            button.imagePosition = .imageTrailing
-        } else {
-            button.image = nil
-            sparkImage = nil
-            sparkImageKey = nil
-        }
-
-        button.toolTip = toolTip(ticker: ticker, connection: connection)
+        StatusItemAlertStyle.apply(to: title, pending: pending, font: baseFont)
+        return title
     }
 
     /// One character of session state for the bar: 前 / 后 / 休.

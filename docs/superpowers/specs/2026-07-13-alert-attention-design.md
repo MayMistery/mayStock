@@ -24,6 +24,15 @@ Pending attention is runtime state. It is not written to `AppConfig`, so restart
 
 ## State model
 
+> **As built (2026-10-09):** the state lives in `AlertEngine` itself, not in a
+> separate type — the engine already records every fired event, so "what
+> fired" and "what is still unacknowledged" are one record. Each event carries
+> its firing order (`AlertEvent.sequence`); acknowledging an instrument records
+> how far its alerts were seen (`acknowledgedThrough`), and `isPending` is the
+> one rule the menu bar, its count and the alerts page read. The event list
+> keeps the newest 50 and never drops a pending one. The design below is the
+> July draft, kept for its reasoning.
+
 Add a small `AlertAttentionState` type to `MayStockKit`:
 
 ```swift

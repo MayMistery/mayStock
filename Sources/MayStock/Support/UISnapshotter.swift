@@ -63,6 +63,8 @@ final class UISnapshotter {
         try capture(panel, name: "panel")
         panelWindow.orderOut(nil)
 
+        try await renderStatusItem(instId: instId)
+
         // The terminal, tall enough that a scrolling page shows all of itself.
         let selection = TerminalSelection()
         selection.strategyId = appState.strategies.first?.id
@@ -189,6 +191,68 @@ final class UISnapshotter {
     }
 
     /// A run-loop breath for SwiftUI to lay out and draw a state change.
+    /// The menu bar item for `instId`, as it draws normally and with two
+    /// alerts pending — built by the same functions the live item uses, on a
+    /// status bar button, whose layer is geometry-flipped like the real one's.
+    private func renderStatusItem(instId: String) async throws {
+        guard let watchItem = appState.store.config.watchlist.first(where: { $0.instId == instId }),
+              let session = appState.hub.session(for: instId) else { return }
+        for pending in [0, 2] {
+            let button = NSStatusBarButton(frame: .zero)
+            button.isBordered = false
+            button.wantsLayer = true
+            button.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+            button.attributedTitle = StatusItemController.title(
+                for: watchItem, ticker: session.ticker, connection: session.connection,
+                decimals: watchItem.decimals ?? session.priceDecimals, pending: pending)
+            if watchItem.style == .sparkline || watchItem.style == .full {
+                button.image = SparklineRenderer.image(
+                    points: watchItem.sparkWindow.points(from: session.spark, venue: watchItem.venue))
+                button.imagePosition = .imageTrailing
+            }
+            let size = NSSize(width: button.intrinsicContentSize.width + 12, height: 24)
+            let host = NSView(frame: NSRect(origin: .zero, size: size))
+            host.wantsLayer = true
+            host.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+            button.frame = host.bounds
+            host.addSubview(button)
+            let window = OffscreenWindow(size: size, chrome: false)
+            window.contentView = host
+            window.orderFrontRegardless()
+            StatusItemAlertStyle.updateLine(on: button, active: pending > 0, reduceMotion: true)
+            try await pause()
+            try captureLayers(host, name: pending > 0 ? "statusitem-alert" : "statusitem")
+            window.orderOut(nil)
+        }
+    }
+
+    /// A view through its layer tree: `cacheDisplay` draws views, not the
+    /// Core Animation layers added to them — the alert line is one.
+    private func captureLayers(_ view: NSView, name: String) throws {
+        view.layoutSubtreeIfNeeded()
+        view.displayIfNeeded()
+        let bounds = view.bounds
+        let width = Int(bounds.width * scale), height = Int(bounds.height * scale)
+        guard let layer = view.layer, width > 0, height > 0,
+              let context = CGContext(
+                data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { throw SnapshotError.renderFailed(name) }
+        context.scaleBy(x: scale, y: scale)
+        if layer.isGeometryFlipped {
+            context.translateBy(x: 0, y: bounds.height)
+            context.scaleBy(x: 1, y: -1)
+        }
+        layer.render(in: context)
+        guard let image = context.makeImage() else { throw SnapshotError.renderFailed(name) }
+        let rep = NSBitmapImageRep(cgImage: image)
+        rep.size = bounds.size
+        guard let png = rep.representation(using: .png, properties: [:]) else {
+            throw SnapshotError.renderFailed(name)
+        }
+        try png.write(to: directory.appendingPathComponent("\(name).png"))
+    }
+
     private func pause() async throws {
         try await Task.sleep(nanoseconds: 400_000_000)
     }

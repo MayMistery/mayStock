@@ -77,12 +77,17 @@ public struct AlertEvent: Sendable, Equatable {
     /// How the ticker that fired it frames a change, for the summary.
     public let basis: ChangeBasis
     public let firedAt: Date
+    /// The engine's count of alerts fired when this one fired: what an
+    /// acknowledgement covers is everything fired up to a point in this
+    /// order, not in clock time.
+    public let sequence: Int
 
-    public init(rule: AlertRule, price: Double, basis: ChangeBasis, firedAt: Date = Date()) {
+    public init(rule: AlertRule, price: Double, basis: ChangeBasis, firedAt: Date = Date(), sequence: Int = 0) {
         self.rule = rule
         self.price = price
         self.basis = basis
         self.firedAt = firedAt
+        self.sequence = sequence
     }
 
     public var summary: String { rule.condition.summary(basis: basis) }
