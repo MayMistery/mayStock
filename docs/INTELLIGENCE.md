@@ -45,6 +45,8 @@ python Intelligence/runner.py --smoke-retrieval
 
 `--doctor` 不访问模型，报告版本、CLI 路径、连接来源、服务 origin、header **名称**和被忽略的环境变量**名称**，不输出凭证值。`--smoke-model` 会实际调用模型并检查结构化输出；这两个诊断命令通过 `--model` 显式选择模型，未提供时使用旧默认值，不会改写终端设置。`--smoke-retrieval` 检查新闻发现与官方日历，明确返回不可读取的来源。模型失败按 SDK 提供的 HTTP 状态或明确错误类型区分认证、权限、限流、上游故障和请求拒绝；含糊的“所选模型有问题”不会直接断言模型不存在。
 
+App 内每轮运行时，runner 在 stderr 上标为 `notice` 的诊断——模型失败、结构化结果未过校验、来源抓取或行情读取失败、一致性复核未完成、没有采用的继承路由——由 `IntelligenceBridge` 写进 engine-log，每轮每个阶段一行（次数和各字段取值，只有字段名单内的分类值，不含凭证）。阶段与字段只在 `runner.DIAGNOSTICS` 声明一处，见 `docs/INTELLIGENCE-CONTRACT.md`。
+
 ## 来源与时间规则
 
 每次自动搜索全球局势、美国政策和加密市场。Bing News RSS 和 Google News RSS 只用于发现线索；引用依据来自实际读取的发布者网页。Google 的聚合链接先解析为原始发布者，再读取正文。每日预加载 BLS 官方 ICS、Fed FOMC 日历和 BEA 官方 ICS，覆盖通胀、就业、利率、GDP/PCE 等事件。日历时间由程序解析。日报、小时分析和快报均开放完整只读研究工具；预取资料只作为起点，agent 可自主选择查询主题、来源、时间尺度和追查顺序。

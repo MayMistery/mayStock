@@ -90,8 +90,47 @@ def sdk_options(cwd: str, mcp_servers=None, schema=None, model=MODEL):
     )
 
 
+_MODEL_ERROR = {"model", "code", "evidence", "apiStatus", "errorClass", "subtype", "terminalReason", "assistantError"}
+
+# Every diagnostic the runner writes to stderr, and the fields it may carry.
+# "notice" marks what the host must keep — a failure, a degradation, a value
+# the run deliberately did not take — and the app writes those to its engine
+# log; "info" is progress. A field outside a stage's set never reaches stderr.
+# One table: docs/INTELLIGENCE-CONTRACT.md names its notices, and the tests walk
+# every progress() call against it.
+DIAGNOSTICS = {
+    "connection_configured": ("info", {"source", "origin", "headerNames", "ignoredEnvironmentKeys", "cliSelection"}),
+    "connection_environment_ignored": ("notice", {"source", "ignoredEnvironmentKeys"}),
+    "research_start": ("info", {"kind", "model"}),
+    "model_query": ("info", {"attempt", "model"}),
+    "model_tools": ("info", {"tools", "model"}),
+    "model_result": ("info", {"model", "subtype", "isError", "apiStatus", "structured"}),
+    "model_failure": ("notice", _MODEL_ERROR),
+    "model_exception": ("notice", _MODEL_ERROR),
+    "validation_failed": ("notice", {"code", "model"}),
+    "search_start": ("info", set()),
+    "search_done": ("info", {"leads"}),
+    "fetch_start": ("info", {"host"}),
+    "fetch_done": ("info", {"host", "characters"}),
+    "fetch_failed": ("notice", {"host"}),
+    "market_start": ("info", {"dataset", "symbol"}),
+    "market_done": ("info", {"dataset", "symbol"}),
+    "market_failed": ("notice", {"dataset", "symbol"}),
+    "consistency_review_start": ("info", {"model"}),
+    "consistency_review_done": ("info", {"model"}),
+    "consistency_review_incomplete": ("notice", {"model"}),
+}
+
+
 def progress(stage, **fields):
-    print(json.dumps({"stage": stage, "at": time.time(), **fields}, ensure_ascii=False), file=sys.stderr, flush=True)
+    level, allowed = DIAGNOSTICS[stage]
+    event = {"stage": stage, "level": level, "at": time.time(),
+             **{key: value for key, value in fields.items() if key in allowed}}
+    undeclared = sorted(set(fields) - allowed)
+    if undeclared:
+        # Names only, never values: an undeclared field is unreviewed.
+        event["undeclaredFields"] = undeclared
+    print(json.dumps(event, ensure_ascii=False), file=sys.stderr, flush=True)
 
 
 async def invoke_model(options, prompt, validator=None):
@@ -342,8 +381,12 @@ def main():
     args = parser.parse_args()
     try:
         profile = configure_runtime()
-        progress("connection_configured", **profile.diagnostics(),
+        diagnostics = profile.diagnostics()
+        progress("connection_configured", **diagnostics,
                  cliSelection="override" if os.environ.get("MAYSTOCK_CLAUDE_PATH") else "sdk_default")
+        if diagnostics["ignoredEnvironmentKeys"]:
+            progress("connection_environment_ignored", source=diagnostics["source"],
+                     ignoredEnvironmentKeys=diagnostics["ignoredEnvironmentKeys"])
         result = asyncio.run(asyncio.wait_for(main_async(args), timeout=840))
         print(json.dumps(result, ensure_ascii=False, allow_nan=False))
         return 0

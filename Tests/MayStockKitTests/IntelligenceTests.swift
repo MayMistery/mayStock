@@ -81,3 +81,28 @@ struct IntelligenceTests {
         #expect(try IntelligenceJSON.decoder().decode(IntelligenceReport.self, from: updated).coverageComplete == false)
     }
 }
+
+/// The runner's notices reach the engine log; its progress does not.
+@Suite("Intelligence runner notices")
+struct IntelligenceRunnerNoticeTests {
+    @Test("每个 notice 阶段一行：次数和各字段的取值；info、非 JSON、对象字段都不进日志")
+    func noticesBecomeOneLinePerStage() {
+        let stderr = """
+        Traceback-like noise that is not JSON
+        {"stage":"fetch_start","level":"info","at":1,"host":"a.test"}
+        {"stage":"fetch_failed","level":"notice","at":2,"host":"a.test"}
+        {"stage":"fetch_failed","level":"notice","at":3,"host":"b.test"}
+        {"stage":"fetch_failed","level":"notice","at":4,"host":"a.test"}
+        {"stage":"model_failure","level":"notice","at":5,"code":"MODEL_RATE_LIMIT","apiStatus":429,"assistantError":null,"nested":{"secret":"SENTINEL"}}
+        {"stage":"connection_environment_ignored","level":"notice","at":6,"source":"connection","ignoredEnvironmentKeys":["ANTHROPIC_BASE_URL","CLAUDECODE"],"isRelay":true}
+        """
+        let lines = IntelligenceBridge.noticeLines(fromStderr: Data(stderr.utf8))
+        #expect(lines == [
+            "intelligence: fetch_failed ×3 · host=a.test、b.test",
+            "intelligence: model_failure · apiStatus=429 · code=MODEL_RATE_LIMIT",
+            "intelligence: connection_environment_ignored · ignoredEnvironmentKeys=ANTHROPIC_BASE_URL,CLAUDECODE · isRelay=true · source=connection",
+        ])
+        #expect(!lines.joined().contains("SENTINEL"))
+        #expect(IntelligenceBridge.noticeLines(fromStderr: Data()).isEmpty)
+    }
+}

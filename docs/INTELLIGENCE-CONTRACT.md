@@ -1,8 +1,16 @@
 # Intelligence bridge contract
 
 The native app runs `Intelligence/runner.py` with one JSON request on stdin and
-reads one JSON report from stdout. Diagnostics go to stderr. All timestamps are
-Unix seconds (UTC); all UI day boundaries use the request's IANA timezone.
+reads one JSON report from stdout. All timestamps are Unix seconds (UTC); all UI
+day boundaries use the request's IANA timezone.
+
+Diagnostics go to stderr, one JSON object per line — `{stage, level, at, …fields}` —
+each stage and the fields it may carry declared once, in `runner.DIAGNOSTICS`; a
+field outside its stage's set is dropped and only its name reported
+(`undeclaredFields`). `info` is progress. Every `notice` — a failure, a
+degradation, or a value the run deliberately did not take — is written to the
+app's engine log by `IntelligenceBridge`, one line per stage per run.
+Notices: `connection_environment_ignored`, `model_failure`, `model_exception`, `validation_failed`, `fetch_failed`, `market_failed`, `consistency_review_incomplete`.
 
 Request:
 `{kind: daily|hourly|flash, now: number, timezone: string, horizonHours: number, model?: string,

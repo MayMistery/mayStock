@@ -82,6 +82,53 @@ public struct IntelligenceBridge: Sendable {
     public let script: URL
     public init(python: URL, script: URL) { self.python = python; self.script = script }
 
+    /// The runner's `notice` events on stderr (`runner.DIAGNOSTICS`,
+    /// docs/INTELLIGENCE-CONTRACT.md), one engine-log line per stage: how many
+    /// times it fired and the values each field took. Before this the app
+    /// read stdout only, so a fetch that failed, a model error or an inherited
+    /// route the run left out was written to a stream nobody kept. Lines that
+    /// are not JSON, and `info` progress, are skipped.
+    static func noticeLines(fromStderr data: Data) -> [String] {
+        var stages: [String] = []
+        var counts: [String: Int] = [:]
+        var values: [String: [String: [String]]] = [:]
+        for line in data.split(separator: UInt8(ascii: "\n")) {
+            guard let event = (try? JSONSerialization.jsonObject(with: Data(line))) as? [String: Any],
+                  event["level"] as? String == "notice", let stage = event["stage"] as? String else { continue }
+            if counts[stage] == nil { stages.append(stage) }
+            counts[stage, default: 0] += 1
+            for (key, value) in event where !["stage", "level", "at"].contains(key) {
+                guard let text = loggable(value) else { continue }
+                var seen = values[stage, default: [:]][key, default: []]
+                if !seen.contains(text), seen.count < 6 { seen.append(text) }
+                values[stage, default: [:]][key] = seen
+            }
+        }
+        return stages.map { stage in
+            let count = counts[stage] ?? 0
+            let fields = (values[stage] ?? [:]).sorted { $0.key < $1.key }
+                .map { "\($0.key)=\($0.value.joined(separator: "、"))" }
+            return "intelligence: \(stage)" + (count > 1 ? " ×\(count)" : "")
+                + (fields.isEmpty ? "" : " · " + fields.joined(separator: " · "))
+        }
+    }
+
+    /// A field's value as one short piece of text: strings, numbers,
+    /// booleans and lists of them. Anything else is left out.
+    private static func loggable(_ value: Any) -> String? {
+        switch value {
+        case let text as String:
+            return String(text.prefix(80))
+        case let number as NSNumber:
+            return CFGetTypeID(number) == CFBooleanGetTypeID() ? (number.boolValue ? "true" : "false") : number.stringValue
+        case let list as [Any]:
+            let parts = list.compactMap(loggable)
+            return parts.isEmpty ? nil : String(parts.joined(separator: ",").prefix(160))
+        default:
+            return nil
+        }
+    }
+
     public func generate(_ request: IntelligenceRequest) async throws -> IntelligenceReport {
         var environment = ProcessInfo.processInfo.environment
         // Finder launches have a minimal PATH. No login shell is needed.
@@ -98,6 +145,9 @@ public struct IntelligenceBridge: Sendable {
         } catch {
             throw IntelligenceBridgeError.failed("情报运行环境启动失败，请检查 Python SDK 安装。")
         }
+        // What the run marked worth keeping — failures, degradations, routing
+        // it deliberately did not take — goes to the engine log, success or not.
+        for line in Self.noticeLines(fromStderr: output.stderr) { Log.warn(line) }
         guard output.exitCode == 0 else {
             // Only expose the runner's deliberately sanitized error envelope, never raw stderr.
             struct RunnerError: Decodable { var error: String }
