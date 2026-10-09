@@ -35,6 +35,8 @@ pub enum MarketCalendar {
 }
 
 impl MarketCalendar {
+    pub const ALL: [MarketCalendar; 2] = [Self::Continuous, Self::UsEquities];
+
     /// Trading sessions in a year. The annualisation constant for daily bars.
     pub fn sessions_per_year(self) -> f64 {
         match self {
@@ -125,8 +127,10 @@ impl MarketCalendar {
         }
         match self {
             Self::Continuous => {
-                let bar_ms = bar_millis(bar_seconds);
-                ((to_ms - from_ms + bar_ms - 1) / bar_ms) as usize
+                // Unsigned from the start, as in `opens_strictly_between`:
+                // `to_ms` is the later, so the distance is the span.
+                let bar_ms = bar_millis(bar_seconds).unsigned_abs();
+                to_ms.abs_diff(from_ms).div_ceil(bar_ms) as usize
             }
             Self::UsEquities => {
                 let mut count = 0;
@@ -148,8 +152,14 @@ impl MarketCalendar {
         }
         match self {
             Self::Continuous => {
-                let bar_ms = bar_millis(bar_seconds);
-                ((b_ms - a_ms) / bar_ms).saturating_sub(1) as usize
+                // Whole bars spanned, less the one opening at `b_ms` itself —
+                // none when the two are closer than one bar. Counted unsigned,
+                // where saturating stops at zero. In `i64` it stops at
+                // `i64::MIN`: the less-one came out −1 there, and `as usize`
+                // made that `usize::MAX`, a panic in a debug build and in
+                // release a gap count wrapped past zero.
+                let bar_ms = bar_millis(bar_seconds).unsigned_abs();
+                (b_ms.abs_diff(a_ms) / bar_ms).saturating_sub(1) as usize
             }
             Self::UsEquities => {
                 let mut count = 0;
@@ -686,6 +696,60 @@ mod tests {
         assert!(cal.on_grid(None, t0 + 1234, HOUR));
         assert!(cal.on_grid(Some(t0), t0 + 3_600_000, HOUR));
         assert!(!cal.on_grid(Some(t0), t0 + 5_400_000, HOUR));
+    }
+
+    /// Bars the calendar expects at `bar_seconds`, walked from a Friday open
+    /// across the weekend the clocks sprang forward on, and from the open of
+    /// the early-close day before Independence Day across the holiday.
+    fn expected_opens(calendar: MarketCalendar, bar_seconds: f64) -> Vec<i64> {
+        let mut opens = Vec::new();
+        for start in [ny(2024, 3, 8, 9, 30), ny(2024, 7, 3, 9, 30)] {
+            let mut t = start;
+            for _ in 0..400 {
+                opens.push(t);
+                t = calendar.next_open(t, bar_seconds);
+            }
+        }
+        opens
+    }
+
+    /// Two bars closer than one interval have no open between them, on every
+    /// calendar at every interval the kernel knows. Counted as "whole bars
+    /// spanned, less one" in `i64`, the continuous calendar made that −1 and
+    /// then `usize::MAX`: hourly bars judged at 4H panicked the gap detector
+    /// in a debug build and wrapped its count past zero in release.
+    #[test]
+    fn bars_closer_than_one_interval_have_nothing_between_them() {
+        for calendar in MarketCalendar::ALL {
+            for (interval, seconds) in crate::strategy::BAR_INTERVALS {
+                let bar_ms = bar_millis(seconds);
+                for a in expected_opens(calendar, seconds) {
+                    for closer in [1, bar_ms / 2, bar_ms - 1] {
+                        let b = a + closer;
+                        let case = format!("{calendar:?} {interval}: {a} and {closer} ms later");
+                        assert_eq!(calendar.opens_strictly_between(a, b, seconds), 0, "{case}");
+                        assert_eq!(calendar.opens_strictly_between(b, a, seconds), 0, "{case}, reversed");
+                        // At most the open at `b` itself: nothing fits before it.
+                        assert!(calendar.opens_between(a, b, seconds) <= 1, "{case}");
+                        assert_eq!(calendar.opens_between(b, a, seconds), 0, "{case}, reversed");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A calendar added to the enum fails to compile here until it is placed;
+    /// the arm is the reminder that it belongs in `ALL` too, which every
+    /// property that must hold on each calendar walks.
+    #[test]
+    fn all_lists_every_calendar_once() {
+        let position = |calendar: MarketCalendar| match calendar {
+            MarketCalendar::Continuous => 0,
+            MarketCalendar::UsEquities => 1,
+        };
+        for (index, calendar) in MarketCalendar::ALL.iter().enumerate() {
+            assert_eq!(position(*calendar), index, "{calendar:?}");
+        }
     }
 
     // MARK: Staleness

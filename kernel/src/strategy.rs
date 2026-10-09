@@ -277,24 +277,32 @@ fn default_bar() -> String {
     "1H".to_string()
 }
 
+/// Every bar interval the kernel knows, with its length in seconds.
+///
+/// The one list: [`bar_seconds`] reads it, and a property that must hold at
+/// every interval walks it rather than naming the ones in use today.
+pub const BAR_INTERVALS: [(&str, f64); 12] = [
+    ("1m", 60.0),
+    ("3m", 180.0),
+    ("5m", 300.0),
+    ("15m", 900.0),
+    ("30m", 1_800.0),
+    ("1H", 3_600.0),
+    ("2H", 7_200.0),
+    ("4H", 14_400.0),
+    ("6H", 21_600.0),
+    ("12H", 43_200.0),
+    ("1D", 86_400.0),
+    ("1W", 604_800.0),
+];
+
 /// Seconds in one bar of the named interval. Unknown intervals fall back to an
 /// hour rather than zero, which would make funding bucketing divide by nothing.
 pub fn bar_seconds(bar: &str) -> f64 {
-    match bar {
-        "1m" => 60.0,
-        "3m" => 180.0,
-        "5m" => 300.0,
-        "15m" => 900.0,
-        "30m" => 1_800.0,
-        "1H" => 3_600.0,
-        "2H" => 7_200.0,
-        "4H" => 14_400.0,
-        "6H" => 21_600.0,
-        "12H" => 43_200.0,
-        "1D" => 86_400.0,
-        "1W" => 604_800.0,
-        _ => 3_600.0,
-    }
+    BAR_INTERVALS
+        .iter()
+        .find(|(name, _)| *name == bar)
+        .map_or(3_600.0, |(_, seconds)| *seconds)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1206,6 +1214,11 @@ mod tests {
 
     #[test]
     fn bar_intervals_convert_to_seconds() {
+        // A name listed twice would answer with its first length only.
+        for (name, seconds) in BAR_INTERVALS {
+            assert_eq!(bar_seconds(name), seconds, "{name}");
+            assert!(seconds > 0.0, "{name}: the calendar divides by it");
+        }
         assert_eq!(bar_seconds("4H"), 14_400.0);
         assert_eq!(bar_seconds("1D"), 86_400.0);
         assert_eq!(bar_seconds("nonsense"), 3_600.0);
