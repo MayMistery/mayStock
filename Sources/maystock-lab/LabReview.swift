@@ -22,7 +22,15 @@ extension LabMain {
         }
 
         let configIO = ConfigIO(directory: directory)
-        let config = configIO.load()
+        let (config, readIssue) = configIO.read()
+        // Acting on the defaults would write them over the file that could
+        // not be read: the review can still report, but it will not apply.
+        if let readIssue {
+            if arguments.has("apply") {
+                throw LabError.usage("\(readIssue)。不会在默认配置上执行 --apply")
+            }
+            Out.warn("\(readIssue)。以下按默认配置复盘")
+        }
         let mode = config.strategy.mode
         let policy = policyStore.load()
 

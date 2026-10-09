@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 // MARK: - Watchlist
 
@@ -294,6 +295,17 @@ public struct AppConfig: Codable, Sendable, Equatable {
 
 // MARK: - Persistence + v1 migration
 
+/// A configuration file that exists and could not be read.
+public struct ConfigReadIssue: Error, Sendable, Equatable, CustomStringConvertible {
+    public let reason: String
+    /// Where the unreadable file was kept, when keeping it worked.
+    public let keptAt: URL?
+
+    public var description: String {
+        "配置文件读不出来（\(reason)）" + (keptAt.map { "，原文件已另存为 \($0.path)" } ?? "")
+    }
+}
+
 /// Loads/saves `AppConfig` as JSON. Migrates MayStock 1.x configs
 /// (a bare `[MonitorItem]` array) by keeping crypto items and dropping
 /// the removed CPU/MEM/NET monitors.
@@ -310,18 +322,57 @@ public struct ConfigIO: Sendable {
         return base.appendingPathComponent("MayStock")
     }
 
-    public func load() -> AppConfig {
-        guard let data = try? Data(contentsOf: fileURL) else { return .default }
+    /// The configuration on disk, or the defaults when there is none.
+    public func load() -> AppConfig { read().config }
+
+    /// The configuration on disk, and — when a file exists but cannot be
+    /// read — why, and where it was kept.
+    ///
+    /// An unreadable file used to come back as the defaults in silence, and
+    /// the next save wrote the defaults over it: one field a newer build
+    /// added, or one hand-edited typo, and the watchlist, alerts and
+    /// strategy budgets were gone with nothing in the log. Now the file is
+    /// copied beside itself first (`config.json.unreadable-<digest>`, one copy
+    /// per distinct content), the reason is logged, and the caller is told —
+    /// the app says so on launch, and `review --apply` refuses to write.
+    public func read() -> (config: AppConfig, issue: ConfigReadIssue?) {
+        guard let data = try? Data(contentsOf: fileURL) else { return (.default, nil) }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        if var config = try? decoder.decode(AppConfig.self, from: data),
-           config.schemaVersion >= AppConfig.minimumSupportedSchemaVersion,
-           !config.watchlist.isEmpty {
-            config.schemaVersion = AppConfig.currentSchemaVersion
-            return config
+        let reason: String
+        do {
+            var config = try decoder.decode(AppConfig.self, from: data)
+            if config.schemaVersion >= AppConfig.minimumSupportedSchemaVersion {
+                config.schemaVersion = AppConfig.currentSchemaVersion
+                // The menu bar is the app's only way in, so it never starts
+                // empty — but an empty watchlist is no reason to drop every
+                // other setting, which is what this used to do.
+                if config.watchlist.isEmpty {
+                    Log.warn("config: 自选为空，恢复默认自选，其余设置照旧")
+                    config.watchlist = AppConfig.default.watchlist
+                }
+                return (config, nil)
+            }
+            reason = "schemaVersion \(config.schemaVersion) 低于最低支持的 \(AppConfig.minimumSupportedSchemaVersion)"
+        } catch {
+            reason = String(describing: error)
         }
-        if let migrated = Self.migrateV1(data: data) { return migrated }
-        return .default
+        if let migrated = Self.migrateV1(data: data) { return (migrated, nil) }
+        let kept = keepUnreadable(data)
+        Log.warn("config: config.json 读不出来（\(reason)），"
+                 + (kept.map { "原文件另存为 \($0.lastPathComponent)，" } ?? "另存也失败，")
+                 + "这次用默认配置")
+        return (.default, ConfigReadIssue(reason: reason, keptAt: kept))
+    }
+
+    /// Copy an unreadable file beside itself, named by its content so the
+    /// same file read twice is kept once.
+    private func keepUnreadable(_ data: Data) -> URL? {
+        let digest = SHA256.hash(data: data).prefix(4).map { String(format: "%02x", $0) }.joined()
+        let copy = fileURL.deletingLastPathComponent()
+            .appendingPathComponent("\(fileURL.lastPathComponent).unreadable-\(digest)")
+        if FileManager.default.fileExists(atPath: copy.path) { return copy }
+        return (try? data.write(to: copy, options: .atomic)) != nil ? copy : nil
     }
 
     public func save(_ config: AppConfig) throws {

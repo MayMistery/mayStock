@@ -8,16 +8,20 @@ import MayStockKit
 @MainActor
 final class ConfigStore {
     var config: AppConfig
+    /// Set when a config file existed and could not be read: the app runs on
+    /// the defaults, the original is kept beside it, and launch says so.
+    let readIssue: ConfigReadIssue?
     private let io: ConfigIO
     private var saveScheduled = false
 
     init(directory: URL) {
-        self.io = ConfigIO(directory: directory)
-        self.config = io.load()
         // The app owns this directory, so it is the one process allowed to
         // keep a readable log there. Nothing else — tests included — writes
-        // anywhere but stderr.
+        // anywhere but stderr. Wired before the read, so a config that
+        // cannot be read is logged where it can be found.
         Log.useFile(in: directory)
+        self.io = ConfigIO(directory: directory)
+        (config, readIssue) = io.read()
     }
 
     /// Mutate + persist + let AppState react.
@@ -196,6 +200,9 @@ final class AppState {
         startLiveLayer()
         reloadStrategies()
         applyConfig()
+        if let issue = store.readIssue {
+            notifications.post(title: "MayStock · 配置没读出来，这次用默认配置", body: issue.description, sound: true)
+        }
         Task {
             await detectTradeCLI()
             await detectSchwabCLI()
