@@ -7,7 +7,7 @@ from pathlib import Path
 import sqlite3
 import time
 
-from .providers import CAVEAT, PredictionError, Provider, PublicClient, number
+from .providers import CAVEAT, PredictionError, Provider, PublicClient, identifier, market_flags, number
 
 QUALITY_DEFAULTS = {"max_age_seconds": 120, "max_gap_seconds": 120,
                     "max_spread_pp": 3, "min_depth_usd": 100,
@@ -52,6 +52,12 @@ def validate_config(config):
         for key in ("market_id", "outcome", "rationale"):
             if not isinstance(mapping.get(key), str) or not mapping[key].strip():
                 raise PredictionError(f"PREDICTION_CONFIG: {key} must be a nonempty string")
+        try:
+            identifier(mapping["market_id"])
+        except PredictionError:
+            raise PredictionError("PREDICTION_CONFIG: market_id must be an exact provider ID/ticker/slug, not a URL") from None
+        if len(mapping["outcome"]) > 100 or (mapping["provider"] == "kalshi" and mapping["outcome"].casefold() not in {"yes", "no"}):
+            raise PredictionError("PREDICTION_CONFIG: outcome must be an exact label <=100 characters; Kalshi requires Yes or No")
         if not isinstance(mapping.get("subjects"), list) or not mapping["subjects"] or any(not isinstance(x, str) or not x for x in mapping["subjects"]):
             raise PredictionError("PREDICTION_CONFIG: subjects must be a nonempty string array")
         if "event" in mapping:
@@ -111,17 +117,16 @@ def fingerprint(mapping):
     return hashlib.sha256(json.dumps(mapping, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:20]
 
 
+def provider_block(details, now):
+    if details.get("access_denied"):
+        return "PREDICTION_ACCESS_DENIED: use reset-health only after access is restored"
+    if details.get("retry_after_until", 0) > now:
+        return "PREDICTION_RETRY_LATER: honoring provider Retry-After"
+    return None
+
+
 def quality_flags(observation, quality, now):
-    flags = []
-    if not observation.get("active"):
-        flags.append("inactive_market")
-    if not observation.get("supported_contract"):
-        flags.append("unsupported_contract")
-    if observation.get("result") or observation.get("resolution_status") in {"resolved", "disputed", "proposed", "finalized"}:
-        flags.append("resolved_or_resolution_status")
-    close = observation.get("close_at")
-    if close is not None and close <= now:
-        flags.append("market_past_close")
+    flags = market_flags(observation, now)
     received = observation.get("received_at")
     if received is None or received > now + 5 or now - received > quality["max_age_seconds"]:
         flags.append("stale_or_future_retrieval")
@@ -174,6 +179,10 @@ class Store:
     def health(self, key, status, now, details):
         self.db.execute("INSERT OR REPLACE INTO health VALUES (?,?,?,?)", (key, status, now, json.dumps(details)))
 
+    def health_details(self, key):
+        row = self.db.execute("SELECT payload FROM health WHERE key=?", (key,)).fetchone()
+        return json.loads(row[0]) if row else {}
+
     def status(self, now=None):
         now = time.time() if now is None else now
         sources = [{"key": r["key"], "status": r["status"], "checked_at": r["checked_at"],
@@ -211,17 +220,15 @@ class Engine:
             key = mapping["id"] + ":" + fingerprint(mapping)
             health_key = mapping["provider"] + ":" + mapping["market_id"] + ":" + mapping["outcome"]
             provider_health_key = mapping["provider"] + ":*"
-            prior_health = self.store.db.execute("SELECT status,payload FROM health WHERE key=?", (provider_health_key,)).fetchone()
             # A recorded access denial requires explicit reset-health; no
             # automatic repeated requests, fallback hosts, identities or proxy.
-            provider_status = json.loads(prior_health["payload"]) if prior_health else {}
             at = time.time() if now is None else now
-            if provider_status.get("access_denied") or provider_status.get("retry_after_until", 0) > at:
+            reason = provider_block(self.store.health_details(provider_health_key), at)
+            if reason:
                 with self.store.db:
                     self.store.db.execute("BEGIN IMMEDIATE")
                     state = self.store.state(key)
                     self.store.set_state(key, {"last_alerts": state.get("last_alerts", {}), "invalidated_at": at})
-                reason = "PREDICTION_ACCESS_DENIED: use reset-health only after access is restored" if provider_status.get("access_denied") else "PREDICTION_RETRY_LATER: honoring provider Retry-After"
                 results.append({"mapping_id": mapping["id"], "status": "unavailable", "error": reason})
                 continue
             try:
@@ -229,10 +236,21 @@ class Engine:
                 at = time.time() if now is None else now
                 with self.store.db:
                     self.store.db.execute("BEGIN IMMEDIATE")
+                    # Another worker may have recorded a restriction while
+                    # this GET was in flight. Read it under the write lock;
+                    # old successes must neither erase it nor emit signals.
+                    current = self.store.health_details(provider_health_key)
+                    reason = provider_block(current, at)
+                    if reason:
+                        state = self.store.state(key)
+                        self.store.set_state(key, {"last_alerts": state.get("last_alerts", {}), "invalidated_at": at})
+                        self.store.health(health_key, "unavailable", at, {"error": reason,
+                                          "access_denied": current.get("access_denied", False)})
+                        results.append({"mapping_id": mapping["id"], "status": "unavailable", "error": reason})
+                        continue
                     emitted, flags = self.evaluate(mapping, key, observation, at)
                     alerts.extend(emitted)
-                    if provider_status.get("retry_after_until", 0) <= at and not provider_status.get("access_denied"):
-                        self.store.db.execute("DELETE FROM health WHERE key=?", (provider_health_key,))
+                    self.store.db.execute("DELETE FROM health WHERE key=?", (provider_health_key,))
                     self.store.health(health_key, "healthy" if not flags else "degraded", at,
                                       {"quality_flags": flags, "freshness_basis": observation["freshness_basis"]})
                 results.append({"mapping_id": mapping["id"], "status": "healthy" if not flags else "degraded",
@@ -246,12 +264,16 @@ class Engine:
                     state = self.store.state(key)
                     self.store.set_state(key, {"last_alerts": state.get("last_alerts", {}), "invalidated_at": at})
                     denied = "HTTP_403" in error or "HTTP_401" in error or "ACCESS_DENIED" in error
-                    self.store.health(health_key, "unavailable", at, {"error": error, "access_denied": denied})
+                    current = self.store.health_details(provider_health_key)
                     if denied:
-                        self.store.health(provider_health_key, "unavailable", at, {"error": error, "access_denied": True})
-                    elif getattr(exc, "retry_after", 0) > 0:
                         self.store.health(provider_health_key, "unavailable", at,
-                                          {"error": error, "retry_after_until": at + exc.retry_after})
+                                          {**current, "error": error, "access_denied": True})
+                    elif getattr(exc, "retry_after", 0) > 0 and not current.get("access_denied"):
+                        until = max(current.get("retry_after_until", 0), at + exc.retry_after)
+                        self.store.health(provider_health_key, "unavailable", at,
+                                          {**current, "error": error, "retry_after_until": until})
+                    self.store.health(health_key, "unavailable", at,
+                                      {"error": error, "access_denied": denied or current.get("access_denied", False)})
                 results.append({"mapping_id": mapping["id"], "status": "unavailable", "error": error})
         at = time.time() if now is None else now
         with self.store.db:

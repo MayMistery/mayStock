@@ -39,6 +39,11 @@ class AutonomousRunnerTests(unittest.TestCase):
         async def investigate(options, prompt, validator):
             self.assertIn("mcp__research__market_data", options.allowed_tools)
             self.assertIn("mcp__research__search_news", options.allowed_tools)
+            self.assertIn("mcp__research__prediction_markets", options.allowed_tools)
+            catalog = await dispatched["prediction_markets"].handler({"action": "catalog", "provider": "kalshi",
+                "query": "", "market_id": "", "outcome": "Yes", "limit": 20})
+            self.assertFalse(catalog["isError"])
+            self.assertEqual(json.loads(catalog["content"][0]["text"])["result"]["providers"], ["polymarket", "kalshi"])
             for index in range(5):
                 result = await dispatched["search_news"].handler({"query": f"Follow-up hypothesis {index}"})
                 self.assertFalse(result["isError"])
@@ -53,6 +58,7 @@ class AutonomousRunnerTests(unittest.TestCase):
                    "watchlist": ["BTC-USDT", "BRK-B"], "quotes": [], "knownEvents": [], "horizonHours": 1}
         with contextlib.redirect_stderr(io.StringIO()), \
              patch("runner.Research", return_value=store), \
+             patch("runner.routing_environment", return_value={}), \
              patch("market_data.MarketData", return_value=market), \
              patch("daily.prefetch_news", new=AsyncMock(return_value=[])), \
              patch("calendar_events.assemble_calendar_events", return_value=[{"id": "official"}]), \

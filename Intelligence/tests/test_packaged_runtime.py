@@ -9,6 +9,26 @@ import unittest
 
 
 class PackagedRuntimeTests(unittest.TestCase):
+    def test_packaged_prediction_modules_import_without_mutating_resources(self):
+        source = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory(prefix="maystock-prediction-resources-") as directory:
+            resources = Path(directory) / "Intelligence"
+            shutil.copytree(source, resources, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+            before = {p.relative_to(resources): p.read_bytes() for p in resources.rglob("*") if p.is_file()}
+            result = subprocess.run([sys.executable, "-c", """
+import asyncio, json
+import runner
+from prediction_markets.__main__ import parser
+from prediction_markets.sdk import PredictionResearch
+from research import Research
+assert parser().parse_args(['validate-config', '--config', 'examples/prediction-markets.json'])
+print(json.dumps(asyncio.run(PredictionResearch(Research()).query())['providers']))
+"""], cwd=resources, capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('"polymarket", "kalshi"', result.stdout)
+            after = {p.relative_to(resources): p.read_bytes() for p in resources.rglob("*") if p.is_file()}
+            self.assertEqual(before, after)
+
     def test_startup_does_not_add_import_caches_to_app_resources(self):
         source = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory(prefix="maystock-signed-resources-") as directory:

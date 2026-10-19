@@ -153,4 +153,4 @@ python3 -m Intelligence.prediction_markets search kalshi "" --limit 5 --pages 1
 python3 -m Intelligence.prediction_markets validate-config --config Intelligence/examples/prediction-markets.json
 ```
 
-Linux 可运行此工具，不能运行 macOS 界面。Kalshi 无盘口源时间戳，接收时间模式需显式启用；本云环境 Polymarket 返回 403，保持不可用。详见 [配置、运行与边界](docs/PREDICTION-MARKETS.md)。
+Linux 可运行此工具，不能运行 macOS 界面。Kalshi 无盘口源时间戳，接收时间模式需显式启用。2026-10-19 已使用实际客户端验证指定 Polymarket Gamma/CLOB 和 Kalshi 合约的公开数据；此前另一请求路径的 403 不能代表适配器整体不可用。详见 [配置、运行、逐项验收与边界](docs/PREDICTION-MARKETS.md)。

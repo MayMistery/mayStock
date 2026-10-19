@@ -130,6 +130,73 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(value["scanned"], 1)
         self.assertIn("mve_filter=exclude", provider.client.get.call_args.args[0])
 
+    def test_polymarket_discovery_filters_lifecycle_deadline_rules_and_bad_items_before_limit(self):
+        changes = [{"closed": True}, {"active": False}, {"endDate": "2020-01-01T00:00:00Z"},
+                   {"umaResolutionStatus": "resolved"}, {"endDate": None}, {"description": ""},
+                   {"outcomes": '["Yes", "No", "Other"]', "clobTokenIds": '["1", "2", "3"]'},
+                   {"outcomes": "broken-json"}]
+        markets = [{**poly(), **change, "id": str(index + 1)} for index, change in enumerate(changes)]
+        markets.append(poly())
+        result = self.adapter("polymarket", [{"events": [{"markets": markets}], "pagination": {"hasMore": False}}]).search("bitcoin", limit=1)
+        self.assertEqual([m["market_id"] for m in result["markets"]], ["123"])
+        for flag in ("inactive_market", "market_past_close", "resolved_or_resolution_status", "missing_market_close",
+                     "missing_resolution_rules", "unsupported_contract", "invalid_market_metadata"):
+            self.assertGreater(result["filtered_counts"].get(flag, 0), 0, flag)
+        self.assertEqual(result["scanned"], 9)
+        self.assertFalse(result["truncated"])
+
+    def test_polymarket_pages_skip_expired_results_and_preserve_partial_coverage(self):
+        expired = {**poly(), "endDate": "2020-01-01T00:00:00Z"}
+        replies = [{"events": [{"markets": [expired]}], "pagination": {"hasMore": True}},
+                   {"events": [{"markets": [poly()]}], "pagination": {"hasMore": True}}]
+        provider = self.adapter("polymarket", replies)
+        result = provider.search("bitcoin", limit=1, pages=2)
+        self.assertEqual(len(result["markets"]), 1)
+        self.assertTrue(result["truncated"])
+        urls = [call.args[0] for call in provider.client.get.call_args_list]
+        self.assertEqual(len(urls), 2)
+        for index, url in enumerate(urls, 1):
+            self.assertIn(f"page={index}", url)
+            self.assertIn("events_status=active", url)
+            self.assertIn("keep_closed_markets=0", url)
+
+    def test_discovery_deduplicates_and_empty_polymarket_response_is_valid(self):
+        result = self.adapter("polymarket", [{"events": [{"markets": [poly(), poly()]}]}]).search("bitcoin")
+        self.assertEqual(len(result["markets"]), 1)
+        self.assertEqual(result["filtered_counts"]["duplicate_market"], 1)
+        result = self.adapter("polymarket", [{"events": None}]).search("unmatched")
+        self.assertEqual(result["markets"], [])
+        self.assertFalse(result["truncated"])
+        for response in ({"events": {}}, {"events": [{"markets": False}]}):
+            with self.assertRaises(PredictionError):
+                self.adapter("polymarket", [response]).search("bitcoin")
+
+    def test_kalshi_discovery_rechecks_current_contracts_even_if_server_says_open(self):
+        markets = [{**kalshi(), **change, "ticker": f"TEST-{index}"} for index, change in enumerate([
+            {"close_time": "2020-01-01T00:00:00Z"}, {"status": "settled", "result": "yes"},
+            {"notional_value_dollars": "10"}, {"rules_primary": "", "rules_secondary": ""}])]
+        markets.append(kalshi())
+        result = self.adapter("kalshi", [{"markets": markets, "cursor": ""}]).search("", limit=1)
+        self.assertEqual([m["market_id"] for m in result["markets"]], [kalshi()["ticker"]])
+        self.assertEqual(result["scanned"], 5)
+
+    def test_search_rejects_invalid_bounds_and_empty_polymarket_query_before_network(self):
+        provider = self.adapter("polymarket", [])
+        for kwargs in ({"query": ""}, {"query": "bitcoin", "limit": True}, {"query": "bitcoin", "pages": 1.5}):
+            with self.assertRaises(PredictionError):
+                provider.search(**kwargs)
+        provider.client.get.assert_not_called()
+
+    def test_event_lifecycle_and_clob_asset_condition_identity_are_checked(self):
+        for change in ({"closed": True}, {"archived": True}, {"active": False}):
+            value = Provider("polymarket")._poly_metadata(poly(), {"id": "12", **change})
+            self.assertFalse(value["active"])
+        token = json.loads(poly()["clobTokenIds"])[1]
+        for change in ({"asset_id": "wrong"}, {"market": "wrong"}):
+            book = {"asset_id": token, "market": "0xabc", **change}
+            with self.assertRaisesRegex(PredictionError, "mismatch"):
+                self.adapter("polymarket", [poly(), book]).get("123", "Yes")
+
     def test_no_arbitrary_url_or_order_route(self):
         for value in ("https://localhost/x", "../../portfolio/orders", "a/b", "a?x=y"):
             with self.assertRaises(PredictionError):
@@ -169,7 +236,7 @@ class ProviderTests(unittest.TestCase):
                 Provider("polymarket")._poly_metadata({**poly(), field: value})
 
     def test_redirect_refused_before_following(self):
-        requests = []
+        requests, responses = [], []
         class FakeHTTPS(urllib.request.HTTPSHandler):
             def https_open(self, req):
                 requests.append(req.full_url)
@@ -177,12 +244,14 @@ class ProviderTests(unittest.TestCase):
                 headers["Location"] = "https://example.com/not-provider"
                 response = urllib.response.addinfourl(io.BytesIO(b"{}"), headers, req.full_url, 302)
                 response.msg = "Found"
+                responses.append(response)
                 return response
         build = urllib.request.build_opener
         with patch("Intelligence.prediction_markets.providers.urllib.request.build_opener", lambda *handlers: build(*handlers, FakeHTTPS())):
             with self.assertRaisesRegex(PredictionError, "REDIRECT"):
                 PublicClient().get("https://gamma-api.polymarket.com/markets/123")
         self.assertEqual(len(requests), 1)
+        self.assertTrue(responses[0].closed)
 
     def test_long_retry_after_seconds_and_date_do_not_retry_early(self):
         for retry_after in ("60", email.utils.formatdate(NOW + 60, usegmt=True)):
@@ -293,6 +362,23 @@ class EngineTests(unittest.TestCase):
                                 ({"volume_24h": None}, "insufficient_activity")):
             self.assertIn(flag, quality_flags(observation(.4, NOW, **overrides), {**QUALITY_DEFAULTS, "min_volume_24h": 10}, NOW))
 
+    def test_missing_deadline_or_rules_cannot_trigger_even_with_a_fresh_book(self):
+        for change, flag in (({"close_at": None}, "missing_market_close"), ({"rules": ""}, "missing_resolution_rules")):
+            engine = self.engine(config({"id": "cross", "type": "cross", "confirmations": 1}))
+            self.poll(engine, .4, NOW)
+            result = self.poll(engine, .6, NOW + 30, **change)
+            self.assertEqual(result["alerts"], [])
+            self.assertIn(flag, result["mappings"][0]["quality_flags"])
+            self.assertEqual(self.poll(engine, .6, NOW + 60)["alerts"], [])
+
+    def test_config_rejects_invalid_market_ids_and_outcome_before_polling(self):
+        for change in ({"market_id": "https://localhost/private"}, {"market_id": "../orders"},
+                       {"outcome": "Maybe"}, {"outcome": "a" * 101}):
+            value = config()
+            value["mappings"][0].update(change)
+            with self.assertRaisesRegex(PredictionError, "PREDICTION_CONFIG"):
+                validate_config(value)
+
     def test_provider_failure_invalidates_window_and_latches_denial(self):
         engine = self.engine()
         self.poll(engine, .4, NOW)
@@ -370,6 +456,34 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(len(store.alerts()), 1)
             store.close()
 
+    def test_access_denial_survives_reopen_and_explicit_test_reset_rebaselines(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = folder + "/state.db"
+            conf = config({"id": "cross", "type": "cross", "confirmations": 1})
+            store = Store(path)
+            engine = Engine(conf, store, {"kalshi": self.provider})
+            self.poll(engine, .4, NOW)
+            self.provider.get.side_effect = PredictionError("SOURCE_HTTP_403: denied fixture")
+            engine.poll(NOW + 30)
+            store.close()
+            store = Store(path)
+            engine = Engine(conf, store, {"kalshi": self.provider})
+            count = self.provider.get.call_count
+            engine.poll(NOW + 60)
+            self.assertEqual(self.provider.get.call_count, count)
+            store.close()
+            # Only this temporary fixture database is reset; never a live latch.
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["--db", path, "reset-health", "kalshi"]), 0)
+            store = Store(path)
+            try:
+                self.provider.get.side_effect = None
+                engine = Engine(conf, store, {"kalshi": self.provider})
+                self.assertEqual(self.poll(engine, .6, NOW + 90)["alerts"], [])
+                self.assertEqual(self.provider.get.call_count, count + 1)
+            finally:
+                store.close()
+
     def test_changed_rule_version_rebaselines(self):
         first = self.engine(config({"id": "cross", "type": "cross", "confirmations": 1}))
         self.poll(first, .4, NOW)
@@ -384,6 +498,89 @@ class EngineTests(unittest.TestCase):
             mutate(c)
             with self.assertRaises(PredictionError):
                 validate_config(c)
+
+
+class ProviderHealthRaceTests(unittest.TestCase):
+    def race(self, blocked_error, inflight_error=None):
+        with tempfile.TemporaryDirectory() as folder:
+            path = folder + "/state.db"
+            conf = config({"id": "cross", "type": "cross", "confirmations": 1})
+            seed = Store(path)
+            initial = Mock()
+            initial.get.return_value = observation(.4, NOW)
+            Engine(conf, seed, {"kalshi": initial}).poll(NOW)
+            seed.close()
+            started, release, results = threading.Event(), threading.Event(), []
+
+            def in_flight():
+                state = Store(path)
+                provider = Mock()
+                def fetch(*args):
+                    started.set()
+                    if not release.wait(5):
+                        raise RuntimeError("test release timed out")
+                    if inflight_error:
+                        raise inflight_error
+                    return observation(.6, NOW + 60)
+                provider.get.side_effect = fetch
+                try:
+                    results.append(Engine(conf, state, {"kalshi": provider}).poll(NOW + 60))
+                except Exception as exc:
+                    results.append(exc)
+                finally:
+                    state.close()
+
+            thread = threading.Thread(target=in_flight)
+            thread.start()
+            try:
+                self.assertTrue(started.wait(5))
+                state = Store(path)
+                rejected = Mock()
+                rejected.get.side_effect = blocked_error
+                Engine(conf, state, {"kalshi": rejected}).poll(NOW + 30)
+                state.close()
+            finally:
+                release.set()
+                thread.join(10)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(len(results), 1)
+            self.assertIsInstance(results[0], dict, results)
+            self.assertEqual(results[0]["alerts"], [])
+            state = Store(path)
+            try:
+                details = json.loads(state.db.execute("SELECT payload FROM health WHERE key='kalshi:*'").fetchone()[0])
+                if "403" in str(blocked_error):
+                    self.assertTrue(details["access_denied"])
+                else:
+                    self.assertEqual(details["retry_after_until"], NOW + 150)
+                later = Mock()
+                later.get.return_value = observation(.6, NOW + 90)
+                result = Engine(conf, state, {"kalshi": later}).poll(NOW + 90)
+                later.get.assert_not_called()
+                self.assertEqual(result["alerts"], [])
+                self.assertEqual(state.status()["observations"], 1)
+            finally:
+                state.close()
+
+    def test_inflight_success_cannot_clear_newer_access_denial(self):
+        self.race(PredictionError("SOURCE_HTTP_403: denied"))
+
+    def test_inflight_success_cannot_clear_newer_retry_after(self):
+        error = PredictionError("SOURCE_HTTP_429: rate limited")
+        error.retry_after = 120
+        self.race(error)
+
+    def test_inflight_rate_limit_cannot_replace_access_denial(self):
+        error = PredictionError("SOURCE_HTTP_429: rate limited")
+        error.retry_after = 60
+        self.race(PredictionError("SOURCE_HTTP_403: denied"), error)
+
+    def test_inflight_shorter_retry_after_cannot_shorten_newer_backoff(self):
+        newer = PredictionError("SOURCE_HTTP_429: rate limited")
+        newer.retry_after = 120
+        older = PredictionError("SOURCE_HTTP_429: rate limited")
+        older.retry_after = 30
+        self.race(newer, older)
 
 
 class CLITests(unittest.TestCase):
@@ -417,6 +614,24 @@ class CLITests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("PREDICTION_ID", result[0]["error"])
 
+    def test_enabled_one_shot_persists_healthy_fixture_without_startup_alert(self):
+        with tempfile.TemporaryDirectory() as folder:
+            from pathlib import Path
+            path = Path(folder) / "config.json"
+            path.write_text(json.dumps(config()))
+            adapter = Mock()
+            adapter.get.return_value = observation(.6, NOW)
+            db = folder + "/state.db"
+            with patch("Intelligence.prediction_markets.engine.Provider", return_value=adapter), \
+                 patch("Intelligence.prediction_markets.engine.time.time", return_value=NOW):
+                code, result = self.run_cli("--db", db, "evaluate", "--config", str(path))
+            self.assertEqual(code, 0)
+            self.assertEqual(result[0]["status"], "healthy")
+            self.assertEqual(result[0]["alerts"], [])
+            code, result = self.run_cli("--db", db, "status")
+            self.assertEqual(result[0]["observations"], 1)
+            self.assertEqual(result[0]["alert_count"], 0)
+
 
 class SDKTests(unittest.IsolatedAsyncioTestCase):
     async def test_catalog_no_network_state_or_credentials(self):
@@ -429,6 +644,19 @@ class SDKTests(unittest.IsolatedAsyncioTestCase):
     async def test_reject_mutating_action(self):
         with self.assertRaises(PredictionError):
             await PredictionResearch(Research()).query(action="order")
+
+    async def test_get_records_book_evidence_in_the_shared_research_ledger(self):
+        research = Research(max_requests=7)
+        tool = PredictionResearch(research)
+        replies = iter([{"market": kalshi()}, {"orderbook_fp": {"yes_dollars": [[".41", "2500"]], "no_dollars": [[".57", "3000"]]}}])
+        tool.client._download = Mock(side_effect=lambda url: (url, json.dumps(next(replies)), "application/json"))
+        result = await tool.query(action="get", provider="kalshi", market_id="KXFED-TEST-T4")
+        self.assertIs(tool.client.research, research)
+        self.assertEqual(tool.client._download.call_count, 2)
+        self.assertIn(result["url"], research.market_document_urls)
+        self.assertIn(result["book_source_url"], result["text"])
+        self.assertEqual(research.documents[result["url"]].text, result["text"])
+        self.assertEqual(result["freshness_basis"], "received_at")
 
 
 if __name__ == "__main__":

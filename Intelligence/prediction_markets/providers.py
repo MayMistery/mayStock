@@ -87,10 +87,32 @@ def identifier(value):
     return value
 
 
+def market_flags(metadata, now):
+    """Lifecycle gates shared by discovery and trigger evaluation."""
+    flags = []
+    if not metadata.get("active"):
+        flags.append("inactive_market")
+    if not metadata.get("supported_contract"):
+        flags.append("unsupported_contract")
+    if metadata.get("result") or metadata.get("resolution_status") in {"resolved", "disputed", "proposed", "finalized"}:
+        flags.append("resolved_or_resolution_status")
+    close = metadata.get("close_at")
+    if close is None:
+        flags.append("missing_market_close")
+    elif close <= now:
+        flags.append("market_past_close")
+    if not isinstance(metadata.get("rules"), str) or not metadata["rules"].strip():
+        flags.append("missing_resolution_rules")
+    return flags
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         # Reject before the destination is requested, including same-host moves.
-        raise PredictionError("PREDICTION_REDIRECT: provider redirects are disabled")
+        try:
+            fp.close()
+        finally:
+            raise PredictionError("PREDICTION_REDIRECT: provider redirects are disabled")
 
 
 class PublicClient:
@@ -233,24 +255,47 @@ class Provider:
         return self.client.get(base + path + ("?" + urllib.parse.urlencode(params) if params else ""))
 
     def search(self, query, limit=20, pages=3, series_ticker=""):
-        if not isinstance(query, str) or len(query) > 200 or not 1 <= limit <= 100 or not 1 <= pages <= 5:
+        if (not isinstance(query, str) or len(query) > 200 or type(limit) is not int or
+                type(pages) is not int or not 1 <= limit <= 100 or not 1 <= pages <= 5):
             raise PredictionError("PREDICTION_QUERY: query <=200 characters, limit 1..100, pages 1..5")
+        if self.name == "polymarket" and not query.strip():
+            raise PredictionError("PREDICTION_QUERY: Polymarket search requires a nonempty query")
         if series_ticker:
             identifier(series_ticker)
             if self.name != "kalshi":
                 raise PredictionError("PREDICTION_QUERY: series_ticker is a Kalshi filter")
         found, scanned, received, source = [], 0, time.time(), BASES[self.name]
-        more = False
+        more, filtered, seen = False, {}, set()
+
+        def keep(metadata):
+            flags = market_flags(metadata, received)
+            if metadata["market_id"] in seen:
+                flags.append("duplicate_market")
+            for flag in flags:
+                filtered[flag] = filtered.get(flag, 0) + 1
+            if not flags:
+                seen.add(metadata["market_id"])
+                found.append(metadata)
+
         if self.name == "polymarket":
-            raw, received, source = self._get("/public-search", {"q": query, "limit_per_type": limit})
-            if not isinstance(raw, dict):
-                raise PredictionError("PREDICTION_SCHEMA: invalid search response")
-            for event in array(raw.get("events", [])):
-                event = object_value(event)
-                for market in array(event.get("markets", [])):
-                    scanned += 1
-                    found.append(self._poly_metadata(market, event))
-            more = bool(object_value(raw.get("pagination", {})).get("hasMore", False)) or len(found) > limit
+            for page in range(1, pages + 1):
+                raw, received, source = self._get("/public-search", {"q": query, "limit_per_type": limit,
+                    "page": page, "events_status": "active", "keep_closed_markets": 0})
+                if not isinstance(raw, dict):
+                    raise PredictionError("PREDICTION_SCHEMA: invalid search response")
+                event_rows = raw.get("events")
+                for event in array([] if event_rows is None else event_rows):
+                    event = object_value(event)
+                    market_rows = event.get("markets")
+                    for market in array([] if market_rows is None else market_rows):
+                        scanned += 1
+                        try:
+                            keep(self._poly_metadata(market, event))
+                        except PredictionError:
+                            filtered["invalid_market_metadata"] = filtered.get("invalid_market_metadata", 0) + 1
+                more = bool(object_value(raw.get("pagination", {})).get("hasMore", False))
+                if not more or len(found) >= limit:
+                    break
         else:
             cursor = None
             for _ in range(pages):
@@ -267,14 +312,18 @@ class Provider:
                     scanned += 1
                     haystack = " ".join(str(market.get(k, "")) for k in ("title", "subtitle", "ticker", "event_ticker")).casefold()
                     if all(word in haystack for word in query.casefold().split()):
-                        found.append(self._kalshi_metadata(market))
+                        try:
+                            keep(self._kalshi_metadata(market))
+                        except PredictionError:
+                            filtered["invalid_market_metadata"] = filtered.get("invalid_market_metadata", 0) + 1
                 cursor = raw.get("cursor")
                 more = bool(cursor)
                 if not cursor or len(found) >= limit:
                     break
         return {"provider": self.name, "query": query, "series_ticker": series_ticker or None, "markets": found[:limit], "scanned": scanned,
-                "truncated": more or len(found) > limit, "received_at": received, "source_url": source,
-                "note": "Bounded discovery only. No result is not proof of no matching market. Review proposition, dates and resolution rules before configuring exact IDs.", "caveat": CAVEAT}
+                "truncated": more or len(found) > limit, "filtered_counts": filtered,
+                "received_at": received, "source_url": source,
+                "note": "Bounded current binary-contract discovery only; closed, expired, incomplete and unsupported contracts are excluded. No result is not proof of no matching market. Review proposition, dates and resolution rules before configuring exact IDs; discovery does not validate book quality.", "caveat": CAVEAT}
 
     def series(self, query="", category="", limit=20):
         if self.name != "kalshi" or not isinstance(query, str) or len(query) > 200 or not isinstance(category, str) or len(category) > 100 or not 1 <= limit <= 100:
@@ -359,8 +408,12 @@ class Provider:
                 raise PredictionError("PREDICTION_SCHEMA: invalid market lifecycle flag")
         events = array(raw.get("events", []))
         event = object_value(event or (events[0] if events else {}))
+        for flag in ("active", "closed", "archived"):
+            if flag in event and not isinstance(event[flag], bool):
+                raise PredictionError("PREDICTION_SCHEMA: invalid event lifecycle flag")
         active = raw.get("active") is True and not raw.get("closed", False) and not raw.get("archived", False)
         active = active and raw.get("acceptingOrders") is True and raw.get("enableOrderBook") is True
+        active = active and event.get("active", True) and not event.get("closed", False) and not event.get("archived", False)
         slug = event.get("slug")
         return {"provider": "polymarket", "market_id": str(raw["id"]), "event_id": str(event.get("id", "")),
                 "question": raw["question"], "slug": raw.get("slug"), "condition_id": raw.get("conditionId"),
