@@ -77,7 +77,7 @@ App 内每轮运行时，runner 在 stderr 上标为 `notice` 的诊断——模
 
 Swift 负责调度、持久化和重试；Python 只接收一次请求并产生一次结果。正常 stdout 为一个报告 JSON；失败为 `{"error":"已脱敏的说明"}`，并以非零状态退出。总体运行有 840 秒限制；日报和小时研究的模型阶段各为 600 秒，快报为 360 秒。日报/小时草稿另有最多 150 秒的一致性复核，使用同一模型核对时间对齐、涨跌幅比较和归因，只返回短句修订，不重新搜索或改写来源。复核失败保留来源有效的初稿并显示覆盖警示；取消时关闭 SDK 连接。研究共用 120 次公网请求和最多 40 轮 agent 交互，不再限制成 3 次搜索、6 个页面或 300 字摘要；工具会返回剩余请求和时间，让 agent 自行取舍。校验失败最多在同一 SDK 会话内修正一次，沿用本次原文证据。已有好数据在失败后继续保留，界面另行显示失败状态。短窗口事件在输出完成时再次检查是否仍在最近 30/60 分钟内；报告覆盖终点仍是检索开始时刻，不声称覆盖生成期间的新消息。
 
-SDK 禁用内置工具、用户/项目设置、hooks、插件、skills、自动记忆和其他 MCP 连接；开放 `search_news`、`fetch_page`、`market_data` 三个只读研究工具。`search_news` 可用任意主题和来源查询，`fetch_page` 可读公开 HTTPS 网页、JSON 和官方数据，`market_data` 提供带单位、真实时间、口径和可引用原文的行情/衍生品数据。HTTPS 检索拒绝本地/私有地址、凭证 URL 和非标准端口，在连接时固定已核验的公网 IP，保持原始主机名的 TLS 校验，并逐跳验证重定向。检索不使用本机代理设置；模型路由仍可使用明确配置的代理。
+SDK 禁用内置工具、用户/项目设置、hooks、插件、skills、自动记忆和其他 MCP 连接；开放 `search_news`、`fetch_page`、`market_data` 等只读研究工具。`search_news` 可用任意主题和来源查询，`fetch_page` 可读公开 HTTPS 网页、JSON 和官方数据，`market_data` 提供带单位、真实时间、口径和可引用原文的行情/衍生品数据。HTTPS 检索拒绝本地/私有地址、凭证 URL 和非标准端口，在连接时固定已核验的公网 IP，保持原始主机名的 TLS 校验，并逐跳验证重定向。检索不使用本机代理设置；模型路由仍可使用明确配置的代理。
 
 ## 开发验证
 
@@ -88,3 +88,7 @@ SDK 禁用内置工具、用户/项目设置、hooks、插件、skills、自动�
 测试也覆盖日报自主追加研究、跨市场/衍生品口径、分时完整性、相同 URL 的多次快照、部分坏引用隔离及预测引用归属。测试覆盖旧事新发、发布时间与发生时间混淆、不相关日期与时刻组合、短窗口边界、去重、同一日历同时发布的不同指标、缺失/陈旧报价、完整关注列表、夏令时、来源原文核验、必需检索失败与部分覆盖的边界、程序覆盖字段及 SDK 设置隔离。
 
 数据结构详见 [INTELLIGENCE-CONTRACT.md](INTELLIGENCE-CONTRACT.md)。SDK 配置依据 [Python Agent SDK 官方参考](https://code.claude.com/docs/en/agent-sdk/python)、[结构化输出](https://code.claude.com/docs/en/agent-sdk/structured-outputs) 和 [设置隔离边界](https://code.claude.com/docs/en/agent-sdk/claude-code-features)。
+
+## 预测市场公开数据与事件触发
+
+新增 `prediction_markets` 只读 SDK 工具：`catalog`、`search`、`get`。保留具体问题、结果标签、结算规则、双边盘口与时间口径，不将预测市场价格当成已发生新闻或标的方向。独立标准库 CLI 支持显式事件映射、本地 SQLite 和信息型触发；默认不向外发送、不执行交易。参见 [PREDICTION-MARKETS.md](PREDICTION-MARKETS.md)。

@@ -172,6 +172,7 @@ MARKET_API_HOSTS = {
     "data-api.binance.vision", "api.binance.com", "fapi.binance.com",
     "www.okx.com", "query1.finance.yahoo.com", "query2.finance.yahoo.com",
     "api.exchange.coinbase.com", "api.coinbase.com", "api.kraken.com",
+    "gamma-api.polymarket.com", "clob.polymarket.com", "external-api.kalshi.com",
 }
 
 

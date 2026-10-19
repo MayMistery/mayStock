@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "poll_seconds": 60,
+  "retention_days": 7,
+  "mappings": [
+    {
+      "id": "eth-reviewed-event",
+      "enabled": false,
+      "provider": "polymarket",
+      "market_id": "REPLACE_WITH_REVIEWED_MARKET_ID",
+      "outcome": "Yes",
+      "subjects": ["ETH-USDT"],
+      "rationale": "Template only: choose a specific Ethereum-related proposition and review its exact threshold, deadline and settlement rules. An outcome-price move does not establish ETH direction.",
+      "event": {
+        "title": "Ethereum event selected after market review",
+        "note": "No live contract is selected. Similar wording is not proof of equivalent settlement."
+      },
+      "quality": {
+        "max_age_seconds": 120,
+        "max_gap_seconds": 120,
+        "max_spread_pp": 3,
+        "min_depth_usd": 100,
+        "allow_receipt_time": false
+      },
+      "rules": [
+        {"id": "five-pp-15m", "type": "change", "window_seconds": 900, "change_pp": 5},
+        {"id": "cross-50", "type": "cross", "threshold": 0.5, "hysteresis_pp": 2}
+      ]
+    },
+    {
+      "id": "fed-reviewed-meeting",
+      "enabled": false,
+      "provider": "kalshi",
+      "market_id": "REPLACE_WITH_REVIEWED_MARKET_TICKER",
+      "outcome": "Yes",
+      "subjects": ["ETH-USDT", "QQQ"],
+      "rationale": "Template only: map an exact Fed decision contract to the same meeting date and rate outcome. This provides macro context, not an ETH/QQQ buy or sell signal.",
+      "event": {
+        "title": "Fed meeting selected after contract review",
+        "source_url": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
+        "note": "Check the official meeting date and the contract's resolution rules. No date or exact match has been asserted."
+      },
+      "quality": {
+        "max_age_seconds": 60,
+        "max_gap_seconds": 120,
+        "max_spread_pp": 3,
+        "min_depth_usd": 100,
+        "allow_receipt_time": true
+      },
+      "rules": [
+        {"id": "five-pp-15m", "type": "change", "window_seconds": 900, "change_pp": 5},
+        {"id": "cross-50", "type": "cross", "threshold": 0.5, "hysteresis_pp": 2}
+      ]
+    }
+  ]
+}

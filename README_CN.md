@@ -143,3 +143,14 @@ CLI 程序本身只剩账单流水在用。
 ## 许可
 
 [MIT](LICENSE)
+
+## 预测市场事件工具（无头模式）
+
+新增标准库 Python CLI，将人工核对的 Polymarket / Kalshi 合约与关注标的、事件关联，输出概率变化和阈值穿越的 JSON 提示。带双边盘口、价差、深度、时效过滤，以及 SQLite 历史、冷却和启动保护。无需模型或交易凭证，不下单、不执行 shell hook、不发送外部通知。示例 ETH / Fed 映射默认禁用，需填入已核对的具体合约。
+
+```sh
+python3 -m Intelligence.prediction_markets search kalshi "" --limit 5 --pages 1
+python3 -m Intelligence.prediction_markets validate-config --config Intelligence/examples/prediction-markets.json
+```
+
+Linux 可运行此工具，不能运行 macOS 界面。Kalshi 无盘口源时间戳，接收时间模式需显式启用；本云环境 Polymarket 返回 403，保持不可用。详见 [配置、运行与边界](docs/PREDICTION-MARKETS.md)。

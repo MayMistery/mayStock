@@ -76,7 +76,7 @@ def sdk_options(cwd: str, mcp_servers=None, schema=None, model=MODEL):
 
     return ClaudeAgentOptions(
         model=normalize_model(model), fallback_model=None, tools=[],
-        allowed_tools=["mcp__research__search_news", "mcp__research__fetch_page", "mcp__research__market_data"] if mcp_servers else [],
+        allowed_tools=["mcp__research__search_news", "mcp__research__fetch_page", "mcp__research__market_data", "mcp__research__prediction_markets"] if mcp_servers else [],
         mcp_servers=mcp_servers or {}, strict_mcp_config=True,
         setting_sources=[], settings=json.dumps(SAFE_SETTINGS), plugins=[], skills=[],
         system_prompt=SYSTEM_PROMPT, cwd=cwd,
@@ -192,11 +192,13 @@ async def make_report(request):
     from claude_agent_sdk import create_sdk_mcp_server, tool, ToolAnnotations
     if __package__:
         from .market_data import MarketData
+        from .prediction_markets.sdk import PredictionResearch
         from .calendar_events import assemble_calendar_events
         from .daily import prefetch_news
         from .review import audit_report
     else:
         from market_data import MarketData
+        from prediction_markets.sdk import PredictionResearch
         from calendar_events import assemble_calendar_events
         from daily import prefetch_news
         from review import audit_report
@@ -205,6 +207,7 @@ async def make_report(request):
     options_factory = partial(sdk_options, model=request["model"])
     research = Research(max_requests=PUBLIC_REQUEST_BUDGET)
     market = MarketData(research)
+    predictions = PredictionResearch(research)
     progress("research_start", kind=request["kind"], model=request["model"])
     seed = await research.bootstrap(request["kind"])
     start, end = window(request)
@@ -262,6 +265,16 @@ async def make_report(request):
             return tool_result(error=str(exc) if isinstance(exc, ResearchError) else
                                "MARKET_UNAVAILABLE: 该数据请求未完成，可调整查询或换公开来源；不能将缺失解释为零。")
 
+    @tool("prediction_markets", "Read public prediction-market metadata and books. Use action=catalog, search or get. Search results require manual proposition/date/rules review; outcome prices are not verified events or asset direction. No accounts, orders, mappings or trigger mutations.",
+          {"action": str, "provider": str, "query": str, "market_id": str, "outcome": str, "limit": int},
+          annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, maxResultSizeChars=150000))
+    async def prediction_markets(args):
+        try:
+            return tool_result(await predictions.query(**args))
+        except (ResearchError, ValueError, TypeError, KeyError) as exc:
+            return tool_result(error=str(exc) if isinstance(exc, ResearchError) else
+                               "PREDICTION_UNAVAILABLE: public prediction-market data could not be read")
+
     async def prepare(output):
         output = dict(output)
         if not isinstance(output.get("events"), list):
@@ -272,7 +285,7 @@ async def make_report(request):
         validate_report(output, request, research, completed_at=time.time())
         return output
 
-    server = create_sdk_mcp_server(name="research", tools=[search_news, fetch_page, market_data])
+    server = create_sdk_mcp_server(name="research", tools=[search_news, fetch_page, market_data, prediction_markets])
     prompt = json.dumps({"request": request, "windowStart": start, "windowEnd": end,
                          "preloadedResearch": seed, "verifiedCalendarEvents": calendar,
                          "fetchedNewsDocuments": news,

@@ -99,6 +99,11 @@
   DXY/VIX/treasuries, Coinbase premium — all free, no key, up to 65 years of
   history) plus an `ic` command that scores them with overlap and
   multiple-testing corrections. See [docs/STRATEGY-DEV.md](docs/STRATEGY-DEV.md).
+- **Prediction-market event tools** — a Python headless, public-data-only CLI
+  connects explicitly reviewed Polymarket/Kalshi contracts to watched subjects.
+  JSON probability-change/crossing events use quality filters, SQLite history,
+  cooldowns and startup protection. No model credentials, orders or outbound
+  notifications. See [setup, examples and limits](docs/PREDICTION-MARKETS.md).
 - **Watchlist** — any OKX spot/perp instrument, validated against the
   exchange when added. BTC-USDT out of the box.
 - **Intelligence station** — a terminal calendar covering seven days back and

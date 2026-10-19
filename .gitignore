@@ -11,3 +11,6 @@ dist/
 .build-xcode/
 __pycache__/
 *.pyc
+
+# Local read-only prediction-market observations (never commit runtime state).
+.local/
